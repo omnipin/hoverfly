@@ -363,7 +363,11 @@ pub async fn upload_bytes(
             .stamp(addr)
             .map_err(|e| ClientError::Stamp(e.to_string()))?;
         let stamp_bytes = stamp.to_bytes();
-        let chunk_data = chunk.data().to_vec();
+        // bee Delivery.data is the wire form: span(8 LE) || payload, so bee can
+        // verify BMT_hash(span||payload) == address.
+        let mut wire = Vec::with_capacity(8 + chunk.data().len());
+        wire.extend_from_slice(&chunk.span().to_le_bytes());
+        wire.extend_from_slice(chunk.data());
         let mut addr32 = [0u8; 32];
         addr32.copy_from_slice(addr.as_bytes());
 
@@ -371,7 +375,7 @@ pub async fn upload_bytes(
             transport,
             peers,
             &addr32,
-            &chunk_data,
+            &wire,
             &stamp_bytes[..],
             max_retries_per_chunk,
         )
