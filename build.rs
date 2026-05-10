@@ -9,6 +9,7 @@ fn main() -> Result<()> {
             "proto/pricing.proto",
             "proto/retrieval.proto",
             "proto/pushsync.proto",
+            "proto/pseudosettle.proto",
         ],
         &["proto/"],
     )?;

@@ -9,5 +9,6 @@ pub mod hive;
 pub mod pricing;
 pub mod retrieval;
 pub mod pushsync;
+pub mod pseudosettle;
 
 pub mod framing;

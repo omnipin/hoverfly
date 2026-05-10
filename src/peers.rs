@@ -39,6 +39,16 @@ impl Peer {
         self.underlays.iter().find_map(|s| s.parse().ok())
     }
 
+    /// First parseable ws/wss multiaddr, if any. Hive responses often
+    /// list both TCP and ws underlays for the same peer; we can only
+    /// dial ws from this WASM-portable client.
+    pub fn first_ws_underlay(&self) -> Option<Multiaddr> {
+        self.underlays
+            .iter()
+            .filter(|s| s.contains("/ws") || s.contains("/wss"))
+            .find_map(|s| s.parse().ok())
+    }
+
     pub fn overlay_bytes(&self) -> Option<[u8; 32]> {
         let bytes = hex::decode(self.overlay.trim_start_matches("0x")).ok()?;
         if bytes.len() != 32 {

@@ -176,6 +176,110 @@ fn trim_padding(b: &[u8]) -> &[u8] {
     &b[..end]
 }
 
+/// Bee mantaray metadata keys (matching `pkg/manifest/manifest.go`).
+pub const ENTRY_METADATA_CONTENT_TYPE_KEY: &str = "Content-Type";
+pub const ENTRY_METADATA_FILENAME_KEY: &str = "Filename";
+pub const WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY: &str = "website-index-document";
+pub const WEBSITE_ERROR_DOCUMENT_PATH_KEY: &str = "website-error-document";
+/// Bee's manifest root-path marker for website metadata.
+pub const ROOT_PATH: &str = "/";
+
+/// One file entry to include in a collection manifest.
+pub struct CollectionEntry {
+    /// In-manifest path (e.g. `"index.html"`, `"static/app.css"`). Used as
+    /// both the trie key and as the `Filename` metadata value.
+    pub path: String,
+    /// Reference to the file's content (its BMT root).
+    pub reference: ChunkAddress,
+    /// Optional `Content-Type`; set this to whatever the client should
+    /// receive when fetching this entry.
+    pub content_type: Option<String>,
+}
+
+/// Build a single-entry mantaray manifest with `path` -> `file_root` and the
+/// given `Content-Type`. Returns `(manifest_root, chunks)` where each chunk's
+/// payload is ready to be wrapped in `span_LE_8 || payload` and pushed via
+/// pushsync. Uses nectar-mantaray's encoder (its decoder rejects bee's
+/// ref_size=0 nodes, but its encoder is fine).
+pub fn build_single_entry_manifest(
+    path: &str,
+    file_root: ChunkAddress,
+    content_type: Option<&str>,
+) -> Result<(ChunkAddress, Vec<(ChunkAddress, bytes::Bytes)>), ManifestError> {
+    let entries = vec![CollectionEntry {
+        path: path.to_string(),
+        reference: file_root,
+        content_type: content_type.map(str::to_string),
+    }];
+    build_collection_manifest(&entries, None, None)
+}
+
+/// Build a multi-entry "collection" mantaray manifest as bee produces when
+/// you POST a tar to `/bzz` with `Content-Type: application/x-tar`. Each
+/// entry becomes a fork in the trie at its `path`, carrying `Content-Type`
+/// and `Filename` metadata. Optional `index_document` / `error_document`
+/// are written as root-path metadata so that gateways resolve `/<root>/`
+/// to the index and 404s to the error doc.
+///
+/// Returns `(manifest_root, chunks_in_wire_form)`.
+pub fn build_collection_manifest(
+    entries: &[CollectionEntry],
+    index_document: Option<&str>,
+    error_document: Option<&str>,
+) -> Result<(ChunkAddress, Vec<(ChunkAddress, bytes::Bytes)>), ManifestError> {
+    use nectar_mantaray::PlainManifest;
+    use nectar_primitives::DEFAULT_BODY_SIZE;
+    use nectar_primitives::DefaultMemoryStore;
+
+    let store = DefaultMemoryStore::new();
+    let mut manifest: PlainManifest<_, DEFAULT_BODY_SIZE> = PlainManifest::new(store);
+
+    for entry in entries {
+        let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(ct) = &entry.content_type {
+            metadata.insert(ENTRY_METADATA_CONTENT_TYPE_KEY.to_string(), ct.clone());
+        }
+        // Filename is the basename of the path (matching bee's behaviour).
+        let filename = entry
+            .path
+            .rsplit('/')
+            .next()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(entry.path.as_str())
+            .to_string();
+        metadata.insert(ENTRY_METADATA_FILENAME_KEY.to_string(), filename);
+
+        manifest
+            .add_with_metadata(&entry.path, entry.reference, metadata)
+            .map_err(|e| ManifestError::Metadata(e.to_string()))?;
+    }
+
+    if index_document.is_some() || error_document.is_some() {
+        let mut root_meta: BTreeMap<String, String> = BTreeMap::new();
+        if let Some(idx) = index_document {
+            root_meta.insert(WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY.to_string(), idx.to_string());
+        }
+        if let Some(err) = error_document {
+            root_meta.insert(WEBSITE_ERROR_DOCUMENT_PATH_KEY.to_string(), err.to_string());
+        }
+        // bee uses swarm.ZeroAddress for the root entry's reference.
+        manifest
+            .add_with_metadata(ROOT_PATH, ChunkAddress::new([0u8; 32]), root_meta)
+            .map_err(|e| ManifestError::Metadata(e.to_string()))?;
+    }
+
+    let root = manifest.save().map_err(|e| ManifestError::Metadata(e.to_string()))?;
+
+    let (_node, store) = manifest.into_parts();
+    let chunks: Vec<(ChunkAddress, bytes::Bytes)> = store
+        .into_chunks()
+        .into_iter()
+        .map(|(addr, chunk)| (addr, chunk.into_bytes()))
+        .collect();
+
+    Ok((root, chunks))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

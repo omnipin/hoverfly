@@ -27,6 +27,9 @@ pub mod proto {
     pub mod pushsync {
         include!(concat!(env!("OUT_DIR"), "/pushsync.rs"));
     }
+    pub mod pseudosettle {
+        include!(concat!(env!("OUT_DIR"), "/pseudosettle.rs"));
+    }
 }
 
 pub mod protocols;
@@ -48,8 +51,8 @@ pub use signer::SwarmSigner;
 pub use peers::{Peer, PeerStore};
 pub use transport::{Transport, TransportConfig, TransportError};
 pub use client::{
-    discover, fetch_bytes, fetch_manifest_path, list_manifest, upload_bytes, ClientError,
-    ManifestEntry,
+    discover, fetch_bytes, fetch_manifest_path, list_manifest, upload_bytes, upload_collection,
+    ClientError, ManifestEntry, UploadFile,
 };
 pub use doh::Doh;
 

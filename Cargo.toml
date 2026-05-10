@@ -22,7 +22,7 @@ required-features = ["cli"]
 
 [features]
 default = ["cli"]
-cli = ["dep:clap", "dep:tracing-subscriber"]
+cli = ["dep:clap", "dep:tracing-subscriber", "dep:tar"]
 
 [dependencies]
 # Nectar primitives (BMT, chunks, file split/join, mantaray, postage)
@@ -81,6 +81,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "ne
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+tar = { version = "0.4", optional = true }
 getrandom = { version = "0.3", default-features = false }
 
 # Wasm-only

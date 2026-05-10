@@ -5,9 +5,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
-use isheika::client::{fetch_manifest_path, list_manifest};
+use isheika::client::{
+    fetch_manifest_path, list_manifest, upload_bytes_ex, upload_collection,
+    upload_file_with_manifest_ex, DEFAULT_UPLOAD_CONCURRENCY,
+};
+use isheika::client::discover_recursive;
 use isheika::{
-    discover, fetch_bytes, upload_bytes, Doh, PeerStore, SwarmSigner, Transport, TransportConfig,
+    fetch_bytes, Doh, PeerStore, SwarmSigner, Transport, TransportConfig, UploadFile,
     DEFAULT_DOH_URL, MAINNET_BOOTNODE,
 };
 use libp2p::Multiaddr;
@@ -60,6 +64,12 @@ enum Commands {
         /// Append to existing peers.json instead of overwriting
         #[arg(long)]
         append: bool,
+
+        /// Number of recursive discovery hops. 1 = bootnode only. 2-3 is
+        /// recommended for upload workloads — chunk pushes need a peer
+        /// near each chunk's address, so a broader peerlist matters.
+        #[arg(long, default_value_t = 1)]
+        rounds: usize,
     },
 
     /// Fetch content addressed by a 32-byte hex root hash.
@@ -89,7 +99,9 @@ enum Commands {
         max_retries: usize,
     },
 
-    /// Upload a file using an existing postage batch.
+    /// Upload a file using an existing postage batch. Wraps the file in a
+    /// single-entry mantaray manifest with the file's basename as path. The
+    /// returned root resolves to the file via `fetch <root> --path <name>`.
     Upload {
         /// Input file
         #[arg(value_name = "FILE")]
@@ -114,7 +126,91 @@ enum Commands {
         /// Number of peers to try per chunk before giving up
         #[arg(long, default_value_t = 10)]
         max_retries: usize,
+
+        /// Upload raw chunks only, skip manifest creation.
+        #[arg(long)]
+        raw: bool,
+
+        /// Override the manifest path (default: file basename).
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<String>,
+
+        /// Override the Content-Type metadata (default: auto-detected from extension).
+        #[arg(long, value_name = "MIME")]
+        content_type: Option<String>,
+
+        /// Number of peer sessions to keep open in parallel during upload.
+        /// Each session reuses a single libp2p connection for many chunks,
+        /// so a small pool (4-16) is usually plenty.
+        #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY)]
+        concurrency: usize,
+
+        /// Treat the input as a tar archive (bee's `application/x-tar`
+        /// collection upload): unpack and upload each regular file as its
+        /// own entry in a multi-entry mantaray, addressable individually.
+        /// Auto-enabled for `*.tar` and `application/x-tar`.
+        #[arg(long)]
+        collection: bool,
+
+        /// (Collection only) Filename served when the root manifest is
+        /// fetched without a sub-path. Equivalent to bee's
+        /// `Swarm-Index-Document` header. Typically `index.html`.
+        #[arg(long, value_name = "FILE", requires = "collection")]
+        index_document: Option<String>,
+
+        /// (Collection only) Filename served on lookups that miss.
+        /// Equivalent to bee's `Swarm-Error-Document` header.
+        #[arg(long, value_name = "FILE", requires = "collection")]
+        error_document: Option<String>,
     },
+}
+
+/// Parse a tar archive into a flat list of `UploadFile`s (regular files
+/// only), matching bee's `pkg/api/dirs.go::tarReader::Next` semantics.
+fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::Error>> {
+    let mut archive = tar::Archive::new(std::io::Cursor::new(bytes));
+    let mut out = Vec::new();
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let header = entry.header().clone();
+        if !header.entry_type().is_file() {
+            continue;
+        }
+        let path = entry.path()?.to_string_lossy().into_owned();
+        let path = path.trim_start_matches("./").to_string();
+        if path.is_empty() || path == "." {
+            continue;
+        }
+        let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
+        std::io::Read::read_to_end(&mut entry, &mut data)?;
+        let content_type = guess_content_type(&path).map(str::to_string);
+        out.push(UploadFile { path, content_type, data });
+    }
+    Ok(out)
+}
+
+fn guess_content_type(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    let ext = lower.rsplit('.').next()?;
+    match ext {
+        "jpg" | "jpeg" => Some("image/jpeg"),
+        "png" => Some("image/png"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "txt" => Some("text/plain"),
+        "html" | "htm" => Some("text/html"),
+        "css" => Some("text/css"),
+        "js" | "mjs" => Some("application/javascript"),
+        "json" => Some("application/json"),
+        "pdf" => Some("application/pdf"),
+        "zip" => Some("application/zip"),
+        "tar" => Some("application/x-tar"),
+        "mp4" => Some("video/mp4"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        _ => None,
+    }
 }
 
 #[tokio::main]
@@ -141,12 +237,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doh = Doh::with_url(&cli.doh_url);
 
     match cli.command {
-        Commands::Discover { peer, output, wait, append } => {
+        Commands::Discover { peer, output, wait, append, rounds } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
-            let discovered = discover(&transport, &doh, &bootstrap, Duration::from_secs(wait)).await?;
-            println!("discovered {} peers", discovered.len());
+            let discovered = discover_recursive(
+                &transport,
+                &doh,
+                &bootstrap,
+                Duration::from_secs(wait),
+                rounds.max(1),
+            )
+            .await?;
+            println!("discovered {} peers ({} hop(s))", discovered.len(), rounds);
 
             let mut store = if append { PeerStore::load_or_create(&output) } else { PeerStore::new() };
             for p in discovered {
@@ -186,16 +289,111 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        Commands::Upload { file, batch, depth, key, peerlist, max_retries } => {
-            let data = std::fs::read(&file)?;
+        Commands::Upload {
+            file,
+            batch,
+            depth,
+            key,
+            peerlist,
+            max_retries,
+            raw,
+            manifest_path,
+            content_type,
+            concurrency,
+            collection,
+            index_document,
+            error_document,
+        } => {
             let signer = SwarmSigner::from_hex(&key, cli.network_id)?;
             let transport = Transport::new(signer.clone(), cfg);
             let peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!("peerlist {} is empty", peerlist.display()).into());
             }
-            let root = upload_bytes(&transport, &peers, &signer, &batch, depth, &data, max_retries).await?;
-            println!("uploaded {} bytes — root: {}", data.len(), hex::encode(root.as_bytes()));
+
+            // Auto-detect tar by extension if the user didn't pass --raw.
+            let is_tar = file
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("tar"))
+                .unwrap_or(false);
+            if (collection || (is_tar && !raw)) && !raw {
+                let bytes = std::fs::read(&file)?;
+                let files = read_tar_files(&bytes)?;
+                if files.is_empty() {
+                    return Err("tar archive contains no regular files".into());
+                }
+                let n_files = files.len();
+                let total: usize = files.iter().map(|f| f.data.len()).sum();
+                let root = upload_collection(
+                    &transport,
+                    &peers,
+                    &signer,
+                    &batch,
+                    depth,
+                    files,
+                    index_document.as_deref(),
+                    error_document.as_deref(),
+                    max_retries,
+                    concurrency,
+                )
+                .await?;
+                println!(
+                    "uploaded {} files ({} bytes) — manifest root: {}",
+                    n_files,
+                    total,
+                    hex::encode(root.as_bytes())
+                );
+                println!("retrieve a file with: isheika fetch {} --path <name> -o <out>",
+                    hex::encode(root.as_bytes()));
+                println!("list contents with: isheika fetch {} --list", hex::encode(root.as_bytes()));
+                return Ok(());
+            }
+
+            let data = std::fs::read(&file)?;
+            if raw {
+                let root = upload_bytes_ex(
+                    &transport,
+                    &peers,
+                    &signer,
+                    &batch,
+                    depth,
+                    &data,
+                    max_retries,
+                    concurrency,
+                )
+                .await?;
+                println!("uploaded {} bytes — root (raw): {}", data.len(), hex::encode(root.as_bytes()));
+            } else {
+                let path = manifest_path.unwrap_or_else(|| {
+                    file.file_name()
+                        .and_then(|s| s.to_str())
+                        .map(str::to_string)
+                        .unwrap_or_else(|| "file".to_string())
+                });
+                let ct = content_type.or_else(|| guess_content_type(&path).map(str::to_string));
+                let root = upload_file_with_manifest_ex(
+                    &transport,
+                    &peers,
+                    &signer,
+                    &batch,
+                    depth,
+                    &data,
+                    &path,
+                    ct.as_deref(),
+                    max_retries,
+                    concurrency,
+                )
+                .await?;
+                let display_ct = ct.as_deref().unwrap_or("-");
+                println!(
+                    "uploaded {} bytes ({}) — manifest root: {}",
+                    data.len(),
+                    display_ct,
+                    hex::encode(root.as_bytes())
+                );
+                println!("retrieve with: isheika fetch {} --path {} -o {}", hex::encode(root.as_bytes()), path, path);
+            }
         }
     }
 
