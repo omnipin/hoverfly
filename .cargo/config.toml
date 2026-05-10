@@ -1,0 +1,13 @@
+# wasm32 builds need atomics + bulk-memory enabled because nectar-primitives
+# pulls in `wasm-bindgen-rayon` for parallel BMT. Use nightly + build-std for
+# this target, e.g.:
+#
+#   rustup target add wasm32-unknown-unknown --toolchain nightly
+#   RUSTUP_TOOLCHAIN=nightly cargo build --target wasm32-unknown-unknown --no-default-features
+#
+
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals"]
+
+[unstable]
+build-std = ["panic_abort", "std"]

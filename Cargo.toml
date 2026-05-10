@@ -1,0 +1,114 @@
+[package]
+name = "isheika"
+version = "0.1.0"
+edition = "2024"
+description = "Minimal WS-only WASM-portable Swarm micro-client"
+license = "MIT"
+
+[lib]
+name = "isheika"
+path = "src/lib.rs"
+crate-type = ["cdylib", "rlib"]
+
+[[bin]]
+name = "isheika"
+path = "src/bin/isheika.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "sigcheck"
+path = "src/bin/sigcheck.rs"
+required-features = ["cli"]
+
+[features]
+default = ["cli"]
+cli = ["dep:clap", "dep:tracing-subscriber"]
+
+[dependencies]
+# Nectar primitives (BMT, chunks, file split/join, mantaray, postage)
+nectar-primitives = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386" }
+nectar-mantaray   = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386" }
+nectar-postage    = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386", features = ["std"] }
+nectar-postage-issuer = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386", features = ["std", "local-signer"] }
+
+# alloy crypto (matches nectar's signer)
+alloy-primitives = { version = "1.5.4", default-features = false, features = ["getrandom"] }
+alloy-signer = { version = "1.5.2", default-features = false }
+alloy-signer-local = { version = "1.5.2", default-features = false }
+
+# Wire protocols
+prost = "0.13"
+k256 = { version = "0.13", features = ["ecdsa"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Crypto / encoding
+sha3 = "0.10"
+hex = "0.4"
+bytes = "1"
+
+# Errors / logging
+thiserror = "1"
+tracing = "0.1"
+
+# Async
+futures = "0.3"
+async-trait = "0.1"
+
+# Cross-platform Instant
+web-time = "1"
+
+# libp2p stream multiplexing (cross-platform)
+libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
+
+# Native-only
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", default-features = false, features = [
+    "noise",
+    "yamux",
+    "tokio",
+    "macros",
+    "secp256k1",
+    "ecdsa",
+    "identify",
+] }
+libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", features = ["tokio"] }
+libp2p-websocket = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
+libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+clap = { version = "4", features = ["derive"], optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
+getrandom = { version = "0.3", default-features = false }
+
+# Wasm-only
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", default-features = false, features = [
+    "websocket-websys",
+    "noise",
+    "yamux",
+    "macros",
+    "secp256k1",
+    "ecdsa",
+    "identify",
+] }
+libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
+tokio = { package = "tokio_with_wasm", version = "0.8", features = ["sync", "macros", "time"] }
+getrandom = { version = "0.3", default-features = false, features = ["wasm_js"] }
+getrandom_02 = { package = "getrandom", version = "0.2", default-features = false, features = ["js"] }
+# alloy-primitives 1.5.x pulls in getrandom 0.4 transitively; enable wasm_js there too.
+getrandom_04 = { package = "getrandom", version = "0.4", default-features = false, features = ["wasm_js"] }
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+js-sys = "0.3"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+console_error_panic_hook = "0.1"
+tracing-wasm = "0.2"
+
+[build-dependencies]
+prost-build = "0.13"
+
+[dev-dependencies]
+tokio-test = "0.4"

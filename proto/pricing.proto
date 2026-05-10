@@ -1,0 +1,10 @@
+// Swarm pricing/payment threshold protocol
+// Source: github.com/ethersphere/bee
+
+syntax = "proto3";
+
+package pricing;
+
+message AnnouncePaymentThreshold {
+    bytes payment_threshold = 1;
+}

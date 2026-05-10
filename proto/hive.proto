@@ -1,0 +1,17 @@
+// Swarm hive/Kademlia peer discovery protocol
+// Source: github.com/ethersphere/bee
+
+syntax = "proto3";
+
+package hive;
+
+message Peers {
+    repeated BzzAddress peers = 1;
+}
+
+message BzzAddress {
+    bytes underlay = 1;
+    bytes signature = 2;
+    bytes overlay = 3;
+    bytes nonce = 4;
+}

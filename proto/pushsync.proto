@@ -1,0 +1,20 @@
+// Swarm pushsync protocol - chunk upload
+// Source: github.com/ethersphere/bee
+
+syntax = "proto3";
+
+package pushsync;
+
+message Delivery {
+    bytes address = 1;
+    bytes data = 2;
+    bytes stamp = 3;
+}
+
+message Receipt {
+    bytes address = 1;
+    bytes signature = 2;
+    bytes nonce = 3;
+    string err = 4;
+    uint32 storage_radius = 5;
+}

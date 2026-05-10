@@ -1,0 +1,16 @@
+// Swarm chunk retrieval protocol
+// Source: github.com/ethersphere/bee
+
+syntax = "proto3";
+
+package retrieval;
+
+message Request {
+    bytes addr = 1;
+}
+
+message Delivery {
+    bytes data = 1;
+    bytes stamp = 2;
+    string err = 3;
+}

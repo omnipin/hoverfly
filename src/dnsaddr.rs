@@ -1,0 +1,111 @@
+//! `/dnsaddr/...` resolution over DoH.
+//!
+//! Bee bootnodes are advertised as `/dnsaddr/<host>`. The actual TXT record
+//! at `_dnsaddr.<host>` contains entries like `dnsaddr=/ip4/.../tcp/443/wss/p2p/...`.
+//! Each TXT line may itself reference another `/dnsaddr/...` so we recurse.
+//!
+//! This module returns only multiaddrs that contain `/ws` or `/wss` (WS-only client).
+
+use libp2p::Multiaddr;
+use std::collections::HashSet;
+use thiserror::Error;
+
+use crate::doh::{Doh, DohError};
+
+#[derive(Debug, Error)]
+pub enum DnsAddrError {
+    #[error("not a /dnsaddr/ multiaddr")]
+    NotDnsAddr,
+    #[error("doh: {0}")]
+    Doh(#[from] DohError),
+    #[error("multiaddr parse: {0}")]
+    Parse(String),
+    #[error("recursion limit exceeded")]
+    Recursion,
+}
+
+const MAX_DEPTH: usize = 5;
+const TXT_PREFIX: &str = "dnsaddr=";
+
+/// Resolve a `/dnsaddr/<host>` (or any multiaddr) into a flat set of dialable
+/// multiaddrs. Returns only ws/wss results.
+pub async fn resolve(ma: &Multiaddr, doh: &Doh) -> Result<Vec<Multiaddr>, DnsAddrError> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    resolve_recursive(ma, doh, 0, &mut out, &mut seen).await?;
+    out.retain(is_ws_multiaddr);
+    Ok(out)
+}
+
+/// Resolve any number of input multiaddrs concurrently. Falls back to passing
+/// through inputs that aren't `/dnsaddr/`.
+pub async fn resolve_many(addrs: &[Multiaddr], doh: &Doh) -> Vec<Multiaddr> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for ma in addrs {
+        let _ = resolve_recursive(ma, doh, 0, &mut out, &mut seen).await;
+    }
+    out.retain(is_ws_multiaddr);
+    out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
+    out.dedup();
+    out
+}
+
+async fn resolve_recursive(
+    ma: &Multiaddr,
+    doh: &Doh,
+    depth: usize,
+    out: &mut Vec<Multiaddr>,
+    seen: &mut HashSet<String>,
+) -> Result<(), DnsAddrError> {
+    if depth > MAX_DEPTH {
+        return Err(DnsAddrError::Recursion);
+    }
+    let key = ma.to_string();
+    if !seen.insert(key.clone()) {
+        return Ok(());
+    }
+
+    let host = match dnsaddr_host(ma) {
+        Some(h) => h,
+        None => {
+            // Not a /dnsaddr/ — pass through.
+            out.push(ma.clone());
+            return Ok(());
+        }
+    };
+
+    let qname = format!("_dnsaddr.{host}");
+    let records = doh.txt(&qname).await?;
+    for rec in records {
+        if let Some(payload) = rec.strip_prefix(TXT_PREFIX) {
+            let next: Multiaddr = match payload.parse() {
+                Ok(m) => m,
+                Err(e) => {
+                    tracing::debug!(target: "isheika::dnsaddr", "skip {}: {}", payload, e);
+                    continue;
+                }
+            };
+            // Recurse via boxed future since this is async + recursive.
+            Box::pin(resolve_recursive(&next, doh, depth + 1, out, seen)).await?;
+        }
+    }
+    Ok(())
+}
+
+/// Extract the host from a `/dnsaddr/<host>` multiaddr.
+fn dnsaddr_host(ma: &Multiaddr) -> Option<String> {
+    use libp2p::multiaddr::Protocol;
+    for proto in ma.iter() {
+        if let Protocol::Dnsaddr(host) = proto {
+            return Some(host.to_string());
+        }
+    }
+    None
+}
+
+/// True if multiaddr contains a /ws or /wss component.
+pub fn is_ws_multiaddr(ma: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    ma.iter().any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_)))
+}
