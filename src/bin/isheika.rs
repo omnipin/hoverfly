@@ -34,7 +34,7 @@ struct Cli {
     network_id: u64,
 
     /// Connection timeout in seconds
-    #[arg(long, global = true, default_value_t = 30, value_name = "SECS")]
+    #[arg(long, global = true, default_value_t = 10, value_name = "SECS")]
     timeout: u64,
 
     #[command(subcommand)]
