@@ -13,6 +13,8 @@ use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
 use nectar_primitives::file::{join, sync_split};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
+use std::collections::HashMap;
+use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -46,6 +48,8 @@ pub enum ClientError {
     BadBatchLen(usize),
     #[error("stamp: {0}")]
     Stamp(String),
+    #[error("manifest: {0}")]
+    Manifest(String),
 }
 
 impl From<nectar_primitives::error::PrimitivesError> for ClientError {
@@ -94,11 +98,15 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
             };
             match self.transport.fetch_chunk(&underlay, &bytes32).await {
                 Ok(delivery) => {
-                    let chunk = ContentChunk::<DEFAULT_BODY_SIZE>::with_address(
-                        delivery.data.clone(),
-                        *address,
-                    )
-                    .map_err(|e| ChunkStoreError::Other(format!("decode chunk: {e}")))?;
+                    // bee sends span(8) || payload; parse via TryFrom which splits them.
+                    let chunk = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice())
+                        .map_err(|e| ChunkStoreError::Other(format!("decode chunk: {e}")))?;
+                    use nectar_primitives::Chunk as _;
+                    if chunk.address() != address {
+                        warn!(target: "isheika::fetch", "peer {} returned chunk with wrong address", peer.overlay);
+                        last_err = "address mismatch".to_string();
+                        continue;
+                    }
                     return Ok(AnyChunk::from(chunk));
                 }
                 Err(e) => {
@@ -108,6 +116,47 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
             }
         }
         Err(ChunkStoreError::Other(format!("all peers failed: {last_err}")))
+    }
+}
+
+/// A `SyncChunkGet` adapter that wraps an async network fetch by blocking
+/// the current thread (via `tokio::task::block_in_place`). Used by mantaray
+/// manifest decoding which expects a synchronous chunk store.
+pub struct BlockingNetworkedStore<'a> {
+    transport: &'a Transport,
+    peers: &'a PeerStore,
+    max_retries: usize,
+    cache: Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>,
+}
+
+impl<'a> BlockingNetworkedStore<'a> {
+    pub fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
+        Self {
+            transport,
+            peers,
+            max_retries,
+            cache: Mutex::new(HashMap::new()),
+        }
+    }
+}
+
+impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
+    type Error = ChunkStoreError;
+
+    fn get(&self, address: &ChunkAddress) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+        if let Some(c) = self.cache.lock().unwrap().get(address).cloned() {
+            return Ok(c);
+        }
+        info!(target: "isheika::manifest", "blocking fetch for {}", address);
+        let handle = tokio::runtime::Handle::current();
+        let store = NetworkedStore::new(self.transport, self.peers, self.max_retries);
+        let address_copy = *address;
+        let chunk = handle.block_on(async move {
+            ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &address_copy).await
+        })?;
+        info!(target: "isheika::manifest", "got chunk: data.len()={}", chunk.data().len());
+        self.cache.lock().unwrap().insert(*address, chunk.clone());
+        Ok(chunk)
     }
 }
 
@@ -152,6 +201,126 @@ pub async fn fetch_bytes(
     let store = NetworkedStore::new(transport, peers, max_retries_per_chunk);
     let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(store, root).await?;
     Ok(bytes)
+}
+
+/// Resolve `path` through the mantaray manifest at `root_hex` and fetch the
+/// resulting entry's content. Returns `(content_bytes, content_type)` where
+/// `content_type` is `None` if the manifest entry has no `Content-Type`
+/// metadata.
+pub async fn fetch_manifest_path(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let root = parse_root(root_hex)?;
+    let (target, content_type) = lookup_manifest_path(transport, peers, root, path, max_retries_per_chunk).await?;
+
+    let async_store = NetworkedStore::new(transport, peers, max_retries_per_chunk);
+    let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(async_store, target).await?;
+    Ok((bytes, content_type))
+}
+
+/// List entries in the mantaray manifest at `root_hex`.
+pub async fn list_manifest(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    max_retries_per_chunk: usize,
+) -> Result<Vec<ManifestEntry>, ClientError> {
+    let root = parse_root(root_hex)?;
+    let mut out = Vec::new();
+    walk_manifest(transport, peers, root, Vec::new(), max_retries_per_chunk, &mut out).await?;
+    Ok(out)
+}
+
+async fn lookup_manifest_path(
+    transport: &Transport,
+    peers: &PeerStore,
+    root: ChunkAddress,
+    path: &str,
+    max_retries: usize,
+) -> Result<(ChunkAddress, Option<String>), ClientError> {
+    use crate::manifest::decode_node;
+    let store = NetworkedStore::new(transport, peers, max_retries);
+    let mut current = root;
+    let mut remaining: &[u8] = path.as_bytes();
+    let mut last_content_type: Option<String> = None;
+
+    loop {
+        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &current)
+            .await
+            .map_err(|e| ClientError::Manifest(format!("fetch node {current}: {e}")))?;
+        let node = decode_node(chunk.data())
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
+
+        if remaining.is_empty() {
+            return node
+                .entry
+                .map(|addr| (addr, last_content_type.clone()))
+                .ok_or_else(|| ClientError::Manifest(format!("path {path} has no entry")));
+        }
+
+        let first = remaining[0];
+        let fork = node
+            .forks
+            .get(&first)
+            .ok_or_else(|| ClientError::Manifest(format!("no fork for {path}")))?;
+        if !remaining.starts_with(&fork.prefix) {
+            return Err(ClientError::Manifest(format!(
+                "path {path} doesn't match fork prefix"
+            )));
+        }
+        if let Some(ct) = fork.metadata.get("Content-Type") {
+            last_content_type = Some(ct.clone());
+        }
+        remaining = &remaining[fork.prefix.len()..];
+        current = fork.reference;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn walk_manifest<'a>(
+    transport: &'a Transport,
+    peers: &'a PeerStore,
+    addr: ChunkAddress,
+    path_so_far: Vec<u8>,
+    max_retries: usize,
+    out: &'a mut Vec<ManifestEntry>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send + 'a>> {
+    Box::pin(async move {
+        use crate::manifest::decode_node;
+        let store = NetworkedStore::new(transport, peers, max_retries);
+        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &addr)
+            .await
+            .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
+        let node =
+            decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+
+        if let Some(entry_addr) = node.entry {
+            let path = String::from_utf8_lossy(&path_so_far).into_owned();
+            out.push(ManifestEntry {
+                path,
+                reference: hex::encode(entry_addr.as_bytes()),
+                content_type: None,
+            });
+        }
+
+        for fork in node.forks.values() {
+            let mut next_path = path_so_far.clone();
+            next_path.extend_from_slice(&fork.prefix);
+            walk_manifest(transport, peers, fork.reference, next_path, max_retries, out).await?;
+        }
+        Ok(())
+    })
+}
+
+#[derive(Debug, Clone)]
+pub struct ManifestEntry {
+    pub path: String,
+    pub reference: String,
+    pub content_type: Option<String>,
 }
 
 /// Upload arbitrary-size content. Splits via nectar, stamps each chunk with

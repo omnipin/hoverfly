@@ -5,6 +5,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
+use isheika::client::{fetch_manifest_path, list_manifest};
 use isheika::{
     discover, fetch_bytes, upload_bytes, Doh, PeerStore, SwarmSigner, Transport, TransportConfig,
     DEFAULT_DOH_URL, MAINNET_BOOTNODE,
@@ -67,9 +68,17 @@ enum Commands {
         #[arg(value_name = "HASH")]
         hash: String,
 
-        /// Output file
+        /// Output file (required unless --list)
         #[arg(short, long, value_name = "FILE")]
-        output: PathBuf,
+        output: Option<PathBuf>,
+
+        /// Treat the root as a mantaray manifest and resolve this path.
+        #[arg(long, value_name = "PATH")]
+        path: Option<String>,
+
+        /// List all entries in the manifest at the root and exit.
+        #[arg(long, conflicts_with = "path")]
+        list: bool,
 
         /// peers.json path
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
@@ -147,17 +156,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} peers to {}", store.len(), output.display());
         }
 
-        Commands::Fetch { hash, output, peerlist, max_retries } => {
-            // For fetch we don't need an authenticated signer, but we do need an identity.
+        Commands::Fetch { hash, output, path, list, peerlist, max_retries } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!("peerlist {} is empty — run `isheika discover` first", peerlist.display()).into());
             }
-            let bytes = fetch_bytes(&transport, &peers, &hash, max_retries).await?;
-            std::fs::write(&output, &bytes)?;
-            println!("fetched {} bytes -> {}", bytes.len(), output.display());
+
+            if list {
+                let entries = list_manifest(&transport, &peers, &hash, max_retries).await?;
+                println!("{} entries:", entries.len());
+                for e in entries {
+                    let ct = e.content_type.as_deref().unwrap_or("-");
+                    println!("  {}  {}  [{}]", e.reference, e.path, ct);
+                }
+            } else {
+                let output = output.ok_or("--output is required (omit only with --list)")?;
+                if let Some(p) = path {
+                    let (bytes, content_type) = fetch_manifest_path(&transport, &peers, &hash, &p, max_retries).await?;
+                    std::fs::write(&output, &bytes)?;
+                    let ct = content_type.as_deref().unwrap_or("-");
+                    println!("fetched {} bytes ({}) -> {}", bytes.len(), ct, output.display());
+                } else {
+                    let bytes = fetch_bytes(&transport, &peers, &hash, max_retries).await?;
+                    std::fs::write(&output, &bytes)?;
+                    println!("fetched {} bytes -> {}", bytes.len(), output.display());
+                }
+            }
         }
 
         Commands::Upload { file, batch, depth, key, peerlist, max_retries } => {

@@ -32,6 +32,7 @@ pub mod proto {
 pub mod protocols;
 pub mod transport;
 pub mod client;
+pub mod manifest;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -46,7 +47,10 @@ pub use nectar_primitives::{
 pub use signer::SwarmSigner;
 pub use peers::{Peer, PeerStore};
 pub use transport::{Transport, TransportConfig, TransportError};
-pub use client::{discover, fetch_bytes, upload_bytes, ClientError};
+pub use client::{
+    discover, fetch_bytes, fetch_manifest_path, list_manifest, upload_bytes, ClientError,
+    ManifestEntry,
+};
 pub use doh::Doh;
 
 /// Default Swarm mainnet bootnode (resolved via DoH).
