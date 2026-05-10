@@ -4,7 +4,8 @@
 //! at `_dnsaddr.<host>` contains entries like `dnsaddr=/ip4/.../tcp/443/wss/p2p/...`.
 //! Each TXT line may itself reference another `/dnsaddr/...` so we recurse.
 //!
-//! This module returns only multiaddrs that contain `/ws` or `/wss` (WS-only client).
+//! This module returns only multiaddrs that our transport stack can dial:
+//! on WASM that means ws/wss only; on native we also accept plain tcp.
 
 use libp2p::Multiaddr;
 use std::collections::HashSet;
@@ -33,7 +34,7 @@ pub async fn resolve(ma: &Multiaddr, doh: &Doh) -> Result<Vec<Multiaddr>, DnsAdd
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     resolve_recursive(ma, doh, 0, &mut out, &mut seen).await?;
-    out.retain(is_ws_multiaddr);
+    out.retain(is_dialable_multiaddr);
     Ok(out)
 }
 
@@ -45,7 +46,7 @@ pub async fn resolve_many(addrs: &[Multiaddr], doh: &Doh) -> Vec<Multiaddr> {
     for ma in addrs {
         let _ = resolve_recursive(ma, doh, 0, &mut out, &mut seen).await;
     }
-    out.retain(is_ws_multiaddr);
+    out.retain(is_dialable_multiaddr);
     out.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     out.dedup();
     out
@@ -108,4 +109,37 @@ fn dnsaddr_host(ma: &Multiaddr) -> Option<String> {
 pub fn is_ws_multiaddr(ma: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     ma.iter().any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_)))
+}
+
+/// True if multiaddr is a plain `/tcp/...` (not wrapped in `/ws`/`/wss`).
+/// Used on native builds where we can dial bee's bare TCP endpoint
+/// (e.g. mainnet bootnodes that don't expose WebSocket).
+pub fn is_tcp_multiaddr(ma: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    let mut has_tcp = false;
+    for proto in ma.iter() {
+        match proto {
+            Protocol::Ws(_) | Protocol::Wss(_) => return false,
+            Protocol::Tcp(_) => has_tcp = true,
+            _ => {}
+        }
+    }
+    has_tcp
+}
+
+/// True if our transport stack can dial this multiaddr.
+///
+/// - Native CLI / `cfg(not(target_arch = "wasm32"))`: ws/wss **or** plain
+///   tcp (libp2p-tcp + libp2p-websocket, combined via `or_transport`).
+/// - WASM browser / `cfg(target_arch = "wasm32")`: ws/wss only — browsers
+///   can't open raw TCP sockets.
+pub fn is_dialable_multiaddr(ma: &Multiaddr) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        is_ws_multiaddr(ma) || is_tcp_multiaddr(ma)
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        is_ws_multiaddr(ma)
+    }
 }

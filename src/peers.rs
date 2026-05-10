@@ -40,13 +40,33 @@ impl Peer {
     }
 
     /// First parseable ws/wss multiaddr, if any. Hive responses often
-    /// list both TCP and ws underlays for the same peer; we can only
-    /// dial ws from this WASM-portable client.
+    /// list both TCP and ws underlays for the same peer.
     pub fn first_ws_underlay(&self) -> Option<Multiaddr> {
         self.underlays
             .iter()
             .filter(|s| s.contains("/ws") || s.contains("/wss"))
             .find_map(|s| s.parse().ok())
+    }
+
+    /// First underlay our transport stack can dial. On native this
+    /// returns either a ws or plain-tcp address; on WASM it returns
+    /// ws-only. Prefers ws/wss over plain tcp so that browser-portable
+    /// nodes in the peerset always pick the ws path when one exists.
+    pub fn first_dialable_underlay(&self) -> Option<Multiaddr> {
+        if let Some(ws) = self.first_ws_underlay() {
+            return Some(ws);
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.underlays
+                .iter()
+                .filter(|s| s.contains("/tcp/") && !is_ws(s))
+                .find_map(|s| s.parse().ok())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
     }
 
     pub fn overlay_bytes(&self) -> Option<[u8; 32]> {
@@ -88,9 +108,10 @@ impl PeerStore {
         self.peers.values()
     }
 
-    /// Insert or merge a peer. Underlays are filtered to ws/wss only and de-duplicated.
+    /// Insert or merge a peer. Underlays are filtered to those our transport
+    /// stack can dial (ws/wss everywhere, plus plain `/tcp/...` on native).
     pub fn upsert(&mut self, mut peer: Peer) {
-        peer.underlays.retain(|u| is_ws(u));
+        peer.underlays.retain(|u| is_dialable_str(u));
         peer.underlays.sort();
         peer.underlays.dedup();
         if peer.underlays.is_empty() {
@@ -151,4 +172,20 @@ impl PeerStore {
 
 fn is_ws(ma: &str) -> bool {
     ma.contains("/ws") || ma.contains("/wss")
+}
+
+/// Cheap string-form check that matches `dnsaddr::is_dialable_multiaddr`
+/// without parsing — used in `upsert` because peer entries arrive as
+/// `Vec<String>`. On native we also accept plain `/tcp/...` (TCP-direct
+/// transport in `transport.rs::build_swarm`); on WASM we keep ws-only
+/// since browsers can't open raw TCP.
+fn is_dialable_str(ma: &str) -> bool {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        is_ws(ma) || (ma.contains("/tcp/") && !is_ws(ma))
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        is_ws(ma)
+    }
 }

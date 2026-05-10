@@ -16,7 +16,7 @@ use libp2p::{
 use thiserror::Error;
 use tracing::{debug, info};
 
-use crate::dnsaddr::is_ws_multiaddr;
+use crate::dnsaddr::is_dialable_multiaddr;
 use crate::peers::Peer;
 use crate::protocols::handshake::{self, HandshakeError};
 use crate::protocols::hive;
@@ -725,7 +725,7 @@ async fn close_stream_polled<S: futures::AsyncWrite + Unpin>(swarm: &mut Swarm<B
 }
 
 fn ensure_ws(ma: &Multiaddr) -> Result<PeerId, TransportError> {
-    if !is_ws_multiaddr(ma) {
+    if !is_dialable_multiaddr(ma) {
         return Err(TransportError::NotWebSocket(ma.to_string()));
     }
     extract_peer_id(ma).ok_or(TransportError::MissingPeerId)
@@ -963,9 +963,8 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
     let swarm = SwarmBuilder::with_existing_identity(t.keypair.clone())
         .with_tokio()
         .with_other_transport(|key| {
-            let tcp = libp2p_tcp::tokio::Transport::new(libp2p_tcp::Config::default());
-            let ws = libp2p_websocket::Config::new(tcp);
-            Ok(ws
+            // Plain TCP for `/ip4/.../tcp/.../p2p/...` (mainnet bootnodes).
+            let tcp_plain = libp2p_tcp::tokio::Transport::new(libp2p_tcp::Config::default())
                 .upgrade(upgrade::Version::V1)
                 .authenticate(noise::Config::new(key).map_err(|e| {
                     libp2p::TransportError::Other(std::io::Error::new(
@@ -974,6 +973,33 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
                     ))
                 })?)
                 .multiplex(yamux::Config::default())
+                .boxed();
+
+            // TCP-over-WebSocket for `/ip4/.../tcp/.../ws[s]/p2p/...`
+            // (testnet bees that expose ws).
+            let tcp_for_ws = libp2p_tcp::tokio::Transport::new(libp2p_tcp::Config::default());
+            let ws = libp2p_websocket::Config::new(tcp_for_ws)
+                .upgrade(upgrade::Version::V1)
+                .authenticate(noise::Config::new(key).map_err(|e| {
+                    libp2p::TransportError::Other(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        e.to_string(),
+                    ))
+                })?)
+                .multiplex(yamux::Config::default())
+                .boxed();
+
+            // libp2p picks the right transport based on the multiaddr's
+            // protocol stack (presence of `/ws` or `/wss`). `or_transport`
+            // wraps the output in `Either`; map it back to a uniform
+            // `(PeerId, StreamMuxerBox)` for SwarmBuilder.
+            use futures::future::Either;
+            Ok(ws
+                .or_transport(tcp_plain)
+                .map(|either, _| match either {
+                    Either::Left(x) => x,
+                    Either::Right(x) => x,
+                })
                 .boxed())
         })
         .map_err(|e| TransportError::DialFailed(e.to_string()))?

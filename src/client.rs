@@ -18,7 +18,7 @@ use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::dnsaddr::{is_ws_multiaddr, resolve, DnsAddrError};
+use crate::dnsaddr::{resolve, DnsAddrError};
 use crate::doh::Doh;
 use crate::peers::{Peer, PeerStore};
 use crate::signer::SwarmSigner;
@@ -95,9 +95,9 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
 
         let mut last_err = String::from("no peers tried");
         for peer in candidates {
-            let underlay = match peer.first_underlay() {
-                Some(ma) if is_ws_multiaddr(&ma) => ma,
-                _ => continue,
+            let underlay = match peer.first_dialable_underlay() {
+                Some(ma) => ma,
+                None => continue,
             };
             match self.transport.fetch_chunk(&underlay, &bytes32).await {
                 Ok(delivery) => {
@@ -219,12 +219,11 @@ pub async fn discover_recursive(
                         let key = p.overlay.to_lowercase();
                         if seen_overlays.insert(key) {
                             // Queue this peer as a discovery target for the
-                            // next round if it has any ws/wss underlay.
-                            // (Bee hive announcements typically include both
-                            // a TCP and a ws address per peer; we filter
-                            // explicitly to ws — the only transport we can
-                            // dial from a WASM-portable client.)
-                            if let Some(u) = p.first_ws_underlay() {
+                            // next round if our transport can dial it. (Bee
+                            // hive announcements often include both a TCP and
+                            // a ws address per peer; native builds can use
+                            // either, WASM builds only ws.)
+                            if let Some(u) = p.first_dialable_underlay() {
                                 next_frontier.push(u);
                             }
                             all.push(p);
@@ -906,9 +905,9 @@ async fn open_session_pool(
 
     let mut dialing = FuturesUnordered::new();
     for peer in candidates {
-        let underlay = match peer.first_underlay() {
-            Some(ma) if is_ws_multiaddr(&ma) => ma,
-            _ => continue,
+        let underlay = match peer.first_dialable_underlay() {
+            Some(ma) => ma,
+            None => continue,
         };
         let overlay_hex = peer.overlay.clone();
         let overlay = match peer.overlay_address() {
