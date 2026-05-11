@@ -78,6 +78,17 @@ enum Commands {
         /// `70 × wait` seconds.
         #[arg(long, default_value_t = DEFAULT_DISCOVER_CONCURRENCY)]
         discover_concurrency: usize,
+
+        /// After discovery, probe each peer's underlay to verify
+        /// reachability. The results are written into peers.json's
+        /// reachability cache so future operations skip known-dead
+        /// peers up-front (saving ~timeout seconds per dead peer).
+        #[arg(long)]
+        healthcheck: bool,
+
+        /// Concurrency for the healthcheck probe phase.
+        #[arg(long, default_value_t = 64)]
+        healthcheck_concurrency: usize,
     },
 
     /// Fetch content addressed by a 32-byte hex root hash.
@@ -257,7 +268,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doh = Doh::with_url(&cli.doh_url);
 
     match cli.command {
-        Commands::Discover { peer, output, wait, append, rounds, discover_concurrency } => {
+        Commands::Discover { peer, output, wait, append, rounds, discover_concurrency, healthcheck, healthcheck_concurrency } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
@@ -276,6 +287,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             for p in discovered {
                 store.upsert(p);
             }
+
+            if healthcheck {
+                println!("probing {} peers for reachability...", store.len());
+                isheika::client::healthcheck_peers(&transport, &store, healthcheck_concurrency).await;
+                isheika::peers::apply_log(&mut store, transport.reachability_log());
+            }
+
             store.save(&output)?;
             println!("wrote {} peers to {}", store.len(), output.display());
         }
@@ -283,31 +301,41 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Commands::Fetch { hash, output, path, list, peerlist, max_retries, concurrency } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
-            let peers = PeerStore::load_or_create(&peerlist);
+            let mut peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!("peerlist {} is empty — run `isheika discover` first", peerlist.display()).into());
             }
 
-            if list {
-                let entries = list_manifest_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
-                println!("{} entries:", entries.len());
-                for e in entries {
-                    let ct = e.content_type.as_deref().unwrap_or("-");
-                    println!("  {}  {}  [{}]", e.reference, e.path, ct);
-                }
-            } else {
-                let output = output.ok_or("--output is required (omit only with --list)")?;
-                if let Some(p) = path {
-                    let (bytes, content_type) = fetch_manifest_path_ex(&transport, &peers, &hash, &p, max_retries, concurrency).await?;
-                    std::fs::write(&output, &bytes)?;
-                    let ct = content_type.as_deref().unwrap_or("-");
-                    println!("fetched {} bytes ({}) -> {}", bytes.len(), ct, output.display());
+            let result: Result<(), Box<dyn std::error::Error>> = (async {
+                if list {
+                    let entries = list_manifest_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
+                    println!("{} entries:", entries.len());
+                    for e in entries {
+                        let ct = e.content_type.as_deref().unwrap_or("-");
+                        println!("  {}  {}  [{}]", e.reference, e.path, ct);
+                    }
+                    Ok(())
                 } else {
-                    let bytes = fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
-                    std::fs::write(&output, &bytes)?;
-                    println!("fetched {} bytes -> {}", bytes.len(), output.display());
+                    let output = output.ok_or("--output is required (omit only with --list)")?;
+                    if let Some(p) = path {
+                        let (bytes, content_type) = fetch_manifest_path_ex(&transport, &peers, &hash, &p, max_retries, concurrency).await?;
+                        std::fs::write(&output, &bytes)?;
+                        let ct = content_type.as_deref().unwrap_or("-");
+                        println!("fetched {} bytes ({}) -> {}", bytes.len(), ct, output.display());
+                    } else {
+                        let bytes = fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
+                        std::fs::write(&output, &bytes)?;
+                        println!("fetched {} bytes -> {}", bytes.len(), output.display());
+                    }
+                    Ok(())
                 }
-            }
+            }).await;
+
+            // Persist reachability observations back to peers.json on
+            // both success and error so the next run starts faster.
+            isheika::peers::apply_log(&mut peers, transport.reachability_log());
+            let _ = peers.save(&peerlist);
+            result?;
         }
 
         Commands::Upload {
@@ -327,7 +355,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             let signer = SwarmSigner::from_hex(&key, cli.network_id)?;
             let transport = Transport::new(signer.clone(), cfg);
-            let peers = PeerStore::load_or_create(&peerlist);
+            let mut peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!("peerlist {} is empty", peerlist.display()).into());
             }
@@ -368,6 +396,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("retrieve a file with: isheika fetch {} --path <name> -o <out>",
                     hex::encode(root.as_bytes()));
                 println!("list contents with: isheika fetch {} --list", hex::encode(root.as_bytes()));
+                isheika::peers::apply_log(&mut peers, transport.reachability_log());
+                let _ = peers.save(&peerlist);
                 return Ok(());
             }
 
@@ -415,6 +445,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
                 println!("retrieve with: isheika fetch {} --path {} -o {}", hex::encode(root.as_bytes()), path, path);
             }
+
+            isheika::peers::apply_log(&mut peers, transport.reachability_log());
+            let _ = peers.save(&peerlist);
         }
     }
 

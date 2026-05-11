@@ -58,6 +58,7 @@ where
                         } else {
                             Some(hex::encode(&entry.nonce))
                         },
+                        ..Default::default()
                     });
                 }
             }

@@ -11,9 +11,8 @@ use nectar_postage::{Batch, BatchId};
 use nectar_postage_issuer::{BatchStamper, MemoryIssuer, Stamper};
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
-use nectar_primitives::file::{join, sync_split};
+use nectar_primitives::file::{sync_split, GenericJoiner};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
-#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
@@ -22,7 +21,7 @@ use tracing::{debug, info, warn};
 
 use crate::dnsaddr::{resolve, DnsAddrError};
 use crate::doh::Doh;
-use crate::peers::{Peer, PeerStore};
+use crate::peers::{DialResult, Peer, PeerStore};
 use crate::signer::SwarmSigner;
 use crate::transport::{
     is_connection_dead, peer_price, PeerSession, PushOutcome, Transport, TransportError,
@@ -85,28 +84,50 @@ pub const DEFAULT_DISCOVER_CONCURRENCY: usize = 16;
 /// the rest are dropped. If a peer fails, the next-closest candidate is
 /// launched until either a success is observed or `max_retries` peers have
 /// been exhausted.
+#[derive(Clone)]
 pub struct NetworkedStore<'a> {
     transport: &'a Transport,
     peers: &'a PeerStore,
     max_retries: usize,
     concurrency: usize,
+    /// Process-local cache of chunks already fetched. Used by mantaray
+    /// manifest decoding (which re-visits forks) and any composite call
+    /// chain that touches a chunk more than once. Cheap (a HashMap +
+    /// Mutex); chunks are at most 4 KiB so even tens of thousands of
+    /// entries cost only single-digit MB.
+    ///
+    /// `Clone` shares the cache: pass a clone of the store to nectar's
+    /// `join` and our manifest walkers and they'll reuse fetched chunks.
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>>,
 }
 
 impl<'a> NetworkedStore<'a> {
     /// Construct a store with sequential fetch (concurrency = 1).
-    pub const fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
-        Self { transport, peers, max_retries, concurrency: 1 }
+    pub fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
+        Self {
+            transport,
+            peers,
+            max_retries,
+            concurrency: 1,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 
     /// Construct a store that races up to `concurrency` peers in parallel
     /// per chunk. `concurrency` is clamped to at least 1.
-    pub const fn with_concurrency(
+    pub fn with_concurrency(
         transport: &'a Transport,
         peers: &'a PeerStore,
         max_retries: usize,
         concurrency: usize,
     ) -> Self {
-        Self { transport, peers, max_retries, concurrency }
+        Self {
+            transport,
+            peers,
+            max_retries,
+            concurrency,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
     }
 }
 
@@ -120,6 +141,13 @@ impl<'a> NetworkedStore<'a> {
     ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, ChunkStoreError> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
+        // Cache hit: skip the entire network round-trip. Manifest decode
+        // re-fetches the root multiple times during `walk_manifest` and
+        // `lookup_manifest_path`; BMT joins re-visit intermediate nodes.
+        if let Some(c) = self.cache.lock().unwrap().get(&address).cloned() {
+            return Ok(c);
+        }
+
         let mut bytes32 = [0u8; 32];
         bytes32.copy_from_slice(address.as_bytes());
 
@@ -130,9 +158,19 @@ impl<'a> NetworkedStore<'a> {
         // wins on average because nearby peers are more likely to have the
         // chunk locally and skip the forwarding cost.
         //
+        // Peers that recently failed to dial (per `peers.json`'s reachability
+        // cache) are pushed to the back of the candidate list so we don't
+        // waste timeouts on known-dead peers up front.
+        //
         // `max_retries == 0` means "no cap"; otherwise it bounds the number
         // of peer attempts before giving up.
-        let candidates = self.peers.closest(&address, usize::MAX);
+        let now = crate::peers::now_unix();
+        let (fresh, stale): (Vec<_>, Vec<_>) = self
+            .peers
+            .closest(&address, usize::MAX)
+            .into_iter()
+            .partition(|p| !p.is_recently_unreachable(now));
+        let candidates: Vec<&Peer> = fresh.into_iter().chain(stale.into_iter()).collect();
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
         }
@@ -146,16 +184,26 @@ impl<'a> NetworkedStore<'a> {
         let mut candidates_iter = candidates.into_iter().take(attempt_cap);
 
         // Build a future that performs a single peer fetch and returns a
-        // structured result. Captures peer metadata for logging.
+        // structured result. Captures peer metadata for logging and feeds
+        // dial-result observations into the transport's reachability log.
+        let log = self.transport.reachability_log().clone();
         let try_peer = |peer: &'a Peer| {
             let overlay = peer.overlay.clone();
             let underlay = peer.first_dialable_underlay();
+            let log = log.clone();
             async move {
                 let Some(underlay) = underlay else {
                     return (overlay, Err("no dialable underlay".to_string()));
                 };
-                match self.transport.fetch_chunk(&underlay, &bytes32).await {
+                let started = web_time::Instant::now();
+                let res = self.transport.fetch_chunk(&underlay, &bytes32).await;
+                let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+                match res {
                     Ok(delivery) => {
+                        log.lock().unwrap().insert(
+                            overlay.to_lowercase(),
+                            crate::peers::DialResult::Success { rtt_ms },
+                        );
                         match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice()) {
                             Ok(chunk) => {
                                 use nectar_primitives::Chunk as _;
@@ -168,7 +216,13 @@ impl<'a> NetworkedStore<'a> {
                             Err(e) => (overlay, Err(format!("decode chunk: {e}"))),
                         }
                     }
-                    Err(e) => (overlay, Err(e.to_string())),
+                    Err(e) => {
+                        log.lock().unwrap().insert(
+                            overlay.to_lowercase(),
+                            crate::peers::DialResult::Failure,
+                        );
+                        (overlay, Err(e.to_string()))
+                    }
                 }
             }
         };
@@ -182,7 +236,10 @@ impl<'a> NetworkedStore<'a> {
         let mut last_err = String::from("no peers tried");
         while let Some((overlay, outcome)) = inflight.next().await {
             match outcome {
-                Ok(chunk) => return Ok(chunk),
+                Ok(chunk) => {
+                    self.cache.lock().unwrap().insert(address, chunk.clone());
+                    return Ok(chunk);
+                }
                 Err(e) => {
                     warn!(target: "isheika::fetch", "peer {} failed: {}", overlay, e);
                     last_err = e;
@@ -432,7 +489,15 @@ pub async fn fetch_bytes_ex(
 ) -> Result<Vec<u8>, ClientError> {
     let root = parse_root(root_hex)?;
     let store = NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
-    let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(store, root).await?;
+    // Drive nectar's BMT joiner with the same per-chunk concurrency as
+    // our network store so deep trees don't bottleneck on its default
+    // (8). Each chunk fetch already races peers internally; this is the
+    // outer "chunks in flight" knob.
+    let bytes = GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(store, root)
+        .await?
+        .with_concurrency(concurrency.max(1).max(8))
+        .read_all()
+        .await?;
     Ok(bytes)
 }
 
@@ -461,12 +526,16 @@ pub async fn fetch_manifest_path_ex(
     concurrency: usize,
 ) -> Result<(Vec<u8>, Option<String>), ClientError> {
     let root = parse_root(root_hex)?;
-    let (target, content_type) =
-        lookup_manifest_path(transport, peers, root, path, max_retries_per_chunk, concurrency).await?;
-
-    let async_store =
+    // Single store shared between path lookup and content fetch; the
+    // root chunk is hit by both phases so the cache saves a round-trip.
+    let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
-    let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(async_store, target).await?;
+    let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
+    let bytes = GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(store, target)
+        .await?
+        .with_concurrency(concurrency.max(1).max(8))
+        .read_all()
+        .await?;
     Ok((bytes, content_type))
 }
 
@@ -490,27 +559,22 @@ pub async fn list_manifest_ex(
     concurrency: usize,
 ) -> Result<Vec<ManifestEntry>, ClientError> {
     let root = parse_root(root_hex)?;
-    let mut out = Vec::new();
-    walk_manifest(transport, peers, root, Vec::new(), max_retries_per_chunk, concurrency, &mut out).await?;
-    Ok(out)
+    let store = NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+    walk_manifest(&store, root, Vec::new()).await
 }
 
 async fn lookup_manifest_path(
-    transport: &Transport,
-    peers: &PeerStore,
+    store: &NetworkedStore<'_>,
     root: ChunkAddress,
     path: &str,
-    max_retries: usize,
-    concurrency: usize,
 ) -> Result<(ChunkAddress, Option<String>), ClientError> {
     use crate::manifest::decode_node;
-    let store = NetworkedStore::with_concurrency(transport, peers, max_retries, concurrency);
     let mut current = root;
     let mut remaining: &[u8] = path.as_bytes();
     let mut last_content_type: Option<String> = None;
 
     loop {
-        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &current)
+        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &current)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {current}: {e}")))?;
         let node = decode_node(chunk.data())
@@ -541,25 +605,27 @@ async fn lookup_manifest_path(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+/// Walk the manifest rooted at `addr`, fanning out fork descents in
+/// parallel. Each level's forks are independent chunk fetches; serial
+/// descent was the dominant cost on deep manifests (every level adds an
+/// RTT). The store's internal cache makes repeat visits free.
 fn walk_manifest<'a>(
-    transport: &'a Transport,
-    peers: &'a PeerStore,
+    store: &'a NetworkedStore<'a>,
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
-    max_retries: usize,
-    concurrency: usize,
-    out: &'a mut Vec<ManifestEntry>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + Send + 'a>>
+{
     Box::pin(async move {
         use crate::manifest::decode_node;
-        let store = NetworkedStore::with_concurrency(transport, peers, max_retries, concurrency);
-        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &addr)
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
         let node =
             decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
+        let mut out = Vec::new();
         if let Some(entry_addr) = node.entry {
             let path = String::from_utf8_lossy(&path_so_far).into_owned();
             out.push(ManifestEntry {
@@ -569,12 +635,22 @@ fn walk_manifest<'a>(
             });
         }
 
-        for fork in node.forks.values() {
-            let mut next_path = path_so_far.clone();
-            next_path.extend_from_slice(&fork.prefix);
-            walk_manifest(transport, peers, fork.reference, next_path, max_retries, concurrency, out).await?;
+        // Descend into each fork in parallel; each subtree's entries are
+        // appended in arrival order.
+        let mut children: FuturesUnordered<_> = node
+            .forks
+            .values()
+            .map(|fork| {
+                let mut next_path = path_so_far.clone();
+                next_path.extend_from_slice(&fork.prefix);
+                let r = fork.reference;
+                walk_manifest(store, r, next_path)
+            })
+            .collect();
+        while let Some(res) = children.next().await {
+            out.extend(res?);
         }
-        Ok(())
+        Ok(out)
     })
 }
 
@@ -663,7 +739,7 @@ pub async fn upload_collection(
     // duplication (common headers, all-zero padding, identical assets),
     // so we deduplicate by chunk address before stamping.
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-    let mut work: Vec<StampedChunk> = Vec::new();
+    let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> = Vec::new();
     let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
     let mut total_bytes: usize = 0;
     let mut raw_chunks = 0usize;
@@ -682,7 +758,7 @@ pub async fn upload_collection(
             if !seen.insert(addr_bytes) {
                 continue; // already stamped — bee dedupes on address anyway
             }
-            work.push(stamp_chunk(&mut stamper, &addr, wire_form(&chunk))?);
+            stamp_in.push((addr, wire_form(&chunk)));
         }
         entries.push(CollectionEntry {
             path: f.path.clone(),
@@ -695,25 +771,26 @@ pub async fn upload_collection(
     let (manifest_root, manifest_chunks) =
         crate::manifest::build_collection_manifest(&entries, index_document, error_document)
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
-    info!(
-        target: "isheika::upload",
-        "collection: {} files ({} bytes) -> {} unique file chunks ({} duplicates skipped) + {} manifest chunks (root {})",
-        files.len(), total_bytes, work.len(),
-        raw_chunks.saturating_sub(work.len()),
-        manifest_chunks.len(), manifest_root,
-    );
-
-    // 3. Stamp manifest chunks (also dedup; share the seen set).
-    for (addr, wire) in manifest_chunks {
+    let unique_data_chunks = stamp_in.len();
+    // 3. Add manifest chunks (also dedup; share the seen set).
+    for (addr, wire) in manifest_chunks.iter() {
         let mut addr_bytes = [0u8; 32];
         addr_bytes.copy_from_slice(addr.as_bytes());
         if !seen.insert(addr_bytes) {
             continue;
         }
-        work.push(stamp_chunk(&mut stamper, &addr, wire.to_vec())?);
+        stamp_in.push((*addr, wire.to_vec()));
     }
+    info!(
+        target: "isheika::upload",
+        "collection: {} files ({} bytes) -> {} unique file chunks ({} duplicates skipped) + {} manifest chunks (root {})",
+        files.len(), total_bytes, unique_data_chunks,
+        raw_chunks.saturating_sub(unique_data_chunks),
+        manifest_chunks.len(), manifest_root,
+    );
 
-    // 4. Push everything concurrently.
+    // 4. Stamp in parallel, then push everything concurrently.
+    let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
     push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
     Ok(manifest_root)
 }
@@ -747,16 +824,18 @@ pub async fn upload_file_with_manifest_ex(
     // 3. Build stamper.
     let mut stamper = build_stamper(signer, batch_id, depth);
 
-    // 4. Pre-stamp everything (stamper is single-threaded — produce the wire
-    // forms and stamps up-front so the push phase is purely network-bound).
-    let mut work: Vec<StampedChunk> =
+    // 4. Pre-stamp everything (parallel-signed via rayon; index alloc
+    // is serial). Produces all wire forms up-front so the push phase is
+    // purely network-bound.
+    let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
         Vec::with_capacity(file_store.len() + manifest_chunks.len());
     for (addr, chunk) in file_store.into_chunks() {
-        work.push(stamp_chunk(&mut stamper, &addr, wire_form(&chunk))?);
+        stamp_in.push((addr, wire_form(&chunk)));
     }
     for (addr, wire) in manifest_chunks {
-        work.push(stamp_chunk(&mut stamper, &addr, wire.to_vec())?);
+        stamp_in.push((addr, wire.to_vec()));
     }
+    let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
 
     // 5. Open a pool of long-lived sessions and push concurrently.
     push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
@@ -812,6 +891,68 @@ fn stamp_chunk(
     Ok(StampedChunk { addr: addr32, wire, stamp: stamp_bytes })
 }
 
+/// Stamp a batch of (address, wire) pairs, signing in parallel via rayon.
+///
+/// secp256k1 signing is ~ms per chunk and serial on `stamp_chunk` — for
+/// big uploads (10 MB ≈ 2500 chunks) this can dominate a few seconds of
+/// CPU. Split the operation: the issuer-side `prepare_stamp` (index
+/// allocation, no crypto) stays serial because the issuer requires
+/// `&mut`, then the digest signing fans out across cores.
+///
+/// Native-only: wasm32 is single-threaded so rayon has no thread pool
+/// to spread work over; the serial path is just as fast there.
+#[cfg(not(target_arch = "wasm32"))]
+fn stamp_chunks_parallel(
+    stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
+    work: Vec<(ChunkAddress, Vec<u8>)>,
+) -> Result<Vec<StampedChunk>, ClientError> {
+    use nectar_postage::current_timestamp;
+    use nectar_postage_issuer::StampIssuer;
+    use rayon::prelude::*;
+
+    // Phase 1 (serial): allocate batch indices & build digests.
+    let timestamp = current_timestamp();
+    let mut prepared: Vec<(ChunkAddress, Vec<u8>, nectar_postage::StampDigest)> =
+        Vec::with_capacity(work.len());
+    for (addr, wire) in work {
+        let digest = stamper
+            .issuer_mut()
+            .prepare_stamp(&addr, timestamp)
+            .map_err(|e| ClientError::Stamp(e.to_string()))?;
+        prepared.push((addr, wire, digest));
+    }
+
+    // Phase 2 (parallel): sign each digest. `PrivateKeySigner: Sync` so
+    // the same instance can be shared across rayon worker threads.
+    let signer: &alloy_signer_local::PrivateKeySigner = stamper.signer();
+    let stamped: Result<Vec<StampedChunk>, ClientError> = prepared
+        .into_par_iter()
+        .map(|(addr, wire, digest)| {
+            use alloy_signer::SignerSync;
+            let prehash = digest.to_prehash();
+            let sig = signer
+                .sign_message_sync(prehash.as_slice())
+                .map_err(|e| ClientError::Stamp(e.to_string()))?;
+            let stamp = BatchStamper::<MemoryIssuer, alloy_signer_local::PrivateKeySigner>::stamp_from_signature(&digest, sig);
+            let stamp_bytes = stamp.to_bytes().to_vec();
+            let mut addr32 = [0u8; 32];
+            addr32.copy_from_slice(addr.as_bytes());
+            Ok(StampedChunk { addr: addr32, wire, stamp: stamp_bytes })
+        })
+        .collect();
+    stamped
+}
+
+#[cfg(target_arch = "wasm32")]
+fn stamp_chunks_parallel(
+    stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
+    work: Vec<(ChunkAddress, Vec<u8>)>,
+) -> Result<Vec<StampedChunk>, ClientError> {
+    work.into_iter()
+        .map(|(addr, wire)| stamp_chunk(stamper, &addr, wire))
+        .collect()
+}
+
 /// Upload arbitrary-size content. Splits via nectar, stamps each chunk with
 /// the supplied batch + signer, and pushes every chunk via pushsync to the
 /// closest peer in the peerlist. Returns the root content address.
@@ -857,10 +998,11 @@ pub async fn upload_bytes_ex(
     let mut stamper = build_stamper(signer, batch_id, depth);
 
     let snapshot = store.into_chunks();
-    let mut work: Vec<StampedChunk> = Vec::with_capacity(snapshot.len());
-    for (addr, chunk) in &snapshot {
-        work.push(stamp_chunk(&mut stamper, addr, wire_form(chunk))?);
-    }
+    let stamp_in: Vec<(ChunkAddress, Vec<u8>)> = snapshot
+        .iter()
+        .map(|(addr, chunk)| (*addr, wire_form(chunk)))
+        .collect();
+    let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
 
     push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
     Ok(root)
@@ -915,7 +1057,13 @@ async fn push_chunks_concurrent(
         return Ok(());
     }
 
-    let sessions = open_session_pool(transport, peers, concurrency.max(1)).await?;
+    // Adaptive sizing: never open more sessions than we have chunks to
+    // push. A 1888-byte file is 2 chunks; opening 32 sessions for that
+    // wastes ~30 s on dial timeouts when the user picked a high
+    // --concurrency for the upload-machine defaults. Floor at 4 so very
+    // small uploads still get the multi-peer race for resilience.
+    let target_sessions = concurrency.max(1).min(work.len().max(4));
+    let sessions = open_session_pool(transport, peers, target_sessions).await?;
     if sessions.is_empty() {
         return Err(ClientError::NoPeers("no reachable ws peers".into()));
     }
@@ -941,12 +1089,19 @@ async fn push_chunks_concurrent(
     // `PREEMPT_INTERVAL` fire another push to the next-closest peer in
     // parallel, returning on the first valid receipt.
     const CHUNK_PEER_PARALLELISM: usize = 3;
-    const PREEMPT_INTERVAL: Duration = Duration::from_secs(5);
+    // Shorter than bee's 5s — bee tunes for inter-node forwarding RTTs;
+    // our pushes are a single hop from the client and a stuck peer at
+    // 2.5s usually means a dead path, not a slow forwarder.
+    const PREEMPT_INTERVAL: Duration = Duration::from_millis(2500);
 
     let dispatch = |chunk: StampedChunk| {
         let pool = pool.clone();
         let pushed = pushed.clone();
         let transport = transport;
+        // Wrap the chunk in Arc once per dispatch so preemptive retries
+        // share its (potentially 4 KiB) wire bytes instead of cloning
+        // per attempt.
+        let chunk = Arc::new(chunk);
         async move {
             use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -992,10 +1147,12 @@ async fn push_chunks_concurrent(
             let mut last_err: Option<TransportError> = None;
             let mut overdrafts = 0usize;
             let mut errors = 0usize;
-            let mut preempt = tokio::time::interval_at(
-                tokio::time::Instant::now() + PREEMPT_INTERVAL,
-                PREEMPT_INTERVAL,
-            );
+            // Box-pinned sleep that we recreate on each fire / push-refill;
+            // PREEMPT_INTERVAL then counts from the most recent push event.
+            // (Native tokio has Sleep::reset, but tokio_with_wasm doesn't,
+            // so a re-pin is the portable common subset.)
+            let mut sleep: std::pin::Pin<Box<tokio::time::Sleep>> =
+                Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
 
             loop {
                 tokio::select! {
@@ -1040,48 +1197,88 @@ async fn push_chunks_concurrent(
                             attempt_no += 1;
                             inflight.push(attempt(idx, attempt_no));
                         }
+                        // Reset preempt timer: we just observed activity, so
+                        // start the next PREEMPT_INTERVAL countdown fresh.
+                        sleep = Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
                     }
 
-                    _ = preempt.tick(), if inflight.len() < CHUNK_PEER_PARALLELISM => {
+                    _ = sleep.as_mut(), if inflight.len() < CHUNK_PEER_PARALLELISM => {
                         // Preemptive fanout: closest peer hasn't returned within
                         // `PREEMPT_INTERVAL`, so race another peer in parallel.
                         if let Some(idx) = order_iter.next() {
                             attempt_no += 1;
                             inflight.push(attempt(idx, attempt_no));
                         }
+                        // Restart preempt countdown.
+                        sleep = Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
                     }
 
                     else => break,
                 }
             }
 
-            // All candidates exhausted. If everyone overdrafted (no real
-            // errors), wait one refresh cycle and retry the closest few —
-            // pseudosettle has freed credit by then.
+            // All candidates within `cap` exhausted. If everyone
+            // overdrafted (no real errors), prefer trying more peers
+            // beyond `cap` over sleeping — the pool has many peers, and
+            // a fresh peer's credit ceiling is uncorrelated with our
+            // already-attempted ones'. Only fall back to a 1.1 s
+            // refresh-wait + closest-N retry if there genuinely are no
+            // more peers in the pool.
             if errors == 0 && overdrafts > 0 {
-                debug!(target: "isheika::upload",
-                    "all attempted peers overdrafted; waiting for refresh");
-                tokio::time::sleep(Duration::from_millis(1100)).await;
-                for idx in order.iter().take(cap).copied() {
-                    let entry = &pool[idx];
-                    let mut peer_overlay = [0u8; 32];
-                    peer_overlay.copy_from_slice(entry.overlay.as_bytes());
-                    let price = peer_price(&peer_overlay, &chunk.addr);
-                    match try_push_with_rotation(entry, &chunk, price, transport).await {
-                        Ok(PushOutcome::Receipt(_)) => {
-                            let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                            if done % 50 == 0 || done == total {
-                                info!(target: "isheika::upload",
-                                    "pushed {}/{} chunks (latest via {} po={})",
-                                    done, total, entry.overlay_hex,
-                                    chunk_addr.proximity(&entry.overlay));
+                let already_attempted = attempt_no;
+                let extra: Vec<usize> = order.iter().skip(already_attempted).copied().collect();
+                if !extra.is_empty() {
+                    debug!(target: "isheika::upload",
+                        "all {} attempted peers overdrafted; trying {} more",
+                        already_attempted, extra.len());
+                    for idx in extra {
+                        let entry = &pool[idx];
+                        let mut peer_overlay = [0u8; 32];
+                        peer_overlay.copy_from_slice(entry.overlay.as_bytes());
+                        let price = peer_price(&peer_overlay, &chunk.addr);
+                        match try_push_with_rotation(entry, &chunk, price, transport).await {
+                            Ok(PushOutcome::Receipt(_)) => {
+                                let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if done % 50 == 0 || done == total {
+                                    info!(target: "isheika::upload",
+                                        "pushed {}/{} chunks (latest via {} po={})",
+                                        done, total, entry.overlay_hex,
+                                        chunk_addr.proximity(&entry.overlay));
+                                }
+                                return Ok::<_, ClientError>(());
                             }
-                            return Ok::<_, ClientError>(());
+                            Ok(PushOutcome::Overdraft) => continue,
+                            Err(e) => {
+                                last_err = Some(e);
+                                break;
+                            }
                         }
-                        Ok(PushOutcome::Overdraft) => continue,
-                        Err(e) => {
-                            last_err = Some(e);
-                            break;
+                    }
+                } else {
+                    debug!(target: "isheika::upload",
+                        "all peers overdrafted and no more candidates; waiting for refresh");
+                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    for idx in order.iter().take(cap).copied() {
+                        let entry = &pool[idx];
+                        let mut peer_overlay = [0u8; 32];
+                        peer_overlay.copy_from_slice(entry.overlay.as_bytes());
+                        let price = peer_price(&peer_overlay, &chunk.addr);
+                        match try_push_with_rotation(entry, &chunk, price, transport).await {
+                            Ok(PushOutcome::Receipt(_)) => {
+                                let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if done % 50 == 0 || done == total {
+                                    info!(target: "isheika::upload",
+                                        "pushed {}/{} chunks (latest via {} po={})",
+                                        done, total, entry.overlay_hex,
+                                        chunk_addr.proximity(&entry.overlay));
+                                }
+                                return Ok::<_, ClientError>(());
+                            }
+                            Ok(PushOutcome::Overdraft) => continue,
+                            Err(e) => {
+                                last_err = Some(e);
+                                break;
+                            }
                         }
                     }
                 }
@@ -1184,6 +1381,7 @@ async fn open_session_pool(
     peers: &PeerStore,
     max_sessions: usize,
 ) -> Result<Vec<SessionEntry>, ClientError> {
+    let log = transport.reachability_log();
     use futures::stream::{FuturesUnordered, StreamExt};
 
     // Walk every peer in the peerstore in a stable (closest-to-zero)
@@ -1191,15 +1389,26 @@ async fn open_session_pool(
     // the first `max_sessions` successful ones — most candidate addresses
     // on mainnet are stale, so a wide dial window finds reachable peers
     // ~order-of-magnitude faster than a `max_sessions`-wide window.
+    //
+    // Peers we've recently failed to dial (within RECENT_FAILURE_SECS)
+    // are moved to the end of the candidate list rather than dropped:
+    // they're still tried if no fresher peer answers, but won't burn
+    // 10 s timeouts at the front of the dial parade.
+    let now = crate::peers::now_unix();
     let zero = ChunkAddress::new([0u8; 32]);
-    let candidates: Vec<_> = peers
+    let (fresh, stale): (Vec<_>, Vec<_>) = peers
         .closest(&zero, usize::MAX)
         .into_iter()
         .filter_map(|p| {
             let underlay = p.first_dialable_underlay()?;
             let overlay = p.overlay_address()?;
-            Some((overlay, p.overlay.clone(), underlay))
+            Some((overlay, p.overlay.clone(), underlay, p.is_recently_unreachable(now)))
         })
+        .partition(|(_, _, _, stale)| !stale);
+    let candidates: Vec<(SwarmAddress, String, Multiaddr)> = fresh
+        .into_iter()
+        .chain(stale.into_iter())
+        .map(|(o, hex, u, _)| (o, hex, u))
         .collect();
     if candidates.is_empty() {
         return Err(ClientError::NoPeers("peerlist empty".into()));
@@ -1209,8 +1418,10 @@ async fn open_session_pool(
     let mut iter = candidates.into_iter();
     let mut dialing = FuturesUnordered::new();
     let dial = |overlay: SwarmAddress, overlay_hex: String, underlay: Multiaddr| async move {
+        let started = web_time::Instant::now();
         let result = transport.open_session(&underlay).await;
-        (overlay, overlay_hex, underlay, result)
+        let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        (overlay, overlay_hex, underlay, result, rtt_ms)
     };
 
     // Seed initial in-flight window — wider than max_sessions to absorb
@@ -1220,11 +1431,16 @@ async fn open_session_pool(
     }
 
     let mut sessions = Vec::with_capacity(max_sessions);
-    while let Some((overlay, overlay_hex, underlay, res)) = dialing.next().await {
+    while let Some((overlay, overlay_hex, underlay, res, rtt_ms)) = dialing.next().await {
         match res {
             Ok(session) => {
                 debug!(target: "isheika::upload",
-                    "session opened to {} ({})", overlay_hex, underlay);
+                    "session opened to {} ({}) in {} ms",
+                    overlay_hex, underlay, rtt_ms);
+                log.lock().unwrap().insert(
+                    overlay_hex.to_lowercase(),
+                    DialResult::Success { rtt_ms },
+                );
                 sessions.push(SessionEntry {
                     overlay,
                     overlay_hex,
@@ -1238,6 +1454,8 @@ async fn open_session_pool(
             Err(e) => {
                 warn!(target: "isheika::upload",
                     "session to {} failed: {}", overlay_hex, e);
+                log.lock().unwrap()
+                    .insert(overlay_hex.to_lowercase(), DialResult::Failure);
             }
         }
         // Keep the in-flight window full so we don't sit waiting on a few
@@ -1247,6 +1465,58 @@ async fn open_session_pool(
         }
     }
     Ok(sessions)
+}
+
+/// Quick reachability probe: dial each peer in parallel, record success/
+/// failure (with rtt) into the reachability log without keeping the
+/// resulting sessions open. Called optionally by `discover` after a hive
+/// round to pre-prune dead peers from `peers.json`.
+pub async fn healthcheck_peers(
+    transport: &Transport,
+    peers: &PeerStore,
+    concurrency: usize,
+) {
+    let log = transport.reachability_log();
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let zero = ChunkAddress::new([0u8; 32]);
+    let candidates: Vec<_> = peers
+        .closest(&zero, usize::MAX)
+        .into_iter()
+        .filter_map(|p| {
+            let underlay = p.first_dialable_underlay()?;
+            Some((p.overlay.clone(), underlay))
+        })
+        .collect();
+    let total = candidates.len();
+
+    let concurrency = concurrency.max(1);
+    let mut iter = candidates.into_iter();
+    let mut inflight = FuturesUnordered::new();
+    let probe = |overlay_hex: String, underlay: Multiaddr| async move {
+        let started = web_time::Instant::now();
+        let res = transport.open_session(&underlay).await;
+        let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        (overlay_hex, res.is_ok(), rtt_ms)
+    };
+    for (overlay_hex, underlay) in iter.by_ref().take(concurrency) {
+        inflight.push(probe(overlay_hex, underlay));
+    }
+    let mut reached = 0usize;
+    while let Some((overlay_hex, ok, rtt_ms)) = inflight.next().await {
+        if ok {
+            reached += 1;
+        }
+        log.lock().unwrap().insert(
+            overlay_hex.to_lowercase(),
+            if ok { DialResult::Success { rtt_ms } } else { DialResult::Failure },
+        );
+        if let Some((overlay_hex, underlay)) = iter.next() {
+            inflight.push(probe(overlay_hex, underlay));
+        }
+    }
+    info!(target: "isheika::discover",
+        "healthcheck: {}/{} peers reachable", reached, total);
 }
 
 fn parse_root(hex_str: &str) -> Result<ChunkAddress, ClientError> {

@@ -20,7 +20,7 @@ pub enum PeerStoreError {
 }
 
 /// A discovered peer.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Peer {
     /// 32-byte overlay (hex).
     pub overlay: String,
@@ -32,6 +32,57 @@ pub struct Peer {
     /// 32-byte nonce used to derive overlay (hex). Zero by default.
     #[serde(default)]
     pub nonce: Option<String>,
+
+    /// Reachability cache, updated by dial attempts (session pool open,
+    /// healthcheck, etc.). Persists across CLI runs so we don't waste
+    /// ~timeout seconds re-dialing peers we know are dead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dial_success_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dial_failure_unix: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_dial_rtt_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub consecutive_failures: u16,
+}
+
+fn is_zero_u16(x: &u16) -> bool { *x == 0 }
+
+/// Window (seconds) within which a recent dial failure causes a peer to
+/// be deprioritised. Tuned so that a peer down at the time of one upload
+/// is given a chance again on the next run a few minutes later.
+pub const RECENT_FAILURE_SECS: u64 = 300;
+
+/// Outcome of a dial attempt, recorded in a [`ReachabilityLog`] so the
+/// session-pool dial loop and healthcheck probe can feed observations
+/// back to a writable [`PeerStore`] without holding a `&mut` reference
+/// across many concurrent dials.
+#[derive(Clone, Copy, Debug)]
+pub enum DialResult {
+    Success { rtt_ms: u32 },
+    Failure,
+}
+
+/// Thread-safe map of `overlay_hex_lowercase → DialResult` populated by
+/// concurrent dial loops. Apply to a [`PeerStore`] with [`apply_log`].
+pub type ReachabilityLog = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, DialResult>>>;
+
+pub fn new_log() -> ReachabilityLog {
+    std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Drain `log` into `store`, updating each peer's reachability fields.
+pub fn apply_log(store: &mut PeerStore, log: &ReachabilityLog) {
+    let entries: Vec<(String, DialResult)> = {
+        let mut guard = log.lock().unwrap();
+        guard.drain().collect()
+    };
+    for (overlay, result) in entries {
+        match result {
+            DialResult::Success { rtt_ms } => store.record_dial_success(&overlay, rtt_ms),
+            DialResult::Failure => store.record_dial_failure(&overlay),
+        }
+    }
 }
 
 impl Peer {
@@ -82,6 +133,36 @@ impl Peer {
     pub fn overlay_address(&self) -> Option<SwarmAddress> {
         Some(SwarmAddress::new(self.overlay_bytes()?))
     }
+
+    /// `true` if this peer's last dial attempt failed within the recent
+    /// failure window AND we haven't had a successful dial since.
+    pub fn is_recently_unreachable(&self, now_unix: u64) -> bool {
+        let Some(fail) = self.last_dial_failure_unix else {
+            return false;
+        };
+        if let Some(succ) = self.last_dial_success_unix {
+            if succ >= fail {
+                return false;
+            }
+        }
+        now_unix.saturating_sub(fail) < RECENT_FAILURE_SECS
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn now_unix() -> u64 {
+    (web_time::SystemTime::now()
+        .duration_since(web_time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)) as u64
 }
 
 /// In-memory peer store keyed by overlay hex.
@@ -110,6 +191,9 @@ impl PeerStore {
 
     /// Insert or merge a peer. Underlays are filtered to those our transport
     /// stack can dial (ws/wss everywhere, plus plain `/tcp/...` on native).
+    /// Reachability fields from `peer` overwrite the existing entry only
+    /// if they're newer than what's already stored (so older hive-only
+    /// announcements never wipe out recent dial-result observations).
     pub fn upsert(&mut self, mut peer: Peer) {
         peer.underlays.retain(|u| is_dialable_str(u));
         peer.underlays.sort();
@@ -133,10 +217,42 @@ impl PeerStore {
                 if existing.nonce.is_none() {
                     existing.nonce = peer.nonce;
                 }
+                // Reachability is monotonic on each field — take the newer.
+                if peer.last_dial_success_unix > existing.last_dial_success_unix {
+                    existing.last_dial_success_unix = peer.last_dial_success_unix;
+                    existing.last_dial_rtt_ms = peer.last_dial_rtt_ms;
+                    existing.consecutive_failures = 0;
+                }
+                if peer.last_dial_failure_unix > existing.last_dial_failure_unix {
+                    existing.last_dial_failure_unix = peer.last_dial_failure_unix;
+                    existing.consecutive_failures =
+                        existing.consecutive_failures.saturating_add(peer.consecutive_failures.max(1));
+                }
             }
             None => {
                 self.peers.insert(key, peer);
             }
+        }
+    }
+
+    /// Record a successful dial for the peer with this overlay (hex).
+    /// No-op if the peer isn't in the store.
+    pub fn record_dial_success(&mut self, overlay_hex: &str, rtt_ms: u32) {
+        let key = overlay_hex.to_lowercase();
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.last_dial_success_unix = Some(now_unix());
+            p.last_dial_rtt_ms = Some(rtt_ms);
+            p.consecutive_failures = 0;
+        }
+    }
+
+    /// Record a failed dial for the peer with this overlay (hex).
+    /// No-op if the peer isn't in the store.
+    pub fn record_dial_failure(&mut self, overlay_hex: &str) {
+        let key = overlay_hex.to_lowercase();
+        if let Some(p) = self.peers.get_mut(&key) {
+            p.last_dial_failure_unix = Some(now_unix());
+            p.consecutive_failures = p.consecutive_failures.saturating_add(1);
         }
     }
 

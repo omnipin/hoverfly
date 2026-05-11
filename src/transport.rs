@@ -180,12 +180,23 @@ pub struct Transport {
     keypair: Keypair,
     signer: SwarmSigner,
     config: TransportConfig,
+    /// Shared reachability log: every dial / session open / healthcheck
+    /// records its (overlay → success/failure + rtt) here. The CLI drains
+    /// the log after an operation completes and writes the observations
+    /// back to `peers.json`, so future runs skip recently-failed peers
+    /// up-front. Always present so callers don't need to check.
+    reachability_log: crate::peers::ReachabilityLog,
 }
 
 impl Transport {
     pub fn new(signer: SwarmSigner, config: TransportConfig) -> Self {
         let keypair = Keypair::generate_ed25519();
-        Self { keypair, signer, config }
+        Self {
+            keypair,
+            signer,
+            config,
+            reachability_log: crate::peers::new_log(),
+        }
     }
 
     pub const fn signer(&self) -> &SwarmSigner {
@@ -194,6 +205,12 @@ impl Transport {
 
     pub const fn config(&self) -> &TransportConfig {
         &self.config
+    }
+
+    /// Reachability observations collected by recent dial attempts.
+    /// Drain with [`crate::peers::apply_log`] to update a `PeerStore`.
+    pub fn reachability_log(&self) -> &crate::peers::ReachabilityLog {
+        &self.reachability_log
     }
 
     /// Fetch a single chunk by address. Convenience for single-shot fetches —
@@ -206,21 +223,6 @@ impl Transport {
     ) -> Result<ChunkDelivery, TransportError> {
         let session = PeerSession::connect(self, peer_addr).await?;
         session.fetch_chunk(chunk_addr).await
-    }
-
-    /// Push a single chunk to a peer. Convenience for single-shot pushes —
-    /// opens a fresh connection, does the handshake/pricing dance, pushes one
-    /// chunk, and tears down. For multi-chunk workloads use `PeerSession`
-    /// (one session per peer, then many `pushsync_chunk` calls).
-    pub async fn pushsync_chunk(
-        &self,
-        peer_addr: &Multiaddr,
-        chunk_addr: &[u8; 32],
-        chunk_data: &[u8],
-        stamp: &[u8],
-    ) -> Result<PushsyncReceipt, TransportError> {
-        let session = PeerSession::connect(self, peer_addr).await?;
-        session.pushsync_chunk(chunk_addr, chunk_data, stamp).await
     }
 
     /// Open a long-lived session to a peer. The handshake and pricing dance
@@ -414,25 +416,6 @@ impl PeerSession {
             .await
             .map_err(|_| TransportError::ConnectionClosed)?;
         rx.await.map_err(|_| TransportError::ConnectionClosed)?
-    }
-
-    /// Back-compat single-shot push. Uses a worst-case price estimate so
-    /// the accounting check always passes for a freshly opened session.
-    pub async fn pushsync_chunk(
-        &self,
-        chunk_addr: &[u8; 32],
-        chunk_data: &[u8],
-        stamp: &[u8],
-    ) -> Result<PushsyncReceipt, TransportError> {
-        // (MaxPO + 1) × PO_PRICE = pessimistic 320_000.
-        let worst = (u64::from(MAX_PO) + 1) * PO_PRICE_PLUR;
-        match self
-            .pushsync_chunk_priced(chunk_addr, chunk_data, stamp, worst)
-            .await?
-        {
-            PushOutcome::Receipt(r) => Ok(r),
-            PushOutcome::Overdraft => Err(TransportError::PseudoSettle("overdraft".into())),
-        }
     }
 
     /// Fetch one chunk over a fresh substream on this session's connection.

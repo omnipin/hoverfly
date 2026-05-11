@@ -83,6 +83,9 @@ clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tar = { version = "0.4", optional = true }
 getrandom = { version = "0.3", default-features = false }
+# Parallel postage stamp signing on native targets. Wasm-single-thread
+# doesn't benefit and rayon doesn't compile there anyway.
+rayon = "1"
 
 # Wasm-only
 [target.'cfg(target_arch = "wasm32")'.dependencies]
