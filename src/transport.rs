@@ -147,7 +147,17 @@ pub enum TransportError {
 
 #[derive(Clone, Debug)]
 pub struct TransportConfig {
+    /// Per-operation timeout (one pushsync substream, one retrieval
+    /// substream, one pseudosettle round-trip). Sized for round-trip
+    /// latency + bee handler processing, not for connection setup.
     pub timeout: Duration,
+    /// Wall-clock budget for the entire `PeerSession::connect()` —
+    /// libp2p dial + identify + handshake + pricing. Healthy peers
+    /// finish in ≪ 1 s; dead/NAT'd ones eat the full budget. Kept
+    /// separate from `timeout` so we can fail dial-attempts on dead
+    /// peers in 2-3 s while still allowing 10+ s for slow push/fetch
+    /// round trips on live peers.
+    pub dial_timeout: Duration,
     pub network_id: u64,
 }
 
@@ -155,6 +165,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            dial_timeout: Duration::from_secs(3),
             network_id: 1,
         }
     }
@@ -305,6 +316,11 @@ impl Transport {
 pub struct PeerSession {
     cmd_tx: tokio::sync::mpsc::Sender<SessionCommand>,
     peer_id: PeerId,
+    /// Shared with the driver so callers can observe the push counter
+    /// without round-tripping through the command channel — used by
+    /// the upload layer to pre-warm a replacement session before this
+    /// one hits its rotation limit.
+    state: std::sync::Arc<SessionState>,
 }
 
 enum SessionCommand {
@@ -332,6 +348,21 @@ impl PeerSession {
         transport: &Transport,
         peer_addr: &Multiaddr,
     ) -> Result<Self, TransportError> {
+        // The dial phase (connect + identify + handshake + pricing) is
+        // bounded by `dial_timeout`. Healthy peers finish well under 1 s;
+        // dead peers used to eat the full per-op timeout (10+ s) before
+        // we'd give up. Once the session is open, per-substream work uses
+        // `config.timeout` instead — see the SessionState below.
+        let dial_budget = transport.config.dial_timeout;
+        tokio::time::timeout(dial_budget, Self::connect_inner(transport, peer_addr))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+    }
+
+    async fn connect_inner(
+        transport: &Transport,
+        peer_addr: &Multiaddr,
+    ) -> Result<Self, TransportError> {
         let peer_id = ensure_ws(peer_addr)?;
         let mut swarm = build_swarm(transport).await?;
         let mut control = swarm.behaviour().stream.new_control();
@@ -339,7 +370,7 @@ impl PeerSession {
         let mut pr_in = accept(&mut control, PRICING_PROTO)?;
         let hive_in = accept(&mut control, HIVE_PROTO)?;
         dial(&mut swarm, peer_id, peer_addr)?;
-        let underlay = prep_connection(&mut swarm, peer_id, transport.config.timeout).await?;
+        let underlay = prep_connection(&mut swarm, peer_id, transport.config.dial_timeout).await?;
         do_handshake(
             &mut swarm,
             peer_id,
@@ -354,7 +385,7 @@ impl PeerSession {
             peer_id,
             &mut control,
             &mut pr_in,
-            transport.config.timeout,
+            transport.config.dial_timeout,
         )
         .await?;
 
@@ -373,6 +404,7 @@ impl PeerSession {
             settle_lock: tokio::sync::Mutex::new(()),
             pushes_used: std::sync::atomic::AtomicU32::new(0),
         });
+        let session_state = state.clone();
         spawn_session_driver(SessionDriver {
             swarm,
             state,
@@ -381,11 +413,20 @@ impl PeerSession {
             _pr_in: pr_in,
             _hive_in: hive_in,
         });
-        Ok(Self { cmd_tx, peer_id })
+        Ok(Self { cmd_tx, peer_id, state: session_state })
     }
 
     pub const fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// Pushes attempted on this session's underlying connection so far.
+    /// Approaches [`MAX_PUSHES_PER_SESSION`]; callers use this watermark
+    /// to pre-warm a replacement session before the current one retires.
+    pub fn pushes_used(&self) -> u32 {
+        self.state
+            .pushes_used
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Push one chunk over a fresh substream on this session's connection,

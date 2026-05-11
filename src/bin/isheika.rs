@@ -38,9 +38,17 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 1, value_name = "ID")]
     network_id: u64,
 
-    /// Connection timeout in seconds
+    /// Per-operation timeout in seconds (one pushsync or retrieval
+    /// round-trip on an already-open session).
     #[arg(long, global = true, default_value_t = 10, value_name = "SECS")]
     timeout: u64,
+
+    /// Wall-clock budget for opening a session to a peer (libp2p dial +
+    /// identify + handshake + pricing). Set low (1-3 s) so dead/NAT'd
+    /// peers fail fast; live peers usually answer in well under a
+    /// second. Independent of `--timeout`.
+    #[arg(long, global = true, default_value_t = 3, value_name = "SECS")]
+    dial_timeout: u64,
 
     #[command(subcommand)]
     command: Commands,
@@ -263,6 +271,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = TransportConfig {
         timeout: Duration::from_secs(cli.timeout),
+        dial_timeout: Duration::from_secs(cli.dial_timeout),
         network_id: cli.network_id,
     };
     let doh = Doh::with_url(&cli.doh_url);

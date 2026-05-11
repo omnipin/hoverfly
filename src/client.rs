@@ -1018,6 +1018,13 @@ struct SessionEntry {
     overlay_hex: String,
     underlay: libp2p::Multiaddr,
     session: std::sync::Mutex<PeerSession>,
+    /// Pre-warmed replacement session. Populated by the upload loop
+    /// once the active session crosses [`PREWARM_WATERMARK`] pushes; if
+    /// present, `try_push_with_rotation` swaps it in instead of dialing
+    /// synchronously. `bool` flags whether a pre-warm is already in
+    /// flight (so we don't queue two for the same entry).
+    pending: std::sync::Mutex<Option<PeerSession>>,
+    prewarm_inflight: std::sync::atomic::AtomicBool,
 }
 
 impl SessionEntry {
@@ -1025,13 +1032,32 @@ impl SessionEntry {
         self.session.lock().expect("session mutex poisoned").clone()
     }
 
-    /// Replace the stored session with `new`, returning whether the
-    /// caller's snapshot is now stale (always true).
+    /// Replace the stored session with `new`. The previous session's
+    /// `cmd_tx` is dropped, which signals its driver to shut down once
+    /// any in-flight pushes finish.
     fn replace(&self, new: PeerSession) {
         let mut guard = self.session.lock().expect("session mutex poisoned");
         *guard = new;
     }
+
+    /// Take a pre-warmed session if one is ready. Returns `None` if no
+    /// pre-warm has completed yet — caller falls back to dialing sync.
+    fn take_pending(&self) -> Option<PeerSession> {
+        self.pending.lock().expect("pending mutex poisoned").take()
+    }
+
+    /// Store a freshly-dialed session as the pre-warmed replacement.
+    fn store_pending(&self, session: PeerSession) {
+        let mut guard = self.pending.lock().expect("pending mutex poisoned");
+        *guard = Some(session);
+    }
 }
+
+/// Push count at which we kick off a background dial for a session's
+/// replacement. Sized comfortably below `MAX_PUSHES_PER_SESSION = 25`
+/// so the dial completes (typical 200-700 ms on a live peer) before the
+/// active session hits the wall.
+const PREWARM_WATERMARK: u32 = 20;
 
 /// Push a batch of pre-stamped chunks using a pool of long-lived peer
 /// sessions. Each session handshakes once and is then reused for many
@@ -1305,18 +1331,94 @@ async fn push_chunks_concurrent(
         }
     }
 
+    // Separate side-queue of background dials used to pre-warm session
+    // replacements. Each dial runs concurrently with chunk pushes, so
+    // when an active session retires (after MAX_PUSHES_PER_SESSION) the
+    // replacement is already open instead of forcing the chunk that
+    // triggered the rotation to pay the dial cost synchronously.
+    //
+    // The future borrows `transport` for `'_`, so we use BoxFuture<'_>
+    // from the futures crate (which carries an explicit lifetime),
+    // not the more common +'static dyn pinning.
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut prewarm_dials: FuturesUnordered<
+        futures::future::BoxFuture<'_, (usize, Result<PeerSession, TransportError>)>,
+    > = FuturesUnordered::new();
+    #[cfg(target_arch = "wasm32")]
+    let mut prewarm_dials: FuturesUnordered<
+        futures::future::LocalBoxFuture<'_, (usize, Result<PeerSession, TransportError>)>,
+    > = FuturesUnordered::new();
+
+    let maybe_prewarm = |idx: usize, prewarm_dials: &mut FuturesUnordered<_>| {
+        let entry = &pool[idx];
+        let used = entry.snapshot().pushes_used();
+        if used >= PREWARM_WATERMARK
+            && entry
+                .prewarm_inflight
+                .compare_exchange(
+                    false,
+                    true,
+                    Ordering::AcqRel,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            let underlay = entry.underlay.clone();
+            #[cfg(not(target_arch = "wasm32"))]
+            prewarm_dials.push(Box::pin(async move {
+                let res = transport.open_session(&underlay).await;
+                (idx, res)
+            }) as futures::future::BoxFuture<'_, _>);
+            #[cfg(target_arch = "wasm32")]
+            prewarm_dials.push(Box::pin(async move {
+                let res = transport.open_session(&underlay).await;
+                (idx, res)
+            }) as futures::future::LocalBoxFuture<'_, _>);
+        }
+    };
+
     let mut first_err: Option<ClientError> = None;
-    while let Some(res) = inflight.next().await {
-        match res {
-            Ok(()) => {
-                if let Some(c) = iter.next() {
-                    inflight.push(dispatch(c));
+    loop {
+        tokio::select! {
+            biased;
+
+            Some(res) = inflight.next(), if !inflight.is_empty() => {
+                match res {
+                    Ok(()) => {
+                        // Opportunistically pre-warm any session that's
+                        // approaching its rotation limit. compare_exchange
+                        // ensures only one dial per entry at a time.
+                        for i in 0..pool.len() {
+                            maybe_prewarm(i, &mut prewarm_dials);
+                        }
+                        if let Some(c) = iter.next() {
+                            inflight.push(dispatch(c));
+                        }
+                    }
+                    Err(e) => {
+                        first_err = Some(e);
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                first_err = Some(e);
-                break;
+
+            Some((idx, res)) = prewarm_dials.next(), if !prewarm_dials.is_empty() => {
+                let entry = &pool[idx];
+                entry.prewarm_inflight.store(false, Ordering::Release);
+                match res {
+                    Ok(session) => {
+                        debug!(target: "isheika::upload",
+                            "pre-warm dial for {} ready", entry.overlay_hex);
+                        entry.store_pending(session);
+                    }
+                    Err(e) => {
+                        debug!(target: "isheika::upload",
+                            "pre-warm dial for {} failed: {}", entry.overlay_hex, e);
+                    }
+                }
             }
+
+            else => break,
         }
     }
 
@@ -1348,13 +1450,24 @@ async fn try_push_with_rotation(
         // just unhappy on this peer. Bubble up so the dispatcher picks
         // the next peer.
         Err(e) if !is_connection_dead(&e) => Err(e),
-        // Connection is gone. Dial a fresh one (resets bee's
-        // ghostBalance via Connect()) and retry once on the new session.
+        // Connection is gone. Prefer a pre-warmed replacement (zero
+        // wait) if the upload loop has dialed one for us; otherwise
+        // dial sync. Either way, resets bee's ghostBalance via the
+        // fresh `Connect()` and retries the push.
         Err(_) => {
-            let fresh = transport.open_session(&entry.underlay).await?;
-            debug!(target: "isheika::upload",
-                "rotated session to {} (new libp2p connection)",
-                entry.overlay_hex);
+            let fresh = match entry.take_pending() {
+                Some(s) => {
+                    debug!(target: "isheika::upload",
+                        "rotated to pre-warmed session for {}", entry.overlay_hex);
+                    s
+                }
+                None => {
+                    let s = transport.open_session(&entry.underlay).await?;
+                    debug!(target: "isheika::upload",
+                        "rotated session to {} (sync dial)", entry.overlay_hex);
+                    s
+                }
+            };
             entry.replace(fresh.clone());
             fresh
                 .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
@@ -1446,6 +1559,8 @@ async fn open_session_pool(
                     overlay_hex,
                     underlay,
                     session: std::sync::Mutex::new(session),
+                    pending: std::sync::Mutex::new(None),
+                    prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
                 });
                 if sessions.len() >= max_sessions {
                     break;

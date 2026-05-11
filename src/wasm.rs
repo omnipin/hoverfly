@@ -53,7 +53,11 @@ impl IsheikaClient {
             Some(hex) => SwarmSigner::from_hex(hex, network_id).map_err(into_js_err)?,
             None => SwarmSigner::random(network_id),
         };
-        let cfg = TransportConfig { timeout, network_id };
+        let cfg = TransportConfig {
+            timeout,
+            dial_timeout: Duration::from_secs(3),
+            network_id,
+        };
 
         Ok(Self {
             transport: Transport::new(signer, cfg),
