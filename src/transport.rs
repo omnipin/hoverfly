@@ -358,17 +358,23 @@ impl PeerSession {
 
         let timeout = transport.config.timeout;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<SessionCommand>(64);
-        spawn_session_driver(SessionDriver {
-            swarm,
+        let state = std::sync::Arc::new(SessionState {
             control,
             peer_id,
             timeout,
+            accounting: tokio::sync::Mutex::new(AccountingState {
+                reserve_plur: 0,
+                balance_plur: 0,
+                threshold_plur: SAFE_PEER_THRESHOLD_PLUR,
+                last_settle: None,
+            }),
+            settle_lock: tokio::sync::Mutex::new(()),
+            pushes_used: std::sync::atomic::AtomicU32::new(0),
+        });
+        spawn_session_driver(SessionDriver {
+            swarm,
+            state,
             cmd_rx,
-            reserve_plur: 0,
-            balance_plur: 0,
-            threshold_plur: SAFE_PEER_THRESHOLD_PLUR,
-            last_settle: None,
-            pushes_used: 0,
             _hs_in: hs_in,
             _pr_in: pr_in,
             _hive_in: hive_in,
@@ -447,115 +453,25 @@ impl PeerSession {
     }
 }
 
-struct SessionDriver {
-    swarm: Swarm<Behaviour>,
-    control: libp2p_stream::Control,
-    peer_id: PeerId,
-    timeout: Duration,
-    cmd_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
-    /// Per-peer client-side accounting, mirroring
-    /// `pkg/accounting/accounting.go` and weeb-3's `accounting.rs`:
-    /// `reserve` is PLUR locked-in by in-flight pushes;
-    /// `balance` is PLUR we've committed but not yet settled.
-    /// We refuse a push if `reserve + balance + price > threshold`.
+/// Mutable, lock-protected accounting state shared across concurrent
+/// pushes on a single session. Mirrors `pkg/accounting/accounting.go`:
+/// - `reserve_plur` is PLUR locked in by in-flight pushes (not yet
+///   committed against the peer's balance);
+/// - `balance_plur` is PLUR we've committed but haven't yet settled.
+/// A push is refused if `reserve + balance + price > threshold`.
+struct AccountingState {
     reserve_plur: u64,
     balance_plur: u64,
     threshold_plur: u64,
-    /// `Instant` of our last successful pseudosettle (bee rejects two
-    /// within the same wall-second on its end).
+    /// `Instant` of our last successful pseudosettle. Bee rejects two
+    /// settles within the same wall-second on its end, so we serialize
+    /// settles per peer and gate them on this.
     last_settle: Option<web_time::Instant>,
-    /// Number of push commands handled so far on this connection. When
-    /// this hits [`MAX_PUSHES_PER_SESSION`] the driver exits and the
-    /// session's mpsc closes — the client then needs to dial a fresh
-    /// connection to reset bee's `ghostBalance` (see constant docs).
-    pushes_used: u32,
-    _hs_in: libp2p_stream::IncomingStreams,
-    _pr_in: libp2p_stream::IncomingStreams,
-    _hive_in: libp2p_stream::IncomingStreams,
 }
 
-impl SessionDriver {
-    async fn run(mut self) {
-        loop {
-            tokio::select! {
-                biased;
-                cmd = self.cmd_rx.recv() => {
-                    match cmd {
-                        None => break,
-                        Some(SessionCommand::PushSync { addr, wire, stamp, price_plur, reply }) => {
-                            let res = self.handle_push(&addr, &wire, &stamp, price_plur).await;
-                            let dead = matches!(&res, Err(e) if is_connection_dead(e));
-                            let _ = reply.send(res);
-                            self.pushes_used = self.pushes_used.saturating_add(1);
-                            if dead {
-                                debug!(target: "isheika::transport",
-                                    "session {} retiring: underlying connection dead",
-                                    self.peer_id);
-                                break;
-                            }
-                            if self.pushes_used >= MAX_PUSHES_PER_SESSION {
-                                debug!(target: "isheika::transport",
-                                    "session {} retiring after {} pushes \
-                                     (avoiding bee ghostBalance disconnect)",
-                                    self.peer_id, self.pushes_used);
-                                break;
-                            }
-                        }
-                        Some(SessionCommand::Fetch { addr, reply }) => {
-                            let res = self.do_fetch(&addr).await;
-                            let _ = reply.send(res);
-                        }
-                    }
-                }
-                _ = self.swarm.select_next_some() => {}
-            }
-        }
-    }
-
-    /// One push, with accounting. Mirrors `weeb-3::upload::push_chunk` +
-    /// `weeb-3::accounting::{reserve, apply_credit, cancel_reserve}`.
-    async fn handle_push(
-        &mut self,
-        addr: &[u8; 32],
-        wire: &[u8],
-        stamp: &[u8],
-        price: u64,
-    ) -> Result<PushOutcome, TransportError> {
-        // 1. Try to reserve. If we'd exceed threshold, try an in-line
-        // settlement to recover credit, then re-check.
-        if !self.try_reserve(price) {
-            let _ = self.try_settle_once().await;
-            if !self.try_reserve(price) {
-                return Ok(PushOutcome::Overdraft);
-            }
-        }
-
-        // 2. Do the actual push.
-        let result = self.do_pushsync(addr, wire, stamp).await;
-
-        // 3. Account for the outcome.
-        match &result {
-            Ok(_) => {
-                // Move price from reserve → balance.
-                self.reserve_plur = self.reserve_plur.saturating_sub(price);
-                self.balance_plur = self.balance_plur.saturating_add(price);
-                // Auto-settle when balance reaches one refresh-rate (weeb-3:
-                // `apply_credit` triggers the refresh channel at this level).
-                if self.balance_plur >= REFRESH_RATE_PLUR {
-                    let _ = self.try_settle_once().await;
-                }
-            }
-            Err(_) => {
-                // Push failed: release the reservation without committing.
-                self.reserve_plur = self.reserve_plur.saturating_sub(price);
-            }
-        }
-
-        result.map(PushOutcome::Receipt)
-    }
-
+impl AccountingState {
     /// `weeb-3::accounting::reserve`: atomically check
-    /// `reserve + balance + price ≤ threshold`, and if so add to reserve.
+    /// `reserve + balance + price ≤ threshold` and, if so, add to reserve.
     fn try_reserve(&mut self, price: u64) -> bool {
         let Some(new_reserve) = self.reserve_plur.checked_add(price) else {
             return false;
@@ -569,110 +485,288 @@ impl SessionDriver {
         self.reserve_plur = new_reserve;
         true
     }
+}
 
-    async fn do_pushsync(
-        &mut self,
+/// Shared session state. Cloned (via `Arc`) into every concurrent push /
+/// fetch task spawned on a session so they can race over the same
+/// libp2p connection.
+struct SessionState {
+    control: libp2p_stream::Control,
+    peer_id: PeerId,
+    timeout: Duration,
+    accounting: tokio::sync::Mutex<AccountingState>,
+    /// Serializes pseudosettle attempts on this peer — bee rejects
+    /// two settles within the same wall-second, and back-to-back
+    /// concurrent settles would just both re-settle the same balance.
+    settle_lock: tokio::sync::Mutex<()>,
+    /// Pushes attempted on this connection so far. When this exceeds
+    /// [`MAX_PUSHES_PER_SESSION`] the session is considered "dead" by
+    /// the caller and rotated; bee's per-overlay `ghostBalance` resets
+    /// only on a fresh `Connect()`. See `MAX_PUSHES_PER_SESSION` docs.
+    pushes_used: std::sync::atomic::AtomicU32,
+}
+
+impl SessionState {
+    /// One push, with accounting. Mirrors `weeb-3::upload::push_chunk` +
+    /// `weeb-3::accounting::{reserve, apply_credit, cancel_reserve}`.
+    /// Safe to call concurrently — accounting is mutex-protected, and
+    /// each call opens its own yamux substream via the cloned `Control`.
+    async fn push(
+        self: &std::sync::Arc<Self>,
         addr: &[u8; 32],
         wire: &[u8],
         stamp: &[u8],
-    ) -> Result<PushsyncReceipt, TransportError> {
-        let mut stream = poll_until_timeout(
-            &mut self.swarm,
-            self.control.open_stream(self.peer_id, PUSHSYNC_PROTO),
-            self.timeout,
-        )
-        .await?
-        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-        poll_until_timeout(
-            &mut self.swarm,
-            pushsync::push(&mut stream, addr, wire, stamp),
-            self.timeout,
-        )
-        .await?
-        .map_err(Into::into)
-    }
-
-    async fn do_fetch(&mut self, addr: &[u8; 32]) -> Result<ChunkDelivery, TransportError> {
-        let mut stream = poll_until_timeout(
-            &mut self.swarm,
-            self.control.open_stream(self.peer_id, RETRIEVAL_PROTO),
-            self.timeout,
-        )
-        .await?
-        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-        poll_until_timeout(
-            &mut self.swarm,
-            retrieval::fetch(&mut stream, addr),
-            self.timeout,
-        )
-        .await?
-        .map_err(Into::into)
-    }
-
-    /// Issue one pseudosettle Payment (≤ 1/sec from this overlay, per
-    /// bee's `peerAllowance` check). On success, subtracts the accepted
-    /// amount from `balance_plur`. Best-effort: errors are swallowed,
-    /// because failure to settle just means the next reserve attempt
-    /// will report overdraft.
-    async fn try_settle_once(&mut self) -> Result<(), TransportError> {
-        // Bee rejects two settles within the same wall-second.
-        if let Some(last) = self.last_settle {
-            let since = last.elapsed();
-            if since < Duration::from_millis(1100) {
-                let wait = Duration::from_millis(1100) - since;
-                let sleep = tokio::time::sleep(wait);
-                tokio::pin!(sleep);
-                loop {
-                    tokio::select! {
-                        _ = &mut sleep => break,
-                        _ = self.swarm.select_next_some() => {}
-                    }
+        price: u64,
+    ) -> Result<PushOutcome, TransportError> {
+        // 1. Try to reserve. If we'd exceed threshold, try an in-line
+        // settlement to recover credit, then re-check.
+        {
+            let mut acc = self.accounting.lock().await;
+            if !acc.try_reserve(price) {
+                drop(acc);
+                let _ = self.try_settle_once().await;
+                let mut acc = self.accounting.lock().await;
+                if !acc.try_reserve(price) {
+                    return Ok(PushOutcome::Overdraft);
                 }
             }
         }
 
-        let owed = self.balance_plur.saturating_add(self.reserve_plur);
+        // 2. Do the actual push over a fresh substream.
+        let result = self.do_pushsync(addr, wire, stamp).await;
+
+        // 3. Account for the outcome.
+        let should_settle = {
+            let mut acc = self.accounting.lock().await;
+            match &result {
+                Ok(_) => {
+                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+                    acc.balance_plur = acc.balance_plur.saturating_add(price);
+                    acc.balance_plur >= REFRESH_RATE_PLUR
+                }
+                Err(_) => {
+                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+                    false
+                }
+            }
+        };
+
+        // Auto-settle when balance reaches one refresh-rate (weeb-3:
+        // `apply_credit` triggers the refresh channel at this level).
+        // Outside the accounting lock so concurrent pushes don't stall.
+        if should_settle {
+            let _ = self.try_settle_once().await;
+        }
+
+        result.map(PushOutcome::Receipt)
+    }
+
+    async fn fetch(
+        self: &std::sync::Arc<Self>,
+        addr: &[u8; 32],
+    ) -> Result<ChunkDelivery, TransportError> {
+        self.do_fetch(addr).await
+    }
+
+    async fn do_pushsync(
+        &self,
+        addr: &[u8; 32],
+        wire: &[u8],
+        stamp: &[u8],
+    ) -> Result<PushsyncReceipt, TransportError> {
+        let mut control = self.control.clone();
+        let open = tokio::time::timeout(
+            self.timeout,
+            control.open_stream(self.peer_id, PUSHSYNC_PROTO),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        let mut stream = open;
+        tokio::time::timeout(self.timeout, pushsync::push(&mut stream, addr, wire, stamp))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(Into::into)
+    }
+
+    async fn do_fetch(&self, addr: &[u8; 32]) -> Result<ChunkDelivery, TransportError> {
+        let mut control = self.control.clone();
+        let open = tokio::time::timeout(
+            self.timeout,
+            control.open_stream(self.peer_id, RETRIEVAL_PROTO),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        let mut stream = open;
+        tokio::time::timeout(self.timeout, retrieval::fetch(&mut stream, addr))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(Into::into)
+    }
+
+    /// Issue one pseudosettle Payment. Serialized across concurrent
+    /// pushes via `settle_lock`, gated to at most one per 1.1 seconds.
+    /// Best-effort: errors are swallowed because failure to settle just
+    /// means the next reserve attempt will report overdraft.
+    async fn try_settle_once(&self) -> Result<(), TransportError> {
+        let _guard = self.settle_lock.lock().await;
+
+        // Bee rejects two settles within the same wall-second.
+        let needs_wait = {
+            let acc = self.accounting.lock().await;
+            acc.last_settle
+                .map(|t| t.elapsed())
+                .filter(|d| *d < Duration::from_millis(1100))
+                .map(|d| Duration::from_millis(1100) - d)
+        };
+        if let Some(wait) = needs_wait {
+            tokio::time::sleep(wait).await;
+        }
+
+        let owed = {
+            let acc = self.accounting.lock().await;
+            acc.balance_plur.saturating_add(acc.reserve_plur)
+        };
         if owed == 0 {
             return Ok(());
         }
         let ack = self.do_pseudosettle(u128::from(owed)).await?;
-        self.last_settle = Some(web_time::Instant::now());
-        // Cap accepted at u64::MAX defensively (it's PLUR, never that big).
         let accepted = ack.amount_plur.min(u128::from(u64::MAX)) as u64;
-        self.balance_plur = self.balance_plur.saturating_sub(accepted);
-        debug!(
-            target: "isheika::transport",
-            "settled with {}: asked={} accepted={} balance={} reserve={}",
-            self.peer_id, owed, accepted, self.balance_plur, self.reserve_plur,
-        );
+        {
+            let mut acc = self.accounting.lock().await;
+            acc.last_settle = Some(web_time::Instant::now());
+            acc.balance_plur = acc.balance_plur.saturating_sub(accepted);
+            debug!(
+                target: "isheika::transport",
+                "settled with {}: asked={} accepted={} balance={} reserve={}",
+                self.peer_id, owed, accepted, acc.balance_plur, acc.reserve_plur,
+            );
+        }
         Ok(())
     }
 
     async fn do_pseudosettle(
-        &mut self,
+        &self,
         amount_plur: u128,
     ) -> Result<crate::protocols::pseudosettle::PaymentAck, TransportError> {
-        let mut stream = poll_until_timeout(
-            &mut self.swarm,
-            self.control.open_stream(self.peer_id, PSEUDOSETTLE_PROTO),
+        let mut control = self.control.clone();
+        let open = tokio::time::timeout(
             self.timeout,
+            control.open_stream(self.peer_id, PSEUDOSETTLE_PROTO),
         )
-        .await?
+        .await
+        .map_err(|_| TransportError::Timeout)?
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-        poll_until_timeout(
-            &mut self.swarm,
-            write_then_read_empty_headers(&mut stream),
+        let mut stream = open;
+        tokio::time::timeout(self.timeout, write_then_read_empty_headers(&mut stream))
+            .await
+            .map_err(|_| TransportError::Timeout)??;
+        let ack = tokio::time::timeout(
             self.timeout,
-        )
-        .await??;
-        let ack = poll_until_timeout(
-            &mut self.swarm,
             crate::protocols::pseudosettle::pay(&mut stream, amount_plur),
-            self.timeout,
         )
-        .await?
+        .await
+        .map_err(|_| TransportError::Timeout)?
         .map_err(|e| TransportError::PseudoSettle(e.to_string()))?;
         Ok(ack)
+    }
+}
+
+struct SessionDriver {
+    swarm: Swarm<Behaviour>,
+    state: std::sync::Arc<SessionState>,
+    cmd_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
+    _hs_in: libp2p_stream::IncomingStreams,
+    _pr_in: libp2p_stream::IncomingStreams,
+    _hive_in: libp2p_stream::IncomingStreams,
+}
+
+impl SessionDriver {
+    /// Drive the libp2p swarm forever, accepting commands and spawning
+    /// each push/fetch as a concurrent sub-future. Commands only borrow
+    /// the cheap-to-clone `Control` (via the shared `Arc<SessionState>`),
+    /// so the swarm can run alongside many in-flight requests without
+    /// having to wait for one to finish before starting the next.
+    ///
+    /// libp2p's stream behaviour communicates with `Control` via internal
+    /// channels — as long as the swarm is being polled (the `select_next_some`
+    /// arm below), the streams returned by `Control::open_stream` make
+    /// progress in parallel.
+    async fn run(mut self) {
+        use futures::stream::FuturesUnordered;
+        use std::sync::atomic::Ordering;
+
+        // Native tokio::spawn requires Send; wasm spawn_local doesn't,
+        // and tokio_with_wasm::time::Sleep isn't Send anyway.
+        #[cfg(not(target_arch = "wasm32"))]
+        type TaskFuture = std::pin::Pin<Box<dyn core::future::Future<Output = bool> + Send>>;
+        #[cfg(target_arch = "wasm32")]
+        type TaskFuture = std::pin::Pin<Box<dyn core::future::Future<Output = bool>>>;
+        let mut tasks: FuturesUnordered<TaskFuture> = FuturesUnordered::new();
+        let mut accept_new = true;
+
+        loop {
+            tokio::select! {
+                biased;
+
+                cmd = self.cmd_rx.recv(), if accept_new => {
+                    let Some(cmd) = cmd else { break };
+                    match cmd {
+                        SessionCommand::PushSync { addr, wire, stamp, price_plur, reply } => {
+                            let used = self.state.pushes_used.fetch_add(1, Ordering::Relaxed) + 1;
+                            if used > MAX_PUSHES_PER_SESSION {
+                                // Decline new pushes once we've hit the rotation
+                                // limit; reply with ConnectionClosed so the caller
+                                // dials a fresh session (resets bee's ghostBalance).
+                                let _ = reply.send(Err(TransportError::ConnectionClosed));
+                                accept_new = false;
+                                continue;
+                            }
+                            let state = self.state.clone();
+                            tasks.push(Box::pin(async move {
+                                let res = state.push(&addr, &wire, &stamp, price_plur).await;
+                                let dead = matches!(&res, Err(e) if is_connection_dead(e));
+                                let _ = reply.send(res);
+                                dead
+                            }));
+                            if used >= MAX_PUSHES_PER_SESSION {
+                                debug!(target: "isheika::transport",
+                                    "session {} retiring after {} pushes \
+                                     (avoiding bee ghostBalance disconnect)",
+                                    self.state.peer_id, used);
+                                accept_new = false;
+                            }
+                        }
+                        SessionCommand::Fetch { addr, reply } => {
+                            let state = self.state.clone();
+                            tasks.push(Box::pin(async move {
+                                let res = state.fetch(&addr).await;
+                                let _ = reply.send(res);
+                                false
+                            }));
+                        }
+                    }
+                }
+
+                Some(dead) = tasks.next(), if !tasks.is_empty() => {
+                    if dead {
+                        debug!(target: "isheika::transport",
+                            "session {} retiring: underlying connection dead",
+                            self.state.peer_id);
+                        accept_new = false;
+                    }
+                }
+
+                _ = self.swarm.select_next_some() => {}
+            }
+
+            // Once we've stopped accepting new commands and drained all
+            // in-flight tasks, the session is fully retired.
+            if !accept_new && tasks.is_empty() {
+                break;
+            }
+        }
     }
 }
 

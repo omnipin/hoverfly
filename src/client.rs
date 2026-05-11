@@ -773,6 +773,7 @@ fn wire_form(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Vec<u8> {
 }
 
 /// A chunk pre-stamped and ready for the wire.
+#[derive(Clone)]
 struct StampedChunk {
     addr: [u8; 32],
     wire: Vec<u8>,
@@ -935,11 +936,20 @@ async fn push_chunks_concurrent(
     // session.
     let buffer = pool.len().saturating_mul(4).max(pool.len());
 
+    // Per-chunk parallelism (matches bee's `pushsync.maxMultiplexForwards`
+    // + `preemptiveInterval`): start with the closest peer, then every
+    // `PREEMPT_INTERVAL` fire another push to the next-closest peer in
+    // parallel, returning on the first valid receipt.
+    const CHUNK_PEER_PARALLELISM: usize = 3;
+    const PREEMPT_INTERVAL: Duration = Duration::from_secs(5);
+
     let dispatch = |chunk: StampedChunk| {
         let pool = pool.clone();
         let pushed = pushed.clone();
         let transport = transport;
         async move {
+            use futures::stream::{FuturesUnordered, StreamExt};
+
             // Rank sessions by proximity to this chunk's address; closest
             // first. bee at that peer is then either inside its area of
             // responsibility (stores directly) or only a short hop away.
@@ -951,68 +961,135 @@ async fn push_chunks_concurrent(
                 pb.cmp(&pa) // descending PO == closer first
             });
 
-            // Two outer rounds: if every peer reports Overdraft on the first
-            // pass we sleep briefly to let pseudosettle refresh free credit,
-            // then retry. After that, treat as a hard failure.
-            let mut last_err: Option<TransportError> = None;
-            for outer in 0..3u32 {
-                let mut all_overdraft = true;
-                for (i, &idx) in order.iter().take(max_retries.max(1)).enumerate() {
+            let cap = max_retries.max(1).min(order.len());
+            let mut order_iter = order.iter().take(cap).copied();
+
+            let attempt = |idx: usize, attempt_no: usize| {
+                let pool = pool.clone();
+                let chunk = chunk.clone();
+                async move {
                     let entry = &pool[idx];
                     let mut peer_overlay = [0u8; 32];
                     peer_overlay.copy_from_slice(entry.overlay.as_bytes());
                     let price = peer_price(&peer_overlay, &chunk.addr);
                     let outcome = try_push_with_rotation(entry, &chunk, price, transport).await;
-                    match outcome {
+                    (idx, attempt_no, price, outcome)
+                }
+            };
+
+            let mut inflight = FuturesUnordered::new();
+            let mut attempt_no = 0usize;
+
+            // Seed with the first peer.
+            if let Some(idx) = order_iter.next() {
+                attempt_no += 1;
+                inflight.push(attempt(idx, attempt_no));
+            }
+
+            // Two outer rounds: if every peer reports Overdraft on the first
+            // pass we sleep briefly to let pseudosettle refresh free credit,
+            // then retry. After that, treat as a hard failure.
+            let mut last_err: Option<TransportError> = None;
+            let mut overdrafts = 0usize;
+            let mut errors = 0usize;
+            let mut preempt = tokio::time::interval_at(
+                tokio::time::Instant::now() + PREEMPT_INTERVAL,
+                PREEMPT_INTERVAL,
+            );
+
+            loop {
+                tokio::select! {
+                    biased;
+
+                    Some((idx, n, price, outcome)) = inflight.next(), if !inflight.is_empty() => {
+                        let entry = &pool[idx];
+                        match outcome {
+                            Ok(PushOutcome::Receipt(_)) => {
+                                let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if done % 50 == 0 || done == total {
+                                    info!(target: "isheika::upload",
+                                        "pushed {}/{} chunks (latest via {} po={})",
+                                        done, total, entry.overlay_hex,
+                                        chunk_addr.proximity(&entry.overlay));
+                                } else {
+                                    debug!(target: "isheika::upload",
+                                        "push ok ({}/{}) via {} (po={}, price={})",
+                                        done, total, entry.overlay_hex,
+                                        chunk_addr.proximity(&entry.overlay), price);
+                                }
+                                return Ok::<_, ClientError>(());
+                            }
+                            Ok(PushOutcome::Overdraft) => {
+                                overdrafts += 1;
+                                debug!(target: "isheika::upload",
+                                    "overdraft on {} (po={}); trying next peer",
+                                    entry.overlay_hex,
+                                    chunk_addr.proximity(&entry.overlay));
+                            }
+                            Err(e) => {
+                                errors += 1;
+                                warn!(target: "isheika::upload",
+                                    "push attempt {} via {} (po={}) failed: {}",
+                                    n, entry.overlay_hex,
+                                    chunk_addr.proximity(&entry.overlay), e);
+                                last_err = Some(e);
+                            }
+                        }
+                        // Top up the in-flight window with the next-closest peer.
+                        if let Some(idx) = order_iter.next() {
+                            attempt_no += 1;
+                            inflight.push(attempt(idx, attempt_no));
+                        }
+                    }
+
+                    _ = preempt.tick(), if inflight.len() < CHUNK_PEER_PARALLELISM => {
+                        // Preemptive fanout: closest peer hasn't returned within
+                        // `PREEMPT_INTERVAL`, so race another peer in parallel.
+                        if let Some(idx) = order_iter.next() {
+                            attempt_no += 1;
+                            inflight.push(attempt(idx, attempt_no));
+                        }
+                    }
+
+                    else => break,
+                }
+            }
+
+            // All candidates exhausted. If everyone overdrafted (no real
+            // errors), wait one refresh cycle and retry the closest few —
+            // pseudosettle has freed credit by then.
+            if errors == 0 && overdrafts > 0 {
+                debug!(target: "isheika::upload",
+                    "all attempted peers overdrafted; waiting for refresh");
+                tokio::time::sleep(Duration::from_millis(1100)).await;
+                for idx in order.iter().take(cap).copied() {
+                    let entry = &pool[idx];
+                    let mut peer_overlay = [0u8; 32];
+                    peer_overlay.copy_from_slice(entry.overlay.as_bytes());
+                    let price = peer_price(&peer_overlay, &chunk.addr);
+                    match try_push_with_rotation(entry, &chunk, price, transport).await {
                         Ok(PushOutcome::Receipt(_)) => {
                             let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                            // Log every 50th success at info, plus the last
-                            // few. Per-chunk would drown the WARN noise we
-                            // already emit on failures.
                             if done % 50 == 0 || done == total {
                                 info!(target: "isheika::upload",
                                     "pushed {}/{} chunks (latest via {} po={})",
                                     done, total, entry.overlay_hex,
                                     chunk_addr.proximity(&entry.overlay));
-                            } else {
-                                debug!(target: "isheika::upload",
-                                    "push ok ({}/{}) via {} (po={}, price={})",
-                                    done, total, entry.overlay_hex,
-                                    chunk_addr.proximity(&entry.overlay), price);
                             }
                             return Ok::<_, ClientError>(());
                         }
-                        Ok(PushOutcome::Overdraft) => {
-                            debug!(target: "isheika::upload",
-                                "overdraft on {} (po={}); trying next peer",
-                                entry.overlay_hex,
-                                chunk_addr.proximity(&entry.overlay));
-                            continue;
-                        }
+                        Ok(PushOutcome::Overdraft) => continue,
                         Err(e) => {
-                            all_overdraft = false;
-                            warn!(
-                                target: "isheika::upload",
-                                "push attempt {} via {} (po={}) failed: {}",
-                                i + 1,
-                                entry.overlay_hex,
-                                chunk_addr.proximity(&entry.overlay),
-                                e
-                            );
                             last_err = Some(e);
+                            break;
                         }
                     }
                 }
-                if !all_overdraft {
-                    break;
-                }
-                debug!(target: "isheika::upload",
-                    "all peers overdrafted (round {}); waiting for refresh", outer);
-                tokio::time::sleep(Duration::from_millis(1100)).await;
             }
+
             Err(ClientError::NoPeers(format!(
                 "all {} attempts failed: {}",
-                max_retries.max(1),
+                cap,
                 last_err
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "all overdrafted".into())
