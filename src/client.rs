@@ -808,25 +808,53 @@ pub async fn upload_file_with_manifest_ex(
     max_retries_per_chunk: usize,
     concurrency: usize,
 ) -> Result<ChunkAddress, ClientError> {
+    let (manifest_root, work) = prepare_upload_file_with_manifest(
+        signer, batch_id_hex, depth, data, path, content_type,
+    )?;
+    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
+    Ok(manifest_root)
+}
+
+/// Daemon-mode single-file-with-manifest upload through a pre-built pool.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_file_with_manifest_with_pool(
+    transport: &Transport,
+    pool: &SessionPool,
+    signer: &SwarmSigner,
+    batch_id_hex: &str,
+    depth: u8,
+    data: &[u8],
+    path: &str,
+    content_type: Option<&str>,
+    max_retries_per_chunk: usize,
+) -> Result<ChunkAddress, ClientError> {
+    let (manifest_root, work) = prepare_upload_file_with_manifest(
+        signer, batch_id_hex, depth, data, path, content_type,
+    )?;
+    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
+    Ok(manifest_root)
+}
+
+fn prepare_upload_file_with_manifest(
+    signer: &SwarmSigner,
+    batch_id_hex: &str,
+    depth: u8,
+    data: &[u8],
+    path: &str,
+    content_type: Option<&str>,
+) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
-    // 1. Split file into BMT tree.
     let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
     info!(target: "isheika::upload", "file: {} bytes -> {} chunks (root {})",
         data.len(), file_store.len(), file_root);
 
-    // 2. Build a single-entry manifest pointing at file_root.
     let (manifest_root, manifest_chunks) =
         crate::manifest::build_single_entry_manifest(path, file_root, content_type)
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
     info!(target: "isheika::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
 
-    // 3. Build stamper.
     let mut stamper = build_stamper(signer, batch_id, depth);
-
-    // 4. Pre-stamp everything (parallel-signed via rayon; index alloc
-    // is serial). Produces all wire forms up-front so the push phase is
-    // purely network-bound.
     let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
         Vec::with_capacity(file_store.len() + manifest_chunks.len());
     for (addr, chunk) in file_store.into_chunks() {
@@ -836,11 +864,7 @@ pub async fn upload_file_with_manifest_ex(
         stamp_in.push((addr, wire.to_vec()));
     }
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
-
-    // 5. Open a pool of long-lived sessions and push concurrently.
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
-
-    Ok(manifest_root)
+    Ok((manifest_root, work))
 }
 
 /// Convert a nectar AnyChunk into the wire form `span_LE_8 || payload`.
@@ -989,6 +1013,37 @@ pub async fn upload_bytes_ex(
     max_retries_per_chunk: usize,
     concurrency: usize,
 ) -> Result<ChunkAddress, ClientError> {
+    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
+    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
+    Ok(root)
+}
+
+/// Daemon-mode raw upload: split + stamp + push through a pre-built
+/// session pool. Skips the per-request pool-fill dial parade.
+pub async fn upload_bytes_with_pool(
+    transport: &Transport,
+    pool: &SessionPool,
+    signer: &SwarmSigner,
+    batch_id_hex: &str,
+    depth: u8,
+    data: &[u8],
+    max_retries_per_chunk: usize,
+) -> Result<ChunkAddress, ClientError> {
+    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
+    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
+    Ok(root)
+}
+
+/// Split + stamp data, returning the root and the stamped chunks ready
+/// for pushsync. Pure CPU; no network. Pulled out so both the one-shot
+/// (`upload_bytes_ex`) and daemon (`upload_bytes_with_pool`) paths
+/// share the BMT/stamp work.
+fn prepare_upload_bytes(
+    signer: &SwarmSigner,
+    batch_id_hex: &str,
+    depth: u8,
+    data: &[u8],
+) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
     let (root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
@@ -1003,9 +1058,7 @@ pub async fn upload_bytes_ex(
         .map(|(addr, chunk)| (*addr, wire_form(chunk)))
         .collect();
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
-
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
-    Ok(root)
+    Ok((root, work))
 }
 
 /// A session and the peer overlay it talks to, kept together so we can
@@ -1059,21 +1112,79 @@ impl SessionEntry {
 /// active session hits the wall.
 const PREWARM_WATERMARK: u32 = 20;
 
-/// Push a batch of pre-stamped chunks using a pool of long-lived peer
-/// sessions. Each session handshakes once and is then reused for many
-/// pushsync streams (each chunk gets its own yamux substream).
-///
-/// Routing: bee's pushsync handler will only store a chunk locally if it
-/// lies within the peer's storage radius; otherwise it must forward to a
-/// closer peer, which can fail with `handler: push to closest chunk X:
-/// could not push chunk`. To minimise forwarding hops we sort sessions by
-/// proximity to the chunk address and try the closest ones first.
+/// A long-lived pool of peer sessions usable across multiple uploads.
+/// Construct with [`SessionPool::open`]. Pre-warm rotation, mid-upload
+/// session retirement, and accounting state are all handled internally —
+/// once opened, a pool can be re-used (e.g. by the daemon) for many
+/// upload requests without paying the dial-fill cost each time.
+pub struct SessionPool {
+    sessions: std::sync::Arc<Vec<SessionEntry>>,
+}
+
+impl SessionPool {
+    /// Open up to `target_size` sessions to peers selected by proximity
+    /// to the zero address (a stable ordering). Skips recently-failed
+    /// peers and dials wider than `target_size` in parallel to absorb
+    /// the high failure rate of stale mainnet hive announcements.
+    pub async fn open(
+        transport: &Transport,
+        peers: &PeerStore,
+        target_size: usize,
+    ) -> Result<Self, ClientError> {
+        let sessions = open_session_pool(transport, peers, target_size).await?;
+        if sessions.is_empty() {
+            return Err(ClientError::NoPeers("no reachable ws peers".into()));
+        }
+        Ok(Self { sessions: std::sync::Arc::new(sessions) })
+    }
+
+    pub fn len(&self) -> usize {
+        self.sessions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.sessions.is_empty()
+    }
+}
+
+/// Build a one-shot pool sized for `work.len()` and push everything
+/// through it. The pool is dropped on return; for daemon-style reuse,
+/// build a [`SessionPool`] separately and call
+/// [`push_chunks_with_pool`].
 async fn push_chunks_concurrent(
     transport: &Transport,
     peers: &PeerStore,
     work: Vec<StampedChunk>,
     max_retries: usize,
     concurrency: usize,
+) -> Result<(), ClientError> {
+    if work.is_empty() {
+        return Ok(());
+    }
+    // Adaptive sizing: never open more sessions than we have chunks to
+    // push. A 1888-byte file is 2 chunks; opening 32 sessions for that
+    // wastes ~30 s on dial timeouts when the user picked a high
+    // --concurrency for the upload-machine defaults. Floor at 4 so very
+    // small uploads still get the multi-peer race for resilience.
+    let target_sessions = concurrency.max(1).min(work.len().max(4));
+    let pool = SessionPool::open(transport, peers, target_sessions).await?;
+    info!(
+        target: "isheika::upload",
+        "opened {} peer session(s), pushing {} chunks",
+        pool.len(),
+        work.len()
+    );
+    push_chunks_with_pool(transport, &pool, work, max_retries).await
+}
+
+/// Push `work` through an existing pool. Used by the daemon to amortise
+/// pool-fill cost across many upload requests; the CLI builds a fresh
+/// pool per invocation via [`push_chunks_concurrent`].
+pub(crate) async fn push_chunks_with_pool(
+    transport: &Transport,
+    session_pool: &SessionPool,
+    work: Vec<StampedChunk>,
+    max_retries: usize,
 ) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1082,25 +1193,10 @@ async fn push_chunks_concurrent(
     if work.is_empty() {
         return Ok(());
     }
-
-    // Adaptive sizing: never open more sessions than we have chunks to
-    // push. A 1888-byte file is 2 chunks; opening 32 sessions for that
-    // wastes ~30 s on dial timeouts when the user picked a high
-    // --concurrency for the upload-machine defaults. Floor at 4 so very
-    // small uploads still get the multi-peer race for resilience.
-    let target_sessions = concurrency.max(1).min(work.len().max(4));
-    let sessions = open_session_pool(transport, peers, target_sessions).await?;
-    if sessions.is_empty() {
+    let pool = session_pool.sessions.clone();
+    if pool.is_empty() {
         return Err(ClientError::NoPeers("no reachable ws peers".into()));
     }
-    info!(
-        target: "isheika::upload",
-        "opened {} peer session(s), pushing {} chunks",
-        sessions.len(),
-        work.len()
-    );
-
-    let pool = Arc::new(sessions);
     let total = work.len();
     let pushed = Arc::new(AtomicUsize::new(0));
 

@@ -77,7 +77,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", def
 libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", features = ["tokio"] }
 libp2p-websocket = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }

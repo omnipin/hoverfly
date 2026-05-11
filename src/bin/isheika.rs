@@ -136,6 +136,12 @@ enum Commands {
         /// sequential behavior.
         #[arg(long, default_value_t = DEFAULT_FETCH_CONCURRENCY)]
         concurrency: usize,
+
+        /// Connect to a running daemon instead of executing the fetch
+        /// in this process. See `isheika daemon`.
+        #[cfg(unix)]
+        #[arg(long, value_name = "SOCKET")]
+        daemon: Option<PathBuf>,
     },
 
     /// Upload a file using an existing postage batch. Wraps the file in a
@@ -201,6 +207,38 @@ enum Commands {
         /// Equivalent to bee's `Swarm-Error-Document` header.
         #[arg(long, value_name = "FILE", requires = "collection")]
         error_document: Option<String>,
+
+        /// Connect to a running daemon instead of executing the upload
+        /// in this process. The daemon must own a warm session pool —
+        /// see `isheika daemon`. Mutually exclusive with the in-process
+        /// peerlist; the daemon's own peerlist is used.
+        #[cfg(unix)]
+        #[arg(long, value_name = "SOCKET")]
+        daemon: Option<PathBuf>,
+    },
+
+    /// Run a long-lived daemon that holds a warm session pool across
+    /// upload/fetch requests. Listens on a unix socket; the same CLI
+    /// (`upload --daemon <socket>` / `fetch --daemon <socket>`)
+    /// connects in client mode. Reduces per-request session pool
+    /// fill from ~3-10 s to ~0 s.
+    #[cfg(unix)]
+    Daemon {
+        /// Unix socket path the daemon listens on. Removed on graceful
+        /// shutdown; stale sockets from crashed daemons are unlinked
+        /// at startup.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+
+        /// peers.json path (loaded at startup, saved on shutdown).
+        #[arg(long, default_value = "peers.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Target size of the warm session pool. The daemon dials this
+        /// many sessions on the first upload and keeps them open
+        /// (auto-rotated via pre-warm) for all subsequent requests.
+        #[arg(long, default_value_t = 16)]
+        pool_size: usize,
     },
 }
 
@@ -307,7 +345,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} peers to {}", store.len(), output.display());
         }
 
-        Commands::Fetch { hash, output, path, list, peerlist, max_retries, concurrency } => {
+        Commands::Fetch { hash, output, path, list, peerlist, max_retries, concurrency,
+                          #[cfg(unix)] daemon } => {
+            #[cfg(unix)]
+            if let Some(sock) = daemon {
+                let output = output.ok_or("--output is required when using --daemon")?;
+                let req = isheika::daemon::Request::Fetch(isheika::daemon::FetchRequest {
+                    hash,
+                    path,
+                    output: output.clone(),
+                    max_retries,
+                    concurrency,
+                });
+                let resp = isheika::daemon::call(&sock, &req).await?;
+                match resp {
+                    isheika::daemon::Response::Fetched { bytes_written, content_type } => {
+                        let ct = content_type.as_deref().unwrap_or("-");
+                        println!("fetched {} bytes ({}) -> {} (via daemon)",
+                            bytes_written, ct, output.display());
+                        return Ok(());
+                    }
+                    isheika::daemon::Response::Err { message } => {
+                        return Err(format!("daemon error: {message}").into());
+                    }
+                    other => return Err(format!("unexpected daemon response: {:?}", other).into()),
+                }
+            }
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let mut peers = PeerStore::load_or_create(&peerlist);
@@ -361,7 +424,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection,
             index_document,
             error_document,
+            #[cfg(unix)] daemon,
         } => {
+            #[cfg(unix)]
+            if let Some(sock) = daemon {
+                let req = isheika::daemon::Request::Upload(isheika::daemon::UploadRequest {
+                    file: file.clone(),
+                    batch: batch.clone(),
+                    depth,
+                    key: key.clone(),
+                    max_retries,
+                    concurrency,
+                    raw,
+                    collection,
+                    manifest_path: manifest_path.clone(),
+                    content_type: content_type.clone(),
+                    index_document: index_document.clone(),
+                    error_document: error_document.clone(),
+                });
+                let resp = isheika::daemon::call(&sock, &req).await?;
+                match resp {
+                    isheika::daemon::Response::Uploaded { root, bytes } => {
+                        println!("uploaded {} bytes — manifest root: {} (via daemon)", bytes, root);
+                        return Ok(());
+                    }
+                    isheika::daemon::Response::Err { message } => {
+                        return Err(format!("daemon error: {message}").into());
+                    }
+                    other => return Err(format!("unexpected daemon response: {:?}", other).into()),
+                }
+            }
+
             let signer = SwarmSigner::from_hex(&key, cli.network_id)?;
             let transport = Transport::new(signer.clone(), cfg);
             let mut peers = PeerStore::load_or_create(&peerlist);
@@ -457,6 +550,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             isheika::peers::apply_log(&mut peers, transport.reachability_log());
             let _ = peers.save(&peerlist);
+        }
+
+        #[cfg(unix)]
+        Commands::Daemon { socket, peerlist, pool_size } => {
+            // Install a Ctrl-C handler that sends a shutdown request to
+            // ourselves via the socket, triggering graceful peerlist save.
+            let sock_path = socket.clone();
+            tokio::spawn(async move {
+                if tokio::signal::ctrl_c().await.is_ok() {
+                    let _ = isheika::daemon::call(
+                        &sock_path,
+                        &isheika::daemon::Request::Shutdown,
+                    )
+                    .await;
+                }
+            });
+            isheika::daemon::run(
+                socket,
+                peerlist,
+                cli.network_id,
+                pool_size,
+                Duration::from_secs(cli.dial_timeout),
+                Duration::from_secs(cli.timeout),
+            )
+            .await?;
         }
     }
 

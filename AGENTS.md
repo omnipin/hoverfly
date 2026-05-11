@@ -41,7 +41,8 @@ There is no test suite. `dev-dependencies = tokio-test` exists but there are no 
 ## Architecture map
 
 - `src/transport.rs` — libp2p WS transport, per-peer `PeerSession` with a single swarm-driver task + concurrent pushes via `Arc<SessionState>` + cloned `libp2p_stream::Control`. Accounting (`reserve_plur`, `balance_plur`, pseudosettle) lives here, guarded by `tokio::sync::Mutex`.
-- `src/client.rs` — high-level `discover`/`fetch`/`upload`. `NetworkedStore` implements nectar's `ChunkGet`; cache is shared via `Clone`. Upload uses an adaptive session pool, per-chunk peer racing with preemption, pre-warmed session rotation (`PREWARM_WATERMARK`).
+- `src/client.rs` — high-level `discover`/`fetch`/`upload`. `NetworkedStore` implements nectar's `ChunkGet`; cache is shared via `Clone`. Upload uses an adaptive session pool, per-chunk peer racing with preemption, pre-warmed session rotation (`PREWARM_WATERMARK`). Public `SessionPool` lets the daemon reuse a warm pool across requests; `*_with_pool` variants of `upload_bytes` / `upload_file_with_manifest` call `push_chunks_with_pool` directly. Collections still use the one-shot `upload_collection`.
+- `src/daemon.rs` — `#[cfg(unix)]` only. Long-running daemon that owns a `Transport` + in-memory `PeerStore` + lazy `Arc<SessionPool>` reused across requests. Unix-socket IPC, `u32-LE length` + JSON wire protocol. File contents pass by absolute path (not inline). NOT a security boundary — anyone with socket access can read/write the daemon's filesystem and sign uploads with whatever key they send.
 - `src/protocols/` — bee wire protocols (handshake, pricing, retrieval, pushsync, pseudosettle, hive, framing).
 - `src/peers.rs` — JSON-backed peer store. `Peer` carries a reachability cache (`last_dial_success_unix`, `last_dial_failure_unix`, `consecutive_failures`, `last_dial_rtt_ms`). `RECENT_FAILURE_SECS = 300` defines the deprioritization window.
 - `src/manifest.rs` — mantaray encode/decode helpers.

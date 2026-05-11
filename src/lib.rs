@@ -52,8 +52,11 @@ pub use peers::{Peer, PeerStore};
 pub use transport::{Transport, TransportConfig, TransportError};
 pub use client::{
     discover, fetch_bytes, fetch_manifest_path, list_manifest, upload_bytes, upload_collection,
-    ClientError, ManifestEntry, UploadFile,
+    ClientError, ManifestEntry, SessionPool, UploadFile,
 };
+
+#[cfg(unix)]
+pub mod daemon;
 pub use doh::Doh;
 
 /// Default Swarm mainnet bootnode (resolved via DoH).
