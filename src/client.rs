@@ -13,7 +13,9 @@ use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
 use nectar_primitives::file::{join, sync_split};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
+#[cfg(not(target_arch = "wasm32"))]
 use std::collections::HashMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
@@ -67,54 +69,126 @@ impl From<nectar_primitives::file::FileError> for ClientError {
     }
 }
 
+/// Default number of peers raced in parallel per chunk fetch. Each peer
+/// is given the full per-request timeout, but slow/dead peers no longer
+/// block faster ones. Set to 1 to restore the legacy sequential behavior.
+pub const DEFAULT_FETCH_CONCURRENCY: usize = 5;
+
+/// Default number of peers dialed in parallel per discover round. Each
+/// peer is held open for the hive `wait_per_peer` duration; parallelising
+/// avoids 70-peer-round-2 dial chains taking `70 × wait` seconds.
+pub const DEFAULT_DISCOVER_CONCURRENCY: usize = 16;
+
 /// A `ChunkGet` adapter that routes requests through libp2p retrieval to the
-/// closest peer in a peerlist, with retry-on-other-peer fallback.
+/// closest peers in a peerlist. Up to `concurrency` requests are raced in
+/// parallel; whichever peer responds first with a valid chunk wins, and
+/// the rest are dropped. If a peer fails, the next-closest candidate is
+/// launched until either a success is observed or `max_retries` peers have
+/// been exhausted.
 pub struct NetworkedStore<'a> {
     transport: &'a Transport,
     peers: &'a PeerStore,
     max_retries: usize,
+    concurrency: usize,
 }
 
 impl<'a> NetworkedStore<'a> {
+    /// Construct a store with sequential fetch (concurrency = 1).
     pub const fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
-        Self { transport, peers, max_retries }
+        Self { transport, peers, max_retries, concurrency: 1 }
+    }
+
+    /// Construct a store that races up to `concurrency` peers in parallel
+    /// per chunk. `concurrency` is clamped to at least 1.
+    pub const fn with_concurrency(
+        transport: &'a Transport,
+        peers: &'a PeerStore,
+        max_retries: usize,
+        concurrency: usize,
+    ) -> Self {
+        Self { transport, peers, max_retries, concurrency }
     }
 }
 
-impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
-    type Error = ChunkStoreError;
+impl<'a> NetworkedStore<'a> {
+    /// Body of [`ChunkGet::get`]. Pulled into a private helper so the
+    /// `ChunkGet` impl can be split per-target: native uses `async fn`,
+    /// wasm wraps in `SendWrapper` to satisfy the trait's `+ Send` bound.
+    async fn fetch_chunk_inner(
+        &self,
+        address: ChunkAddress,
+    ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, ChunkStoreError> {
+        use futures::stream::{FuturesUnordered, StreamExt};
 
-    async fn get(&self, address: &ChunkAddress) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
         let mut bytes32 = [0u8; 32];
         bytes32.copy_from_slice(address.as_bytes());
 
-        let candidates = self.peers.closest(address, self.max_retries.max(1));
+        // Consider ALL peers in the peerstore, ordered by proximity to the
+        // chunk address. Bee's retrieval protocol forwards requests through
+        // the receiving peer's kademlia table to the chunk's neighborhood,
+        // so even far peers can yield a result — but closest-first still
+        // wins on average because nearby peers are more likely to have the
+        // chunk locally and skip the forwarding cost.
+        //
+        // `max_retries == 0` means "no cap"; otherwise it bounds the number
+        // of peer attempts before giving up.
+        let candidates = self.peers.closest(&address, usize::MAX);
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
         }
+        let attempt_cap = if self.max_retries == 0 {
+            candidates.len()
+        } else {
+            self.max_retries.min(candidates.len())
+        };
+
+        let concurrency = self.concurrency.max(1);
+        let mut candidates_iter = candidates.into_iter().take(attempt_cap);
+
+        // Build a future that performs a single peer fetch and returns a
+        // structured result. Captures peer metadata for logging.
+        let try_peer = |peer: &'a Peer| {
+            let overlay = peer.overlay.clone();
+            let underlay = peer.first_dialable_underlay();
+            async move {
+                let Some(underlay) = underlay else {
+                    return (overlay, Err("no dialable underlay".to_string()));
+                };
+                match self.transport.fetch_chunk(&underlay, &bytes32).await {
+                    Ok(delivery) => {
+                        match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice()) {
+                            Ok(chunk) => {
+                                use nectar_primitives::Chunk as _;
+                                if chunk.address() != &address {
+                                    (overlay, Err("address mismatch".to_string()))
+                                } else {
+                                    (overlay, Ok(AnyChunk::from(chunk)))
+                                }
+                            }
+                            Err(e) => (overlay, Err(format!("decode chunk: {e}"))),
+                        }
+                    }
+                    Err(e) => (overlay, Err(e.to_string())),
+                }
+            }
+        };
+
+        let mut inflight = FuturesUnordered::new();
+        // Seed the initial window.
+        for peer in candidates_iter.by_ref().take(concurrency) {
+            inflight.push(try_peer(peer));
+        }
 
         let mut last_err = String::from("no peers tried");
-        for peer in candidates {
-            let underlay = match peer.first_dialable_underlay() {
-                Some(ma) => ma,
-                None => continue,
-            };
-            match self.transport.fetch_chunk(&underlay, &bytes32).await {
-                Ok(delivery) => {
-                    // bee sends span(8) || payload; parse via TryFrom which splits them.
-                    let chunk = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice())
-                        .map_err(|e| ChunkStoreError::Other(format!("decode chunk: {e}")))?;
-                    use nectar_primitives::Chunk as _;
-                    if chunk.address() != address {
-                        warn!(target: "isheika::fetch", "peer {} returned chunk with wrong address", peer.overlay);
-                        last_err = "address mismatch".to_string();
-                        continue;
-                    }
-                    return Ok(AnyChunk::from(chunk));
-                }
+        while let Some((overlay, outcome)) = inflight.next().await {
+            match outcome {
+                Ok(chunk) => return Ok(chunk),
                 Err(e) => {
-                    warn!(target: "isheika::fetch", "peer {} failed: {}", peer.overlay, e);
-                    last_err = e.to_string();
+                    warn!(target: "isheika::fetch", "peer {} failed: {}", overlay, e);
+                    last_err = e;
+                    if let Some(next) = candidates_iter.next() {
+                        inflight.push(try_peer(next));
+                    }
                 }
             }
         }
@@ -122,27 +196,70 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
+    type Error = ChunkStoreError;
+
+    async fn get(&self, address: &ChunkAddress) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+        self.fetch_chunk_inner(*address).await
+    }
+}
+
+// On wasm32 the inner future isn't `Send` (libp2p swarm + tokio_with_wasm
+// timers aren't Send), but the nectar trait requires `+ Send`. Wrap in
+// `SendWrapper`, which is safe because wasm32 is single-threaded — the
+// future will always be polled on the same thread it was created on.
+#[cfg(target_arch = "wasm32")]
+impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
+    type Error = ChunkStoreError;
+
+    fn get(
+        &self,
+        address: &ChunkAddress,
+    ) -> impl core::future::Future<Output = Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error>> + Send
+    {
+        let address = *address;
+        send_wrapper::SendWrapper::new(self.fetch_chunk_inner(address))
+    }
+}
+
 /// A `SyncChunkGet` adapter that wraps an async network fetch by blocking
 /// the current thread (via `tokio::task::block_in_place`). Used by mantaray
 /// manifest decoding which expects a synchronous chunk store.
+///
+/// Native-only: wasm32 has no multi-thread runtime to block on.
+#[cfg(not(target_arch = "wasm32"))]
 pub struct BlockingNetworkedStore<'a> {
     transport: &'a Transport,
     peers: &'a PeerStore,
     max_retries: usize,
+    concurrency: usize,
     cache: Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<'a> BlockingNetworkedStore<'a> {
     pub fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
+        Self::with_concurrency(transport, peers, max_retries, 1)
+    }
+
+    pub fn with_concurrency(
+        transport: &'a Transport,
+        peers: &'a PeerStore,
+        max_retries: usize,
+        concurrency: usize,
+    ) -> Self {
         Self {
             transport,
             peers,
             max_retries,
+            concurrency,
             cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
     type Error = ChunkStoreError;
 
@@ -152,7 +269,7 @@ impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
         }
         info!(target: "isheika::manifest", "blocking fetch for {}", address);
         let handle = tokio::runtime::Handle::current();
-        let store = NetworkedStore::new(self.transport, self.peers, self.max_retries);
+        let store = NetworkedStore::with_concurrency(self.transport, self.peers, self.max_retries, self.concurrency);
         let address_copy = *address;
         let chunk = handle.block_on(async move {
             ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &address_copy).await
@@ -177,9 +294,10 @@ pub async fn discover(
 /// Recursively discover peers up to `max_rounds` hops out from
 /// `bootstrap`. Each round, every newly-found peer is itself dialed and
 /// asked for its hive — building up a much larger peerset that spans
-/// more of the swarm address space. Pushing chunks to a sparse peerlist
-/// fails when bee can't find a forwarding path (`could not push chunk`),
-/// so for upload-heavy workloads call this with `max_rounds=2..4`.
+/// more of the swarm address space.
+///
+/// Uses [`DEFAULT_DISCOVER_CONCURRENCY`] parallel dials per round; for a
+/// custom value use [`discover_recursive_with_concurrency`].
 pub async fn discover_recursive(
     transport: &Transport,
     doh: &Doh,
@@ -187,6 +305,31 @@ pub async fn discover_recursive(
     wait_per_peer: Duration,
     max_rounds: usize,
 ) -> Result<Vec<Peer>, ClientError> {
+    discover_recursive_with_concurrency(
+        transport,
+        doh,
+        bootstrap,
+        wait_per_peer,
+        max_rounds,
+        DEFAULT_DISCOVER_CONCURRENCY,
+    )
+    .await
+}
+
+/// Like [`discover_recursive`], but with an explicit per-round concurrency
+/// cap. `concurrency` controls how many peers are dialed in parallel; each
+/// dial holds the hive stream open for `wait_per_peer`. With 70 peers in a
+/// round and `concurrency=16`, the round completes in roughly
+/// `ceil(70/16) × wait_per_peer` seconds rather than `70 × wait_per_peer`.
+pub async fn discover_recursive_with_concurrency(
+    transport: &Transport,
+    doh: &Doh,
+    bootstrap: &Multiaddr,
+    wait_per_peer: Duration,
+    max_rounds: usize,
+    concurrency: usize,
+) -> Result<Vec<Peer>, ClientError> {
+    use futures::stream::{FuturesUnordered, StreamExt};
     use std::collections::HashSet;
 
     let resolved = resolve(bootstrap, doh).await?;
@@ -196,6 +339,7 @@ pub async fn discover_recursive(
         )));
     }
 
+    let concurrency = concurrency.max(1);
     let mut all: Vec<Peer> = Vec::new();
     let mut seen_overlays: HashSet<String> = HashSet::new();
     let mut frontier: Vec<Multiaddr> = resolved;
@@ -205,13 +349,30 @@ pub async fn discover_recursive(
             break;
         }
         info!(target: "isheika::discover",
-            "round {} of {}: dialing {} peer(s)",
-            round + 1, max_rounds, frontier.len());
+            "round {} of {}: dialing {} peer(s) ({} in parallel)",
+            round + 1, max_rounds, frontier.len(), concurrency);
 
         let mut next_frontier: Vec<Multiaddr> = Vec::new();
-        for ma in frontier.drain(..) {
+        let mut iter = std::mem::take(&mut frontier).into_iter();
+        let mut inflight = FuturesUnordered::new();
+
+        // Closure-as-fn (rather than an outer fn) keeps the borrow of
+        // `transport` clean and produces a single async-block type so
+        // FuturesUnordered can hold them all.
+        let dial = |ma: Multiaddr| async move {
             debug!(target: "isheika::discover", "dialing {}", ma);
-            match transport.discover_peers(&ma, wait_per_peer).await {
+            let res = transport.discover_peers(&ma, wait_per_peer).await;
+            (ma, res)
+        };
+
+        // Seed initial window.
+        for _ in 0..concurrency {
+            let Some(ma) = iter.next() else { break };
+            inflight.push(dial(ma));
+        }
+
+        while let Some((ma, res)) = inflight.next().await {
+            match res {
                 Ok(batch) => {
                     debug!(target: "isheika::discover",
                         "{} returned {} peers", ma, batch.len());
@@ -235,6 +396,10 @@ pub async fn discover_recursive(
                         "discover from {} failed: {}", ma, e);
                 }
             }
+            // Refill the window.
+            if let Some(ma) = iter.next() {
+                inflight.push(dial(ma));
+            }
         }
 
         info!(target: "isheika::discover",
@@ -253,8 +418,20 @@ pub async fn fetch_bytes(
     root_hex: &str,
     max_retries_per_chunk: usize,
 ) -> Result<Vec<u8>, ClientError> {
+    fetch_bytes_ex(transport, peers, root_hex, max_retries_per_chunk, 1).await
+}
+
+/// Like [`fetch_bytes`], but races up to `concurrency` peers in parallel
+/// per chunk request.
+pub async fn fetch_bytes_ex(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+) -> Result<Vec<u8>, ClientError> {
     let root = parse_root(root_hex)?;
-    let store = NetworkedStore::new(transport, peers, max_retries_per_chunk);
+    let store = NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(store, root).await?;
     Ok(bytes)
 }
@@ -270,10 +447,25 @@ pub async fn fetch_manifest_path(
     path: &str,
     max_retries_per_chunk: usize,
 ) -> Result<(Vec<u8>, Option<String>), ClientError> {
-    let root = parse_root(root_hex)?;
-    let (target, content_type) = lookup_manifest_path(transport, peers, root, path, max_retries_per_chunk).await?;
+    fetch_manifest_path_ex(transport, peers, root_hex, path, max_retries_per_chunk, 1).await
+}
 
-    let async_store = NetworkedStore::new(transport, peers, max_retries_per_chunk);
+/// Like [`fetch_manifest_path`], but races up to `concurrency` peers in
+/// parallel per chunk request.
+pub async fn fetch_manifest_path_ex(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let root = parse_root(root_hex)?;
+    let (target, content_type) =
+        lookup_manifest_path(transport, peers, root, path, max_retries_per_chunk, concurrency).await?;
+
+    let async_store =
+        NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     let bytes = join::<ChunkAddress, _, DEFAULT_BODY_SIZE>(async_store, target).await?;
     Ok((bytes, content_type))
 }
@@ -285,9 +477,21 @@ pub async fn list_manifest(
     root_hex: &str,
     max_retries_per_chunk: usize,
 ) -> Result<Vec<ManifestEntry>, ClientError> {
+    list_manifest_ex(transport, peers, root_hex, max_retries_per_chunk, 1).await
+}
+
+/// Like [`list_manifest`], but races up to `concurrency` peers in
+/// parallel per chunk request.
+pub async fn list_manifest_ex(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+) -> Result<Vec<ManifestEntry>, ClientError> {
     let root = parse_root(root_hex)?;
     let mut out = Vec::new();
-    walk_manifest(transport, peers, root, Vec::new(), max_retries_per_chunk, &mut out).await?;
+    walk_manifest(transport, peers, root, Vec::new(), max_retries_per_chunk, concurrency, &mut out).await?;
     Ok(out)
 }
 
@@ -297,9 +501,10 @@ async fn lookup_manifest_path(
     root: ChunkAddress,
     path: &str,
     max_retries: usize,
+    concurrency: usize,
 ) -> Result<(ChunkAddress, Option<String>), ClientError> {
     use crate::manifest::decode_node;
-    let store = NetworkedStore::new(transport, peers, max_retries);
+    let store = NetworkedStore::with_concurrency(transport, peers, max_retries, concurrency);
     let mut current = root;
     let mut remaining: &[u8] = path.as_bytes();
     let mut last_content_type: Option<String> = None;
@@ -343,11 +548,12 @@ fn walk_manifest<'a>(
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
     max_retries: usize,
+    concurrency: usize,
     out: &'a mut Vec<ManifestEntry>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), ClientError>> + Send + 'a>> {
     Box::pin(async move {
         use crate::manifest::decode_node;
-        let store = NetworkedStore::new(transport, peers, max_retries);
+        let store = NetworkedStore::with_concurrency(transport, peers, max_retries, concurrency);
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &addr)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
@@ -366,7 +572,7 @@ fn walk_manifest<'a>(
         for fork in node.forks.values() {
             let mut next_path = path_so_far.clone();
             next_path.extend_from_slice(&fork.prefix);
-            walk_manifest(transport, peers, fork.reference, next_path, max_retries, out).await?;
+            walk_manifest(transport, peers, fork.reference, next_path, max_retries, concurrency, out).await?;
         }
         Ok(())
     })

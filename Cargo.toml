@@ -107,6 +107,11 @@ js-sys = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"
+# Marker wrapper used to satisfy `+ Send` bounds on futures whose inner
+# state (libp2p swarm + tokio_with_wasm timers) isn't `Send`. Safe on
+# wasm32 because the platform is single-threaded; SendWrapper panics if
+# accessed from a different thread, which can't happen in the browser.
+send_wrapper = { version = "0.6", features = ["futures"] }
 
 [build-dependencies]
 prost-build = "0.13"

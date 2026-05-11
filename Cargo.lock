@@ -2638,6 +2638,7 @@ dependencies = [
  "prost",
  "prost-build",
  "reqwest",
+ "send_wrapper 0.6.0",
  "serde",
  "serde_json",
  "sha3",
@@ -4640,6 +4641,9 @@ name = "send_wrapper"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
+dependencies = [
+ "futures-core",
+]
 
 [[package]]
 name = "serde"

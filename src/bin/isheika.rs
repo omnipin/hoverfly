@@ -6,12 +6,13 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use isheika::client::{
-    fetch_manifest_path, list_manifest, upload_bytes_ex, upload_collection,
-    upload_file_with_manifest_ex, DEFAULT_UPLOAD_CONCURRENCY,
+    fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex, upload_collection,
+    upload_file_with_manifest_ex, DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY,
+    DEFAULT_UPLOAD_CONCURRENCY,
 };
-use isheika::client::discover_recursive;
+use isheika::client::discover_recursive_with_concurrency;
 use isheika::{
-    fetch_bytes, Doh, PeerStore, SwarmSigner, Transport, TransportConfig, UploadFile,
+    Doh, PeerStore, SwarmSigner, Transport, TransportConfig, UploadFile,
     DEFAULT_DOH_URL, MAINNET_BOOTNODE,
 };
 use libp2p::Multiaddr;
@@ -70,6 +71,13 @@ enum Commands {
         /// near each chunk's address, so a broader peerlist matters.
         #[arg(long, default_value_t = 1)]
         rounds: usize,
+
+        /// Peers to dial in parallel per round. Each dial holds the hive
+        /// stream open for `--wait` seconds, so a higher value finishes a
+        /// 70-peer round in `ceil(70/N) × wait` seconds instead of
+        /// `70 × wait` seconds.
+        #[arg(long, default_value_t = DEFAULT_DISCOVER_CONCURRENCY)]
+        discover_concurrency: usize,
     },
 
     /// Fetch content addressed by a 32-byte hex root hash.
@@ -94,9 +102,21 @@ enum Commands {
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
         peerlist: PathBuf,
 
-        /// Number of peers to try per chunk before giving up
-        #[arg(long, default_value_t = 10)]
+        /// Cap on peers tried per chunk before giving up. `0` means no
+        /// cap — march through every peer in the peerlist (proximity-
+        /// ordered) until one yields the chunk. Useful when the chunk
+        /// neighborhood isn't densely represented in your peerlist:
+        /// non-neighbor Bee nodes will forward the request through their
+        /// own kademlia table.
+        #[arg(long, default_value_t = 0)]
         max_retries: usize,
+
+        /// Number of peers to race in parallel per chunk request.
+        /// Slow/dead peers no longer block faster ones — whoever responds
+        /// first with a valid chunk wins. Set to 1 for strict closest-first
+        /// sequential behavior.
+        #[arg(long, default_value_t = DEFAULT_FETCH_CONCURRENCY)]
+        concurrency: usize,
     },
 
     /// Upload a file using an existing postage batch. Wraps the file in a
@@ -237,16 +257,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let doh = Doh::with_url(&cli.doh_url);
 
     match cli.command {
-        Commands::Discover { peer, output, wait, append, rounds } => {
+        Commands::Discover { peer, output, wait, append, rounds, discover_concurrency } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
-            let discovered = discover_recursive(
+            let discovered = discover_recursive_with_concurrency(
                 &transport,
                 &doh,
                 &bootstrap,
                 Duration::from_secs(wait),
                 rounds.max(1),
+                discover_concurrency,
             )
             .await?;
             println!("discovered {} peers ({} hop(s))", discovered.len(), rounds);
@@ -259,7 +280,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} peers to {}", store.len(), output.display());
         }
 
-        Commands::Fetch { hash, output, path, list, peerlist, max_retries } => {
+        Commands::Fetch { hash, output, path, list, peerlist, max_retries, concurrency } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let peers = PeerStore::load_or_create(&peerlist);
@@ -268,7 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             if list {
-                let entries = list_manifest(&transport, &peers, &hash, max_retries).await?;
+                let entries = list_manifest_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
                 println!("{} entries:", entries.len());
                 for e in entries {
                     let ct = e.content_type.as_deref().unwrap_or("-");
@@ -277,12 +298,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 let output = output.ok_or("--output is required (omit only with --list)")?;
                 if let Some(p) = path {
-                    let (bytes, content_type) = fetch_manifest_path(&transport, &peers, &hash, &p, max_retries).await?;
+                    let (bytes, content_type) = fetch_manifest_path_ex(&transport, &peers, &hash, &p, max_retries, concurrency).await?;
                     std::fs::write(&output, &bytes)?;
                     let ct = content_type.as_deref().unwrap_or("-");
                     println!("fetched {} bytes ({}) -> {}", bytes.len(), ct, output.display());
                 } else {
-                    let bytes = fetch_bytes(&transport, &peers, &hash, max_retries).await?;
+                    let bytes = fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
                     std::fs::write(&output, &bytes)?;
                     println!("fetched {} bytes -> {}", bytes.len(), output.display());
                 }
