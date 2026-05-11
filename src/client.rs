@@ -1094,6 +1094,14 @@ async fn try_push_with_rotation(
 /// dispatch uses proximity routing — the more peers we can reach, the
 /// closer (on average) the picked session is to any given chunk address,
 /// and the less bee has to forward.
+/// How many session dials we keep in flight at once while filling the
+/// session pool. Mainnet peerlists are heavy with unreachable peers
+/// (NAT'd, gone offline since being announced, etc.) so we need a wide
+/// in-flight window to find `max_sessions` reachable ones quickly. Bee's
+/// per-incoming-connection cost is cheap, and these dials only run once
+/// per upload.
+const SESSION_DIAL_PARALLELISM: usize = 32;
+
 async fn open_session_pool(
     transport: &Transport,
     peers: &PeerStore,
@@ -1101,32 +1109,37 @@ async fn open_session_pool(
 ) -> Result<Vec<SessionEntry>, ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
 
-    // Take every ws peer we know about (capped). `closest` to the zero
-    // address is just a stable ordering — content here is the full set.
+    // Walk every peer in the peerstore in a stable (closest-to-zero)
+    // order. We keep `dial_parallelism` dials in flight at once and take
+    // the first `max_sessions` successful ones — most candidate addresses
+    // on mainnet are stale, so a wide dial window finds reachable peers
+    // ~order-of-magnitude faster than a `max_sessions`-wide window.
     let zero = ChunkAddress::new([0u8; 32]);
-    let candidates = peers.closest(&zero, peers.len().max(max_sessions));
+    let candidates: Vec<_> = peers
+        .closest(&zero, usize::MAX)
+        .into_iter()
+        .filter_map(|p| {
+            let underlay = p.first_dialable_underlay()?;
+            let overlay = p.overlay_address()?;
+            Some((overlay, p.overlay.clone(), underlay))
+        })
+        .collect();
     if candidates.is_empty() {
         return Err(ClientError::NoPeers("peerlist empty".into()));
     }
 
+    let dial_parallelism = SESSION_DIAL_PARALLELISM.max(max_sessions);
+    let mut iter = candidates.into_iter();
     let mut dialing = FuturesUnordered::new();
-    for peer in candidates {
-        let underlay = match peer.first_dialable_underlay() {
-            Some(ma) => ma,
-            None => continue,
-        };
-        let overlay_hex = peer.overlay.clone();
-        let overlay = match peer.overlay_address() {
-            Some(o) => o,
-            None => continue,
-        };
-        dialing.push(async move {
-            let result = transport.open_session(&underlay).await;
-            (overlay, overlay_hex, underlay, result)
-        });
-        if dialing.len() >= max_sessions {
-            break;
-        }
+    let dial = |overlay: SwarmAddress, overlay_hex: String, underlay: Multiaddr| async move {
+        let result = transport.open_session(&underlay).await;
+        (overlay, overlay_hex, underlay, result)
+    };
+
+    // Seed initial in-flight window — wider than max_sessions to absorb
+    // the high failure rate of mainnet peer dials.
+    for (overlay, overlay_hex, underlay) in iter.by_ref().take(dial_parallelism) {
+        dialing.push(dial(overlay, overlay_hex, underlay));
     }
 
     let mut sessions = Vec::with_capacity(max_sessions);
@@ -1141,11 +1154,19 @@ async fn open_session_pool(
                     underlay,
                     session: std::sync::Mutex::new(session),
                 });
+                if sessions.len() >= max_sessions {
+                    break;
+                }
             }
             Err(e) => {
                 warn!(target: "isheika::upload",
                     "session to {} failed: {}", overlay_hex, e);
             }
+        }
+        // Keep the in-flight window full so we don't sit waiting on a few
+        // remaining timeouts when many candidates remain.
+        if let Some((overlay, overlay_hex, underlay)) = iter.next() {
+            dialing.push(dial(overlay, overlay_hex, underlay));
         }
     }
     Ok(sessions)
