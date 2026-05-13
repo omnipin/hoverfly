@@ -239,6 +239,38 @@ enum Commands {
         /// (auto-rotated via pre-warm) for all subsequent requests.
         #[arg(long, default_value_t = 16)]
         pool_size: usize,
+
+        /// libp2p multiaddr to bind for inbound bee-protocol
+        /// connections. When set (default `/ip4/0.0.0.0/tcp/1634/ws`),
+        /// the daemon serves retrieval requests from its local cache of
+        /// uploaded chunks, so freshly-uploaded roots are immediately
+        /// retrievable by any bee peer / gateway that routes back to
+        /// us. Requires `--identity`.
+        #[arg(long, value_name = "MULTIADDR",
+            default_value = "/ip4/0.0.0.0/tcp/1634/ws")]
+        listen: String,
+
+        /// Disable the inbound listener. Daemon becomes a pure
+        /// outbound client (legacy behaviour).
+        #[arg(long, conflicts_with = "listen")]
+        no_listen: bool,
+
+        /// Daemon identity (hex secp256k1 private key, 32 bytes).
+        /// Required when the inbound listener is active — fixes the
+        /// daemon's overlay address across restarts so peers that
+        /// learn of us via hive can re-dial.
+        #[arg(long, value_name = "HEX")]
+        identity: Option<String>,
+
+        /// Publicly-routable multiaddr to advertise to bee peers
+        /// (without the `/p2p/<peer-id>` tail — appended automatically
+        /// from `--identity`). e.g. `/ip4/167.17.40.160/tcp/1634/ws`.
+        /// Required for the listener to actually be useful: peers add
+        /// us to their kademlia tables based on this address, and
+        /// retrieval lookups route here. When omitted, listener still
+        /// binds but no bee will dial us back.
+        #[arg(long, value_name = "MULTIADDR")]
+        advertise: Option<String>,
     },
 }
 
@@ -311,6 +343,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         timeout: Duration::from_secs(cli.timeout),
         dial_timeout: Duration::from_secs(cli.dial_timeout),
         network_id: cli.network_id,
+        advertise: None,
     };
     let doh = Doh::with_url(&cli.doh_url);
 
@@ -553,7 +586,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
-        Commands::Daemon { socket, peerlist, pool_size } => {
+        Commands::Daemon { socket, peerlist, pool_size, listen, no_listen, identity, advertise } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
             let sock_path = socket.clone();
@@ -566,6 +599,44 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .await;
                 }
             });
+
+            let listen_cfg = if no_listen {
+                None
+            } else {
+                let ma: Multiaddr = listen.parse()
+                    .map_err(|e| format!("invalid --listen multiaddr: {e}"))?;
+                let id_hex = identity
+                    .ok_or("--identity <HEX> is required when the inbound listener is active (or pass --no-listen)")?;
+                let signer = SwarmSigner::from_hex(&id_hex, cli.network_id)?;
+                // Derive our libp2p peer-id from the same identity so we
+                // can append `/p2p/<id>` to the user's advertise addr.
+                let advertised = advertise
+                    .map(|s| -> Result<Multiaddr, Box<dyn std::error::Error>> {
+                        let base: Multiaddr = s.parse()
+                            .map_err(|e| format!("invalid --advertise multiaddr: {e}"))?;
+                        let already_has_p2p = base.iter()
+                            .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)));
+                        if already_has_p2p {
+                            Ok(base)
+                        } else {
+                            let peer_id = isheika::inbound::peer_id_from_identity(&signer);
+                            Ok(base.with(libp2p::multiaddr::Protocol::P2p(peer_id)))
+                        }
+                    })
+                    .transpose()?;
+                println!(
+                    "daemon identity: overlay={} eth={}{}",
+                    hex::encode(signer.overlay()),
+                    hex::encode(signer.eth_address()),
+                    advertised.as_ref().map(|a| format!(" advertise={a}")).unwrap_or_default(),
+                );
+                Some(isheika::daemon::ListenConfig {
+                    listen: ma,
+                    advertise: advertised,
+                    identity: signer,
+                })
+            };
+
             isheika::daemon::run(
                 socket,
                 peerlist,
@@ -573,6 +644,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 pool_size,
                 Duration::from_secs(cli.dial_timeout),
                 Duration::from_secs(cli.timeout),
+                listen_cfg,
             )
             .await?;
         }

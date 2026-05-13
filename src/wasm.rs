@@ -57,6 +57,7 @@ impl IsheikaClient {
             timeout,
             dial_timeout: Duration::from_secs(3),
             network_id,
+            advertise: None,
         };
 
         Ok(Self {

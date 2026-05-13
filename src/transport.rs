@@ -25,12 +25,15 @@ use crate::protocols::pushsync::{self, PushsyncReceipt};
 use crate::protocols::retrieval::{self, ChunkDelivery};
 use crate::signer::{SignerError, SwarmSigner};
 
-const HANDSHAKE_PROTO: StreamProtocol = StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
-const PRICING_PROTO: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
-const HIVE_PROTO: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
-const RETRIEVAL_PROTO: StreamProtocol = StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
-const PUSHSYNC_PROTO: StreamProtocol = StreamProtocol::new("/swarm/pushsync/1.3.1/pushsync");
-const PSEUDOSETTLE_PROTO: StreamProtocol =
+pub(crate) const HANDSHAKE_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
+pub(crate) const PRICING_PROTO: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
+pub(crate) const HIVE_PROTO: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+pub(crate) const RETRIEVAL_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
+pub(crate) const PUSHSYNC_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/pushsync/1.3.1/pushsync");
+pub(crate) const PSEUDOSETTLE_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 
 /// Bee's per-second refresh rate granted by pseudosettle.
@@ -97,19 +100,31 @@ pub fn is_connection_dead(e: &TransportError) -> bool {
     }
 }
 
-/// Maximum pushes a single libp2p connection handles before retiring.
+/// Hard upper bound on pushes per session. Acts as a defence-in-depth
+/// safety net for the [`GHOST_BALANCE_LIMIT_PLUR`] accounting; under
+/// normal operation sessions retire on ghost balance long before they
+/// hit this. Raised from the earlier conservative `25` because that
+/// counted *all* pushes (successful or not), which doesn't reflect
+/// bee's actual ghostBalance behaviour.
+pub const MAX_PUSHES_PER_SESSION: u32 = 10_000;
+
+/// Client-side mirror of bee's `ghostBalance` disconnect threshold.
+/// Bee's `accounting.go` adds the chunk price to `ghostBalance` on
+/// every push it *can't* forward (`debitAction.Cleanup()`), and
+/// blocklists our overlay when `ghostBalance > ~16.875M PLUR`. Only a
+/// fresh `Connect()` resets it. Successful pushes don't increment.
 ///
-/// Why: bee's `accounting.go` keeps a per-overlay `ghostBalance`. Every
-/// push that bee can't forward (e.g. its neighbours all reject the chunk)
-/// calls `debitAction.Cleanup()` which adds the chunk's price to
-/// ghostBalance. Once `ghostBalance > disconnectLimit` (~16.875M PLUR),
-/// bee blocklists our overlay and tears the connection down. The only
-/// thing that resets ghostBalance is `Connect()` — i.e. a fresh libp2p
-/// connection. So we rotate sessions before bee notices.
-///
-/// At 300K PLUR per chunk worst-case, 25 failed pushes is ~7.5M ghost,
-/// well under the limit even if every push fails.
-pub const MAX_PUSHES_PER_SESSION: u32 = 25;
+/// We rotate the session at 12M PLUR — well under bee's limit, leaves
+/// headroom for in-flight pushes that haven't been counted yet, and
+/// for any per-bee variation in the actual disconnect threshold.
+pub const GHOST_BALANCE_LIMIT_PLUR: u64 = 12_000_000;
+
+/// Pre-warm watermark as a fraction of [`GHOST_BALANCE_LIMIT_PLUR`].
+/// We start dialing a replacement session once ghost balance reaches 2/3
+/// of the retirement limit so the dial usually completes before the
+/// active session has to be rotated.
+pub const GHOST_BALANCE_PREWARM_NUMERATOR: u64 = 2;
+pub const GHOST_BALANCE_PREWARM_DENOMINATOR: u64 = 3;
 
 #[derive(Debug, Error)]
 pub enum TransportError {
@@ -159,6 +174,15 @@ pub struct TransportConfig {
     /// round trips on live peers.
     pub dial_timeout: Duration,
     pub network_id: u64,
+    /// Underlay multiaddr we advertise to bee peers in the handshake.
+    /// When `None` (the default, used by ephemeral clients), we
+    /// advertise a synthetic 127.0.0.1 loopback that bee accepts but
+    /// can't dial back. The daemon's inbound-serving mode should set
+    /// this to its real, externally-routable listen address so bee
+    /// peers we connect to learn our underlay, add us to their
+    /// kademlia tables, and route subsequent retrieval lookups for our
+    /// uploaded chunks straight to us. Must include the `/p2p/<id>` tail.
+    pub advertise: Option<Multiaddr>,
 }
 
 impl Default for TransportConfig {
@@ -167,6 +191,7 @@ impl Default for TransportConfig {
             timeout: Duration::from_secs(30),
             dial_timeout: Duration::from_secs(3),
             network_id: 1,
+            advertise: None,
         }
     }
 }
@@ -175,6 +200,10 @@ impl Default for TransportConfig {
 pub struct Behaviour {
     pub stream: libp2p_stream::Behaviour,
     pub identify: libp2p::identify::Behaviour,
+}
+
+pub(crate) fn make_behaviour(keypair: &Keypair) -> Behaviour {
+    behaviour(keypair)
 }
 
 fn behaviour(keypair: &Keypair) -> Behaviour {
@@ -208,6 +237,24 @@ impl Transport {
             config,
             reachability_log: crate::peers::new_log(),
         }
+    }
+
+    /// Like [`Self::new`] but pins the libp2p keypair to a caller-
+    /// supplied value. The daemon uses this to keep outbound dials and
+    /// the inbound listener under the same libp2p peer-id — without
+    /// that, bee peers dial back to our advertised underlay, hit the
+    /// listener under a different peer-id, and reject the connection.
+    pub fn new_with_keypair(signer: SwarmSigner, config: TransportConfig, keypair: Keypair) -> Self {
+        Self {
+            keypair,
+            signer,
+            config,
+            reachability_log: crate::peers::new_log(),
+        }
+    }
+
+    pub fn keypair(&self) -> &Keypair {
+        &self.keypair
     }
 
     pub const fn signer(&self) -> &SwarmSigner {
@@ -261,7 +308,16 @@ impl Transport {
         dial(&mut swarm, peer_id, peer_addr)?;
 
         let underlay = prep_connection(&mut swarm, peer_id, self.config.timeout).await?;
-        do_handshake(&mut swarm, peer_id, &mut control, &mut hs_in, &underlay, &self.signer).await?;
+        do_handshake(
+            &mut swarm,
+            peer_id,
+            &mut control,
+            &mut hs_in,
+            &underlay,
+            &self.signer,
+            self.config.advertise.as_ref(),
+        )
+        .await?;
         do_pricing(&mut swarm, peer_id, &mut control, &mut pr_in, self.config.timeout).await?;
 
         // Wait for the first hive envelope (bee sends a single one then stops),
@@ -378,6 +434,7 @@ impl PeerSession {
             &mut hs_in,
             &underlay,
             &transport.signer,
+            transport.config.advertise.as_ref(),
         )
         .await?;
         do_pricing(
@@ -403,6 +460,7 @@ impl PeerSession {
             }),
             settle_lock: tokio::sync::Mutex::new(()),
             pushes_used: std::sync::atomic::AtomicU32::new(0),
+            ghost_balance_plur: std::sync::atomic::AtomicU64::new(0),
         });
         let session_state = state.clone();
         spawn_session_driver(SessionDriver {
@@ -421,11 +479,18 @@ impl PeerSession {
     }
 
     /// Pushes attempted on this session's underlying connection so far.
-    /// Approaches [`MAX_PUSHES_PER_SESSION`]; callers use this watermark
-    /// to pre-warm a replacement session before the current one retires.
+    /// This is only a defence-in-depth metric; normal rotation is driven
+    /// by [`Self::ghost_balance_plur`].
     pub fn pushes_used(&self) -> u32 {
         self.state
             .pushes_used
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Client-side mirror of bee's per-overlay `ghostBalance`.
+    pub fn ghost_balance_plur(&self) -> u64 {
+        self.state
+            .ghost_balance_plur
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
@@ -523,11 +588,18 @@ struct SessionState {
     /// two settles within the same wall-second, and back-to-back
     /// concurrent settles would just both re-settle the same balance.
     settle_lock: tokio::sync::Mutex<()>,
-    /// Pushes attempted on this connection so far. When this exceeds
-    /// [`MAX_PUSHES_PER_SESSION`] the session is considered "dead" by
-    /// the caller and rotated; bee's per-overlay `ghostBalance` resets
-    /// only on a fresh `Connect()`. See `MAX_PUSHES_PER_SESSION` docs.
+    /// Pushes attempted on this connection so far. Tracked only as a
+    /// safety net against [`MAX_PUSHES_PER_SESSION`]; under normal
+    /// operation retirement is driven by [`ghost_balance_plur`].
     pushes_used: std::sync::atomic::AtomicU32,
+    /// Client-side mirror of bee's per-overlay `ghostBalance`. Bee
+    /// increments this on every push it can't forward; we increment
+    /// on every push that returns Err (timeout, dial fail, peer-side
+    /// receipt error). When it crosses [`GHOST_BALANCE_LIMIT_PLUR`]
+    /// the session retires and the upload loop dials a replacement.
+    /// Successful pushes don't increment — bee doesn't burn ghost
+    /// balance on them.
+    ghost_balance_plur: std::sync::atomic::AtomicU64,
 }
 
 impl SessionState {
@@ -570,6 +642,7 @@ impl SessionState {
                 }
                 Err(_) => {
                     acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+                    self.ghost_balance_plur.fetch_add(price, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
             }
@@ -754,11 +827,11 @@ impl SessionDriver {
                                 let _ = reply.send(res);
                                 dead
                             }));
-                            if used >= MAX_PUSHES_PER_SESSION {
+                            let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
+                            if ghost >= GHOST_BALANCE_LIMIT_PLUR {
                                 debug!(target: "isheika::transport",
-                                    "session {} retiring after {} pushes \
-                                     (avoiding bee ghostBalance disconnect)",
-                                    self.state.peer_id, used);
+                                    "session {} retiring at ghost_balance={} after {} pushes",
+                                    self.state.peer_id, ghost, used);
                                 accept_new = false;
                             }
                         }
@@ -779,6 +852,14 @@ impl SessionDriver {
                             "session {} retiring: underlying connection dead",
                             self.state.peer_id);
                         accept_new = false;
+                    } else {
+                        let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
+                        if ghost >= GHOST_BALANCE_LIMIT_PLUR {
+                            debug!(target: "isheika::transport",
+                                "session {} retiring at ghost_balance={}",
+                                self.state.peer_id, ghost);
+                            accept_new = false;
+                        }
                     }
                 }
 
@@ -937,6 +1018,7 @@ async fn do_handshake(
     hs_in: &mut libp2p_stream::IncomingStreams,
     underlay: &Multiaddr,
     signer: &SwarmSigner,
+    advertised: Option<&Multiaddr>,
 ) -> Result<(), TransportError> {
     let local_peer_id = *swarm.local_peer_id();
     info!(target: "isheika::transport", "opening outbound handshake");
@@ -944,7 +1026,15 @@ async fn do_handshake(
         .await
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
     {
-        let hs_run = handshake::run(&mut stream, signer, signer.network_id(), underlay, &local_peer_id, true);
+        let hs_run = handshake::run(
+            &mut stream,
+            signer,
+            signer.network_id(),
+            underlay,
+            advertised,
+            &local_peer_id,
+            true,
+        );
         // Run handshake while still draining inbound handshake/swarm events.
         tokio::pin!(hs_run);
         loop {
@@ -954,7 +1044,7 @@ async fn do_handshake(
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
                             let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, &local_peer_id)
+                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id)
                             ).await;
                         }
                     }
@@ -1006,10 +1096,11 @@ async fn do_pricing(
     Ok(())
 }
 
-async fn respond_to_handshake<S>(
+pub(crate) async fn respond_to_handshake<S>(
     stream: &mut S,
     signer: &SwarmSigner,
     observed_underlay: Option<&Multiaddr>,
+    advertised: Option<&Multiaddr>,
     our_peer_id: &PeerId,
 ) -> Result<(), TransportError>
 where
@@ -1019,10 +1110,13 @@ where
     use crate::protocols::framing::{read_message, write_message};
 
     let syn: pb::Syn = read_message(stream).await?;
-    let _ = observed_underlay; // ignored — clients don't listen
-    let our_underlay = {
-        let s = format!("/ip4/127.0.0.1/tcp/1634/p2p/{our_peer_id}");
-        s.parse::<Multiaddr>().unwrap().to_vec()
+    let _ = observed_underlay; // ignored — bee doesn't verify it against ours
+    let our_underlay = match advertised {
+        Some(ma) => ma.to_vec(),
+        None => {
+            let s = format!("/ip4/127.0.0.1/tcp/1634/p2p/{our_peer_id}");
+            s.parse::<Multiaddr>().unwrap().to_vec()
+        }
     };
     let signature = signer.sign_handshake(&our_underlay)?;
     let our_addr = pb::BzzAddress {
@@ -1074,11 +1168,31 @@ async fn close_stream<S: futures::AsyncWrite + Unpin>(stream: &mut S) {
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> {
+    let mut swarm = build_swarm_from(&t.keypair, t.config.timeout).await?;
+    // When the caller has set an advertise address (daemon serving
+    // mode), push it as an external address on every outbound swarm so
+    // our libp2p identify message tells the bee peer "you can dial me
+    // back at <advertise>" — exactly what bee needs to add us to its
+    // kademlia routing table after the verification dial-back.
+    if let Some(addr) = t.config.advertise.as_ref() {
+        swarm.add_external_address(addr.clone());
+    }
+    Ok(swarm)
+}
+
+/// Build a libp2p swarm with the standard isheika transport stack
+/// (plain TCP + TCP-over-WS, noise auth, yamux multiplex, identify +
+/// libp2p_stream behaviours). Exposed `pub(crate)` so the daemon's
+/// inbound listener can share the same code path with a separately
+/// owned keypair.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) async fn build_swarm_from(
+    keypair: &Keypair,
+    timeout: Duration,
+) -> Result<Swarm<Behaviour>, TransportError> {
     use libp2p_core::{upgrade, Transport as _};
 
-    let timeout = t.config.timeout;
-
-    let swarm = SwarmBuilder::with_existing_identity(t.keypair.clone())
+    let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
         .with_other_transport(|key| {
             // Plain TCP for `/ip4/.../tcp/.../p2p/...` (mainnet bootnodes).

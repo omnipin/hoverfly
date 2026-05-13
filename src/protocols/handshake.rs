@@ -45,11 +45,18 @@ pub struct HandshakeResult {
 /// `observed_underlay` is the multiaddr we observed for the remote peer
 /// (just the underlay portion, e.g. `/ip4/x.x.x.x/tcp/443/wss/p2p/<id>`).
 /// We pass the full multiaddr serialized.
+///
+/// `advertised_underlay` is the multiaddr we tell the bee peer we listen
+/// on. Pass `Some(addr)` for daemon-serving mode (bee will add us to its
+/// kademlia table and route retrieval lookups back to us); pass `None`
+/// for ephemeral clients, in which case we advertise a synthetic
+/// 127.0.0.1 loopback that bee accepts but can't dial.
 pub async fn run<S>(
     stream: &mut S,
     signer: &SwarmSigner,
     network_id: u64,
     observed_underlay: &Multiaddr,
+    advertised_underlay: Option<&Multiaddr>,
     our_peer_id: &PeerId,
     our_full_node: bool,
 ) -> Result<HandshakeResult, HandshakeError>
@@ -75,11 +82,11 @@ where
     }
 
     // 3. Send Ack with our BzzAddress.
-    // Bee expects OUR listen underlay, not the peer's. Clients don't listen,
-    // so we synthesize a stable loopback underlay; bee verifies the signature
-    // over those bytes and doesn't care that the host is unreachable.
     let _ = observed_underlay;
-    let our_underlay = client_loopback_underlay(our_peer_id);
+    let our_underlay = match advertised_underlay {
+        Some(ma) => ma.to_vec(),
+        None => client_loopback_underlay(our_peer_id),
+    };
     let our_signature = signer.sign_handshake(&our_underlay)?;
     let our_addr = pb::BzzAddress {
         underlay: our_underlay,

@@ -41,3 +41,24 @@ where
     buf[pad..].copy_from_slice(&msg.payment_threshold[..take]);
     Ok(u128::from_be_bytes(buf))
 }
+
+/// Server-side responder: bee opens an inbound pricing stream to
+/// announce its own threshold *to us*. We mirror what bee does on its
+/// side — exchange empty headers, read their announcement, and reply
+/// (over a separately-opened outbound pricing stream — bee does it
+/// reciprocally, not on the same stream). For the inbound half all we
+/// need to do is consume their `AnnouncePaymentThreshold` message and
+/// the empty-headers preamble.
+pub async fn respond_announcement<S>(stream: &mut S) -> Result<u128, PricingError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    use crate::proto::headers as hdr;
+    // 1. Read peer's empty headers.
+    let _req_headers: hdr::Headers = read_message(stream).await?;
+    // 2. Write our empty headers.
+    let resp_headers = hdr::Headers { headers: vec![] };
+    write_message(stream, &resp_headers).await?;
+    // 3. Read the announcement itself.
+    read_announcement(stream).await
+}

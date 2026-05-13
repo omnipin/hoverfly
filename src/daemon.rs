@@ -24,11 +24,13 @@ use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
+use crate::cache::ChunkCache;
 use crate::client::{
     fetch_bytes_ex, fetch_manifest_path_ex, upload_bytes_with_pool, upload_collection,
     upload_file_with_manifest_with_pool, SessionPool,
 };
 use crate::peers::{apply_log, PeerStore};
+use crate::signer::SwarmSigner;
 use crate::transport::Transport;
 use crate::{ClientError, UploadFile};
 
@@ -100,12 +102,35 @@ struct State {
     pool: RwLock<Option<Arc<SessionPool>>>,
     /// Target pool size — daemon owner picks this once at startup.
     pool_target: usize,
+    /// Shared chunk cache populated by every upload (and optionally
+    /// every fetch), served by the inbound retrieval responder so
+    /// freshly uploaded roots are retrievable through bzz.limo / any
+    /// bee peer that routes a retrieval request back to us.
+    cache: ChunkCache,
+}
+
+/// Optional inbound listener configuration for [`run`].
+pub struct ListenConfig {
+    pub listen: libp2p::Multiaddr,
+    /// Publicly-routable multiaddr to advertise (must already include
+    /// the `/p2p/<peer-id>` tail when set). When `None`, falls back to
+    /// loopback advertisement — sufficient for local testing but bee
+    /// peers won't route retrieval requests back to us.
+    pub advertise: Option<libp2p::Multiaddr>,
+    /// Daemon identity. Used both as the libp2p keypair for the
+    /// listener and as the bee handshake signer (overlay derived from
+    /// its eth address + a random nonce).
+    pub identity: SwarmSigner,
 }
 
 /// Run a daemon listening on `socket_path`. Blocks until a `Shutdown`
 /// request arrives or the listener errors out. The peerlist file at
 /// `peerlist_path` is loaded at startup and saved on graceful shutdown;
 /// callers can also force a save via the `SavePeers` op.
+///
+/// `listen` (if `Some`) starts an additional libp2p inbound listener
+/// that accepts bee retrieval/handshake/pricing streams and serves
+/// chunks from the in-memory cache populated by uploads.
 pub async fn run(
     socket_path: PathBuf,
     peerlist_path: PathBuf,
@@ -113,6 +138,7 @@ pub async fn run(
     pool_target: usize,
     dial_timeout: std::time::Duration,
     op_timeout: std::time::Duration,
+    listen: Option<ListenConfig>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove any stale socket from a previous crashed run. The daemon
     // owns the socket file for its lifetime.
@@ -120,19 +146,33 @@ pub async fn run(
         std::fs::remove_file(&socket_path)?;
     }
 
-    let signer = crate::SwarmSigner::random(network_id);
+    // When the daemon has a stable identity (--identity supplied with
+    // --listen), share that signer + libp2p keypair across both the
+    // outbound transport and the inbound listener. This keeps a single
+    // overlay + peer-id across every connection we open or accept, so
+    // bee peers can dial back to our advertised underlay and find the
+    // same identity they handshook with outbound, then add us to their
+    // kademlia tables for retrieval routing.
     let cfg = crate::TransportConfig {
         timeout: op_timeout,
         dial_timeout,
         network_id,
+        advertise: listen.as_ref().and_then(|lc| lc.advertise.clone()),
     };
-    let transport = Arc::new(Transport::new(signer, cfg));
+    let transport = match listen.as_ref() {
+        Some(lc) => {
+            let kp = crate::inbound::libp2p_keypair_from_identity(&lc.identity);
+            Arc::new(Transport::new_with_keypair(lc.identity.clone(), cfg, kp))
+        }
+        None => Arc::new(Transport::new(crate::SwarmSigner::random(network_id), cfg)),
+    };
     let peers = PeerStore::load_or_create(&peerlist_path);
     if peers.is_empty() {
         warn!(target: "isheika::daemon",
             "peerlist {} is empty — daemon will refuse uploads until populated",
             peerlist_path.display());
     }
+    let cache = ChunkCache::new();
     let state = Arc::new(State {
         transport,
         signer_network_id: network_id,
@@ -140,7 +180,26 @@ pub async fn run(
         peerlist_path: peerlist_path.clone(),
         pool: RwLock::new(None),
         pool_target,
+        cache: cache.clone(),
     });
+
+    // Spawn the inbound bee-protocol listener if configured. Failure
+    // to bind is fatal — the user asked for this listener explicitly.
+    if let Some(lc) = listen {
+        let inbound_cfg = crate::inbound::InboundConfig {
+            listen: lc.listen.clone(),
+            advertise: lc.advertise.clone(),
+            signer: lc.identity,
+            op_timeout,
+            idle_timeout: op_timeout,
+            cache: cache.clone(),
+        };
+        tokio::spawn(async move {
+            if let Err(e) = crate::inbound::run(inbound_cfg).await {
+                warn!(target: "isheika::daemon", "inbound listener exited: {e}");
+            }
+        });
+    }
 
     let listener = UnixListener::bind(&socket_path)?;
     info!(target: "isheika::daemon",
@@ -273,6 +332,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                     r.depth,
                     &data,
                     r.max_retries,
+                    Some(&state.cache),
                 )
                 .await?
             } else {
@@ -294,6 +354,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                     &path,
                     ct.as_deref(),
                     r.max_retries,
+                    Some(&state.cache),
                 )
                 .await?
             }

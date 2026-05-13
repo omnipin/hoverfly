@@ -3,6 +3,7 @@
 //! Three operations: `discover`, `fetch`, `upload`. Networking is libp2p WebSocket
 //! only (websys on wasm32). DNS resolution is DoH-only.
 
+pub mod cache;
 pub mod doh;
 pub mod dnsaddr;
 pub mod peers;
@@ -57,6 +58,11 @@ pub use client::{
 
 #[cfg(unix)]
 pub mod daemon;
+
+#[cfg(not(target_arch = "wasm32"))]
+pub mod inbound;
+
+pub use cache::{ChunkCache, CachedChunk};
 pub use doh::Doh;
 
 /// Default Swarm mainnet bootnode (resolved via DoH).

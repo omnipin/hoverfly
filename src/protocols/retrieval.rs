@@ -56,3 +56,58 @@ where
         stamp: delivery.stamp,
     })
 }
+
+/// Server-side retrieval handler. Mirrors `fetch` from the other end:
+/// read empty headers, write empty headers, read `Request { addr }`,
+/// then call `lookup(addr)` and write the resulting `Delivery`.
+///
+/// `lookup` returns `Some((data, stamp))` when the chunk is locally
+/// available, or `None` to respond with an empty-data error
+/// (`Delivery { err: "chunk not found" }`). Mirroring bee's behaviour,
+/// any framing / IO error during the write of an error response is
+/// silently dropped — the peer will time out the stream and move on.
+pub async fn respond<S, F>(stream: &mut S, mut lookup: F) -> Result<(), RetrievalError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    F: FnMut(&[u8; 32]) -> Option<(Vec<u8>, Vec<u8>)>,
+{
+    use crate::proto::headers as hdr;
+
+    // 1. Read empty request headers.
+    let _req_headers: hdr::Headers = read_message(stream).await?;
+
+    // 2. Write empty response headers.
+    let resp_headers = hdr::Headers { headers: vec![] };
+    write_message(stream, &resp_headers).await?;
+
+    // 3. Read request.
+    let req: pb::Request = read_message(stream).await?;
+    let mut addr = [0u8; 32];
+    if req.addr.len() != 32 {
+        let err = pb::Delivery {
+            data: vec![],
+            stamp: vec![],
+            err: format!("invalid address length: {}", req.addr.len()),
+        };
+        write_message(stream, &err).await?;
+        return Ok(());
+    }
+    addr.copy_from_slice(&req.addr);
+
+    // 4. Look up and respond.
+    match lookup(&addr) {
+        Some((data, stamp)) => {
+            let delivery = pb::Delivery { data, stamp, err: String::new() };
+            write_message(stream, &delivery).await?;
+        }
+        None => {
+            let err = pb::Delivery {
+                data: vec![],
+                stamp: vec![],
+                err: "chunk not found".to_string(),
+            };
+            write_message(stream, &err).await?;
+        }
+    }
+    Ok(())
+}

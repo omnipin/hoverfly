@@ -25,6 +25,8 @@ use crate::peers::{DialResult, Peer, PeerStore};
 use crate::signer::SwarmSigner;
 use crate::transport::{
     is_connection_dead, peer_price, PeerSession, PushOutcome, Transport, TransportError,
+    GHOST_BALANCE_LIMIT_PLUR, GHOST_BALANCE_PREWARM_DENOMINATOR,
+    GHOST_BALANCE_PREWARM_NUMERATOR,
 };
 use nectar_primitives::address::SwarmAddress;
 
@@ -827,10 +829,14 @@ pub async fn upload_file_with_manifest_with_pool(
     path: &str,
     content_type: Option<&str>,
     max_retries_per_chunk: usize,
+    cache: Option<&crate::cache::ChunkCache>,
 ) -> Result<ChunkAddress, ClientError> {
     let (manifest_root, work) = prepare_upload_file_with_manifest(
         signer, batch_id_hex, depth, data, path, content_type,
     )?;
+    if let Some(c) = cache {
+        populate_cache(c, &work);
+    }
     push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
     Ok(manifest_root)
 }
@@ -1020,6 +1026,7 @@ pub async fn upload_bytes_ex(
 
 /// Daemon-mode raw upload: split + stamp + push through a pre-built
 /// session pool. Skips the per-request pool-fill dial parade.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_bytes_with_pool(
     transport: &Transport,
     pool: &SessionPool,
@@ -1028,10 +1035,28 @@ pub async fn upload_bytes_with_pool(
     depth: u8,
     data: &[u8],
     max_retries_per_chunk: usize,
+    cache: Option<&crate::cache::ChunkCache>,
 ) -> Result<ChunkAddress, ClientError> {
     let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
+    if let Some(c) = cache {
+        populate_cache(c, &work);
+    }
     push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
     Ok(root)
+}
+
+/// Populate the daemon's [`ChunkCache`] from a batch of stamped chunks
+/// produced by `prepare_upload_*`. Called by the `_with_pool` variants
+/// before they hand `work` over to `push_chunks_with_pool`, so the
+/// cache is hot the moment our peers (or bzz.limo) start asking us
+/// for these chunks via retrieval — they're served directly from RAM
+/// without waiting for pushsync propagation.
+fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
+    use bytes::Bytes;
+    cache.put_many(
+        work.iter()
+            .map(|c| (c.addr, Bytes::copy_from_slice(&c.wire), Bytes::copy_from_slice(&c.stamp))),
+    );
 }
 
 /// Split + stamp data, returning the root and the stamped chunks ready
@@ -1064,7 +1089,8 @@ fn prepare_upload_bytes(
 /// A session and the peer overlay it talks to, kept together so we can
 /// route each chunk to the session whose peer is closest to it. The
 /// `PeerSession` inside is replaced on the fly when the driver retires
-/// itself after `MAX_PUSHES_PER_SESSION` pushes (see transport.rs); a
+/// itself after accumulating too much client-side mirrored ghost balance;
+/// a
 /// brand-new libp2p connection is dialed to reset bee's `ghostBalance`.
 struct SessionEntry {
     overlay: SwarmAddress,
@@ -1072,10 +1098,10 @@ struct SessionEntry {
     underlay: libp2p::Multiaddr,
     session: std::sync::Mutex<PeerSession>,
     /// Pre-warmed replacement session. Populated by the upload loop
-    /// once the active session crosses [`PREWARM_WATERMARK`] pushes; if
-    /// present, `try_push_with_rotation` swaps it in instead of dialing
-    /// synchronously. `bool` flags whether a pre-warm is already in
-    /// flight (so we don't queue two for the same entry).
+    /// once the active session crosses the ghost-balance pre-warm
+    /// threshold; if present, `try_push_with_rotation` swaps it in
+    /// instead of dialing synchronously. `bool` flags whether a pre-warm
+    /// is already in flight (so we don't queue two for the same entry).
     pending: std::sync::Mutex<Option<PeerSession>>,
     prewarm_inflight: std::sync::atomic::AtomicBool,
 }
@@ -1106,11 +1132,8 @@ impl SessionEntry {
     }
 }
 
-/// Push count at which we kick off a background dial for a session's
-/// replacement. Sized comfortably below `MAX_PUSHES_PER_SESSION = 25`
-/// so the dial completes (typical 200-700 ms on a live peer) before the
-/// active session hits the wall.
-const PREWARM_WATERMARK: u32 = 20;
+const PREWARM_GHOST_BALANCE_PLUR: u64 =
+    GHOST_BALANCE_LIMIT_PLUR * GHOST_BALANCE_PREWARM_NUMERATOR / GHOST_BALANCE_PREWARM_DENOMINATOR;
 
 /// A long-lived pool of peer sessions usable across multiple uploads.
 /// Construct with [`SessionPool::open`]. Pre-warm rotation, mid-upload
@@ -1429,7 +1452,7 @@ pub(crate) async fn push_chunks_with_pool(
 
     // Separate side-queue of background dials used to pre-warm session
     // replacements. Each dial runs concurrently with chunk pushes, so
-    // when an active session retires (after MAX_PUSHES_PER_SESSION) the
+    // when an active session retires on ghost-balance the
     // replacement is already open instead of forcing the chunk that
     // triggered the rotation to pay the dial cost synchronously.
     //
@@ -1447,8 +1470,8 @@ pub(crate) async fn push_chunks_with_pool(
 
     let maybe_prewarm = |idx: usize, prewarm_dials: &mut FuturesUnordered<_>| {
         let entry = &pool[idx];
-        let used = entry.snapshot().pushes_used();
-        if used >= PREWARM_WATERMARK
+        let ghost = entry.snapshot().ghost_balance_plur();
+        if ghost >= PREWARM_GHOST_BALANCE_PLUR
             && entry
                 .prewarm_inflight
                 .compare_exchange(
