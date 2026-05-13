@@ -1118,6 +1118,16 @@ where
             s.parse::<Multiaddr>().unwrap().to_vec()
         }
     };
+    debug!(target: "isheika::transport",
+        "respond_to_handshake: syn.observed_underlay({}B)={} our_underlay({}B)={} overlay={} nonce={} network_id={}",
+        syn.observed_underlay.len(),
+        hex::encode(&syn.observed_underlay),
+        our_underlay.len(),
+        hex::encode(&our_underlay),
+        hex::encode(signer.overlay()),
+        hex::encode(signer.nonce()),
+        signer.network_id(),
+    );
     let signature = signer.sign_handshake(&our_underlay)?;
     let our_addr = pb::BzzAddress {
         underlay: our_underlay,

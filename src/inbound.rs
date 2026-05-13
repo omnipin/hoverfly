@@ -151,12 +151,14 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 let signer = signer.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
+                    info!(target: "isheika::inbound",
+                        "inbound handshake stream from {peer_id}");
                     let res = tokio::time::timeout(
                         op_timeout,
                         respond_to_handshake(&mut stream, &signer, None, advertised.as_ref().as_ref(), &our_peer_id),
                     ).await;
                     match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                        Ok(Ok(())) => info!(target: "isheika::inbound",
                             "handshake responded to {peer_id}"),
                         Ok(Err(e)) => warn!(target: "isheika::inbound",
                             "handshake from {peer_id} failed: {e}"),
