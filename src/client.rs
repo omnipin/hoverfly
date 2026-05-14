@@ -1223,11 +1223,14 @@ pub(crate) async fn push_chunks_with_pool(
     let total = work.len();
     let pushed = Arc::new(AtomicUsize::new(0));
 
-    // For each chunk we walk sessions in descending-proximity order. With
-    // many sessions and yamux multiplexing, keeping pool*4 requests in
-    // flight saturates round-trip latency without overcommitting any one
-    // session.
-    let buffer = pool.len().saturating_mul(4).max(pool.len());
+    // Per-chunk dispatch walks sessions in descending-proximity order
+    // and re-tries on shallow / overdraft. Sustained throughput needs
+    // many chunks in flight at once: each push is an RTT to bee plus
+    // bee's internal forwarding cost (~300 ms-2 s), so a buffer of
+    // `pool × 16` keeps every session busy while shallow retries on
+    // one chunk burn another peer in parallel. Capped at `total` so we
+    // don't allocate for nothing on small uploads.
+    let buffer = pool.len().saturating_mul(16).max(pool.len()).min(total);
 
     // Per-chunk parallelism (matches bee's `pushsync.maxMultiplexForwards`
     // + `preemptiveInterval`): start with the closest peer, then every
@@ -1619,6 +1622,37 @@ async fn try_push_with_rotation(
 /// per upload.
 const SESSION_DIAL_PARALLELISM: usize = 32;
 
+/// Reorder a candidate peer list so that consecutive picks cover
+/// distinct proximity-order bins instead of clustering by overlay
+/// prefix. Uses an "anti-prefix" bucket walk: for every PO bin (8-bit
+/// high-byte group, 256 in total) we round-robin one peer at a time.
+/// Cheap (O(N)) and deterministic; no RNG dep.
+fn spread_across_address_space(
+    peers: &mut Vec<(SwarmAddress, String, Multiaddr, bool)>,
+) {
+    // 256 buckets by overlay's leading byte; cheap to compute, gives
+    // even distribution across the first 8 PO bins for random overlays.
+    let mut buckets: Vec<Vec<(SwarmAddress, String, Multiaddr, bool)>> =
+        (0..256).map(|_| Vec::new()).collect();
+    for p in peers.drain(..) {
+        let key = p.0.as_bytes()[0] as usize;
+        buckets[key].push(p);
+    }
+    // Round-robin pop. As long as any bucket has entries, take one
+    // from each in sequence and append to `peers`.
+    let mut nonempty = (0..256).filter(|i| !buckets[*i].is_empty()).count();
+    while nonempty > 0 {
+        for b in buckets.iter_mut() {
+            if let Some(p) = b.pop() {
+                peers.push(p);
+                if b.is_empty() {
+                    nonempty -= 1;
+                }
+            }
+        }
+    }
+}
+
 async fn open_session_pool(
     transport: &Transport,
     peers: &PeerStore,
@@ -1637,17 +1671,30 @@ async fn open_session_pool(
     // are moved to the end of the candidate list rather than dropped:
     // they're still tried if no fresher peer answers, but won't burn
     // 10 s timeouts at the front of the dial parade.
+    // Spread the pool across the swarm address space rather than
+    // clustering around a single reference. The earlier "closest to
+    // zero" ordering biased every session toward overlays starting
+    // with `0x00..`, which means random chunk addresses always hit
+    // far peers (proximity 0-1) — bee then has to forward 8+ hops
+    // and many receipts come back shallow. Sampling peers across PO
+    // bins ensures that for any random chunk, some peer in the pool
+    // is reasonably close.
+    //
+    // Reachability still matters: recently-failed peers move to the
+    // back so we don't burn dial timeouts on known-dead hosts first.
     let now = crate::peers::now_unix();
-    let zero = ChunkAddress::new([0u8; 32]);
-    let (fresh, stale): (Vec<_>, Vec<_>) = peers
-        .closest(&zero, usize::MAX)
+    let mut all: Vec<(SwarmAddress, String, Multiaddr, bool)> = peers
+        .closest(&ChunkAddress::new([0u8; 32]), usize::MAX)
         .into_iter()
         .filter_map(|p| {
             let underlay = p.first_dialable_underlay()?;
             let overlay = p.overlay_address()?;
             Some((overlay, p.overlay.clone(), underlay, p.is_recently_unreachable(now)))
         })
-        .partition(|(_, _, _, stale)| !stale);
+        .collect();
+    spread_across_address_space(&mut all);
+    let (fresh, stale): (Vec<_>, Vec<_>) =
+        all.into_iter().partition(|(_, _, _, stale)| !stale);
     let candidates: Vec<(SwarmAddress, String, Multiaddr)> = fresh
         .into_iter()
         .chain(stale.into_iter())
