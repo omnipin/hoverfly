@@ -1512,7 +1512,16 @@ pub(crate) async fn push_chunks_with_pool(
     };
 
     let mut first_err: Option<ClientError> = None;
+    let mut more_chunks = true;
     loop {
+        // Done: all chunks dispatched, every dispatch resolved. Don't
+        // wait on prewarm_dials — those are opportunistic and a stuck
+        // bee dial there (e.g. mid-Multistream-negotiation hang) would
+        // otherwise block our return forever.
+        if !more_chunks && inflight.is_empty() {
+            break;
+        }
+
         tokio::select! {
             biased;
 
@@ -1527,6 +1536,8 @@ pub(crate) async fn push_chunks_with_pool(
                         }
                         if let Some(c) = iter.next() {
                             inflight.push(dispatch(c));
+                        } else {
+                            more_chunks = false;
                         }
                     }
                     Err(e) => {
@@ -1536,7 +1547,7 @@ pub(crate) async fn push_chunks_with_pool(
                 }
             }
 
-            Some((idx, res)) = prewarm_dials.next(), if !prewarm_dials.is_empty() => {
+            Some((idx, res)) = prewarm_dials.next(), if !prewarm_dials.is_empty() && more_chunks => {
                 let entry = &pool[idx];
                 entry.prewarm_inflight.store(false, Ordering::Release);
                 match res {
