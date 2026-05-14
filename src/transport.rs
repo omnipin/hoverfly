@@ -46,6 +46,13 @@ pub const REFRESH_RATE_PLUR: u64 = 4_500_000;
 /// 9M PLUR leaves plenty of headroom for in-flight rounds.
 pub const SAFE_PEER_THRESHOLD_PLUR: u64 = REFRESH_RATE_PLUR * 2;
 
+/// Hard upper bound regardless of what a peer announces. Bee's mainnet
+/// `maxThreshold = 24 * refreshRate = 108_000_000` PLUR (see
+/// `pkg/node/node.go::node.go`). Using a per-peer 80% margin against
+/// that ceiling lets us pipeline roughly an order of magnitude more
+/// chunks per session before being forced into a pseudosettle round.
+pub const MAX_ACCOUNTING_THRESHOLD_PLUR: u64 = 80_000_000;
+
 /// Bee's per-PO chunk price (`pkg/pricer/pricer.go::PO_PRICE`).
 pub const PO_PRICE_PLUR: u64 = 10_000;
 
@@ -327,7 +334,7 @@ impl Transport {
             self.config.advertise.as_ref(),
         )
         .await?;
-        do_pricing(&mut swarm, peer_id, &mut control, &mut pr_in, self.config.timeout).await?;
+        let _peer_threshold = do_pricing(&mut swarm, peer_id, &mut control, &mut pr_in, self.config.timeout).await?;
 
         // Wait for the first hive envelope (bee sends a single one then stops),
         // bounded by `wait`. Exit as soon as we read it.
@@ -446,7 +453,7 @@ impl PeerSession {
             transport.config.advertise.as_ref(),
         )
         .await?;
-        do_pricing(
+        let peer_threshold = do_pricing(
             &mut swarm,
             peer_id,
             &mut control,
@@ -454,6 +461,17 @@ impl PeerSession {
             transport.config.dial_timeout,
         )
         .await?;
+
+        // Pull the cap toward bee's announced threshold to maximise the
+        // per-session credit budget before we have to pseudosettle.
+        // Bee disconnects at threshold × 1.25, so we cap at 80% of the
+        // peer's announcement and never exceed an absolute safety
+        // ceiling. Falling back to [`SAFE_PEER_THRESHOLD_PLUR`] keeps
+        // the old behaviour for peers that announce a tiny threshold.
+        let threshold_plur = {
+            let announced = (peer_threshold * 4 / 5).min(MAX_ACCOUNTING_THRESHOLD_PLUR as u128);
+            (announced as u64).max(SAFE_PEER_THRESHOLD_PLUR)
+        };
 
         let timeout = transport.config.timeout;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<SessionCommand>(64);
@@ -464,7 +482,7 @@ impl PeerSession {
             accounting: tokio::sync::Mutex::new(AccountingState {
                 reserve_plur: 0,
                 balance_plur: 0,
-                threshold_plur: SAFE_PEER_THRESHOLD_PLUR,
+                threshold_plur,
                 last_settle: None,
             }),
             settle_lock: tokio::sync::Mutex::new(()),
@@ -1073,10 +1091,11 @@ async fn do_pricing(
     control: &mut libp2p_stream::Control,
     pr_in: &mut libp2p_stream::IncomingStreams,
     timeout: Duration,
-) -> Result<(), TransportError> {
+) -> Result<u128, TransportError> {
     // Wait for inbound pricing first (peer announces threshold), then announce ours.
     let deadline = web_time::Instant::now() + timeout;
     let mut pr_in_done = false;
+    let mut peer_threshold: u128 = u128::from(SAFE_PEER_THRESHOLD_PLUR);
     while !pr_in_done {
         let now = web_time::Instant::now();
         if now >= deadline { return Err(TransportError::Timeout); }
@@ -1086,7 +1105,11 @@ async fn do_pricing(
                 if let Some((pid, mut stream)) = ev {
                     if pid == peer_id {
                         let _ = poll_until(swarm, read_then_write_empty_headers(&mut stream)).await;
-                        let _ = poll_until(swarm, pricing::read_announcement(&mut stream)).await;
+                        if let Ok(threshold) =
+                            poll_until(swarm, pricing::read_announcement(&mut stream)).await
+                        {
+                            peer_threshold = threshold;
+                        }
                         pr_in_done = true;
                     }
                 }
@@ -1101,8 +1124,9 @@ async fn do_pricing(
     poll_until(swarm, write_then_read_empty_headers(&mut stream)).await?;
     poll_until(swarm, pricing::announce(&mut stream)).await?;
     close_stream_polled(swarm, &mut stream).await;
-    info!(target: "isheika::transport", "outbound pricing complete");
-    Ok(())
+    info!(target: "isheika::transport",
+        "outbound pricing complete (peer threshold {} PLUR)", peer_threshold);
+    Ok(peer_threshold)
 }
 
 pub(crate) async fn respond_to_handshake<S>(
