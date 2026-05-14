@@ -26,6 +26,45 @@ pub struct PushsyncReceipt {
     pub storage_radius: u32,
 }
 
+impl PushsyncReceipt {
+    /// Recover the overlay address of the bee node that signed this
+    /// receipt. The signature is over the chunk address (EIP-191
+    /// prefixed, keccak256-hashed by alloy's recovery helper); the
+    /// overlay is then `keccak(eth_addr || network_id_LE_8 || nonce)`.
+    /// Returns `None` if signature recovery or layout checks fail.
+    pub fn storer_overlay(&self, network_id: u64) -> Option<[u8; 32]> {
+        use alloy_signer::Signature;
+        if self.address.len() != 32 || self.signature.len() != 65 || self.nonce.len() != 32 {
+            return None;
+        }
+        let sig = Signature::from_raw(&self.signature).ok()?;
+        let eth = sig.recover_address_from_msg(&self.address).ok()?;
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&self.nonce);
+        Some(crate::signer::derive_overlay(&eth.0.0, network_id, &nonce))
+    }
+
+    /// Returns `true` when the receipt's signing peer was *not* in the
+    /// chunk's storage neighborhood. Bee's check (mirrored from
+    /// `pkg/pushsync/pushsync.go::checkReceipt`) compares
+    /// `proximity(storer_overlay, chunk_addr)` against the receipt's
+    /// claimed `storage_radius`. A shallow receipt means the chunk was
+    /// only forwarded, not durably stored in any peer's reserve, and
+    /// the upload should retry against a different peer.
+    pub fn is_shallow(&self, network_id: u64) -> bool {
+        let Some(overlay) = self.storer_overlay(network_id) else {
+            return true;
+        };
+        if self.address.len() != 32 {
+            return true;
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&self.address);
+        let po = crate::transport::proximity(&overlay, &addr);
+        u32::from(po) < self.storage_radius
+    }
+}
+
 /// Push a single chunk and read the receipt.
 ///
 /// `chunk_data` must already include the 8-byte LE span prefix (i.e. the

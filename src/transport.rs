@@ -75,12 +75,21 @@ pub fn proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
 /// Result of a price-aware push attempt.
 #[derive(Debug)]
 pub enum PushOutcome {
-    /// Reserve succeeded, push delivered, peer acknowledged.
+    /// Reserve succeeded, push delivered, peer acknowledged with a
+    /// signed receipt whose signing overlay is *within* the chunk's
+    /// AOR. The chunk has durably landed in a neighborhood reserve.
     Receipt(PushsyncReceipt),
     /// Reserve would have exceeded the peer's threshold even after an
     /// in-line settlement attempt. The push was not made; try a different
     /// peer or wait for refresh to free credit.
     Overdraft,
+    /// Pushsync returned a receipt, but the signing peer's overlay is
+    /// not within the chunk's storage radius — meaning the chunk was
+    /// only forwarded, not stored in any peer's reserve. Bee mirrors
+    /// this via `ErrShallowReceipt`; the upload should retry against
+    /// a different (closer) peer so the chunk actually lands. The
+    /// receipt is included so callers can log it for diagnostics.
+    Shallow(PushsyncReceipt),
 }
 
 /// Heuristic: does this error mean the underlying libp2p connection is

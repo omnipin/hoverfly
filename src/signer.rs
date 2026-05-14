@@ -91,7 +91,7 @@ fn random_nonce() -> [u8; 32] {
 }
 
 /// `keccak256(eth_addr || network_id_LE_8 || nonce_32)`
-fn derive_overlay(eth_address: &[u8; 20], network_id: u64, nonce: &[u8; 32]) -> [u8; 32] {
+pub fn derive_overlay(eth_address: &[u8; 20], network_id: u64, nonce: &[u8; 32]) -> [u8; 32] {
     let mut h = Keccak256::new();
     h.update(eth_address);
     h.update(network_id.to_le_bytes());

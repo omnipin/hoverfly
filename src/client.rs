@@ -1292,6 +1292,7 @@ pub(crate) async fn push_chunks_with_pool(
             let mut last_err: Option<TransportError> = None;
             let mut overdrafts = 0usize;
             let mut errors = 0usize;
+            let mut shallows = 0usize;
             // Box-pinned sleep that we recreate on each fire / push-refill;
             // PREEMPT_INTERVAL then counts from the most recent push event.
             // (Native tokio has Sleep::reset, but tokio_with_wasm doesn't,
@@ -1327,6 +1328,14 @@ pub(crate) async fn push_chunks_with_pool(
                                     "overdraft on {} (po={}); trying next peer",
                                     entry.overlay_hex,
                                     chunk_addr.proximity(&entry.overlay));
+                            }
+                            Ok(PushOutcome::Shallow(r)) => {
+                                shallows += 1;
+                                debug!(target: "isheika::upload",
+                                    "shallow receipt on {} (po={}, storage_radius={}); trying next peer",
+                                    entry.overlay_hex,
+                                    chunk_addr.proximity(&entry.overlay),
+                                    r.storage_radius);
                             }
                             Err(e) => {
                                 errors += 1;
@@ -1369,13 +1378,13 @@ pub(crate) async fn push_chunks_with_pool(
             // already-attempted ones'. Only fall back to a 1.1 s
             // refresh-wait + closest-N retry if there genuinely are no
             // more peers in the pool.
-            if errors == 0 && overdrafts > 0 {
+            if errors == 0 && (overdrafts > 0 || shallows > 0) {
                 let already_attempted = attempt_no;
                 let extra: Vec<usize> = order.iter().skip(already_attempted).copied().collect();
                 if !extra.is_empty() {
                     debug!(target: "isheika::upload",
-                        "all {} attempted peers overdrafted; trying {} more",
-                        already_attempted, extra.len());
+                        "all {} attempted peers gave overdraft/shallow ({}+{}); trying {} more",
+                        already_attempted, overdrafts, shallows, extra.len());
                     for idx in extra {
                         let entry = &pool[idx];
                         let mut peer_overlay = [0u8; 32];
@@ -1392,14 +1401,14 @@ pub(crate) async fn push_chunks_with_pool(
                                 }
                                 return Ok::<_, ClientError>(());
                             }
-                            Ok(PushOutcome::Overdraft) => continue,
+                            Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
                             Err(e) => {
                                 last_err = Some(e);
                                 break;
                             }
                         }
                     }
-                } else {
+                } else if overdrafts > 0 {
                     debug!(target: "isheika::upload",
                         "all peers overdrafted and no more candidates; waiting for refresh");
                     tokio::time::sleep(Duration::from_millis(1100)).await;
@@ -1419,7 +1428,7 @@ pub(crate) async fn push_chunks_with_pool(
                                 }
                                 return Ok::<_, ClientError>(());
                             }
-                            Ok(PushOutcome::Overdraft) => continue,
+                            Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
                             Err(e) => {
                                 last_err = Some(e);
                                 break;
@@ -1430,11 +1439,14 @@ pub(crate) async fn push_chunks_with_pool(
             }
 
             Err(ClientError::NoPeers(format!(
-                "all {} attempts failed: {}",
+                "all {} attempts failed ({} overdraft, {} shallow, {} err): {}",
                 cap,
+                overdrafts,
+                shallows,
+                errors,
                 last_err
                     .map(|e| e.to_string())
-                    .unwrap_or_else(|| "all overdrafted".into())
+                    .unwrap_or_else(|| "all overdraft/shallow".into())
             )))
         }
     };
@@ -1548,10 +1560,12 @@ pub(crate) async fn push_chunks_with_pool(
 }
 
 /// Send one push, transparently rotating the underlying libp2p
-/// connection when the driver retires. The driver retires after
-/// `MAX_PUSHES_PER_SESSION` pushes to keep bee's per-overlay
-/// `ghostBalance` from reaching its disconnect threshold (see
-/// transport.rs::MAX_PUSHES_PER_SESSION).
+/// connection when the driver retires. After a successful pushsync,
+/// validates the receipt against the chunk's storage radius — a
+/// shallow receipt (peer signed but isn't in the chunk's AOR) is
+/// reported as [`PushOutcome::Shallow`] so the dispatcher can retry
+/// against a different peer instead of trusting that the chunk has
+/// landed.
 async fn try_push_with_rotation(
     entry: &SessionEntry,
     chunk: &StampedChunk,
@@ -1559,20 +1573,13 @@ async fn try_push_with_rotation(
     transport: &Transport,
 ) -> Result<PushOutcome, TransportError> {
     let session = entry.snapshot();
-    match session
+    let net = transport.config().network_id;
+    let result = match session
         .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
         .await
     {
         Ok(out) => Ok(out),
-        // Bee returned a Receipt with err set ("could not push chunk",
-        // "invalid stamp", etc.). The connection is fine; the chunk is
-        // just unhappy on this peer. Bubble up so the dispatcher picks
-        // the next peer.
         Err(e) if !is_connection_dead(&e) => Err(e),
-        // Connection is gone. Prefer a pre-warmed replacement (zero
-        // wait) if the upload loop has dialed one for us; otherwise
-        // dial sync. Either way, resets bee's ghostBalance via the
-        // fresh `Connect()` and retries the push.
         Err(_) => {
             let fresh = match entry.take_pending() {
                 Some(s) => {
@@ -1592,7 +1599,11 @@ async fn try_push_with_rotation(
                 .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
                 .await
         }
-    }
+    };
+    Ok(match result? {
+        PushOutcome::Receipt(r) if r.is_shallow(net) => PushOutcome::Shallow(r),
+        out => out,
+    })
 }
 
 /// Open sessions to every reachable ws peer in the store, capped at
