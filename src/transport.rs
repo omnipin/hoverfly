@@ -1044,7 +1044,7 @@ async fn do_handshake(
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
                             let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id)
+                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid)
                             ).await;
                         }
                     }
@@ -1102,6 +1102,7 @@ pub(crate) async fn respond_to_handshake<S>(
     observed_underlay: Option<&Multiaddr>,
     advertised: Option<&Multiaddr>,
     our_peer_id: &PeerId,
+    remote_peer_id: PeerId,
 ) -> Result<(), TransportError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
@@ -1109,8 +1110,8 @@ where
     use crate::proto::handshake as pb;
     use crate::protocols::framing::{read_message, write_message};
 
-    let syn: pb::Syn = read_message(stream).await?;
-    let _ = observed_underlay; // ignored — bee doesn't verify it against ours
+    let _syn: pb::Syn = read_message(stream).await?;
+    let _ = observed_underlay;
     let our_underlay = match advertised {
         Some(ma) => ma.to_vec(),
         None => {
@@ -1118,24 +1119,25 @@ where
             s.parse::<Multiaddr>().unwrap().to_vec()
         }
     };
+    // Bee (the dialer) verifies that the `observed_underlay` we put in
+    // our SynAck contains *bee's* own peer-id — proving we know who
+    // we're talking to. The address portion is parsed but not
+    // validated against the connection, so any well-formed multiaddr
+    // ending in `/p2p/<bee_peer_id>` is sufficient. See bee's
+    // `pkg/p2p/libp2p/internal/handshake/handshake.go::Handshake` for
+    // the `libp2pID != observedUnderlayAddrInfo.ID` check.
+    let peer_observed = format!("/ip4/0.0.0.0/tcp/0/p2p/{remote_peer_id}")
+        .parse::<Multiaddr>()
+        .expect("synthetic peer observed multiaddr is valid")
+        .to_vec();
     let signature = signer.sign_handshake(&our_underlay)?;
-    debug!(target: "isheika::transport",
-        "respond_to_handshake: underlay({}B)={} overlay={} nonce={} network_id={} sig={} eth={}",
-        our_underlay.len(),
-        hex::encode(&our_underlay),
-        hex::encode(signer.overlay()),
-        hex::encode(signer.nonce()),
-        signer.network_id(),
-        hex::encode(signature),
-        hex::encode(signer.eth_address()),
-    );
     let our_addr = pb::BzzAddress {
         underlay: our_underlay,
         signature: signature.to_vec(),
         overlay: signer.overlay().to_vec(),
     };
     let synack = pb::SynAck {
-        syn: Some(pb::Syn { observed_underlay: syn.observed_underlay }),
+        syn: Some(pb::Syn { observed_underlay: peer_observed }),
         ack: Some(pb::Ack {
             address: Some(our_addr),
             network_id: signer.network_id(),
