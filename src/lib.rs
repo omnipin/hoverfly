@@ -4,6 +4,7 @@
 //! only (websys on wasm32). DNS resolution is DoH-only.
 
 pub mod cache;
+pub mod cid;
 pub mod doh;
 pub mod dnsaddr;
 pub mod peers;

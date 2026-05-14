@@ -288,6 +288,18 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
     Ok(out)
 }
 
+/// Convert a 64-char hex Swarm reference to a multibase-encoded CIDv1
+/// (`b...` lowercase base32). Returns `None` on malformed input.
+fn root_hex_to_cid(root_hex: &str) -> Option<String> {
+    let bytes = hex::decode(root_hex).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Some(isheika::cid::reference_to_cid(&arr))
+}
+
 fn guess_content_type(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
     let ext = lower.rsplit('.').next()?;
@@ -468,7 +480,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let resp = isheika::daemon::call(&sock, &req).await?;
                 match resp {
                     isheika::daemon::Response::Uploaded { root, bytes } => {
+                        let cid = root_hex_to_cid(&root);
                         println!("uploaded {} bytes — manifest root: {} (via daemon)", bytes, root);
+                        if let Some(c) = cid.as_deref() {
+                            println!("bzz.limo:   https://bzz.limo/bzz/{root}/");
+                            println!("subdomain:  https://{c}.bzz.limo/");
+                        }
                         return Ok(());
                     }
                     isheika::daemon::Response::Err { message } => {
@@ -512,15 +529,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     concurrency,
                 )
                 .await?;
+                let root_hex = hex::encode(root.as_bytes());
                 println!(
                     "uploaded {} files ({} bytes) — manifest root: {}",
-                    n_files,
-                    total,
-                    hex::encode(root.as_bytes())
+                    n_files, total, root_hex,
                 );
-                println!("retrieve a file with: isheika fetch {} --path <name> -o <out>",
-                    hex::encode(root.as_bytes()));
-                println!("list contents with: isheika fetch {} --list", hex::encode(root.as_bytes()));
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/");
+                    println!("subdomain:  https://{c}.bzz.limo/");
+                }
+                println!("retrieve a file with: isheika fetch {root_hex} --path <name> -o <out>");
+                println!("list contents with: isheika fetch {root_hex} --list");
                 isheika::peers::apply_log(&mut peers, transport.reachability_log());
                 let _ = peers.save(&peerlist);
                 return Ok(());
@@ -539,7 +558,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     concurrency,
                 )
                 .await?;
-                println!("uploaded {} bytes — root (raw): {}", data.len(), hex::encode(root.as_bytes()));
+                let root_hex = hex::encode(root.as_bytes());
+                println!("uploaded {} bytes — root (raw): {}", data.len(), root_hex);
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("cid: {c}");
+                }
             } else {
                 let path = manifest_path.unwrap_or_else(|| {
                     file.file_name()
@@ -562,13 +585,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 let display_ct = ct.as_deref().unwrap_or("-");
+                let root_hex = hex::encode(root.as_bytes());
                 println!(
                     "uploaded {} bytes ({}) — manifest root: {}",
-                    data.len(),
-                    display_ct,
-                    hex::encode(root.as_bytes())
+                    data.len(), display_ct, root_hex,
                 );
-                println!("retrieve with: isheika fetch {} --path {} -o {}", hex::encode(root.as_bytes()), path, path);
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/{path}");
+                    println!("subdomain:  https://{c}.bzz.limo/{path}");
+                }
+                println!("retrieve with: isheika fetch {root_hex} --path {path} -o {path}");
             }
 
             isheika::peers::apply_log(&mut peers, transport.reachability_log());
