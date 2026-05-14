@@ -46,12 +46,7 @@ pub const REFRESH_RATE_PLUR: u64 = 4_500_000;
 /// 9M PLUR leaves plenty of headroom for in-flight rounds.
 pub const SAFE_PEER_THRESHOLD_PLUR: u64 = REFRESH_RATE_PLUR * 2;
 
-/// Hard upper bound regardless of what a peer announces. Bee's mainnet
-/// `maxThreshold = 24 * refreshRate = 108_000_000` PLUR (see
-/// `pkg/node/node.go::node.go`). Using a per-peer 80% margin against
-/// that ceiling lets us pipeline roughly an order of magnitude more
-/// chunks per session before being forced into a pseudosettle round.
-pub const MAX_ACCOUNTING_THRESHOLD_PLUR: u64 = 80_000_000;
+
 
 /// Bee's per-PO chunk price (`pkg/pricer/pricer.go::PO_PRICE`).
 pub const PO_PRICE_PLUR: u64 = 10_000;
@@ -453,7 +448,7 @@ impl PeerSession {
             transport.config.advertise.as_ref(),
         )
         .await?;
-        let peer_threshold = do_pricing(
+        let _peer_threshold = do_pricing(
             &mut swarm,
             peer_id,
             &mut control,
@@ -461,17 +456,15 @@ impl PeerSession {
             transport.config.dial_timeout,
         )
         .await?;
-
-        // Pull the cap toward bee's announced threshold to maximise the
-        // per-session credit budget before we have to pseudosettle.
-        // Bee disconnects at threshold × 1.25, so we cap at 80% of the
-        // peer's announcement and never exceed an absolute safety
-        // ceiling. Falling back to [`SAFE_PEER_THRESHOLD_PLUR`] keeps
-        // the old behaviour for peers that announce a tiny threshold.
-        let threshold_plur = {
-            let announced = (peer_threshold * 4 / 5).min(MAX_ACCOUNTING_THRESHOLD_PLUR as u128);
-            (announced as u64).max(SAFE_PEER_THRESHOLD_PLUR)
-        };
+        // Note: we deliberately keep `SAFE_PEER_THRESHOLD_PLUR` as the
+        // local cap even though `_peer_threshold` is typically much
+        // larger. Lifting the cap led to thundering-herd contention on
+        // the per-session accounting mutex (overdrafts on 50 MiB shot
+        // from ~1.6k to ~51k once every session held ~10M PLUR of
+        // pending pushes simultaneously). The narrower cap forces
+        // pseudosettles to happen more often but keeps the dispatch
+        // queue from piling up.
+        let threshold_plur = SAFE_PEER_THRESHOLD_PLUR;
 
         let timeout = transport.config.timeout;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<SessionCommand>(64);
