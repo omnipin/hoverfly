@@ -69,6 +69,23 @@ where
     Ok(out)
 }
 
+/// Server-side hive: bee opens an inbound `peers` stream to us
+/// expecting an empty `Peers` envelope (or our list of known peers).
+/// We respond with an empty list — bee's hive lets us indicate "I
+/// don't know any peers right now" without erroring out, which is
+/// fine for an edge daemon that doesn't maintain a kademlia table.
+pub async fn respond_empty<S>(stream: &mut S) -> Result<(), HiveError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    // bee writes empty headers first → we ack, then send a single
+    // empty Peers envelope.
+    let _: hdr::Headers = read_message(stream).await?;
+    write_message(stream, &hdr::Headers { headers: vec![] }).await?;
+    write_message(stream, &pb::Peers { peers: vec![] }).await?;
+    Ok(())
+}
+
 fn deserialize_underlays(data: &[u8]) -> Result<Vec<Multiaddr>, ()> {
     if data.is_empty() {
         return Err(());

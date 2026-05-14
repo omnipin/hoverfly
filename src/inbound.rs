@@ -28,11 +28,11 @@ use thiserror::Error;
 use tracing::{debug, info, warn};
 
 use crate::cache::ChunkCache;
-use crate::protocols::{pricing, retrieval};
+use crate::protocols::{hive, pricing, retrieval};
 use crate::signer::SwarmSigner;
 use crate::transport::{
-    build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO, PRICING_PROTO,
-    RETRIEVAL_PROTO,
+    build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO, HIVE_PROTO,
+    PRICING_PROTO, RETRIEVAL_PROTO,
 };
 
 #[derive(Debug, Error)]
@@ -102,6 +102,9 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
     let mut re_in = control
         .accept(RETRIEVAL_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept retrieval: {e:?}")))?;
+    let mut hive_in = control
+        .accept(HIVE_PROTO)
+        .map_err(|e| InboundError::StreamControl(format!("accept hive: {e:?}")))?;
 
     info!(
         target: "isheika::inbound",
@@ -188,16 +191,46 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
             Some((peer_id, mut stream)) = re_in.next() => {
                 let cache = cache.clone();
                 tokio::spawn(async move {
+                    let cache_len = cache.len();
+                    info!(target: "isheika::inbound",
+                        "inbound retrieval stream from {peer_id} (cache size {cache_len})");
                     let res = tokio::time::timeout(op_timeout, retrieval::respond(&mut stream, |addr| {
-                        cache.get(addr).map(|c| (c.data.to_vec(), c.stamp.to_vec()))
+                        let hit = cache.get(addr).map(|c| (c.data.to_vec(), c.stamp.to_vec()));
+                        if hit.is_some() {
+                            info!(target: "isheika::inbound",
+                                "retrieval HIT addr={} for {peer_id}",
+                                hex::encode(addr));
+                        } else {
+                            debug!(target: "isheika::inbound",
+                                "retrieval MISS addr={} for {peer_id}",
+                                hex::encode(addr));
+                        }
+                        hit
                     })).await;
                     match res {
                         Ok(Ok(())) => debug!(target: "isheika::inbound",
-                            "retrieval served to {peer_id}"),
+                            "retrieval responded to {peer_id}"),
                         Ok(Err(e)) => debug!(target: "isheika::inbound",
                             "retrieval from {peer_id} failed: {e}"),
                         Err(_) => debug!(target: "isheika::inbound",
                             "retrieval from {peer_id} timed out"),
+                    }
+                });
+            }
+
+            Some((peer_id, mut stream)) = hive_in.next() => {
+                tokio::spawn(async move {
+                    let res = tokio::time::timeout(
+                        op_timeout,
+                        hive::respond_empty(&mut stream),
+                    ).await;
+                    match res {
+                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                            "hive responded (empty) to {peer_id}"),
+                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                            "hive from {peer_id} failed: {e}"),
+                        Err(_) => debug!(target: "isheika::inbound",
+                            "hive from {peer_id} timed out"),
                     }
                 });
             }
