@@ -1615,7 +1615,25 @@ async fn try_push_with_rotation(
         }
     };
     Ok(match result? {
-        PushOutcome::Receipt(r) if r.is_shallow(net) => PushOutcome::Shallow(r),
+        PushOutcome::Receipt(r) => {
+            let storer = r.storer_overlay(net).unwrap_or([0u8; 32]);
+            let po = crate::transport::proximity(&storer, &{
+                let mut a = [0u8; 32];
+                a.copy_from_slice(&r.address);
+                a
+            });
+            if r.is_shallow(net) {
+                debug!(target: "isheika::upload",
+                    "shallow: chunk={} storer={} po={} storage_radius={}",
+                    hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
+                PushOutcome::Shallow(r)
+            } else {
+                debug!(target: "isheika::upload",
+                    "receipt OK: chunk={} storer={} po={} storage_radius={}",
+                    hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
+                PushOutcome::Receipt(r)
+            }
+        }
         out => out,
     })
 }
