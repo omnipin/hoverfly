@@ -1342,7 +1342,14 @@ pub(crate) async fn push_chunks_with_pool(
                             }
                             Err(e) => {
                                 errors += 1;
-                                warn!(target: "isheika::upload",
+                                // Demoted from `warn!`: a single failed push
+                                // attempt is part of normal dispatcher work —
+                                // the next peer in `order_iter` will be tried
+                                // immediately and the chunk almost always
+                                // lands on a subsequent retry. We surface the
+                                // last error in the eventual `NoPeers`
+                                // return-value if the entire fan-out fails.
+                                debug!(target: "isheika::upload",
                                     "push attempt {} via {} (po={}) failed: {}",
                                     n, entry.overlay_hex,
                                     chunk_addr.proximity(&entry.overlay), e);
@@ -1773,7 +1780,11 @@ async fn open_session_pool(
                 }
             }
             Err(e) => {
-                warn!(target: "isheika::upload",
+                // Per-peer dial failures during pool fill are expected
+                // on mainnet (~50%+ peers are stale / NAT'd / running
+                // an incompatible bee). Stay at debug so the user-visible
+                // log shows only the successful pool size.
+                debug!(target: "isheika::upload",
                     "session to {} failed: {}", overlay_hex, e);
                 log.lock().unwrap()
                     .insert(overlay_hex.to_lowercase(), DialResult::Failure);
