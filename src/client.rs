@@ -1121,12 +1121,12 @@ struct SessionEntry {
     /// is already in flight (so we don't queue two for the same entry).
     pending: std::sync::Mutex<Option<PeerSession>>,
     prewarm_inflight: std::sync::atomic::AtomicBool,
+    /// Consecutive rotation-dial failures observed on this entry. We
+    /// only flag it dead once it crosses [`DEAD_STRIKES`]; a single
+    /// transient peer hiccup shouldn't shrink the live pool.
+    failure_strikes: std::sync::atomic::AtomicU32,
     /// Unix-seconds timestamp before which this entry is considered
-    /// "dead" and skipped by the dispatcher. Set after a hard rotation
-    /// failure (peer's connection drops + redial errors). Prevents the
-    /// thundering-herd pattern where every chunk independently picks
-    /// the same dead peer from its proximity-sorted candidate list and
-    /// burns a dial-timeout in turn. Default `0` = always-live.
+    /// "dead" and skipped by the dispatcher. Default `0` = always-live.
     skip_until_unix: std::sync::atomic::AtomicU64,
 }
 
@@ -1162,6 +1162,28 @@ impl SessionEntry {
         deadline > crate::peers::now_unix()
     }
 
+    /// Reset the failure-strike counter on a successful push so a
+    /// previously-flaky peer doesn't get marked dead by stale
+    /// accumulated strikes after it recovers.
+    fn clear_strikes(&self) {
+        self.failure_strikes.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Record one rotation-dial failure. Returns `true` (and arms the
+    /// dead window) only once the entry crosses [`DEAD_STRIKES`] —
+    /// a single transient failure no longer shrinks the live pool.
+    fn record_failure(&self, secs: u64) -> bool {
+        let strikes = self
+            .failure_strikes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        if strikes >= DEAD_STRIKES {
+            self.mark_dead(secs)
+        } else {
+            false
+        }
+    }
+
     /// Mark this entry as dead for `secs` seconds. Subsequent chunks
     /// skip it during proximity ordering. Returns `true` only on the
     /// first call within a dead window — the caller can use this to
@@ -1176,12 +1198,19 @@ impl SessionEntry {
     }
 }
 
-/// How long to skip a session after it returns a hard error (dial
-/// fail / protocol-negotiation reset / closed connection during
-/// rotation). Long enough that pending chunks don't all immediately
-/// re-pick the same dead peer; short enough that a transiently
-/// overloaded peer comes back into rotation reasonably fast.
-const DEAD_SKIP_SECS: u64 = 30;
+/// How long to skip a session after it crosses [`DEAD_STRIKES`]
+/// consecutive rotation-dial failures. Long enough that pending
+/// chunks don't all immediately re-pick the same dead peer; short
+/// enough that a transiently overloaded peer comes back into rotation
+/// reasonably fast.
+const DEAD_SKIP_SECS: u64 = 15;
+
+/// Number of consecutive rotation-dial failures we tolerate on a
+/// single entry before flagging it dead. A single transient hiccup
+/// (peer ghost-balance-retired, brief network blip) shouldn't shrink
+/// the live pool; a peer that errors three pushes in a row is
+/// genuinely broken for the moment.
+const DEAD_STRIKES: u32 = 3;
 
 const PREWARM_GHOST_BALANCE_PLUR: u64 =
     GHOST_BALANCE_LIMIT_PLUR * GHOST_BALANCE_PREWARM_NUMERATOR / GHOST_BALANCE_PREWARM_DENOMINATOR;
@@ -1299,16 +1328,29 @@ pub(crate) async fn push_chunks_with_pool(
     // — the timeout itself is the failover.
     const PREEMPT_INTERVAL: Duration = Duration::from_secs(30);
 
-    let dispatch = |chunk: StampedChunk| {
+    /// Per-chunk pusher-layer retry budget. Mirrors bee's
+    /// `pusher.DefaultRetryCount = 6`: if a chunk exhausts its
+    /// proximity-ordered candidate list with only `connection_dead` /
+    /// timeout errors, we wait and retry the whole peer fan-out a
+    /// few more times before giving up on the upload. Without this,
+    /// a single chunk that hits a transient cluster-wide network
+    /// blip (every session in the pool ghost-balance-retiring at
+    /// once, brief peer routing churn) aborts an otherwise-successful
+    /// 3 000-chunk upload.
+    const MAX_CHUNK_RETRIES: u8 = 6;
+
+    let dispatch = |chunk: Arc<StampedChunk>, attempts: u8| {
         let pool = pool.clone();
         let pushed = pushed.clone();
         let transport = transport;
         let progress = progress.cloned();
-        // Wrap the chunk in Arc once per dispatch so preemptive retries
-        // share its (potentially 4 KiB) wire bytes instead of cloning
-        // per attempt.
-        let chunk = Arc::new(chunk);
+        let chunk_for_result = chunk.clone();
         async move {
+            // Inner result; the outer arm returns the chunk + retry
+            // count alongside so the dispatch driver can re-queue
+            // failed chunks for another round (bee's pusher does the
+            // same when pushsync exits without a valid receipt).
+            let result: Result<(), ClientError> = async move {
             use futures::stream::{FuturesUnordered, StreamExt};
 
             // Rank sessions by proximity to this chunk's address; closest
@@ -1597,15 +1639,30 @@ pub(crate) async fn push_chunks_with_pool(
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "all overdraft/shallow".into())
             )))
+            }.await;
+            (chunk_for_result, attempts, result)
         }
     };
 
-    let mut inflight = FuturesUnordered::new();
-    let mut iter = work.into_iter();
+    // Box-pin chunk dispatches so the retry path (which awaits an
+    // inner sleep before delegating) and the initial path (no sleep)
+    // unify on a single Future type that FuturesUnordered can hold.
+    #[cfg(not(target_arch = "wasm32"))]
+    type DispatchFut<'a> = futures::future::BoxFuture<
+        'a,
+        (Arc<StampedChunk>, u8, Result<(), ClientError>),
+    >;
+    #[cfg(target_arch = "wasm32")]
+    type DispatchFut<'a> = futures::future::LocalBoxFuture<
+        'a,
+        (Arc<StampedChunk>, u8, Result<(), ClientError>),
+    >;
+    let mut inflight: FuturesUnordered<DispatchFut<'_>> = FuturesUnordered::new();
+    let mut iter = work.into_iter().map(|c| Arc::new(c));
 
     for _ in 0..buffer {
         if let Some(c) = iter.next() {
-            inflight.push(dispatch(c));
+            inflight.push(Box::pin(dispatch(c, 0)));
         } else {
             break;
         }
@@ -1673,7 +1730,7 @@ pub(crate) async fn push_chunks_with_pool(
         tokio::select! {
             biased;
 
-            Some(res) = inflight.next(), if !inflight.is_empty() => {
+            Some((chunk, attempts, res)) = inflight.next(), if !inflight.is_empty() => {
                 match res {
                     Ok(()) => {
                         // Opportunistically pre-warm any session that's
@@ -1683,10 +1740,34 @@ pub(crate) async fn push_chunks_with_pool(
                             maybe_prewarm(i, &mut prewarm_dials);
                         }
                         if let Some(c) = iter.next() {
-                            inflight.push(dispatch(c));
+                            inflight.push(Box::pin(dispatch(c, 0)));
                         } else {
                             more_chunks = false;
                         }
+                    }
+                    Err(e) if attempts + 1 < MAX_CHUNK_RETRIES => {
+                        // Per-chunk pusher-layer retry. The proximity-
+                        // sorted candidate list was exhausted without a
+                        // valid (or shallow) receipt. Most often this is
+                        // a transient network blip on our end — every
+                        // session in the pool ghost-balance-retiring at
+                        // once, brief routing churn, or a small pool
+                        // (sparse peerlist) that all timed out. Sleep
+                        // with linear backoff and re-dispatch the chunk
+                        // through the whole proximity list. Dead-marked
+                        // entries will have expired their skip windows
+                        // by the time we retry.
+                        let next = attempts + 1;
+                        let backoff = Duration::from_millis(500u64 * (1 + next as u64));
+                        warn!(target: "isheika::upload",
+                            "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
+                            hex::encode(chunk.addr), e, next, MAX_CHUNK_RETRIES,
+                            backoff.as_millis());
+                        let dispatch = &dispatch;
+                        inflight.push(Box::pin(async move {
+                            tokio::time::sleep(backoff).await;
+                            dispatch(chunk, next).await
+                        }));
                     }
                     Err(e) => {
                         first_err = Some(e);
@@ -1775,19 +1856,17 @@ async fn try_push_with_rotation(
                         s
                     }
                     Err(e) => {
-                        // Hard re-dial failure: the peer's bee is gone /
-                        // refusing / blocklisting us. Park the entry so
-                        // the next batch of chunks won't independently
-                        // pick it from their proximity-sorted list and
-                        // burn the same dial timeout in turn. Only log
-                        // on the first failure within a dead window —
-                        // many concurrent chunks may discover the same
-                        // dead peer simultaneously, but we only want
-                        // one "marked dead" line per actual event.
-                        if entry.mark_dead(DEAD_SKIP_SECS) {
+                        // Rotation-dial failure. Count a strike; only
+                        // park the entry once it crosses DEAD_STRIKES
+                        // so a single transient hiccup (peer's session
+                        // ghost-balance-retiring + a slow redial,
+                        // momentary routing churn) doesn't shrink the
+                        // live pool. Log "marked dead" exactly once
+                        // per dead-window event.
+                        if entry.record_failure(DEAD_SKIP_SECS) {
                             debug!(target: "isheika::upload",
-                                "marked {} dead for {DEAD_SKIP_SECS}s after dial failure",
-                                entry.overlay_hex);
+                                "marked {} dead for {DEAD_SKIP_SECS}s after {} consecutive dial failures",
+                                entry.overlay_hex, DEAD_STRIKES);
                         }
                         return Err(e);
                     }
@@ -1813,6 +1892,10 @@ async fn try_push_with_rotation(
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
                 PushOutcome::Shallow(r)
             } else {
+                // Real receipt — peer is alive and serving. Clear any
+                // accumulated failure strikes so a previously-flaky
+                // peer fully re-enters rotation.
+                entry.clear_strikes();
                 debug!(target: "isheika::upload",
                     "receipt OK: chunk={} storer={} po={} storage_radius={}",
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
@@ -1952,6 +2035,7 @@ async fn open_session_pool(
                     session: std::sync::Mutex::new(session),
                     pending: std::sync::Mutex::new(None),
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
+                    failure_strikes: std::sync::atomic::AtomicU32::new(0),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
