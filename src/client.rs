@@ -1365,7 +1365,7 @@ pub(crate) async fn push_chunks_with_pool(
                         match outcome {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                                if done % 50 == 0 || done == total {
+                                if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
@@ -1456,7 +1456,7 @@ pub(crate) async fn push_chunks_with_pool(
                         match try_push_with_rotation(entry, &chunk, price, transport).await {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                                if done % 50 == 0 || done == total {
+                                if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
@@ -1483,7 +1483,7 @@ pub(crate) async fn push_chunks_with_pool(
                         match try_push_with_rotation(entry, &chunk, price, transport).await {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                                if done % 50 == 0 || done == total {
+                                if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
@@ -1573,6 +1573,8 @@ pub(crate) async fn push_chunks_with_pool(
 
     let mut first_err: Option<ClientError> = None;
     let mut more_chunks = true;
+    let mut last_pushed_seen = 0usize;
+    let mut heartbeat = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
     loop {
         // Done: all chunks dispatched, every dispatch resolved. Don't
         // wait on prewarm_dials — those are opportunistic and a stuck
@@ -1621,6 +1623,25 @@ pub(crate) async fn push_chunks_with_pool(
                             "pre-warm dial for {} failed: {}", entry.overlay_hex, e);
                     }
                 }
+            }
+
+            _ = heartbeat.as_mut() => {
+                // Every 5 s, surface progress even when the main
+                // throughput hasn't crossed the next 25-chunk
+                // milestone — distinguishes a hang from a slow link.
+                let now = pushed.load(Ordering::Relaxed);
+                if now == last_pushed_seen {
+                    let alive = (0..pool.len()).filter(|i| !pool[*i].is_dead()).count();
+                    info!(target: "isheika::upload",
+                        "stalled at {}/{} chunks (inflight={}, alive sessions={}/{})",
+                        now, total, inflight.len(), alive, pool.len());
+                } else {
+                    info!(target: "isheika::upload",
+                        "pushed {}/{} chunks (inflight={})",
+                        now, total, inflight.len());
+                    last_pushed_seen = now;
+                }
+                heartbeat = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
             }
 
             else => break,
