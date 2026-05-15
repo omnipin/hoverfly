@@ -221,9 +221,31 @@ discipline, and graceful failure handling.
   TCP). Avoids the false choice between "WS-only" (excludes mainnet
   bees that publish plain `/tcp/`) and "TCP-only" (breaks the
   browser).
-- **Identify push during connection setup** (`transport.rs::prep_connection`).
-  Send our identify info before bee waits the default ~10 s for it,
-  cutting handshake-to-first-push latency from ~10 s → ~200-500 ms.
+- **Active identify-push during connection setup**
+  (`transport.rs::prep_connection`, lines 970-1014). One of the
+  largest per-session savings in the crate. The interaction with bee:
+  1. libp2p connection established; bee sends its identify message.
+  2. We receive bee's identify, extract the `observed_addr` (our
+     externally-visible underlay as bee sees us), and
+     `swarm.add_external_address()` it.
+  3. We immediately call `identify.push([peer_id])` — proactively
+     re-sending our identify with the now-correct external address —
+     instead of waiting for libp2p's periodic identify interval.
+  4. We wait for the `Pushed` event before letting `do_handshake` run.
+
+  Without step 3, bee sits idle waiting for our liveness signal
+  (it expects our externally-routable underlay before it will engage
+  the bee-protocol handshake) for the default ~7-10 s libp2p identify
+  interval. Every single session pays that cost. With the active push,
+  bee proceeds the moment it ack's our updated identify, which is
+  one RTT (~50-300 ms on mainnet). Multiplied across a 128-session
+  pool fill, this is the difference between "ready in ~5 s" and
+  "ready in ~15 min".
+
+  Code comment at `transport.rs:972-974` calls this verbatim "the
+  magic that makes bee proceed immediately instead of waiting ~10s
+  for our liveness signal" — preserve that mechanism on any
+  refactor of the connection-setup state machine.
 - **Reachability log + writeback** (`peers.rs::ReachabilityLog`,
   `apply_log`). Every operation collects dial outcomes into a
   thread-safe log; on completion (success or error) the CLI writes
