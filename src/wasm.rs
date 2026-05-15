@@ -10,7 +10,6 @@ use core::time::Duration;
 use js_sys::Uint8Array;
 use libp2p::Multiaddr;
 use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsValue;
 
 use crate::client::{discover, fetch_bytes, upload_bytes};
 use crate::doh::Doh;

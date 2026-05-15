@@ -8,7 +8,9 @@
 use core::time::Duration;
 use libp2p::Multiaddr;
 use nectar_postage::{Batch, BatchId};
-use nectar_postage_issuer::{BatchStamper, MemoryIssuer, Stamper};
+use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
+#[cfg(target_arch = "wasm32")]
+use nectar_postage_issuer::Stamper;
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
 use nectar_primitives::file::{sync_split, GenericJoiner};
@@ -23,6 +25,7 @@ use crate::dnsaddr::{resolve, DnsAddrError};
 use crate::doh::Doh;
 use crate::peers::{DialResult, Peer, PeerStore};
 use crate::signer::SwarmSigner;
+use crate::protocols::pushsync::PushsyncReceipt;
 use crate::transport::{
     is_connection_dead, peer_price, PeerSession, PushOutcome, Transport, TransportError,
     GHOST_BALANCE_LIMIT_PLUR, GHOST_BALANCE_PREWARM_DENOMINATOR,
@@ -894,7 +897,7 @@ fn wire_form(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Vec<u8> {
 
 /// A chunk pre-stamped and ready for the wire.
 #[derive(Clone)]
-struct StampedChunk {
+pub(crate) struct StampedChunk {
     addr: [u8; 32],
     wire: Vec<u8>,
     stamp: Vec<u8>,
@@ -918,6 +921,7 @@ fn build_stamper(
     BatchStamper::new(issuer, signer.alloy_signer().clone())
 }
 
+#[cfg(target_arch = "wasm32")]
 fn stamp_chunk(
     stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
     addr: &ChunkAddress,
@@ -1369,6 +1373,12 @@ pub(crate) async fn push_chunks_with_pool(
             let mut overdrafts = 0usize;
             let mut errors = 0usize;
             let mut shallows = 0usize;
+            // Track the deepest shallow receipt we've seen for this
+            // chunk. After we've exhausted every peer in the pool with
+            // shallow-only outcomes we accept the best (highest-PO)
+            // one rather than failing the whole upload — bee does the
+            // same via `maxPushErrors` + `errSkip` in pushsync.go.
+            let mut best_shallow: Option<(usize, PushsyncReceipt)> = None;
             // Box-pinned sleep that we recreate on each fire / push-refill;
             // PREEMPT_INTERVAL then counts from the most recent push event.
             // (Native tokio has Sleep::reset, but tokio_with_wasm doesn't,
@@ -1410,11 +1420,13 @@ pub(crate) async fn push_chunks_with_pool(
                             }
                             Ok(PushOutcome::Shallow(r)) => {
                                 shallows += 1;
+                                let po = chunk_addr.proximity(&entry.overlay) as usize;
                                 debug!(target: "isheika::upload",
                                     "shallow receipt on {} (po={}, storage_radius={}); trying next peer",
-                                    entry.overlay_hex,
-                                    chunk_addr.proximity(&entry.overlay),
-                                    r.storage_radius);
+                                    entry.overlay_hex, po, r.storage_radius);
+                                if best_shallow.as_ref().map(|(p, _)| po > *p).unwrap_or(true) {
+                                    best_shallow = Some((po, r));
+                                }
                             }
                             Err(e) => {
                                 errors += 1;
@@ -1527,6 +1539,30 @@ pub(crate) async fn push_chunks_with_pool(
                             }
                         }
                     }
+                }
+            }
+
+            // If the only thing the pool produced is shallow receipts
+            // (no real network errors, no overdrafts left to refresh),
+            // accept the deepest one and move on. The chunk *did* get
+            // forwarded into the network — every peer that signed a
+            // shallow receipt acked the push at some hop, the receipt
+            // just doesn't prove durable AOR storage. Bee's pushsync
+            // takes the same way out via `maxPushErrors` once errSkip
+            // has burned through the candidate list. Failing the whole
+            // upload because our pool happened to lack a high-PO peer
+            // for one of 3 000 random chunk addresses is much worse
+            // than a slightly-weaker receipt for ~1% of chunks.
+            if errors == 0 && shallows > 0 {
+                if let Some((po, _r)) = best_shallow {
+                    let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(p) = &progress {
+                        p(done, total);
+                    }
+                    warn!(target: "isheika::upload",
+                        "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft)",
+                        hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts);
+                    return Ok::<_, ClientError>(());
                 }
             }
 

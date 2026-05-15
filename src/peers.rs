@@ -6,6 +6,7 @@ use libp2p::Multiaddr;
 use nectar_primitives::address::SwarmAddress;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 use thiserror::Error;
 

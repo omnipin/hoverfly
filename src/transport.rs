@@ -213,10 +213,6 @@ pub struct Behaviour {
     pub identify: libp2p::identify::Behaviour,
 }
 
-pub(crate) fn make_behaviour(keypair: &Keypair) -> Behaviour {
-    behaviour(keypair)
-}
-
 fn behaviour(keypair: &Keypair) -> Behaviour {
     Behaviour {
         stream: libp2p_stream::Behaviour::new(),
@@ -905,24 +901,6 @@ fn spawn_session_driver(driver: SessionDriver) {
     wasm_bindgen_futures::spawn_local(driver.run());
 }
 
-/// Like `poll_until` but enforces an overall timeout on the inner future.
-async fn poll_until_timeout<T, F: core::future::Future<Output = T>>(
-    swarm: &mut Swarm<Behaviour>,
-    fut: F,
-    timeout: Duration,
-) -> Result<T, TransportError> {
-    tokio::pin!(fut);
-    let sleep = tokio::time::sleep(timeout);
-    tokio::pin!(sleep);
-    loop {
-        tokio::select! {
-            r = &mut fut => return Ok(r),
-            _ = &mut sleep => return Err(TransportError::Timeout),
-            _ = swarm.select_next_some() => {}
-        }
-    }
-}
-
 /// Poll the swarm in parallel with `fut` so that libp2p behaviours
 /// (identify, libp2p-stream) can make progress while we wait on stream IO.
 async fn poll_until<T, F: core::future::Future<Output = T>>(
@@ -1197,11 +1175,6 @@ where
     let _: hdr::Headers = read_message(stream).await?;
     write_message(stream, &hdr::Headers { headers: vec![] }).await?;
     Ok(())
-}
-
-async fn close_stream<S: futures::AsyncWrite + Unpin>(stream: &mut S) {
-    use futures::AsyncWriteExt;
-    let _ = stream.close().await;
 }
 
 #[cfg(not(target_arch = "wasm32"))]

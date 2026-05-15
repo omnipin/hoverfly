@@ -44,7 +44,6 @@ fn main() {
     let signature = Signature::from_slice(&rs).unwrap();
 
     let recovered = VerifyingKey::recover_from_prehash(&digest, &signature, recovery_id).unwrap();
-    use k256::elliptic_curve::sec1::ToEncodedPoint;
     let point = recovered.to_encoded_point(false);
     let pubkey_bytes = &point.as_bytes()[1..];
     let eth_recovered = &Keccak256::digest(pubkey_bytes)[12..];
