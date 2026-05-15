@@ -292,10 +292,14 @@ fn is_ws(ma: &str) -> bool {
 
 /// Cheap string-form check that matches `dnsaddr::is_dialable_multiaddr`
 /// without parsing — used in `upsert` because peer entries arrive as
-/// `Vec<String>`. On native we also accept plain `/tcp/...` (TCP-direct
-/// transport in `transport.rs::build_swarm`); on WASM we keep ws-only
-/// since browsers can't open raw TCP.
+/// `Vec<String>`. Requires `/ip4/`: our transport has no DNS resolver
+/// (`/dns4/`, `/dnsaddr/`) and most consumer networks lack outbound
+/// IPv6, so filtering at peerlist-ingestion time avoids burning dial
+/// timeouts on unreachable underlays later.
 fn is_dialable_str(ma: &str) -> bool {
+    if !ma.contains("/ip4/") {
+        return false;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         is_ws(ma) || (ma.contains("/tcp/") && !is_ws(ma))

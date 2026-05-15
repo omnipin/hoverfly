@@ -133,7 +133,16 @@ pub fn is_tcp_multiaddr(ma: &Multiaddr) -> bool {
 ///   tcp (libp2p-tcp + libp2p-websocket, combined via `or_transport`).
 /// - WASM browser / `cfg(target_arch = "wasm32")`: ws/wss only — browsers
 ///   can't open raw TCP sockets.
+///
+/// Both targets also require an `/ip4/` host component: our transport
+/// has no DNS resolver (`/dns4/`, `/dns6/`, `/dnsaddr/` are filtered)
+/// and most consumer networks lack outbound IPv6 (`/ip6/` is filtered
+/// too — peers reachable only over v6 just look offline). Filtering
+/// here is much cheaper than burning a dial timeout per dead entry.
 pub fn is_dialable_multiaddr(ma: &Multiaddr) -> bool {
+    if !has_ip4_host(ma) {
+        return false;
+    }
     #[cfg(not(target_arch = "wasm32"))]
     {
         is_ws_multiaddr(ma) || is_tcp_multiaddr(ma)
@@ -142,4 +151,9 @@ pub fn is_dialable_multiaddr(ma: &Multiaddr) -> bool {
     {
         is_ws_multiaddr(ma)
     }
+}
+
+fn has_ip4_host(ma: &Multiaddr) -> bool {
+    use libp2p::multiaddr::Protocol;
+    ma.iter().any(|p| matches!(p, Protocol::Ip4(_)))
 }
