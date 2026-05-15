@@ -1199,11 +1199,13 @@ impl SessionEntry {
 }
 
 /// How long to skip a session after it crosses [`DEAD_STRIKES`]
-/// consecutive rotation-dial failures. Long enough that pending
-/// chunks don't all immediately re-pick the same dead peer; short
-/// enough that a transiently overloaded peer comes back into rotation
-/// reasonably fast.
-const DEAD_SKIP_SECS: u64 = 15;
+/// consecutive rotation-dial failures. Sized to outlast both a
+/// rotation-dial cluster (mass-correlated retirement on a large pool
+/// at high `--concurrency`) and bee's typical ghost-overdraw blocklist
+/// window (~20-60 s). Too short and a parked entry revives straight
+/// into more strikes; too long and a transiently-down peer stays out
+/// of rotation longer than necessary.
+const DEAD_SKIP_SECS: u64 = 60;
 
 /// Number of consecutive rotation-dial failures we tolerate on a
 /// single entry before flagging it dead. A single transient hiccup
@@ -1337,7 +1339,7 @@ pub(crate) async fn push_chunks_with_pool(
     /// blip (every session in the pool ghost-balance-retiring at
     /// once, brief peer routing churn) aborts an otherwise-successful
     /// 3 000-chunk upload.
-    const MAX_CHUNK_RETRIES: u8 = 6;
+    const MAX_CHUNK_RETRIES: u8 = 10;
 
     let dispatch = |chunk: Arc<StampedChunk>, attempts: u8| {
         let pool = pool.clone();
@@ -1623,7 +1625,7 @@ pub(crate) async fn push_chunks_with_pool(
                 if let Some(p) = &progress {
                     p(done, total);
                 }
-                warn!(target: "isheika::upload",
+                info!(target: "isheika::upload",
                     "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft / {} err)",
                     hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts, errors);
                 return Ok::<_, ClientError>(());
@@ -1758,8 +1760,19 @@ pub(crate) async fn push_chunks_with_pool(
                         // entries will have expired their skip windows
                         // by the time we retry.
                         let next = attempts + 1;
-                        let backoff = Duration::from_millis(500u64 * (1 + next as u64));
-                        warn!(target: "isheika::upload",
+                        // Linear backoff capped at 10 s. Total wait
+                        // across MAX_CHUNK_RETRIES retries is
+                        // ~1+2+3+...+10+10 ≈ 55 s, which outlasts both
+                        // DEAD_SKIP_SECS (60 s, close enough — entries
+                        // start reviving in the last retry slot) and
+                        // bee's typical ghost-overdraw blocklist
+                        // window. 500 ms × 6 = 10.5 s used to abort
+                        // the upload inside the blocklist window
+                        // every time at higher --concurrency.
+                        let backoff = Duration::from_millis(
+                            (1000u64 * (1 + next as u64)).min(10_000),
+                        );
+                        info!(target: "isheika::upload",
                             "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
                             hex::encode(chunk.addr), e, next, MAX_CHUNK_RETRIES,
                             backoff.as_millis());

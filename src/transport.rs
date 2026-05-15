@@ -99,6 +99,17 @@ pub enum PushOutcome {
 /// errors come from bee's pushsync handler returning a `Receipt{err}` —
 /// the connection is fine. Frame / stream-control / IO / explicit
 /// `ConnectionClosed` errors all indicate the swarm is gone.
+///
+/// `Timeout` is deliberately *not* included: a single slow pushsync
+/// substream doesn't mean the yamux connection is broken. Treating it
+/// as dead retires the whole session on one slow chunk, which at high
+/// `--concurrency` (mass-correlated retirement across the pool) triggers
+/// the rotation-dial cascade that collapses the live pool. The chunk
+/// whose op timed out still surfaces an error to the dispatcher, which
+/// advances to the next peer; the session stays useful for everything
+/// else in flight on it. Ghost-balance accounting still increments on
+/// timeouts (`push()` in `SessionState`), so a session that keeps
+/// timing out retires naturally via the ghost-balance threshold.
 pub fn is_connection_dead(e: &TransportError) -> bool {
     use crate::protocols::pushsync::PushsyncError;
     match e {
@@ -106,7 +117,6 @@ pub fn is_connection_dead(e: &TransportError) -> bool {
         TransportError::StreamControl(_) => true,
         TransportError::Framing(_) => true,
         TransportError::Pushsync(PushsyncError::Frame(_)) => true,
-        TransportError::Timeout => true,
         _ => false,
     }
 }
