@@ -1146,10 +1146,16 @@ impl SessionEntry {
     }
 
     /// Mark this entry as dead for `secs` seconds. Subsequent chunks
-    /// skip it during proximity ordering.
-    fn mark_dead(&self, secs: u64) {
-        let until = crate::peers::now_unix().saturating_add(secs);
+    /// skip it during proximity ordering. Returns `true` only on the
+    /// first call within a dead window — the caller can use this to
+    /// log "peer marked dead" exactly once instead of once per
+    /// concurrently-failing chunk dispatch.
+    fn mark_dead(&self, secs: u64) -> bool {
+        let now = crate::peers::now_unix();
+        let was_alive = self.skip_until_unix.load(std::sync::atomic::Ordering::Relaxed) <= now;
+        let until = now.saturating_add(secs);
         self.skip_until_unix.store(until, std::sync::atomic::Ordering::Relaxed);
+        was_alive
     }
 }
 
@@ -1308,6 +1314,20 @@ pub(crate) async fn push_chunks_with_pool(
                     let mut peer_overlay = [0u8; 32];
                     peer_overlay.copy_from_slice(entry.overlay.as_bytes());
                     let price = peer_price(&peer_overlay, &chunk.addr);
+                    // The order_iter was built before this attempt was
+                    // dispatched. A peer can be marked dead in the
+                    // intervening interval (another in-flight chunk's
+                    // rotation failed). Skip without burning a fresh
+                    // network round-trip; the dispatcher's error arm
+                    // advances order_iter to the next-closest peer.
+                    if entry.is_dead() {
+                        return (
+                            idx,
+                            attempt_no,
+                            price,
+                            Err(TransportError::ConnectionClosed),
+                        );
+                    }
                     let outcome = try_push_with_rotation(entry, &chunk, price, transport).await;
                     (idx, attempt_no, price, outcome)
                 }
@@ -1652,11 +1672,16 @@ async fn try_push_with_rotation(
                         // refusing / blocklisting us. Park the entry so
                         // the next batch of chunks won't independently
                         // pick it from their proximity-sorted list and
-                        // burn the same dial timeout in turn.
-                        entry.mark_dead(DEAD_SKIP_SECS);
-                        debug!(target: "isheika::upload",
-                            "marked {} dead for {DEAD_SKIP_SECS}s after dial failure",
-                            entry.overlay_hex);
+                        // burn the same dial timeout in turn. Only log
+                        // on the first failure within a dead window —
+                        // many concurrent chunks may discover the same
+                        // dead peer simultaneously, but we only want
+                        // one "marked dead" line per actual event.
+                        if entry.mark_dead(DEAD_SKIP_SECS) {
+                            debug!(target: "isheika::upload",
+                                "marked {} dead for {DEAD_SKIP_SECS}s after dial failure",
+                                entry.overlay_hex);
+                        }
                         return Err(e);
                     }
                 },
