@@ -7,6 +7,7 @@ pub mod cache;
 pub mod cid;
 pub mod doh;
 pub mod dnsaddr;
+pub mod mime;
 pub mod peers;
 pub mod signer;
 

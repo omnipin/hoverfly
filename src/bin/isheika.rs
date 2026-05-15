@@ -301,27 +301,7 @@ fn root_hex_to_cid(root_hex: &str) -> Option<String> {
 }
 
 fn guess_content_type(path: &str) -> Option<&'static str> {
-    let lower = path.to_ascii_lowercase();
-    let ext = lower.rsplit('.').next()?;
-    match ext {
-        "jpg" | "jpeg" => Some("image/jpeg"),
-        "png" => Some("image/png"),
-        "gif" => Some("image/gif"),
-        "webp" => Some("image/webp"),
-        "svg" => Some("image/svg+xml"),
-        "txt" => Some("text/plain"),
-        "html" | "htm" => Some("text/html"),
-        "css" => Some("text/css"),
-        "js" | "mjs" => Some("application/javascript"),
-        "json" => Some("application/json"),
-        "pdf" => Some("application/pdf"),
-        "zip" => Some("application/zip"),
-        "tar" => Some("application/x-tar"),
-        "mp4" => Some("video/mp4"),
-        "mp3" => Some("audio/mpeg"),
-        "wav" => Some("audio/wav"),
-        _ => None,
-    }
+    isheika::mime::guess_from_path(path)
 }
 
 #[tokio::main]
