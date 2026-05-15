@@ -1316,19 +1316,41 @@ pub(crate) async fn push_chunks_with_pool(
     // 32-peer pool and turned 6 chunks/s into 0.1 chunks/s.
     let buffer = 128usize.min(total).max(pool.len());
 
-    // No per-chunk peer racing. Shallow-receipt detection already
-    // retries on the next peer when a push hits a forwarder rather than
-    // an AOR storer, so the preemptive 3-way race was redundant — it
-    // tripled session-mutex pressure and made the tail slower, not
-    // faster. One attempt at a time per chunk; advance to the next
-    // proximity-sorted peer as soon as the current one returns
-    // shallow/overdraft/error.
-    const CHUNK_PEER_PARALLELISM: usize = 1;
-    // Preempt timer fires when no in-flight attempt has come back yet.
-    // With per-op timeout at the user's `--timeout` (default 10 s, the
-    // VPS tests used 4 s) we want preempt > timeout so it never fires
-    // — the timeout itself is the failover.
-    const PREEMPT_INTERVAL: Duration = Duration::from_secs(30);
+    // Per-chunk peer racing: race N peers in parallel from the start
+    // of each chunk's dispatch. Most random-addressed chunks on novel
+    // uploads need to walk several peers before one inside (or close
+    // to) the chunk's AOR returns a non-shallow receipt. Serial
+    // walking adds N × RTT to every chunk; racing N collapses tail
+    // latency to roughly one RTT for most chunks.
+    //
+    // The previous "no racing" comment cited session-mutex pressure
+    // tripling and the tail slowing down. That was empirically true
+    // with the older `buffer = pool × 16` regime (1.5k+ in flight on
+    // a 32-peer pool) where accounting contention dominated.
+    // Buffer is now hard-capped at 128 (see below), so `128 × 3 = 384`
+    // in flight is well inside the mutex's hold-microseconds-only
+    // contention zone.
+    //
+    // Accounting stays consistent under loser cancellation: every push
+    // runs as a task inside SessionDriver.tasks polled by the driver,
+    // not by the dispatcher. When the dispatcher accepts the first
+    // non-shallow Receipt and drops the FuturesUnordered, the loser
+    // tasks keep running in their driver, finish their accounting
+    // (reserve_plur decrement, ghost-balance increment on Err) and
+    // silently no-op on `reply.send`. do_pushsync is timeout-bounded
+    // by `--timeout`, so no leaks.
+    //
+    // Cost: we pay bee credit for all N racers per chunk (each
+    // forwarder debits us via PrepareDebit/Apply). 3× bandwidth for
+    // ~2-3× throughput is the deliberate tradeoff.
+    const CHUNK_PEER_PARALLELISM: usize = 3;
+    // Preempt timer extends the race window if the initial seed used
+    // fewer than N peers (small or attrited pool), and tops up the
+    // race after an early shallow/error response if we haven't yet
+    // received a receipt. Short enough to actually race on per-chunk
+    // timescales — most mainnet pushsync RTTs are well under a
+    // second.
+    const PREEMPT_INTERVAL: Duration = Duration::from_secs(1);
 
     /// Per-chunk pusher-layer retry budget. Mirrors bee's
     /// `pusher.DefaultRetryCount = 6`: if a chunk exhausts its
@@ -1404,10 +1426,16 @@ pub(crate) async fn push_chunks_with_pool(
             let mut inflight = FuturesUnordered::new();
             let mut attempt_no = 0usize;
 
-            // Seed with the first peer.
-            if let Some(idx) = order_iter.next() {
-                attempt_no += 1;
-                inflight.push(attempt(idx, attempt_no));
+            // Seed up to CHUNK_PEER_PARALLELISM peers from the start
+            // so the chunk's race is wide immediately rather than
+            // depending on the preempt timer to fan out gradually.
+            for _ in 0..CHUNK_PEER_PARALLELISM {
+                if let Some(idx) = order_iter.next() {
+                    attempt_no += 1;
+                    inflight.push(attempt(idx, attempt_no));
+                } else {
+                    break;
+                }
             }
 
             // Two outer rounds: if every peer reports Overdraft on the first
