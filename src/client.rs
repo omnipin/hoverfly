@@ -1822,6 +1822,10 @@ async fn open_session_pool(
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                 });
+                if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
+                    info!(target: "isheika::upload",
+                        "pool fill: {}/{} sessions open", sessions.len(), max_sessions);
+                }
                 if sessions.len() >= max_sessions {
                     break;
                 }
@@ -1843,6 +1847,9 @@ async fn open_session_pool(
             dialing.push(dial(overlay, overlay_hex, underlay));
         }
     }
+    info!(target: "isheika::upload",
+        "pool fill: done with {} session(s) ({} requested)",
+        sessions.len(), max_sessions);
     Ok(sessions)
 }
 
