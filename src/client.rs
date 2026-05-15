@@ -1445,9 +1445,23 @@ pub(crate) async fn push_chunks_with_pool(
                             }
                         }
                         // Top up the in-flight window with the next-closest peer.
-                        if let Some(idx) = order_iter.next() {
-                            attempt_no += 1;
-                            inflight.push(attempt(idx, attempt_no));
+                        match order_iter.next() {
+                            Some(idx) => {
+                                attempt_no += 1;
+                                inflight.push(attempt(idx, attempt_no));
+                            }
+                            // Order exhausted *and* inflight is empty:
+                            // there's nothing left to wait on. Bail out
+                            // of the inner loop so the fallback paths
+                            // (shallow-accept, retry-with-refresh) can
+                            // run. Without this we'd spin forever on
+                            // the preempt timer arm whose
+                            // `inflight.len() < CHUNK_PEER_PARALLELISM`
+                            // condition stays true once inflight is empty
+                            // — the `else` arm never fires while sleep
+                            // is enabled.
+                            None if inflight.is_empty() => break,
+                            None => {}
                         }
                         // Reset preempt timer: we just observed activity, so
                         // start the next PREEMPT_INTERVAL countdown fresh.
@@ -1457,12 +1471,21 @@ pub(crate) async fn push_chunks_with_pool(
                     _ = sleep.as_mut(), if inflight.len() < CHUNK_PEER_PARALLELISM => {
                         // Preemptive fanout: closest peer hasn't returned within
                         // `PREEMPT_INTERVAL`, so race another peer in parallel.
-                        if let Some(idx) = order_iter.next() {
-                            attempt_no += 1;
-                            inflight.push(attempt(idx, attempt_no));
+                        match order_iter.next() {
+                            Some(idx) => {
+                                attempt_no += 1;
+                                inflight.push(attempt(idx, attempt_no));
+                                sleep = Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
+                            }
+                            // No more peers and nothing in flight — exit
+                            // so the post-loop fallback can decide
+                            // whether to accept a shallow receipt or
+                            // surface the error.
+                            None if inflight.is_empty() => break,
+                            None => {
+                                sleep = Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
+                            }
                         }
-                        // Restart preempt countdown.
-                        sleep = Box::pin(tokio::time::sleep(PREEMPT_INTERVAL));
                     }
 
                     else => break,
@@ -1542,28 +1565,26 @@ pub(crate) async fn push_chunks_with_pool(
                 }
             }
 
-            // If the only thing the pool produced is shallow receipts
-            // (no real network errors, no overdrafts left to refresh),
-            // accept the deepest one and move on. The chunk *did* get
-            // forwarded into the network — every peer that signed a
-            // shallow receipt acked the push at some hop, the receipt
-            // just doesn't prove durable AOR storage. Bee's pushsync
-            // takes the same way out via `maxPushErrors` once errSkip
-            // has burned through the candidate list. Failing the whole
-            // upload because our pool happened to lack a high-PO peer
-            // for one of 3 000 random chunk addresses is much worse
-            // than a slightly-weaker receipt for ~1% of chunks.
-            if errors == 0 && shallows > 0 {
-                if let Some((po, _r)) = best_shallow {
-                    let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                    if let Some(p) = &progress {
-                        p(done, total);
-                    }
-                    warn!(target: "isheika::upload",
-                        "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft)",
-                        hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts);
-                    return Ok::<_, ClientError>(());
+            // If we've seen at least one shallow receipt and we've
+            // walked the full candidate list, accept the deepest
+            // shallow rather than failing the whole upload. The chunk
+            // *did* get forwarded into the network — every peer that
+            // signed a shallow receipt acked the push at some hop, the
+            // receipt just doesn't prove durable AOR storage. Bee's
+            // pushsync takes the same way out via `maxPushErrors` once
+            // errSkip has burned through the candidate list. We accept
+            // even when intermixed timeouts happened: missing the
+            // "strictly best" peer for one of 3 000 random chunks is
+            // not worth aborting the whole upload.
+            if let Some((po, _r)) = best_shallow {
+                let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                if let Some(p) = &progress {
+                    p(done, total);
                 }
+                warn!(target: "isheika::upload",
+                    "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft / {} err)",
+                    hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts, errors);
+                return Ok::<_, ClientError>(());
             }
 
             Err(ClientError::NoPeers(format!(
