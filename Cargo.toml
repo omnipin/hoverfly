@@ -48,6 +48,7 @@ serde_json = "1"
 sha3 = "0.10"
 hex = "0.4"
 bytes = "1"
+mime_guess = { version = "2", default-features = false }
 
 # Errors / logging
 thiserror = "1"

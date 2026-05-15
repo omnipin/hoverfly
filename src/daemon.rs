@@ -435,7 +435,7 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         }
         let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
-        let content_type = crate::mime::guess_from_path(&path).map(str::to_string);
+        let content_type = crate::mime::guess_from_path(&path);
         out.push(UploadFile { path, content_type, data });
     }
     Ok(out)

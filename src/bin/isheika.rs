@@ -282,7 +282,7 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         }
         let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
-        let content_type = guess_content_type(&path).map(str::to_string);
+        let content_type = guess_content_type(&path);
         out.push(UploadFile { path, content_type, data });
     }
     Ok(out)
@@ -300,7 +300,7 @@ fn root_hex_to_cid(root_hex: &str) -> Option<String> {
     Some(isheika::cid::reference_to_cid(&arr))
 }
 
-fn guess_content_type(path: &str) -> Option<&'static str> {
+fn guess_content_type(path: &str) -> Option<String> {
     isheika::mime::guess_from_path(path)
 }
 
@@ -550,7 +550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(str::to_string)
                         .unwrap_or_else(|| "file".to_string())
                 });
-                let ct = content_type.or_else(|| guess_content_type(&path).map(str::to_string));
+                let ct = content_type.or_else(|| guess_content_type(&path));
                 let root = upload_file_with_manifest_ex(
                     &transport,
                     &peers,
