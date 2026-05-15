@@ -1104,6 +1104,13 @@ struct SessionEntry {
     /// is already in flight (so we don't queue two for the same entry).
     pending: std::sync::Mutex<Option<PeerSession>>,
     prewarm_inflight: std::sync::atomic::AtomicBool,
+    /// Unix-seconds timestamp before which this entry is considered
+    /// "dead" and skipped by the dispatcher. Set after a hard rotation
+    /// failure (peer's connection drops + redial errors). Prevents the
+    /// thundering-herd pattern where every chunk independently picks
+    /// the same dead peer from its proximity-sorted candidate list and
+    /// burns a dial-timeout in turn. Default `0` = always-live.
+    skip_until_unix: std::sync::atomic::AtomicU64,
 }
 
 impl SessionEntry {
@@ -1130,7 +1137,28 @@ impl SessionEntry {
         let mut guard = self.pending.lock().expect("pending mutex poisoned");
         *guard = Some(session);
     }
+
+    /// True if the dispatcher should skip this entry for chunks
+    /// dispatched right now (peer has been seen to fail recently).
+    fn is_dead(&self) -> bool {
+        let deadline = self.skip_until_unix.load(std::sync::atomic::Ordering::Relaxed);
+        deadline > crate::peers::now_unix()
+    }
+
+    /// Mark this entry as dead for `secs` seconds. Subsequent chunks
+    /// skip it during proximity ordering.
+    fn mark_dead(&self, secs: u64) {
+        let until = crate::peers::now_unix().saturating_add(secs);
+        self.skip_until_unix.store(until, std::sync::atomic::Ordering::Relaxed);
+    }
 }
+
+/// How long to skip a session after it returns a hard error (dial
+/// fail / protocol-negotiation reset / closed connection during
+/// rotation). Long enough that pending chunks don't all immediately
+/// re-pick the same dead peer; short enough that a transiently
+/// overloaded peer comes back into rotation reasonably fast.
+const DEAD_SKIP_SECS: u64 = 30;
 
 const PREWARM_GHOST_BALANCE_PLUR: u64 =
     GHOST_BALANCE_LIMIT_PLUR * GHOST_BALANCE_PREWARM_NUMERATOR / GHOST_BALANCE_PREWARM_DENOMINATOR;
@@ -1256,8 +1284,13 @@ pub(crate) async fn push_chunks_with_pool(
             // Rank sessions by proximity to this chunk's address; closest
             // first. bee at that peer is then either inside its area of
             // responsibility (stores directly) or only a short hop away.
+            // Skip entries currently flagged dead by a recent hard
+            // failure — the dispatcher's per-chunk thundering-herd on a
+            // single broken peer dominates the warning noise on
+            // mainnet.
             let chunk_addr = SwarmAddress::new(chunk.addr);
-            let mut order: Vec<usize> = (0..pool.len()).collect();
+            let mut order: Vec<usize> =
+                (0..pool.len()).filter(|i| !pool[*i].is_dead()).collect();
             order.sort_by(|&a, &b| {
                 let pa = chunk_addr.proximity(&pool[a].overlay);
                 let pb = chunk_addr.proximity(&pool[b].overlay);
@@ -1608,12 +1641,25 @@ async fn try_push_with_rotation(
                         "rotated to pre-warmed session for {}", entry.overlay_hex);
                     s
                 }
-                None => {
-                    let s = transport.open_session(&entry.underlay).await?;
-                    debug!(target: "isheika::upload",
-                        "rotated session to {} (sync dial)", entry.overlay_hex);
-                    s
-                }
+                None => match transport.open_session(&entry.underlay).await {
+                    Ok(s) => {
+                        debug!(target: "isheika::upload",
+                            "rotated session to {} (sync dial)", entry.overlay_hex);
+                        s
+                    }
+                    Err(e) => {
+                        // Hard re-dial failure: the peer's bee is gone /
+                        // refusing / blocklisting us. Park the entry so
+                        // the next batch of chunks won't independently
+                        // pick it from their proximity-sorted list and
+                        // burn the same dial timeout in turn.
+                        entry.mark_dead(DEAD_SKIP_SECS);
+                        debug!(target: "isheika::upload",
+                            "marked {} dead for {DEAD_SKIP_SECS}s after dial failure",
+                            entry.overlay_hex);
+                        return Err(e);
+                    }
+                },
             };
             entry.replace(fresh.clone());
             fresh
@@ -1774,6 +1820,7 @@ async fn open_session_pool(
                     session: std::sync::Mutex::new(session),
                     pending: std::sync::Mutex::new(None),
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
+                    skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                 });
                 if sessions.len() >= max_sessions {
                     break;
