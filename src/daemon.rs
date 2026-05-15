@@ -305,6 +305,14 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
             if files.is_empty() {
                 return Err(ClientError::File("tar archive contains no regular files".into()));
             }
+            // Default the website index to `index.html` for tar
+            // collections — that's what a static site build expects.
+            // An explicit empty string opts out.
+            let index_doc = r
+                .index_document
+                .as_deref()
+                .map(|s| if s.is_empty() { None } else { Some(s) })
+                .unwrap_or(Some("index.html"));
             upload_collection(
                 &state.transport,
                 &*peers_guard,
@@ -312,7 +320,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 &r.batch,
                 r.depth,
                 files,
-                r.index_document.as_deref(),
+                index_doc,
                 r.error_document.as_deref(),
                 r.max_retries,
                 r.concurrency,

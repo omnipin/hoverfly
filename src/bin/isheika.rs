@@ -196,19 +196,23 @@ enum Commands {
         /// Treat the input as a tar archive (bee's `application/x-tar`
         /// collection upload): unpack and upload each regular file as its
         /// own entry in a multi-entry mantaray, addressable individually.
-        /// Auto-enabled for `*.tar` and `application/x-tar`.
+        /// Auto-enabled for `*.tar`. Pass to force collection mode on
+        /// inputs without a `.tar` extension.
         #[arg(long)]
         collection: bool,
 
-        /// (Collection only) Filename served when the root manifest is
+        /// (Collection mode) Filename served when the root manifest is
         /// fetched without a sub-path. Equivalent to bee's
-        /// `Swarm-Index-Document` header. Typically `index.html`.
-        #[arg(long, value_name = "FILE", requires = "collection")]
+        /// `Swarm-Index-Document` header. Defaults to `index.html` when
+        /// running in collection mode; pass `--index-document ""` to
+        /// disable. Ignored for non-collection uploads.
+        #[arg(long, value_name = "FILE")]
         index_document: Option<String>,
 
-        /// (Collection only) Filename served on lookups that miss.
-        /// Equivalent to bee's `Swarm-Error-Document` header.
-        #[arg(long, value_name = "FILE", requires = "collection")]
+        /// (Collection mode) Filename served on lookups that miss.
+        /// Equivalent to bee's `Swarm-Error-Document` header. Ignored
+        /// for non-collection uploads.
+        #[arg(long, value_name = "FILE")]
         error_document: Option<String>,
 
         /// Connect to a running daemon instead of executing the upload
@@ -537,6 +541,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let n_files = files.len();
                 let total: usize = files.iter().map(|f| f.data.len()).sum();
+                // Default the website index to `index.html`. An empty
+                // string explicitly opts out (no root entry written).
+                let index_doc = index_document
+                    .as_deref()
+                    .map(|s| if s.is_empty() { None } else { Some(s) })
+                    .unwrap_or(Some("index.html"));
                 let progress = make_progress_bar();
                 let root = upload_collection(
                     &transport,
@@ -545,7 +555,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &batch,
                     depth,
                     files,
-                    index_document.as_deref(),
+                    index_doc,
                     error_document.as_deref(),
                     max_retries,
                     concurrency,
