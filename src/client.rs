@@ -1272,24 +1272,28 @@ pub(crate) async fn push_chunks_with_pool(
     let total = work.len();
     let pushed = Arc::new(AtomicUsize::new(0));
 
-    // Per-chunk dispatch walks sessions in descending-proximity order
-    // and re-tries on shallow / overdraft. Sustained throughput needs
-    // many chunks in flight at once: each push is an RTT to bee plus
-    // bee's internal forwarding cost (~300 ms-2 s), so a buffer of
-    // `pool × 16` keeps every session busy while shallow retries on
-    // one chunk burn another peer in parallel. Capped at `total` so we
-    // don't allocate for nothing on small uploads.
-    let buffer = pool.len().saturating_mul(16).max(pool.len()).min(total);
+    // Sized to match bee's pusher `ConcurrentPushes = swarm.Branches = 128`
+    // at workflow level. A wider buffer doesn't help once we're past the
+    // number of pushes the session pool can run truly in parallel —
+    // extra in-flight chunks just contend on the per-session accounting
+    // mutex (try_reserve serialises) and inflate dispatcher overhead.
+    // Earlier `pool × 16` produced 1.5 k+ attempts in flight on a
+    // 32-peer pool and turned 6 chunks/s into 0.1 chunks/s.
+    let buffer = 128usize.min(total).max(pool.len());
 
-    // Per-chunk parallelism (matches bee's `pushsync.maxMultiplexForwards`
-    // + `preemptiveInterval`): start with the closest peer, then every
-    // `PREEMPT_INTERVAL` fire another push to the next-closest peer in
-    // parallel, returning on the first valid receipt.
-    const CHUNK_PEER_PARALLELISM: usize = 3;
-    // Shorter than bee's 5s — bee tunes for inter-node forwarding RTTs;
-    // our pushes are a single hop from the client and a stuck peer at
-    // 2.5s usually means a dead path, not a slow forwarder.
-    const PREEMPT_INTERVAL: Duration = Duration::from_millis(2500);
+    // No per-chunk peer racing. Shallow-receipt detection already
+    // retries on the next peer when a push hits a forwarder rather than
+    // an AOR storer, so the preemptive 3-way race was redundant — it
+    // tripled session-mutex pressure and made the tail slower, not
+    // faster. One attempt at a time per chunk; advance to the next
+    // proximity-sorted peer as soon as the current one returns
+    // shallow/overdraft/error.
+    const CHUNK_PEER_PARALLELISM: usize = 1;
+    // Preempt timer fires when no in-flight attempt has come back yet.
+    // With per-op timeout at the user's `--timeout` (default 10 s, the
+    // VPS tests used 4 s) we want preempt > timeout so it never fires
+    // — the timeout itself is the failover.
+    const PREEMPT_INTERVAL: Duration = Duration::from_secs(30);
 
     let dispatch = |chunk: StampedChunk| {
         let pool = pool.clone();
