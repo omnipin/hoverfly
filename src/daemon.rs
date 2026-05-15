@@ -316,6 +316,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 r.error_document.as_deref(),
                 r.max_retries,
                 r.concurrency,
+                None,
             )
             .await?
         } else {

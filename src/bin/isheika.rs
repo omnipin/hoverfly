@@ -4,11 +4,14 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use std::sync::Arc;
+
 use clap::{Parser, Subcommand};
+use indicatif::{ProgressBar, ProgressStyle};
 use isheika::client::{
     fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex, upload_collection,
-    upload_file_with_manifest_ex, DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY,
-    DEFAULT_UPLOAD_CONCURRENCY,
+    upload_file_with_manifest_ex, ProgressFn, DEFAULT_DISCOVER_CONCURRENCY,
+    DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
 };
 use isheika::client::discover_recursive_with_concurrency;
 use isheika::{
@@ -288,6 +291,44 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
     Ok(out)
 }
 
+/// Build a CLI-side `indicatif` progress bar wrapped in a [`ProgressFn`]
+/// callback the library can call after each successful chunk push.
+///
+/// Returns `None` when stdout isn't a TTY (piping / redirecting to file)
+/// so we don't pollute log captures with terminal escape codes; the
+/// library then falls back to the existing tracing `pushed N/M chunks`
+/// lines, which work fine in log files.
+///
+/// The bar's length starts at 0 because the library only knows the
+/// final chunk count after stamping. The first callback invocation
+/// resizes via `set_length`. The bar finalises itself the moment
+/// `done == total`, then the closure's `ProgressBar` clone is dropped
+/// when the caller releases the `ProgressFn` Arc.
+fn make_progress_bar() -> Option<ProgressFn> {
+    let pb = ProgressBar::new(0);
+    if pb.is_hidden() {
+        return None;
+    }
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  pushing {bar:40.cyan/blue} {pos}/{len} chunks  ({percent}%, eta {eta})",
+        )
+        .ok()?
+        .progress_chars("##-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(250));
+    let cb: ProgressFn = Arc::new(move |done: usize, total: usize| {
+        if pb.length() != Some(total as u64) {
+            pb.set_length(total as u64);
+        }
+        pb.set_position(done as u64);
+        if done >= total {
+            pb.finish_and_clear();
+        }
+    });
+    Some(cb)
+}
+
 /// Convert a 64-char hex Swarm reference to a multibase-encoded CIDv1
 /// (`b...` lowercase base32). Returns `None` on malformed input.
 fn root_hex_to_cid(root_hex: &str) -> Option<String> {
@@ -496,6 +537,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let n_files = files.len();
                 let total: usize = files.iter().map(|f| f.data.len()).sum();
+                let progress = make_progress_bar();
                 let root = upload_collection(
                     &transport,
                     &peers,
@@ -507,8 +549,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     error_document.as_deref(),
                     max_retries,
                     concurrency,
+                    progress.as_ref(),
                 )
                 .await?;
+                drop(progress);
                 let root_hex = hex::encode(root.as_bytes());
                 println!(
                     "uploaded {} files ({} bytes) — manifest root: {}",
@@ -527,6 +571,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             let data = std::fs::read(&file)?;
             if raw {
+                let progress = make_progress_bar();
                 let root = upload_bytes_ex(
                     &transport,
                     &peers,
@@ -536,8 +581,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &data,
                     max_retries,
                     concurrency,
+                    progress.as_ref(),
                 )
                 .await?;
+                drop(progress);
                 let root_hex = hex::encode(root.as_bytes());
                 println!("uploaded {} bytes — root (raw): {}", data.len(), root_hex);
                 if let Some(c) = root_hex_to_cid(&root_hex) {
@@ -551,6 +598,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .unwrap_or_else(|| "file".to_string())
                 });
                 let ct = content_type.or_else(|| guess_content_type(&path));
+                let progress = make_progress_bar();
                 let root = upload_file_with_manifest_ex(
                     &transport,
                     &peers,
@@ -562,8 +610,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     ct.as_deref(),
                     max_retries,
                     concurrency,
+                    progress.as_ref(),
                 )
                 .await?;
+                drop(progress);
                 let display_ct = ct.as_deref().unwrap_or("-");
                 let root_hex = hex::encode(root.as_bytes());
                 println!(

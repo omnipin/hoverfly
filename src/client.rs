@@ -80,6 +80,14 @@ pub const DEFAULT_FETCH_CONCURRENCY: usize = 5;
 /// avoids 70-peer-round-2 dial chains taking `70 × wait` seconds.
 pub const DEFAULT_DISCOVER_CONCURRENCY: usize = 16;
 
+/// Callback invoked by the upload pipeline after each successful push.
+/// Arguments are `(done, total)`. Cheap clone (`Arc`) so the same hook
+/// can be shared across multiple concurrent uploads. Library is decoupled
+/// from any specific UI: the CLI wires an `indicatif` progress bar in
+/// here; programmatic users can plug in metrics counters / channels /
+/// whatever they like.
+pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
+
 /// A `ChunkGet` adapter that routes requests through libp2p retrieval to the
 /// closest peers in a peerlist. Up to `concurrency` requests are raced in
 /// parallel; whichever peer responds first with a valid chunk wins, and
@@ -692,6 +700,7 @@ pub async fn upload_file_with_manifest(
         content_type,
         max_retries_per_chunk,
         DEFAULT_UPLOAD_CONCURRENCY,
+        None,
     )
     .await
 }
@@ -724,6 +733,7 @@ pub async fn upload_collection(
     error_document: Option<&str>,
     max_retries_per_chunk: usize,
     concurrency: usize,
+    progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     use crate::manifest::CollectionEntry;
 
@@ -793,7 +803,7 @@ pub async fn upload_collection(
 
     // 4. Stamp in parallel, then push everything concurrently.
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
+    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
     Ok(manifest_root)
 }
 
@@ -809,11 +819,12 @@ pub async fn upload_file_with_manifest_ex(
     content_type: Option<&str>,
     max_retries_per_chunk: usize,
     concurrency: usize,
+    progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     let (manifest_root, work) = prepare_upload_file_with_manifest(
         signer, batch_id_hex, depth, data, path, content_type,
     )?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
+    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
     Ok(manifest_root)
 }
 
@@ -837,7 +848,7 @@ pub async fn upload_file_with_manifest_with_pool(
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
+    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk, None).await?;
     Ok(manifest_root)
 }
 
@@ -1004,6 +1015,7 @@ pub async fn upload_bytes(
         data,
         max_retries_per_chunk,
         DEFAULT_UPLOAD_CONCURRENCY,
+        None,
     )
     .await
 }
@@ -1018,9 +1030,10 @@ pub async fn upload_bytes_ex(
     data: &[u8],
     max_retries_per_chunk: usize,
     concurrency: usize,
+    progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency).await?;
+    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
     Ok(root)
 }
 
@@ -1041,7 +1054,7 @@ pub async fn upload_bytes_with_pool(
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk).await?;
+    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk, None).await?;
     Ok(root)
 }
 
@@ -1214,6 +1227,7 @@ async fn push_chunks_concurrent(
     work: Vec<StampedChunk>,
     max_retries: usize,
     concurrency: usize,
+    progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
     if work.is_empty() {
         return Ok(());
@@ -1231,7 +1245,7 @@ async fn push_chunks_concurrent(
         pool.len(),
         work.len()
     );
-    push_chunks_with_pool(transport, &pool, work, max_retries).await
+    push_chunks_with_pool(transport, &pool, work, max_retries, progress).await
 }
 
 /// Push `work` through an existing pool. Used by the daemon to amortise
@@ -1242,6 +1256,7 @@ pub(crate) async fn push_chunks_with_pool(
     session_pool: &SessionPool,
     work: Vec<StampedChunk>,
     max_retries: usize,
+    progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1280,6 +1295,7 @@ pub(crate) async fn push_chunks_with_pool(
         let pool = pool.clone();
         let pushed = pushed.clone();
         let transport = transport;
+        let progress = progress.cloned();
         // Wrap the chunk in Arc once per dispatch so preemptive retries
         // share its (potentially 4 KiB) wire bytes instead of cloning
         // per attempt.
@@ -1365,6 +1381,9 @@ pub(crate) async fn push_chunks_with_pool(
                         match outcome {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Some(p) = &progress {
+                                    p(done, total);
+                                }
                                 if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
@@ -1456,6 +1475,9 @@ pub(crate) async fn push_chunks_with_pool(
                         match try_push_with_rotation(entry, &chunk, price, transport).await {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Some(p) = &progress {
+                                    p(done, total);
+                                }
                                 if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
@@ -1483,6 +1505,9 @@ pub(crate) async fn push_chunks_with_pool(
                         match try_push_with_rotation(entry, &chunk, price, transport).await {
                             Ok(PushOutcome::Receipt(_)) => {
                                 let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                                if let Some(p) = &progress {
+                                    p(done, total);
+                                }
                                 if done % 25 == 0 || done == total {
                                     info!(target: "isheika::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
