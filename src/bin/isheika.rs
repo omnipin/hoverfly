@@ -896,7 +896,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 content_type: content_type.clone(),
                 worker_binary,
             };
-            let root = isheika::multiwork::coordinator::run(coord_cfg, cfg).await?;
+            let progress = make_progress_bar();
+            let root =
+                isheika::multiwork::coordinator::run(coord_cfg, cfg, progress.clone()).await?;
+            drop(progress);
             let root_hex = hex::encode(root.as_bytes());
             let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
             println!(

@@ -29,7 +29,7 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::client::{
-    prepare_upload_bytes, prepare_upload_file_with_manifest, StampedChunk,
+    prepare_upload_bytes, prepare_upload_file_with_manifest, ProgressFn, StampedChunk,
 };
 use crate::multiwork::protocol::{
     read_frame, write_frame, ChunkOutcome, Request, Response, PROTOCOL_VERSION,
@@ -102,9 +102,14 @@ pub struct CoordinatorConfig {
 
 /// Run a multi-worker upload to completion. Returns the manifest root
 /// (or BMT root for `--raw` uploads).
+///
+/// `progress`, if provided, is called as `(pushed_so_far, total)`
+/// on every successful or shallow chunk. Same shape as the regular
+/// upload's progress callback so the CLI can reuse its indicatif bar.
 pub async fn run(
     cfg: CoordinatorConfig,
     transport_cfg: TransportConfig,
+    progress: Option<ProgressFn>,
 ) -> Result<ChunkAddress, CoordinatorError> {
     // 1. Read file, BMT-split, stamp every chunk upfront (data +
     //    manifest in one pass when applicable). Stamping uses the
@@ -141,7 +146,7 @@ pub async fn run(
         "{} worker(s) ready", workers.len());
 
     // 3. Distribute + retry.
-    let failed = distribute(workers, work, &cfg, total).await?;
+    let failed = distribute(workers, work, &cfg, total, progress).await?;
     if !failed.is_empty() {
         let (sample_addr, sample_err) = failed
             .first()
@@ -290,6 +295,7 @@ async fn distribute(
     work: Vec<StampedChunk>,
     cfg: &CoordinatorConfig,
     total: usize,
+    progress: Option<ProgressFn>,
 ) -> Result<Vec<([u8; 32], String)>, CoordinatorError> {
     // Shared state across worker tasks:
     let queue: Arc<Mutex<VecDeque<StampedChunk>>> = Arc::new(Mutex::new(VecDeque::from(work)));
@@ -333,9 +339,20 @@ async fn distribute(
         let pushed = pushed.clone();
         let batch_size = cfg.batch_size;
         let max_retries = cfg.max_cross_worker_retries;
+        let progress = progress.clone();
         worker_tasks.push(tokio::spawn(async move {
-            worker_loop(handle, queue, retry_count, failed, pushed, batch_size, max_retries)
-                .await
+            worker_loop(
+                handle,
+                queue,
+                retry_count,
+                failed,
+                pushed,
+                batch_size,
+                max_retries,
+                total,
+                progress,
+            )
+            .await
         }));
     }
 
@@ -385,8 +402,21 @@ async fn worker_loop(
     pushed: Arc<AtomicUsize>,
     batch_size: usize,
     max_cross_worker_retries: usize,
+    total: usize,
+    progress: Option<ProgressFn>,
 ) -> Result<(), CoordinatorError> {
     let worker_id = handle.id;
+    // Helper: re-queue all chunks in `batch` at the front of the work
+    // queue (so the next idle worker picks them up immediately, before
+    // any chunks that were popped after this one). Used on worker IO
+    // failure where we don't know if any of the batch was processed.
+    let requeue_front = |queue: &Arc<Mutex<VecDeque<StampedChunk>>>, batch: Vec<StampedChunk>| {
+        let mut q = queue.lock().unwrap();
+        // Push back in reverse so the original order is preserved.
+        for chunk in batch.into_iter().rev() {
+            q.push_front(chunk);
+        }
+    };
     loop {
         // Pop up to batch_size chunks. Holding the std mutex across
         // `drain` is fine — it's an in-memory operation.
@@ -408,22 +438,60 @@ async fn worker_loop(
 
         debug!(target: "isheika::coordinator",
             "worker {worker_id}: PushBatch x{}", batch.len());
-        write_frame(&mut handle.stream, &Request::PushBatch { chunks: batch.clone() })
-            .await
-            .map_err(|_| CoordinatorError::WorkerDisconnected { id: worker_id })?;
-        let resp = read_frame::<Response>(&mut handle.stream)
-            .await
-            .map_err(|_| CoordinatorError::WorkerDisconnected { id: worker_id })?;
+        // If the worker disconnects mid-conversation, re-queue the
+        // entire batch onto the front of the work queue so a
+        // surviving worker picks it up immediately. Cross-worker
+        // retry counts are NOT incremented here: from the
+        // coordinator's POV none of these chunks were attempted (we
+        // never saw a BatchDone for them).
+        if let Err(e) = write_frame(
+            &mut handle.stream,
+            &Request::PushBatch { chunks: batch.clone() },
+        )
+        .await
+        {
+            warn!(target: "isheika::coordinator",
+                "worker {worker_id}: PushBatch write failed ({e}); re-queueing {} chunks",
+                batch.len());
+            requeue_front(&queue, batch);
+            return Err(CoordinatorError::WorkerDisconnected { id: worker_id });
+        }
+        let resp = match read_frame::<Response>(&mut handle.stream).await {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "isheika::coordinator",
+                    "worker {worker_id}: BatchDone read failed ({e}); re-queueing {} chunks",
+                    batch.len());
+                requeue_front(&queue, batch);
+                return Err(CoordinatorError::WorkerDisconnected { id: worker_id });
+            }
+        };
         let results = match resp {
             Some(Response::BatchDone { results }) => results,
             Some(Response::ProtocolError { message }) => {
+                warn!(target: "isheika::coordinator",
+                    "worker {worker_id}: ProtocolError ({message}); re-queueing {} chunks",
+                    batch.len());
+                requeue_front(&queue, batch);
                 return Err(CoordinatorError::HandshakeFailed {
                     id: worker_id,
                     msg: message,
                 });
             }
-            Some(_) => return Err(CoordinatorError::UnexpectedResponse { id: worker_id }),
-            None => return Err(CoordinatorError::WorkerDisconnected { id: worker_id }),
+            Some(_) => {
+                warn!(target: "isheika::coordinator",
+                    "worker {worker_id}: unexpected response; re-queueing {} chunks",
+                    batch.len());
+                requeue_front(&queue, batch);
+                return Err(CoordinatorError::UnexpectedResponse { id: worker_id });
+            }
+            None => {
+                warn!(target: "isheika::coordinator",
+                    "worker {worker_id}: disconnected; re-queueing {} chunks",
+                    batch.len());
+                requeue_front(&queue, batch);
+                return Err(CoordinatorError::WorkerDisconnected { id: worker_id });
+            }
         };
 
         // Build an index from the batch we sent so we can re-queue
@@ -434,7 +502,10 @@ async fn worker_loop(
         for r in results {
             match r.outcome {
                 ChunkOutcome::Ok | ChunkOutcome::Shallow => {
-                    pushed.fetch_add(1, Ordering::Relaxed);
+                    let now = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                    if let Some(p) = progress.as_ref() {
+                        p(now, total);
+                    }
                 }
                 ChunkOutcome::Failed { error } => {
                     let attempts = {
