@@ -2121,6 +2121,49 @@ async fn open_session_pool(
         return Err(ClientError::NoPeers("peerlist empty".into()));
     }
 
+    // ISHEIKA_CONNECTIONS_PER_PEER (default 1) replicates each
+    // candidate M times in the dial list, so up to M successful dials
+    // become M independent `SessionEntry`s pointing at the same peer.
+    // Each entry owns its own libp2p connection (its own yamux pipe),
+    // so per-chunk dispatchers and pushers see them as independent
+    // sessions with independent flow control.
+    //
+    // Pool size (`max_sessions` ≈ user's `--concurrency`) is unchanged
+    // — it splits between unique peers and connections-per-peer
+    // rather than multiplying. With `M=2`, a 128-session pool covers
+    // ~64 unique peers with 2 connections each (peer-side accounting
+    // is per overlay, so bee treats all M as one logical client with
+    // a fresh per-connection yamux pipe each).
+    //
+    // The motivation is the buffer-scaling negative result
+    // (`ISHEIKA_BUFFER_MULT`): per-connection yamux flow control is
+    // the throughput wall once stream_pool's substream-open
+    // parallelism is unlocked. Each additional connection adds
+    // an independent yamux pipe to the same peer, so push attempts
+    // can actually run in parallel on a per-peer basis.
+    let conn_per_peer: usize = std::env::var("ISHEIKA_CONNECTIONS_PER_PEER")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1);
+    let candidates = if conn_per_peer > 1 {
+        // Interleave rounds: [A, B, C, A, B, C, …] not [A, A, B, B, C, C, …]
+        // so peer A's second dial doesn't race its own first dial
+        // through the initial `SESSION_DIAL_PARALLELISM` window.
+        let mut expanded = Vec::with_capacity(candidates.len() * conn_per_peer);
+        for _ in 0..conn_per_peer {
+            for e in &candidates {
+                expanded.push(e.clone());
+            }
+        }
+        debug!(target: "isheika::upload",
+            "multi-connection pool fill: {} unique peers x {} conns/peer = {} dial candidates",
+            candidates.len(), conn_per_peer, expanded.len());
+        expanded
+    } else {
+        candidates
+    };
+
     let dial_parallelism = SESSION_DIAL_PARALLELISM.max(max_sessions);
     let mut iter = candidates.into_iter();
     let mut dialing = FuturesUnordered::new();
