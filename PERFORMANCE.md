@@ -256,23 +256,47 @@ discipline, and graceful failure handling.
   fastest signal that a random-content upload will stall: that's
   the slowest-chunk neighborhood.
 
+## Empirical ceilings
+
+These numbers are *measurements*, not theoretical floors. They move
+as the code and the peerlist change; treat them as the working floor
+at a given configuration.
+
+| Configuration | Throughput (mainnet, novel random content) |
+|---|---|
+| Residential Mac, racing-only, ~222-peer peerlist (commit `5741cf9`) | ~75 KiB/s |
+| Residential Mac, racing + stream_pool patch, 222 peers (commit `1769220`) | ~133 KiB/s |
+| VPS, racing-only, 340 peers (commit `5741cf9`) | ~152 KiB/s |
+| VPS, racing + stream_pool patch + 3335 peers (5-round discover) | **~335 KiB/s** |
+
+The earliest version of this doc claimed "~150 KiB/s is the protocol
+floor". That claim was wrong; it was a measurement at one
+configuration, not a ceiling. The right framing is: **throughput is
+gated by peerlist coverage of the chunk address space, by the rate
+at which we can negotiate fresh substream upgrades per connection,
+and by bee mainnet's forwarding latency for chunks bee doesn't have
+cached** — in roughly that order of impact based on what we've
+measured. Of those three, the first two are addressable in this
+client; the third is mainnet's reality.
+
 ## Known limits (not bugs)
 
-- **Bee mainnet forwarding RTT** is the floor on novel-chunk upload
-  speed. ~200-800 ms per chunk per hop is normal, more on long PO
-  chains. At pool size 128 with buffer 128 that gives a theoretical
-  ceiling of ~1 MB/s; empirically we see 70-120 KB/s on residential,
-  ~120 KB/s on a Fedora VPS to mainnet. The protocol is the
-  bottleneck, not the client.
+- **Bee mainnet forwarding RTT** is the per-chunk floor. ~200-800 ms
+  per chunk per hop is normal, more on long PO chains. The theoretical
+  ceiling with pool size 128, buffer 128, and per-chunk RTT around
+  500 ms is ~1 MB/s; we now reach ~1/3 of that with the right peerlist.
+  The rest is reachable but needs the levers in the "Further work"
+  section below.
 - **Bee dedup masks performance.** Re-uploading the same bytes hits
   bee's "is within AOR" short-circuit (`pushsync.go:295`) without
   forwarding. Always test with freshly-randomised content; a re-run
   of an earlier upload tells you nothing about real throughput.
-- **Peerlist coverage of the address space** is the floor on
-  random-content upload speed. A chunk whose address lands in a PO
-  bin with <5 peers in your store will stall, no matter how many
-  sessions you open. Fix is `discover --rounds 3+` to broaden the
-  store, not code changes.
+- **Peerlist coverage of the address space** is the dominant single
+  lever for random-content uploads. A chunk whose address lands in a
+  PO bin with <5 peers in your store will stall, no matter how many
+  sessions you open. Going from `--rounds 3` (~340 peers on the VPS)
+  to `--rounds 5` (~3300 peers) more than doubled throughput in
+  measurement; this is the biggest single-knob improvement available.
 - **`--max-retries` is silently capped.** `client.rs:1372`:
   `cap = max_retries.max(1).min(order.len())`. `0` is promoted to
   `1`; the value is capped by the live (non-parked) pool size, so on
@@ -286,3 +310,26 @@ discipline, and graceful failure handling.
   blocked on re-measuring whether the per-session accounting
   contention from the earlier `pool × 16` experiment still
   applies after the timeout-doesn't-retire fix.
+
+## Further work (unblocked, ordered by expected impact)
+
+1. **`MAX_CONCURRENT_OUTBOUND_UPGRADES` tuning**
+   (`src/protocols/stream_pool/handler.rs`). Profile after the
+   stream_pool patch showed per-push latency went up because yamux
+   flow control kicks in when many substreams send concurrently over
+   one connection. The current 64 cap was conservative; 16-32 may
+   trade open-parallelism for less yamux contention and net out
+   higher. One-constant change, easy to A/B.
+2. **Multiple connections per peer.** Each libp2p connection has its
+   own yamux pipe (independent flow control) and its own
+   ConnectionHandler (additional `pending_upgrades` slots from the
+   stream_pool patch). Two connections per peer in a 128-session pool
+   doubles independent yamux channels without adding peers. Cost:
+   handshake + pricing on each extra connection, paid once per
+   session lifetime.
+3. **Multi-overlay parallelism.** Run N isheika processes with
+   distinct `--key`s, each driving its own session pool against
+   mainnet. Bee accounts per source overlay, so N source overlays
+   look like N independent uploaders to mainnet and scale near-
+   linearly. The right shape for the "upload appliance" use case.
+   ~1-2k lines of new coordinator code plus manifest stitching.
