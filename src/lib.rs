@@ -62,6 +62,9 @@ pub use client::{
 #[cfg(unix)]
 pub mod daemon;
 
+#[cfg(unix)]
+pub mod multiwork;
+
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inbound;
 

@@ -983,7 +983,7 @@ fn wire_form(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Vec<u8> {
 /// IPC (currently used by the multi-worker upload subcommand, but the
 /// type is intentionally generic and can be persisted to disk or sent
 /// over any byte channel).
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct StampedChunk {
     pub addr: [u8; 32],
     pub wire: Vec<u8>,
