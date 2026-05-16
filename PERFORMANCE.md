@@ -302,14 +302,32 @@ client; the third is mainnet's reality.
   `1`; the value is capped by the live (non-parked) pool size, so on
   a small or attrited pool the user-supplied number is an upper
   bound, not a guarantee.
-- **The 128-buffer cap doesn't scale with pool size.** Raising
-  `--concurrency` past ~128 doesn't increase in-flight throughput on
-  its own, because every chunk fans out through the same
-  global buffer. Scaling the buffer with pool size is a potential
-  future win (rough estimate: ~2× throughput on a 128-session pool),
-  blocked on re-measuring whether the per-session accounting
-  contention from the earlier `pool × 16` experiment still
-  applies after the timeout-doesn't-retire fix.
+- **The 128-buffer cap doesn't scale with pool size — and that's
+  actually correct.** Raising `--concurrency` past ~128 doesn't
+  increase in-flight throughput on its own. Scaling the buffer with
+  the pool was once speculated to be a "potential future win", but
+  has now been empirically tested on the VPS workload via the
+  `ISHEIKA_BUFFER_MULT` env knob (commit `d549bd6`,
+  `push_chunks_with_pool`). Result is strictly monotonic *worse* as
+  the multiplier grows:
+
+  | `ISHEIKA_BUFFER_MULT` | time (5 MiB random, VPS) |
+  |---:|---:|
+  | 1 (default) | 20 s |
+  | 2 | 24 s |
+  | 4 | 34 s |
+  | 8 | 65 s |
+
+  Each doubling roughly doubles per-session in-flight push attempts
+  (3 → 6 → 12 → 24 at pool=128). The substream-upgrade-cap (64) is
+  not the binding constraint — stream_pool's parallel opens have
+  plenty of headroom. The wall is **per-connection yamux throughput**:
+  once a dozen substreams compete for one TCP connection's flow
+  control, they share bandwidth rather than parallelize. The
+  dispatcher's wider window just means each push waits longer behind
+  sibling chunks on the same connection. The env knob stays for
+  future investigation (e.g. after the multi-connection-per-peer
+  change lands) but isn't a free lever today.
 
 ## `--substream-upgrade-cap` sweep (single-trial)
 
