@@ -363,25 +363,52 @@ interleaved (not all-cap-A-then-all-cap-B) on a representative file
 size, take the median per cap, ignore the deltas if the IQR of any
 single cap overlaps the median of another.
 
+## Multi-connection-per-peer sweep (also a negative result)
+
+Commit `f6ad6ff` added `ISHEIKA_CONNECTIONS_PER_PEER` to test the
+buffer-scaling negative's followup hypothesis: that opening multiple
+independent yamux pipes per peer would relieve the per-connection
+contention. VPS workload (5 MiB random tar, 3335-peer pool,
+`--concurrency 128`), 2D sweep of `BUFFER_MULT × CONNECTIONS_PER_PEER`:
+
+|              | conn=1 | conn=2 | conn=4 |
+|---:|---:|---:|---:|
+| **buf=1** | 16 s | 20 s | 30 s |
+| **buf=2** | 15 s | 48 s | 21 s |
+| **buf=4** | 15 s | 28 s | 28 s |
+| **buf=8** | 34 s | 32 s | 17 s |
+
+The mechanism works as designed — the `buf=8` row (where yamux
+contention is induced) shows monotonic improvement with more
+connections (34 → 32 → 17 s). But no cell in the grid beats the
+baseline `buf=1 conn=1` at 15-16 s. Multi-conn is a real lever for
+configurations that engage yamux contention, but those configurations
+are *also* the ones that aren't fast in the first place. At the
+workload sizes we test, single-connection with default buffer is
+already at or near the per-overlay ceiling.
+
+Both env knobs (`ISHEIKA_BUFFER_MULT`, `ISHEIKA_CONNECTIONS_PER_PEER`)
+stay in the code as investigator tools but should not be the default
+recommendation.
+
 ## Further work (unblocked, ordered by expected impact)
 
-1. **Multiple connections per peer.** Each libp2p connection has its
-   own yamux pipe (independent flow control) and its own
-   ConnectionHandler (additional `pending_upgrades` slots from the
-   stream_pool patch). Two connections per peer in a 128-session pool
-   doubles independent yamux channels without adding peers. Cost:
-   handshake + pricing on each extra connection, paid once per
-   session lifetime.
-2. **Multi-overlay parallelism.** Run N isheika processes with
+1. **Multi-overlay parallelism.** The only remaining lever with
+   plausible multiplicative gain. Run N isheika processes with
    distinct `--key`s, each driving its own session pool against
    mainnet. Bee accounts per source overlay, so N source overlays
    look like N independent uploaders to mainnet and scale near-
    linearly. The right shape for the "upload appliance" use case.
    ~1-2k lines of new coordinator code plus manifest stitching.
+2. **Larger-workload re-measurement.** All sweeps above use a 5 MiB
+   random tar where pool-fill amortises only loosely over push time.
+   A 50-500 MiB workload might surface different bottlenecks (push
+   phase dominates, yamux contention has more chances to engage,
+   ghost-balance rotation actually fires). Multi-conn and buffer
+   knobs might prove load-bearing at that scale even though they're
+   neutral or negative at 5 MiB.
 3. **`--substream-upgrade-cap` re-measurement under controlled
-   conditions.** The single-trial sweep above can't separate signal
-   from noise. A 5-trial interleaved sweep + median would tell us
-   whether 32 actually beats 64, but the available headroom is small
-   (no value in the 32-128 range is more than ~2× the others within
-   measurement noise) and probably not worth the experiment time
-   compared to (1) and (2).
+   conditions.** The single-trial sweep can't separate signal from
+   noise. A 5-trial interleaved sweep + median would tell us whether
+   32 actually beats 64, but the available headroom is small and
+   probably not worth the experiment time compared to (1).
