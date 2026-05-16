@@ -285,6 +285,80 @@ enum Commands {
         advertise: Option<String>,
     },
 
+    /// (Multi-worker upload) Coordinator that spawns N worker
+    /// subprocesses, each with its own ephemeral overlay key, and
+    /// distributes pre-stamped chunks to them. Scales upload
+    /// throughput close to N× by giving bee N independent source
+    /// overlays. The coordinator holds the batch-owner key and
+    /// stamps everything; workers never see the key.
+    #[cfg(unix)]
+    UploadParallel {
+        /// Input file.
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Postage batch ID (hex, 32 bytes).
+        #[arg(long, value_name = "BATCH_ID")]
+        batch: String,
+
+        /// Batch depth.
+        #[arg(long, default_value_t = 20)]
+        depth: u8,
+
+        /// Batch owner private key (hex, 32 bytes).
+        #[arg(long, value_name = "KEY")]
+        key: String,
+
+        /// peers.json path. Shared by all spawned workers.
+        #[arg(long, default_value = "peers.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Number of worker subprocesses to spawn. Each gets its own
+        /// random ephemeral overlay key; bee accounts per-overlay so
+        /// N workers give roughly N× upload throughput. Practical
+        /// cap is ~16 on a single IP before per-bee light-node slot
+        /// limits and per-IP connection rate limits begin to bite.
+        #[arg(long, default_value_t = 4)]
+        workers: usize,
+
+        /// Session pool size per worker.
+        #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY)]
+        concurrency: usize,
+
+        /// Per-chunk peer-candidate cap inside each worker (mirrors
+        /// the regular upload's `--max-retries`).
+        #[arg(long, default_value_t = 10)]
+        max_retries: usize,
+
+        /// How many times a single chunk may be re-routed across
+        /// workers before the coordinator aborts the upload.
+        #[arg(long, default_value_t = 4)]
+        cross_worker_retries: usize,
+
+        /// Chunks per PushBatch frame. Larger = fewer IPC round
+        /// trips, coarser load balance.
+        #[arg(long, default_value_t = 128)]
+        batch_size: usize,
+
+        /// Upload raw bytes (BMT root), skipping manifest wrapping.
+        /// Mirrors the regular upload's `--raw`.
+        #[arg(long)]
+        raw: bool,
+
+        /// Manifest path metadata (defaults to file basename).
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<String>,
+
+        /// Content-Type metadata (defaults to extension-based guess).
+        #[arg(long, value_name = "MIME")]
+        content_type: Option<String>,
+
+        /// Override the binary used to spawn workers (defaults to
+        /// the current executable's path).
+        #[arg(long, value_name = "PATH")]
+        worker_binary: Option<PathBuf>,
+    },
+
     /// (Multi-worker upload, Phase 3) Run a worker process: bind a
     /// unix socket, await a coordinator connection, accept
     /// pre-stamped chunk batches and push them through an ephemeral
@@ -782,6 +856,67 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 overlay_key_hex: overlay_key,
             };
             isheika::multiwork::worker::run(worker_cfg, cfg).await?;
+        }
+
+        #[cfg(unix)]
+        Commands::UploadParallel {
+            file,
+            batch,
+            depth,
+            key,
+            peerlist,
+            workers,
+            concurrency,
+            max_retries,
+            cross_worker_retries,
+            batch_size,
+            raw,
+            manifest_path,
+            content_type,
+            worker_binary,
+        } => {
+            let worker_binary = match worker_binary {
+                Some(p) => p,
+                None => std::env::current_exe()
+                    .map_err(|e| format!("could not resolve current binary: {e}"))?,
+            };
+            let coord_cfg = isheika::multiwork::coordinator::CoordinatorConfig {
+                file: file.clone(),
+                batch_hex: batch.clone(),
+                depth,
+                batch_key_hex: key.clone(),
+                peerlist,
+                workers,
+                concurrency_per_worker: concurrency,
+                max_retries_per_worker: max_retries,
+                max_cross_worker_retries: cross_worker_retries,
+                batch_size,
+                raw,
+                manifest_path: manifest_path.clone(),
+                content_type: content_type.clone(),
+                worker_binary,
+            };
+            let root = isheika::multiwork::coordinator::run(coord_cfg, cfg).await?;
+            let root_hex = hex::encode(root.as_bytes());
+            let bytes = std::fs::metadata(&file).map(|m| m.len()).unwrap_or(0);
+            println!(
+                "uploaded {} bytes — root: {} (via {} worker(s))",
+                bytes, root_hex, workers,
+            );
+            if let Some(c) = root_hex_to_cid(&root_hex) {
+                if raw {
+                    println!("cid: {c}");
+                } else {
+                    let path = manifest_path.clone().unwrap_or_else(|| {
+                        file.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "file".to_string())
+                    });
+                    println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/{path}");
+                    println!("subdomain:  https://{c}.bzz.limo/{path}");
+                }
+            }
         }
     }
 

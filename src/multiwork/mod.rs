@@ -12,3 +12,6 @@ pub mod protocol;
 
 #[cfg(unix)]
 pub mod worker;
+
+#[cfg(unix)]
+pub mod coordinator;

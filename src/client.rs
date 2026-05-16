@@ -920,7 +920,13 @@ pub async fn upload_file_with_manifest_with_pool(
     Ok(manifest_root)
 }
 
-fn prepare_upload_file_with_manifest(
+/// Split + manifest-wrap + stamp a single file in one go. Like
+/// [`prepare_upload_bytes`] but produces a mantaray-manifest root
+/// rather than a raw BMT root: the returned chunks include both the
+/// file's chunks and the manifest entry chunks. Used by the
+/// multi-worker coordinator when uploading a single file with path
+/// metadata.
+pub fn prepare_upload_file_with_manifest(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,

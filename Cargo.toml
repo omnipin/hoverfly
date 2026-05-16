@@ -86,7 +86,10 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", def
 libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", features = ["tokio"] }
 libp2p-websocket = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal", "process"] }
+# Unix-only multi-worker coordinator needs a temp dir for the worker
+# socket files. Mirrored in [dev-dependencies] for the protocol tests.
+tempfile = "3"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
