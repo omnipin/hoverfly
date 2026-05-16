@@ -399,6 +399,54 @@ pub async fn discover_recursive_with_concurrency(
     max_rounds: usize,
     concurrency: usize,
 ) -> Result<Vec<Peer>, ClientError> {
+    discover_recursive_with_progress(
+        transport,
+        doh,
+        bootstrap,
+        wait_per_peer,
+        max_rounds,
+        concurrency,
+        None,
+    )
+    .await
+}
+
+/// Progress callback emitted by [`discover_recursive_with_progress`].
+/// The CLI uses this to surface per-round progress to stdout without
+/// requiring `--verbose`. Stable enough across rounds to drive a
+/// simple `println!`; not stable enough that downstream tooling
+/// should pattern-match on its exact wording.
+pub type DiscoverProgressFn =
+    std::sync::Arc<dyn Fn(DiscoverEvent) + Send + Sync + 'static>;
+
+/// One progress event during a recursive discover.
+#[derive(Debug, Clone)]
+pub enum DiscoverEvent {
+    /// A new round is about to begin.
+    RoundStarted {
+        round: usize,
+        total_rounds: usize,
+        frontier_size: usize,
+        total_peers_so_far: usize,
+    },
+    /// A round just completed.
+    RoundFinished {
+        round: usize,
+        total_rounds: usize,
+        new_peers_this_round: usize,
+        total_peers: usize,
+    },
+}
+
+pub async fn discover_recursive_with_progress(
+    transport: &Transport,
+    doh: &Doh,
+    bootstrap: &Multiaddr,
+    wait_per_peer: Duration,
+    max_rounds: usize,
+    concurrency: usize,
+    progress: Option<DiscoverProgressFn>,
+) -> Result<Vec<Peer>, ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::collections::HashSet;
 
@@ -421,6 +469,15 @@ pub async fn discover_recursive_with_concurrency(
         info!(target: "isheika::discover",
             "round {} of {}: dialing {} peer(s) ({} in parallel)",
             round + 1, max_rounds, frontier.len(), concurrency);
+        if let Some(p) = progress.as_ref() {
+            p(DiscoverEvent::RoundStarted {
+                round: round + 1,
+                total_rounds: max_rounds,
+                frontier_size: frontier.len(),
+                total_peers_so_far: all.len(),
+            });
+        }
+        let peers_before_round = all.len();
 
         let mut next_frontier: Vec<Multiaddr> = Vec::new();
         let mut iter = std::mem::take(&mut frontier).into_iter();
@@ -474,6 +531,14 @@ pub async fn discover_recursive_with_concurrency(
 
         info!(target: "isheika::discover",
             "round {} done: total unique peers = {}", round + 1, all.len());
+        if let Some(p) = progress.as_ref() {
+            p(DiscoverEvent::RoundFinished {
+                round: round + 1,
+                total_rounds: max_rounds,
+                new_peers_this_round: all.len() - peers_before_round,
+                total_peers: all.len(),
+            });
+        }
         frontier = next_frontier;
     }
 

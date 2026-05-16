@@ -13,7 +13,7 @@ use isheika::client::{
     upload_file_with_manifest_ex, ProgressFn, DEFAULT_DISCOVER_CONCURRENCY,
     DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
 };
-use isheika::client::discover_recursive_with_concurrency;
+
 use isheika::{
     Doh, PeerStore, SwarmSigner, Transport, TransportConfig, UploadFile,
     DEFAULT_DOH_URL, MAINNET_BOOTNODE,
@@ -386,13 +386,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
-            let discovered = discover_recursive_with_concurrency(
+            let progress: isheika::client::DiscoverProgressFn = Arc::new(|ev| {
+                use isheika::client::DiscoverEvent::*;
+                match ev {
+                    RoundStarted { round, total_rounds, frontier_size, total_peers_so_far } => {
+                        println!(
+                            "  round {round}/{total_rounds}: dialing {frontier_size} peer(s) (have {total_peers_so_far} so far)"
+                        );
+                    }
+                    RoundFinished { round, total_rounds, new_peers_this_round, total_peers } => {
+                        println!(
+                            "  round {round}/{total_rounds} done: +{new_peers_this_round} new (total {total_peers})"
+                        );
+                    }
+                }
+            });
+            let discovered = isheika::client::discover_recursive_with_progress(
                 &transport,
                 &doh,
                 &bootstrap,
                 Duration::from_secs(wait),
                 rounds.max(1),
                 discover_concurrency,
+                Some(progress),
             )
             .await?;
             println!("discovered {} peers ({} hop(s))", discovered.len(), rounds);
