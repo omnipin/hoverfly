@@ -1379,7 +1379,21 @@ pub(crate) async fn push_chunks_with_pool(
     // mutex (try_reserve serialises) and inflate dispatcher overhead.
     // Earlier `pool × 16` produced 1.5 k+ attempts in flight on a
     // 32-peer pool and turned 6 chunks/s into 0.1 chunks/s.
-    let buffer = 128usize.min(total).max(pool.len());
+    //
+    // ISHEIKA_BUFFER_MULT (default 1) multiplies the cap and the pool-
+    // size floor, so e.g. `=2` doubles in-flight chunks. Kept as an
+    // env knob, not a CLI flag, because per the comment above this
+    // direction has historically regressed throughput; the
+    // experiment is to re-measure under current code (per-chunk
+    // racing + stream_pool parallel opens + timeout-doesn't-retire).
+    // If buffer scaling proves a real win, promote to TransportConfig
+    // and CLI; if not, leave the env var as a perf-investigator tool.
+    let mult: usize = std::env::var("ISHEIKA_BUFFER_MULT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .filter(|n: &usize| *n > 0)
+        .unwrap_or(1);
+    let buffer = (128 * mult).min(total).max(pool.len());
 
     // Per-chunk peer racing: race N peers in parallel from the start
     // of each chunk's dispatch. Most random-addressed chunks on novel
