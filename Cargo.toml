@@ -61,8 +61,10 @@ async-trait = "0.1"
 # Cross-platform Instant
 web-time = "1"
 
-# libp2p stream multiplexing (cross-platform)
-libp2p-stream = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
+# libp2p stream multiplexing is vendored + patched in
+# `src/protocols/stream_pool/` to allow concurrent outbound substream
+# upgrades per connection (upstream `libp2p_stream` serialises them
+# behind a singular `pending_upgrade: Option`). No external dep needed.
 
 # Native-only
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]

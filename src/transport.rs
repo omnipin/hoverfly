@@ -219,13 +219,13 @@ impl Default for TransportConfig {
 
 #[derive(NetworkBehaviour)]
 pub struct Behaviour {
-    pub stream: libp2p_stream::Behaviour,
+    pub stream: crate::protocols::stream_pool::Behaviour,
     pub identify: libp2p::identify::Behaviour,
 }
 
 fn behaviour(keypair: &Keypair) -> Behaviour {
     Behaviour {
-        stream: libp2p_stream::Behaviour::new(),
+        stream: crate::protocols::stream_pool::Behaviour::new(),
         identify: libp2p::identify::Behaviour::new(
             libp2p::identify::Config::new("/swarm/0.1.0".to_string(), keypair.public())
                 .with_agent_version(format!("isheika/{}", crate::VERSION)),
@@ -606,7 +606,7 @@ impl AccountingState {
 /// fetch task spawned on a session so they can race over the same
 /// libp2p connection.
 struct SessionState {
-    control: libp2p_stream::Control,
+    control: crate::protocols::stream_pool::Control,
     peer_id: PeerId,
     timeout: Duration,
     accounting: tokio::sync::Mutex<AccountingState>,
@@ -812,9 +812,9 @@ struct SessionDriver {
     swarm: Swarm<Behaviour>,
     state: std::sync::Arc<SessionState>,
     cmd_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
-    _hs_in: libp2p_stream::IncomingStreams,
-    _pr_in: libp2p_stream::IncomingStreams,
-    _hive_in: libp2p_stream::IncomingStreams,
+    _hs_in: crate::protocols::stream_pool::IncomingStreams,
+    _pr_in: crate::protocols::stream_pool::IncomingStreams,
+    _hive_in: crate::protocols::stream_pool::IncomingStreams,
 }
 
 impl SessionDriver {
@@ -971,9 +971,9 @@ fn dial(swarm: &mut Swarm<Behaviour>, peer_id: PeerId, peer_addr: &Multiaddr) ->
 }
 
 fn accept(
-    control: &mut libp2p_stream::Control,
+    control: &mut crate::protocols::stream_pool::Control,
     proto: StreamProtocol,
-) -> Result<libp2p_stream::IncomingStreams, TransportError> {
+) -> Result<crate::protocols::stream_pool::IncomingStreams, TransportError> {
     control
         .accept(proto)
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))
@@ -1034,8 +1034,8 @@ async fn prep_connection(
 async fn do_handshake(
     swarm: &mut Swarm<Behaviour>,
     peer_id: PeerId,
-    control: &mut libp2p_stream::Control,
-    hs_in: &mut libp2p_stream::IncomingStreams,
+    control: &mut crate::protocols::stream_pool::Control,
+    hs_in: &mut crate::protocols::stream_pool::IncomingStreams,
     underlay: &Multiaddr,
     signer: &SwarmSigner,
     advertised: Option<&Multiaddr>,
@@ -1081,8 +1081,8 @@ async fn do_handshake(
 async fn do_pricing(
     swarm: &mut Swarm<Behaviour>,
     peer_id: PeerId,
-    control: &mut libp2p_stream::Control,
-    pr_in: &mut libp2p_stream::IncomingStreams,
+    control: &mut crate::protocols::stream_pool::Control,
+    pr_in: &mut crate::protocols::stream_pool::IncomingStreams,
     timeout: Duration,
 ) -> Result<u128, TransportError> {
     // Wait for inbound pricing first (peer announces threshold), then announce ours.

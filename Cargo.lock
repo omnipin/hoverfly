@@ -2661,7 +2661,6 @@ dependencies = [
  "k256",
  "libp2p",
  "libp2p-core",
- "libp2p-stream",
  "libp2p-tcp",
  "libp2p-websocket",
  "mime_guess",
@@ -3061,19 +3060,6 @@ dependencies = [
  "socket2",
  "thiserror 2.0.18",
  "tokio",
- "tracing",
-]
-
-[[package]]
-name = "libp2p-stream"
-version = "0.5.0-alpha"
-source = "git+https://github.com/libp2p/rust-libp2p?branch=master#aa8b5dd1874b92d1c54d29001922b8a3f4b35bb5"
-dependencies = [
- "futures",
- "libp2p-core",
- "libp2p-identity",
- "libp2p-swarm",
- "rand 0.8.6",
  "tracing",
 ]
 

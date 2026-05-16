@@ -12,3 +12,5 @@ pub mod pushsync;
 pub mod pseudosettle;
 
 pub mod framing;
+
+pub(crate) mod stream_pool;
