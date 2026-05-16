@@ -697,6 +697,7 @@ impl SessionState {
         wire: &[u8],
         stamp: &[u8],
     ) -> Result<PushsyncReceipt, TransportError> {
+        let t_start = web_time::Instant::now();
         let mut control = self.control.clone();
         let open = tokio::time::timeout(
             self.timeout,
@@ -705,11 +706,22 @@ impl SessionState {
         .await
         .map_err(|_| TransportError::Timeout)?
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        let t_opened = web_time::Instant::now();
         let mut stream = open;
-        tokio::time::timeout(self.timeout, pushsync::push(&mut stream, addr, wire, stamp))
+        let result = tokio::time::timeout(self.timeout, pushsync::push(&mut stream, addr, wire, stamp))
             .await
             .map_err(|_| TransportError::Timeout)?
-            .map_err(Into::into)
+            .map_err(Into::<TransportError>::into);
+        let t_pushed = web_time::Instant::now();
+        tracing::trace!(
+            target: "isheika::profile",
+            peer = %self.peer_id,
+            open_stream_us = (t_opened - t_start).as_micros() as u64,
+            push_total_us = (t_pushed - t_opened).as_micros() as u64,
+            ok = result.is_ok(),
+            "do_pushsync_outer",
+        );
+        result
     }
 
     async fn do_fetch(&self, addr: &[u8; 32]) -> Result<ChunkDelivery, TransportError> {

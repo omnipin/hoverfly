@@ -78,12 +78,19 @@ pub async fn push<S>(
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
+    // Per-phase timing emitted at the end as a single tracing line on
+    // the `isheika::profile` target. Run with `RUST_LOG=isheika::profile=trace`
+    // and pipe through `awk` to get a histogram of where push time goes.
+    let t_start = web_time::Instant::now();
+
     // 1. Send empty request headers.
     let req_headers = hdr::Headers { headers: vec![] };
     write_message(stream, &req_headers).await?;
+    let t_hdr_sent = web_time::Instant::now();
 
     // 2. Read response headers (ignored).
     let _resp_headers: hdr::Headers = read_message(stream).await?;
+    let t_hdr_recv = web_time::Instant::now();
 
     // 3. Send delivery.
     let delivery = pb::Delivery {
@@ -92,9 +99,25 @@ where
         stamp: stamp.to_vec(),
     };
     write_message(stream, &delivery).await?;
+    let t_delivery_sent = web_time::Instant::now();
 
     // 4. Read receipt.
     let receipt: pb::Receipt = read_message(stream).await?;
+    let t_receipt_recv = web_time::Instant::now();
+
+    tracing::trace!(
+        target: "isheika::profile",
+        addr = %hex::encode(address),
+        hdr_send_us = (t_hdr_sent - t_start).as_micros() as u64,
+        hdr_recv_us = (t_hdr_recv - t_hdr_sent).as_micros() as u64,
+        delivery_send_us = (t_delivery_sent - t_hdr_recv).as_micros() as u64,
+        receipt_recv_us = (t_receipt_recv - t_delivery_sent).as_micros() as u64,
+        total_us = (t_receipt_recv - t_start).as_micros() as u64,
+        chunk_bytes = chunk_data.len(),
+        stamp_bytes = stamp.len(),
+        "pushsync_phases",
+    );
+
     if !receipt.err.is_empty() {
         return Err(PushsyncError::Peer(receipt.err));
     }

@@ -29,9 +29,14 @@ struct Cli {
     #[arg(short, long, global = true)]
     verbose: bool,
 
-    /// Debug output (trace-level logging)
+    /// Debug output (debug-level logging)
     #[arg(short, long, global = true)]
     debug: bool,
+
+    /// Trace output (trace-level logging; very noisy, intended for
+    /// profile/diagnostic targets like `isheika::profile`).
+    #[arg(long, global = true)]
+    trace: bool,
 
     /// DoH endpoint to use for DNS resolution
     #[arg(long, global = true, default_value = DEFAULT_DOH_URL, value_name = "URL")]
@@ -353,7 +358,9 @@ fn guess_content_type(path: &str) -> Option<String> {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    let level = if cli.debug {
+    let level = if cli.trace {
+        Level::TRACE
+    } else if cli.debug {
         Level::DEBUG
     } else if cli.verbose {
         Level::INFO
