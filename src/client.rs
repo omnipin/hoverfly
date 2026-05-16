@@ -961,11 +961,33 @@ fn wire_form(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Vec<u8> {
 }
 
 /// A chunk pre-stamped and ready for the wire.
-#[derive(Clone)]
-pub(crate) struct StampedChunk {
-    addr: [u8; 32],
-    wire: Vec<u8>,
-    stamp: Vec<u8>,
+///
+/// The three components are everything a pushsync substream needs:
+/// - `addr` — the BMT root of the chunk (32 bytes); also the chunk's
+///   network address.
+/// - `wire` — the on-the-wire chunk body: `span (LE 8) || payload`
+///   matching nectar's `ContentChunk::data()`. Bee will re-derive
+///   `addr` from this on receipt.
+/// - `stamp` — a postage stamp signed by the batch owner authorising
+///   storage of this chunk against the batch. Validated on the
+///   receiving bee in `pkg/postage.Stamp::Valid` (signature ↔ owner,
+///   bucket match, index in range).
+///
+/// Stamping is decoupled from pushing: a `StampedChunk` carries
+/// everything required to push it without access to the batch owner's
+/// key. This is the unit of work shipped between a coordinator (which
+/// holds the batch key and does the stamping) and worker processes
+/// (which only hold their own libp2p overlay keys and do the pushing).
+///
+/// `Serialize`/`Deserialize` are derived so the type can travel over
+/// IPC (currently used by the multi-worker upload subcommand, but the
+/// type is intentionally generic and can be persisted to disk or sent
+/// over any byte channel).
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+pub struct StampedChunk {
+    pub addr: [u8; 32],
+    pub wire: Vec<u8>,
+    pub stamp: Vec<u8>,
 }
 
 fn build_stamper(
@@ -1142,10 +1164,18 @@ fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
 }
 
 /// Split + stamp data, returning the root and the stamped chunks ready
-/// for pushsync. Pure CPU; no network. Pulled out so both the one-shot
-/// (`upload_bytes_ex`) and daemon (`upload_bytes_with_pool`) paths
-/// share the BMT/stamp work.
-fn prepare_upload_bytes(
+/// for pushsync. Pure CPU; no network.
+///
+/// `signer` is used **only** for stamping — its eth address must be
+/// the batch owner of `batch_id_hex`, and its alloy signer signs each
+/// chunk's postage stamp. The returned [`StampedChunk`]s carry no
+/// reference to the signer; they can be pushed by any libp2p overlay
+/// (the network identity for pushing is supplied separately to
+/// [`push_chunks_with_pool`] via its `Transport`). This decoupling is
+/// what enables the multi-worker upload model: a coordinator with
+/// the batch owner key stamps chunks, then ships them to N workers
+/// with ephemeral overlay keys for pushing.
+pub fn prepare_upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
@@ -1351,7 +1381,15 @@ async fn push_chunks_concurrent(
 /// Push `work` through an existing pool. Used by the daemon to amortise
 /// pool-fill cost across many upload requests; the CLI builds a fresh
 /// pool per invocation via [`push_chunks_concurrent`].
-pub(crate) async fn push_chunks_with_pool(
+///
+/// The pushing path needs **no batch-owner key** — the stamps inside
+/// `work` are already signed. The `transport` carries the libp2p
+/// overlay identity (set at `Transport::new`); that's the only signing
+/// surface this function uses (handshake on connection setup, receipt
+/// verification on `is_shallow`). This is the entrypoint a multi-worker
+/// pusher hits to push pre-stamped chunks under its own ephemeral
+/// overlay key.
+pub async fn push_chunks_with_pool(
     transport: &Transport,
     session_pool: &SessionPool,
     work: Vec<StampedChunk>,
