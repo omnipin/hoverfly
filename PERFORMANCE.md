@@ -311,25 +311,59 @@ client; the third is mainnet's reality.
   contention from the earlier `pool × 16` experiment still
   applies after the timeout-doesn't-retire fix.
 
+## `--substream-upgrade-cap` sweep (single-trial)
+
+One-trial sweep on the 3335-peer VPS workload, fresh random 5-MiB
+tar per iteration, `--concurrency 128 --max-retries 128 --timeout 30`:
+
+| cap | time | throughput |
+|---:|---:|---:|
+| 8 | 56.7 s | 92 KiB/s |
+| 16 | 34.7 s | 151 KiB/s |
+| 32 | 20.9 s | 246 KiB/s |
+| 64 | 46.0 s | 111 KiB/s |
+| 96 | 28.4 s | 180 KiB/s |
+| 128 | 25.0 s | 205 KiB/s |
+
+The non-monotonic shape (64 worse than both 32 and 96) is the
+giveaway that single-trial run-to-run variance on mainnet is
+~2×, comparable to the choice itself. Honest reading:
+
+- cap ≤ 16 is genuinely too low — the bottleneck shifts back toward
+  near-upstream serialization.
+- cap ≥ 32 all sit in the same plausible range; we can't tell them
+  apart at one trial each.
+- Default of 64 is kept because (a) we have prior validation against
+  it (the 15-second VPS baseline + Mac 31% improvement measurement
+  both used 64), (b) it has comfortable headroom for the lower end
+  of `--concurrency` values, and (c) the asymmetric cost of being
+  too low (cap=8 → 57 s) is worse than being too high (cap=128 →
+  25 s).
+
+For a real verdict on a specific deployment, run 5+ trials per cap
+interleaved (not all-cap-A-then-all-cap-B) on a representative file
+size, take the median per cap, ignore the deltas if the IQR of any
+single cap overlaps the median of another.
+
 ## Further work (unblocked, ordered by expected impact)
 
-1. **`MAX_CONCURRENT_OUTBOUND_UPGRADES` tuning**
-   (`src/protocols/stream_pool/handler.rs`). Profile after the
-   stream_pool patch showed per-push latency went up because yamux
-   flow control kicks in when many substreams send concurrently over
-   one connection. The current 64 cap was conservative; 16-32 may
-   trade open-parallelism for less yamux contention and net out
-   higher. One-constant change, easy to A/B.
-2. **Multiple connections per peer.** Each libp2p connection has its
+1. **Multiple connections per peer.** Each libp2p connection has its
    own yamux pipe (independent flow control) and its own
    ConnectionHandler (additional `pending_upgrades` slots from the
    stream_pool patch). Two connections per peer in a 128-session pool
    doubles independent yamux channels without adding peers. Cost:
    handshake + pricing on each extra connection, paid once per
    session lifetime.
-3. **Multi-overlay parallelism.** Run N isheika processes with
+2. **Multi-overlay parallelism.** Run N isheika processes with
    distinct `--key`s, each driving its own session pool against
    mainnet. Bee accounts per source overlay, so N source overlays
    look like N independent uploaders to mainnet and scale near-
    linearly. The right shape for the "upload appliance" use case.
    ~1-2k lines of new coordinator code plus manifest stitching.
+3. **`--substream-upgrade-cap` re-measurement under controlled
+   conditions.** The single-trial sweep above can't separate signal
+   from noise. A 5-trial interleaved sweep + median would tell us
+   whether 32 actually beats 64, but the available headroom is small
+   (no value in the 32-128 range is more than ~2× the others within
+   measurement noise) and probably not worth the experiment time
+   compared to (1) and (2).
