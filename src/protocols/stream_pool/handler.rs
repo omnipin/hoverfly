@@ -18,22 +18,30 @@ use libp2p::swarm::{
 
 use crate::protocols::stream_pool::{shared::Shared, upgrade::Upgrade, OpenStreamError};
 
-/// Maximum number of concurrent outbound substream upgrades we'll
-/// surface to the swarm at once per connection. The upstream
-/// libp2p_stream serialised this at 1 (a singular `Option`); we
-/// instead keep up to this many in flight before applying our own
-/// backpressure on the `NewStream` channel.
+/// Default cap on concurrent outbound substream upgrades per
+/// connection when the caller (e.g. [`Behaviour::new`]) doesn't
+/// override it. Upstream `libp2p_stream` hard-coded this at 1
+/// (singular `pending_upgrade: Option<…>`) which serialised every
+/// substream open behind the previous one. Our default is high
+/// enough that the per-connection layer is rarely the bottleneck for
+/// our pushsync workload (typically 8-32 concurrent pushes per
+/// session at high `--concurrency`), but bounded so a runaway
+/// producer doesn't queue thousands of in-flight protocol
+/// negotiations through a single connection.
 ///
-/// Set high enough that the per-connection libp2p-stream layer is
-/// never the bottleneck for our pushsync workload (typically 8-32
-/// concurrent pushes per session at high `--concurrency`), but
-/// bounded so a runaway producer doesn't queue thousands of
-/// in-flight protocol-negotiations through a single connection.
-const MAX_CONCURRENT_OUTBOUND_UPGRADES: usize = 64;
+/// Tunable via CLI (`--substream-upgrade-cap` / `TransportConfig`).
+/// Profiling under load (post-patch) showed per-push latency goes up
+/// as this grows because yamux flow-control kicks in when many
+/// concurrent substreams share one connection. The sweet spot is
+/// likely workload-dependent — exposing it as a knob lets callers
+/// A/B without recompiling.
+pub const DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES: usize = 64;
 
 pub struct Handler {
     remote: PeerId,
     shared: Arc<Mutex<Shared>>,
+    /// Per-handler cap on concurrent outbound substream upgrades.
+    max_concurrent_upgrades: usize,
 
     receiver: mpsc::Receiver<NewStream>,
     /// Outbound substream upgrades currently in flight, keyed by an
@@ -60,10 +68,12 @@ impl Handler {
         remote: PeerId,
         shared: Arc<Mutex<Shared>>,
         receiver: mpsc::Receiver<NewStream>,
+        max_concurrent_upgrades: usize,
     ) -> Self {
         Self {
             shared,
             receiver,
+            max_concurrent_upgrades: max_concurrent_upgrades.max(1),
             pending_upgrades: HashMap::new(),
             pending_emit: VecDeque::new(),
             next_upgrade_id: 0,
@@ -109,11 +119,12 @@ impl ConnectionHandler for Handler {
         }
 
         // Then: pull from `NewStream` channel until we either hit
-        // `MAX_CONCURRENT_OUTBOUND_UPGRADES` total in flight (pending +
+        // `max_concurrent_upgrades` total in flight (pending +
         // emitted) or the channel returns Pending. Each pulled
         // request becomes either an immediate emit (this poll) or a
         // queued emit (next polls).
-        while self.pending_upgrades.len() + self.pending_emit.len() < MAX_CONCURRENT_OUTBOUND_UPGRADES
+        while self.pending_upgrades.len() + self.pending_emit.len()
+            < self.max_concurrent_upgrades
         {
             match self.receiver.poll_next_unpin(cx) {
                 Poll::Ready(Some(new_stream)) => {

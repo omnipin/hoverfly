@@ -16,12 +16,19 @@ use swarm::{
     dial_opts::PeerCondition,
 };
 
-use crate::protocols::stream_pool::{handler::Handler, shared::Shared, Control};
+use crate::protocols::stream_pool::{
+    handler::{Handler, DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES},
+    shared::Shared,
+    Control,
+};
 
 /// A generic behaviour for stream-oriented protocols.
 pub struct Behaviour {
     shared: Arc<Mutex<Shared>>,
     dial_receiver: mpsc::Receiver<PeerId>,
+    /// Per-handler cap on concurrent outbound substream upgrades.
+    /// Forwarded into each [`Handler`] this behaviour spawns.
+    max_concurrent_upgrades: usize,
 }
 
 impl Default for Behaviour {
@@ -32,11 +39,20 @@ impl Default for Behaviour {
 
 impl Behaviour {
     pub fn new() -> Self {
+        Self::with_max_concurrent_upgrades(DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES)
+    }
+
+    /// Like [`Self::new`] but with an explicit cap on how many outbound
+    /// substream upgrades each [`Handler`] will surface to the swarm
+    /// at once. Default is
+    /// [`DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES`].
+    pub fn with_max_concurrent_upgrades(max_concurrent_upgrades: usize) -> Self {
         let (dial_sender, dial_receiver) = mpsc::channel(0);
 
         Self {
             shared: Arc::new(Mutex::new(Shared::new(dial_sender))),
             dial_receiver,
+            max_concurrent_upgrades: max_concurrent_upgrades.max(1),
         }
     }
 
@@ -73,6 +89,7 @@ impl NetworkBehaviour for Behaviour {
             peer,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
+            self.max_concurrent_upgrades,
         ))
     }
 
@@ -88,6 +105,7 @@ impl NetworkBehaviour for Behaviour {
             peer,
             self.shared.clone(),
             Shared::lock(&self.shared).receiver(peer, connection_id),
+            self.max_concurrent_upgrades,
         ))
     }
 

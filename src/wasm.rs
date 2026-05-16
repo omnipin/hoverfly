@@ -57,6 +57,8 @@ impl IsheikaClient {
             dial_timeout: Duration::from_secs(3),
             network_id,
             advertise: None,
+            max_concurrent_substream_upgrades:
+                crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
         };
 
         Ok(Self {

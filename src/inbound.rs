@@ -74,7 +74,11 @@ pub struct InboundConfig {
 pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
     let keypair = derive_keypair(&cfg.signer);
     let our_peer_id = PeerId::from(keypair.public());
-    let mut swarm = build_swarm_from(&keypair, cfg.idle_timeout)
+    let mut swarm = build_swarm_from(
+        &keypair,
+        cfg.idle_timeout,
+        crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
+    )
         .await
         .map_err(|e| InboundError::Build(e.to_string()))?;
     swarm

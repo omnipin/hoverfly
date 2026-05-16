@@ -13,4 +13,4 @@ pub mod pseudosettle;
 
 pub mod framing;
 
-pub(crate) mod stream_pool;
+pub mod stream_pool;

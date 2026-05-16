@@ -31,3 +31,4 @@ mod upgrade;
 
 pub use behaviour::{AlreadyRegistered, Behaviour};
 pub use control::{Control, IncomingStreams, OpenStreamError};
+pub use handler::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES;

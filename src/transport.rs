@@ -204,6 +204,16 @@ pub struct TransportConfig {
     /// kademlia tables, and route subsequent retrieval lookups for our
     /// uploaded chunks straight to us. Must include the `/p2p/<id>` tail.
     pub advertise: Option<Multiaddr>,
+    /// Per-connection cap on concurrent outbound substream upgrades
+    /// (`/swarm/pushsync/…`, `/swarm/retrieval/…`, etc.). Forwarded to
+    /// every [`crate::protocols::stream_pool::Behaviour`] this transport
+    /// builds. Default is
+    /// [`crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES`].
+    /// Lower values reduce per-push yamux flow-control contention at
+    /// the cost of less parallel substream-open throughput; higher
+    /// values do the reverse. Sweet spot is workload-dependent; see
+    /// `PERFORMANCE.md`.
+    pub max_concurrent_substream_upgrades: usize,
 }
 
 impl Default for TransportConfig {
@@ -213,6 +223,8 @@ impl Default for TransportConfig {
             dial_timeout: Duration::from_secs(3),
             network_id: 1,
             advertise: None,
+            max_concurrent_substream_upgrades:
+                crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
         }
     }
 }
@@ -223,9 +235,11 @@ pub struct Behaviour {
     pub identify: libp2p::identify::Behaviour,
 }
 
-fn behaviour(keypair: &Keypair) -> Behaviour {
+fn behaviour(keypair: &Keypair, max_concurrent_substream_upgrades: usize) -> Behaviour {
     Behaviour {
-        stream: crate::protocols::stream_pool::Behaviour::new(),
+        stream: crate::protocols::stream_pool::Behaviour::with_max_concurrent_upgrades(
+            max_concurrent_substream_upgrades,
+        ),
         identify: libp2p::identify::Behaviour::new(
             libp2p::identify::Config::new("/swarm/0.1.0".to_string(), keypair.public())
                 .with_agent_version(format!("isheika/{}", crate::VERSION)),
@@ -1201,7 +1215,12 @@ where
 
 #[cfg(not(target_arch = "wasm32"))]
 async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> {
-    let mut swarm = build_swarm_from(&t.keypair, t.config.timeout).await?;
+    let mut swarm = build_swarm_from(
+        &t.keypair,
+        t.config.timeout,
+        t.config.max_concurrent_substream_upgrades,
+    )
+    .await?;
     // When the caller has set an advertise address (daemon serving
     // mode), push it as an external address on every outbound swarm so
     // our libp2p identify message tells the bee peer "you can dial me
@@ -1222,6 +1241,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
 pub(crate) async fn build_swarm_from(
     keypair: &Keypair,
     timeout: Duration,
+    max_concurrent_substream_upgrades: usize,
 ) -> Result<Swarm<Behaviour>, TransportError> {
     use libp2p_core::{upgrade, Transport as _};
 
@@ -1268,7 +1288,7 @@ pub(crate) async fn build_swarm_from(
                 .boxed())
         })
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
-        .with_behaviour(|key| behaviour(key))
+        .with_behaviour(|key| behaviour(key, max_concurrent_substream_upgrades))
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(timeout))
         .build();
@@ -1282,6 +1302,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
 
     let keypair = t.keypair.clone();
     let timeout = t.config.timeout;
+    let max_concurrent_substream_upgrades = t.config.max_concurrent_substream_upgrades;
 
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_wasm_bindgen()
@@ -1298,7 +1319,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
                 .boxed())
         })
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
-        .with_behaviour(|key| behaviour(key))
+        .with_behaviour(|key| behaviour(key, max_concurrent_substream_upgrades))
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
         .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(timeout))
         .build();

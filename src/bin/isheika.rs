@@ -58,6 +58,16 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 3, value_name = "SECS")]
     dial_timeout: u64,
 
+    /// Per-connection cap on concurrent outbound substream upgrades.
+    /// Higher means more substream opens negotiate in parallel
+    /// (~lower open latency); lower means less yamux flow-control
+    /// contention per-stream (~lower push latency). Sweet spot is
+    /// workload-dependent; see `PERFORMANCE.md`. Default 64.
+    #[arg(long, global = true,
+          default_value_t = isheika::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
+          value_name = "N")]
+    substream_upgrade_cap: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -378,6 +388,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         dial_timeout: Duration::from_secs(cli.dial_timeout),
         network_id: cli.network_id,
         advertise: None,
+        max_concurrent_substream_upgrades: cli.substream_upgrade_cap,
     };
     let doh = Doh::with_url(&cli.doh_url);
 

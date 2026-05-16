@@ -158,6 +158,8 @@ pub async fn run(
         dial_timeout,
         network_id,
         advertise: listen.as_ref().and_then(|lc| lc.advertise.clone()),
+        max_concurrent_substream_upgrades:
+            crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
     };
     let transport = match listen.as_ref() {
         Some(lc) => {
