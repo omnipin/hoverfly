@@ -284,6 +284,40 @@ enum Commands {
         #[arg(long, value_name = "MULTIADDR")]
         advertise: Option<String>,
     },
+
+    /// (Multi-worker upload, Phase 3) Run a worker process: bind a
+    /// unix socket, await a coordinator connection, accept
+    /// pre-stamped chunk batches and push them through an ephemeral
+    /// overlay key. The worker never holds the batch-owner key.
+    /// Typically spawned by `isheika upload-parallel`, but can be
+    /// run standalone for testing.
+    #[cfg(unix)]
+    Worker {
+        /// Unix socket path to bind. Removed on exit; stale sockets
+        /// at startup are unlinked.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+
+        /// peers.json path (loaded at startup, observations saved on exit).
+        #[arg(long, default_value = "peers.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Session pool size for this worker's pushsync.
+        #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY)]
+        concurrency: usize,
+
+        /// Per-chunk peer-candidate cap. Mirrors the upload-side flag.
+        #[arg(long, default_value_t = 10)]
+        max_retries: usize,
+
+        /// Optional fixed overlay key (hex secp256k1 private key).
+        /// Default is to generate a random ephemeral key per worker
+        /// — the usual case for multi-worker upload, since fresh
+        /// overlays give bee independent ghost-balance accounting
+        /// per worker.
+        #[arg(long, value_name = "HEX")]
+        overlay_key: Option<String>,
+    },
 }
 
 /// Parse a tar archive into a flat list of `UploadFile`s (regular files
@@ -736,6 +770,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 listen_cfg,
             )
             .await?;
+        }
+
+        #[cfg(unix)]
+        Commands::Worker { socket, peerlist, concurrency, max_retries, overlay_key } => {
+            let worker_cfg = isheika::multiwork::worker::WorkerConfig {
+                socket,
+                peerlist,
+                concurrency,
+                max_retries,
+                overlay_key_hex: overlay_key,
+            };
+            isheika::multiwork::worker::run(worker_cfg, cfg).await?;
         }
     }
 

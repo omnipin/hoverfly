@@ -9,3 +9,6 @@
 
 #[cfg(unix)]
 pub mod protocol;
+
+#[cfg(unix)]
+pub mod worker;

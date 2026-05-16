@@ -55,8 +55,8 @@ pub use peers::{Peer, PeerStore};
 pub use transport::{Transport, TransportConfig, TransportError};
 pub use client::{
     discover, fetch_bytes, fetch_manifest_path, list_manifest, prepare_upload_bytes,
-    push_chunks_with_pool, upload_bytes, upload_collection, ClientError, ManifestEntry,
-    SessionPool, StampedChunk, UploadFile,
+    push_chunks_with_pool, push_chunks_with_pool_collect, upload_bytes, upload_collection,
+    ChunkPushFailure, ClientError, ManifestEntry, SessionPool, StampedChunk, UploadFile,
 };
 
 #[cfg(unix)]
