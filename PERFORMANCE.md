@@ -391,24 +391,73 @@ Both env knobs (`ISHEIKA_BUFFER_MULT`, `ISHEIKA_CONNECTIONS_PER_PEER`)
 stay in the code as investigator tools but should not be the default
 recommendation.
 
+## Multi-worker upload (shipped, modest gain)
+
+The 5-phase multi-worker plan landed (commits `b4897c8` Phase 1
+through `02926ea` Phase 5). `isheika upload-parallel` spawns N worker
+subprocesses, each with its own ephemeral overlay key. The
+coordinator stamps every chunk upfront with the batch-owner key and
+distributes batches to workers over Unix sockets; workers push under
+their own libp2p identities. Bee sees N independent source overlays
+with N independent ghost-balance counters.
+
+**The architecture works. The throughput multiplier is much smaller
+than the plan predicted.**
+
+VPS sweep, 50 MiB random content, 3335-peer peerlist, `--concurrency 128`
+per worker, single-trial per cell:
+
+| Configuration | Time | Throughput |
+|---|---:|---:|
+| Single-process `upload --concurrency 128` (baseline) | 116s | 450 KiB/s |
+| `upload-parallel --workers 2 --concurrency 128` | 257s | 204 KiB/s |
+| `upload-parallel --workers 4 --concurrency 128` | 161s | 326 KiB/s |
+| `upload-parallel --workers 8 --concurrency 128` | 89s / 88s | **590 KiB/s** |
+
+Honest read:
+
+- Only `workers=8` clearly beats single-process, and only by **~1.3×**
+  — far below the "4-8× linear scaling" the plan predicted.
+- `workers ∈ {2, 4}` either regress or match the baseline.
+  Coordinator IPC overhead + correlated pool-fill dial storms +
+  reduced per-chunk peer coverage (each chunk only sees its assigned
+  worker's pool) plausibly explain it; we didn't pin down which
+  dominates.
+- The plan's assumption was that bee's per-overlay accounting
+  (4.5 M PLUR/sec refresh rate per overlay) was the cap. Empirically
+  that wasn't the bottleneck at our workload — we're well under the
+  per-overlay credit ceiling. The real wall is some combination of
+  mainnet's aggregate forwarding capacity for this one source IP,
+  variance in close-peer availability across workers' independent
+  pool subsamples, and IPC + coordination overhead.
+
+The multi-worker pipeline is shipped and correct: stamps are reused
+across workers, failed chunks re-route, dying workers re-queue their
+in-flight batches. It's just not the throughput unlock the plan
+hoped for. **For real multiplicative gains, distinct source IPs
+(workers on different machines) is the next architectural step**,
+since per-IP rather than per-overlay seems to be where mainnet's
+implicit ceiling sits.
+
 ## Further work (unblocked, ordered by expected impact)
 
-1. **Multi-overlay parallelism.** The only remaining lever with
-   plausible multiplicative gain. Run N isheika processes with
-   distinct `--key`s, each driving its own session pool against
-   mainnet. Bee accounts per source overlay, so N source overlays
-   look like N independent uploaders to mainnet and scale near-
-   linearly. The right shape for the "upload appliance" use case.
-   ~1-2k lines of new coordinator code plus manifest stitching.
-2. **Larger-workload re-measurement.** All sweeps above use a 5 MiB
-   random tar where pool-fill amortises only loosely over push time.
-   A 50-500 MiB workload might surface different bottlenecks (push
-   phase dominates, yamux contention has more chances to engage,
-   ghost-balance rotation actually fires). Multi-conn and buffer
-   knobs might prove load-bearing at that scale even though they're
-   neutral or negative at 5 MiB.
-3. **`--substream-upgrade-cap` re-measurement under controlled
-   conditions.** The single-trial sweep can't separate signal from
-   noise. A 5-trial interleaved sweep + median would tell us whether
-   32 actually beats 64, but the available headroom is small and
-   probably not worth the experiment time compared to (1).
+1. **Distributed workers on different machines.** Workers communicate
+   with a single remote coordinator over TCP instead of Unix sockets.
+   N different IPs hit mainnet from N different routes; bee's
+   per-IP rate-limit + per-IP connection cap + (likely) aggregate
+   forwarding capacity become N-fold higher. Same protocol
+   (`src/multiwork/protocol.rs`), different transport (replace
+   `UnixStream` with `TcpStream`). Real expected multiplicative
+   scaling — but coordination is harder (auth, NAT, latency).
+2. **Larger-workload re-measurement of single-worker knobs.** All
+   sweeps to date use 5-50 MiB workloads where pool-fill amortises
+   loosely. A 500 MiB-5 GiB workload might surface different
+   bottlenecks (push-phase dominates entirely, ghost-balance
+   rotation fires repeatedly). The multi-conn / buffer / cap knobs
+   we closed as negative at small scale might prove load-bearing at
+   that scale.
+3. **`--substream-upgrade-cap` interleaved-trial sweep.** Single-trial
+   sweep couldn't separate signal from noise. A 5-trial
+   interleaved-order sweep + median per cap would settle whether 32
+   actually beats 64. Available headroom is small per the data;
+   probably not worth the time compared to (1).
