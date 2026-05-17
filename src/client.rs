@@ -901,6 +901,7 @@ pub async fn upload_file_with_manifest_ex(
 pub async fn upload_file_with_manifest_with_pool(
     transport: &Transport,
     pool: &SessionPool,
+    peers: &PeerStore,
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
@@ -916,7 +917,7 @@ pub async fn upload_file_with_manifest_with_pool(
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk, None).await?;
+    push_chunks_with_pool(transport, pool, peers, work, max_retries_per_chunk, None).await?;
     Ok(manifest_root)
 }
 
@@ -1140,6 +1141,7 @@ pub async fn upload_bytes_ex(
 pub async fn upload_bytes_with_pool(
     transport: &Transport,
     pool: &SessionPool,
+    peers: &PeerStore,
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
@@ -1151,7 +1153,7 @@ pub async fn upload_bytes_with_pool(
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, work, max_retries_per_chunk, None).await?;
+    push_chunks_with_pool(transport, pool, peers, work, max_retries_per_chunk, None).await?;
     Ok(root)
 }
 
@@ -1356,8 +1358,18 @@ const PREWARM_GHOST_BALANCE_PLUR: u64 =
 /// session retirement, and accounting state are all handled internally —
 /// once opened, a pool can be re-used (e.g. by the daemon) for many
 /// upload requests without paying the dial-fill cost each time.
+///
+/// Internally the pool is an append-only `Vec<Arc<SessionEntry>>`
+/// guarded by a `RwLock`. Initial entries are added by
+/// [`SessionPool::open`]; the JIT-AOR dialer running inside
+/// [`push_chunks_with_pool`] later appends address-space-targeted
+/// extras for chunks whose neighborhood isn't represented by the
+/// initial pool. The dispatcher snapshots the current entry list
+/// once per chunk (under a brief read lock), so newly-arrived JIT
+/// sessions become eligible for the *next* chunk dispatched without
+/// reorganising the in-flight ones.
 pub struct SessionPool {
-    sessions: std::sync::Arc<Vec<SessionEntry>>,
+    sessions: std::sync::Arc<std::sync::RwLock<Vec<std::sync::Arc<SessionEntry>>>>,
 }
 
 impl SessionPool {
@@ -1374,15 +1386,39 @@ impl SessionPool {
         if sessions.is_empty() {
             return Err(ClientError::NoPeers("no reachable ws peers".into()));
         }
-        Ok(Self { sessions: std::sync::Arc::new(sessions) })
+        let wrapped: Vec<std::sync::Arc<SessionEntry>> =
+            sessions.into_iter().map(std::sync::Arc::new).collect();
+        Ok(Self { sessions: std::sync::Arc::new(std::sync::RwLock::new(wrapped)) })
     }
 
     pub fn len(&self) -> usize {
-        self.sessions.len()
+        self.sessions.read().expect("session pool rwlock poisoned").len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.is_empty()
+        self.sessions.read().expect("session pool rwlock poisoned").is_empty()
+    }
+
+    /// Take a cheap snapshot of the current entries. Each `Arc` is
+    /// cloned (refcount bump only); the read lock is dropped before
+    /// returning. Callers use the snapshot as a fixed-index view into
+    /// the pool for the duration of one chunk's dispatch.
+    fn snapshot(&self) -> Vec<std::sync::Arc<SessionEntry>> {
+        self.sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .clone()
+    }
+
+    /// Append a freshly-opened JIT-AOR session to the pool. The new
+    /// entry becomes visible to dispatchers that snapshot *after*
+    /// this call returns; in-flight chunk dispatches keep their
+    /// earlier snapshot.
+    fn extend_one(&self, entry: std::sync::Arc<SessionEntry>) {
+        self.sessions
+            .write()
+            .expect("session pool rwlock poisoned")
+            .push(entry);
     }
 }
 
@@ -1414,7 +1450,7 @@ async fn push_chunks_concurrent(
         pool.len(),
         work.len()
     );
-    push_chunks_with_pool(transport, &pool, work, max_retries, progress).await
+    push_chunks_with_pool(transport, &pool, peers, work, max_retries, progress).await
 }
 
 /// Push `work` through an existing pool. Used by the daemon to amortise
@@ -1431,6 +1467,7 @@ async fn push_chunks_concurrent(
 pub async fn push_chunks_with_pool(
     transport: &Transport,
     session_pool: &SessionPool,
+    peers: &PeerStore,
     work: Vec<StampedChunk>,
     max_retries: usize,
     progress: Option<&ProgressFn>,
@@ -1442,12 +1479,52 @@ pub async fn push_chunks_with_pool(
     if work.is_empty() {
         return Ok(());
     }
-    let pool = session_pool.sessions.clone();
-    if pool.is_empty() {
+    // Initial pool snapshot — used for sizing decisions only. The
+    // dispatcher takes a fresh snapshot per chunk so JIT-AOR sessions
+    // appended mid-upload become visible to subsequent dispatches.
+    let initial_pool = session_pool.snapshot();
+    if initial_pool.is_empty() {
         return Err(ClientError::NoPeers("no reachable ws peers".into()));
     }
     let total = work.len();
     let pushed = Arc::new(AtomicUsize::new(0));
+
+    // Plan JIT-AOR candidates: for every chunk in `work`, find the
+    // highest-PO peer in the full peerstore that we're not already
+    // talking to. Dedupe, filter recently-failed, sort by best PO
+    // descending, cap at the configured budget. The resulting list
+    // feeds a background dialer that runs concurrently with chunk
+    // pushes inside the outer select loop (see `aor_dial_inflight`
+    // arm below). Sessions land staggered across the early seconds of
+    // the upload; chunks dispatched after each lands take a direct-
+    // to-storer route, skipping bee's pushsync forwarding hops.
+    //
+    // Budget defaults to the initial pool size. Doubling the live
+    // pool with address-space-targeted entries is the operative
+    // hypothesis here, balanced against per-IP / per-machine
+    // ephemeral-port pressure beyond ~1024 simultaneous connections.
+    // `ISHEIKA_AOR_BUDGET` semantics:
+    //   - unset → default to `initial_pool.len()` (= roughly double the
+    //     live pool with address-space-targeted entries)
+    //   - `0`   → disable JIT-AOR dialing (regression-test path)
+    //   - `N>0` → cap candidate list at N
+    let aor_budget: usize = match std::env::var("ISHEIKA_AOR_BUDGET")
+        .ok()
+        .and_then(|s| s.parse().ok())
+    {
+        Some(n) => n,
+        None => initial_pool.len(),
+    };
+    let aor_plan = if aor_budget == 0 {
+        Vec::new()
+    } else {
+        plan_jit_aor_candidates(peers, &work, &initial_pool, aor_budget)
+    };
+    if !aor_plan.is_empty() {
+        info!(target: "isheika::upload",
+            "JIT-AOR plan: {} candidate peers (budget {}); dialer running in background",
+            aor_plan.len(), aor_budget);
+    }
 
     // Sized to match bee's pusher `ConcurrentPushes = swarm.Branches
     // = 128` at workflow level. A wider buffer doesn't help once we're
@@ -1470,7 +1547,7 @@ pub async fn push_chunks_with_pool(
         .and_then(|s| s.parse().ok())
         .filter(|n: &usize| *n > 0)
         .unwrap_or(1);
-    let buffer = (128 * mult).min(total).max(pool.len());
+    let buffer = (128 * mult).min(total).max(initial_pool.len());
 
     // Per-chunk peer racing: race N peers in parallel from the start
     // of each chunk's dispatch. Most random-addressed chunks on novel
@@ -1520,7 +1597,7 @@ pub async fn push_chunks_with_pool(
     const MAX_CHUNK_RETRIES: u8 = 10;
 
     let dispatch = |chunk: Arc<StampedChunk>, attempts: u8| {
-        let pool = pool.clone();
+        let session_pool = session_pool;
         let pushed = pushed.clone();
         let transport = transport;
         let progress = progress.cloned();
@@ -1532,6 +1609,14 @@ pub async fn push_chunks_with_pool(
             // same when pushsync exits without a valid receipt).
             let result: Result<(), ClientError> = async move {
             use futures::stream::{FuturesUnordered, StreamExt};
+
+            // Take a fresh snapshot of the pool for this dispatch. JIT-
+            // AOR sessions appended after `push_chunks_with_pool` started
+            // are picked up automatically here. The snapshot is an
+            // `Arc<Vec<Arc<SessionEntry>>>`-equivalent (cheap clones of
+            // entry Arcs) so the read lock is released immediately and
+            // doesn't gate concurrent dispatches.
+            let pool: Vec<Arc<SessionEntry>> = session_pool.snapshot();
 
             // Rank sessions by proximity to this chunk's address; closest
             // first. bee at that peer is then either inside its area of
@@ -1560,6 +1645,12 @@ pub async fn push_chunks_with_pool(
             // collapses unknown and known-out into a single "PO
             // descending" tier; only the explicit in-AOR-confirmed
             // promotion moves chunks.
+            //
+            // JIT-AOR sessions land here too: they're seeded with a
+            // storage_radius hint at dial-plan time, so their `in_aor()`
+            // returns Some(true) for the chunks they were planned for
+            // and they bubble to the top of `order` for the very first
+            // dispatch after they're appended.
             order.sort_by(|&a, &b| {
                 let pa = chunk_addr.proximity(&pool[a].overlay);
                 let pb = chunk_addr.proximity(&pool[b].overlay);
@@ -1577,10 +1668,9 @@ pub async fn push_chunks_with_pool(
             let mut order_iter = order.iter().take(cap).copied();
 
             let attempt = |idx: usize, attempt_no: usize| {
-                let pool = pool.clone();
+                let entry = pool[idx].clone();
                 let chunk = chunk.clone();
                 async move {
-                    let entry = &pool[idx];
                     let mut peer_overlay = [0u8; 32];
                     peer_overlay.copy_from_slice(entry.overlay.as_bytes());
                     let price = peer_price(&peer_overlay, &chunk.addr);
@@ -1598,7 +1688,7 @@ pub async fn push_chunks_with_pool(
                             Err(TransportError::ConnectionClosed),
                         );
                     }
-                    let outcome = try_push_with_rotation(entry, &chunk, price, transport).await;
+                    let outcome = try_push_with_rotation(&entry, &chunk, price, transport).await;
                     (idx, attempt_no, price, outcome)
                 }
             };
@@ -1887,17 +1977,33 @@ pub async fn push_chunks_with_pool(
     // The future borrows `transport` for `'_`, so we use BoxFuture<'_>
     // from the futures crate (which carries an explicit lifetime),
     // not the more common +'static dyn pinning.
+    // Pre-warm dial returns the SessionEntry it was dialed for (as an
+    // Arc, since the pool snapshot index can shift if JIT-AOR sessions
+    // are appended between the prewarm being kicked off and resolving).
     #[cfg(not(target_arch = "wasm32"))]
     let mut prewarm_dials: FuturesUnordered<
-        futures::future::BoxFuture<'_, (usize, Result<PeerSession, TransportError>)>,
+        futures::future::BoxFuture<
+            '_,
+            (Arc<SessionEntry>, Result<PeerSession, TransportError>),
+        >,
     > = FuturesUnordered::new();
     #[cfg(target_arch = "wasm32")]
     let mut prewarm_dials: FuturesUnordered<
-        futures::future::LocalBoxFuture<'_, (usize, Result<PeerSession, TransportError>)>,
+        futures::future::LocalBoxFuture<
+            '_,
+            (Arc<SessionEntry>, Result<PeerSession, TransportError>),
+        >,
     > = FuturesUnordered::new();
 
-    let maybe_prewarm = |idx: usize, prewarm_dials: &mut FuturesUnordered<_>| {
-        let entry = &pool[idx];
+    // Re-snapshot the pool every time we want to walk it for prewarm
+    // candidates or heartbeat. The snapshot is cheap (Vec of Arc
+    // clones); JIT-AOR entries appended since the last call show up
+    // here, and they're treated identically to initial-pool entries
+    // for ghost-balance pre-warm purposes.
+    let maybe_prewarm = |entries: &[Arc<SessionEntry>],
+                         idx: usize,
+                         prewarm_dials: &mut FuturesUnordered<_>| {
+        let entry = &entries[idx];
         let ghost = entry.snapshot().ghost_balance_plur();
         if ghost >= PREWARM_GHOST_BALANCE_PLUR
             && entry
@@ -1911,18 +2017,82 @@ pub async fn push_chunks_with_pool(
                 .is_ok()
         {
             let underlay = entry.underlay.clone();
+            let entry = entry.clone();
             #[cfg(not(target_arch = "wasm32"))]
             prewarm_dials.push(Box::pin(async move {
                 let res = transport.open_session(&underlay).await;
-                (idx, res)
+                (entry, res)
             }) as futures::future::BoxFuture<'_, _>);
             #[cfg(target_arch = "wasm32")]
             prewarm_dials.push(Box::pin(async move {
                 let res = transport.open_session(&underlay).await;
-                (idx, res)
+                (entry, res)
             }) as futures::future::LocalBoxFuture<'_, _>);
         }
     };
+
+    // Background JIT-AOR dialer: walk `aor_plan` (already sorted by
+    // best seed_radius descending), keep `AOR_DIAL_PARALLELISM` dials
+    // in flight at once, append successful sessions to `session_pool`
+    // as they land. Failures (~50% on mainnet stale peers) are
+    // silently dropped after recording reachability in the log.
+    //
+    // The inflight queue lives in the same select! as the main chunk
+    // dispatch loop; AOR dials race with chunk pushes for transport-
+    // local concurrency. By the time the upload's busy phase begins
+    // (after the in-flight buffer fills with chunk dispatches), most
+    // useful AOR sessions have either landed or failed.
+    const AOR_DIAL_PARALLELISM: usize = 32;
+    let mut aor_plan_iter = aor_plan.into_iter();
+    let aor_dial = |overlay: SwarmAddress,
+                    overlay_hex: String,
+                    underlay: Multiaddr,
+                    seed_radius: u8| async move {
+        let started = web_time::Instant::now();
+        let result = transport.open_session(&underlay).await;
+        let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
+        (overlay, overlay_hex, underlay, seed_radius, result, rtt_ms)
+    };
+    #[cfg(not(target_arch = "wasm32"))]
+    let mut aor_dial_inflight: FuturesUnordered<
+        futures::future::BoxFuture<
+            '_,
+            (
+                SwarmAddress,
+                String,
+                Multiaddr,
+                u8,
+                Result<PeerSession, TransportError>,
+                u32,
+            ),
+        >,
+    > = FuturesUnordered::new();
+    #[cfg(target_arch = "wasm32")]
+    let mut aor_dial_inflight: FuturesUnordered<
+        futures::future::LocalBoxFuture<
+            '_,
+            (
+                SwarmAddress,
+                String,
+                Multiaddr,
+                u8,
+                Result<PeerSession, TransportError>,
+                u32,
+            ),
+        >,
+    > = FuturesUnordered::new();
+    for (overlay, overlay_hex, underlay, seed_radius) in
+        aor_plan_iter.by_ref().take(AOR_DIAL_PARALLELISM)
+    {
+        #[cfg(not(target_arch = "wasm32"))]
+        aor_dial_inflight.push(Box::pin(aor_dial(overlay, overlay_hex, underlay, seed_radius))
+            as futures::future::BoxFuture<'_, _>);
+        #[cfg(target_arch = "wasm32")]
+        aor_dial_inflight.push(Box::pin(aor_dial(overlay, overlay_hex, underlay, seed_radius))
+            as futures::future::LocalBoxFuture<'_, _>);
+    }
+    let aor_log = transport.reachability_log();
+    let aor_landed = Arc::new(AtomicUsize::new(0));
 
     let mut first_err: Option<ClientError> = None;
     let mut more_chunks = true;
@@ -1946,8 +2116,9 @@ pub async fn push_chunks_with_pool(
                         // Opportunistically pre-warm any session that's
                         // approaching its rotation limit. compare_exchange
                         // ensures only one dial per entry at a time.
-                        for i in 0..pool.len() {
-                            maybe_prewarm(i, &mut prewarm_dials);
+                        let entries = session_pool.snapshot();
+                        for i in 0..entries.len() {
+                            maybe_prewarm(&entries, i, &mut prewarm_dials);
                         }
                         if let Some(c) = iter.next() {
                             inflight.push(Box::pin(dispatch(c, 0)));
@@ -1997,8 +2168,7 @@ pub async fn push_chunks_with_pool(
                 }
             }
 
-            Some((idx, res)) = prewarm_dials.next(), if !prewarm_dials.is_empty() && more_chunks => {
-                let entry = &pool[idx];
+            Some((entry, res)) = prewarm_dials.next(), if !prewarm_dials.is_empty() && more_chunks => {
                 entry.prewarm_inflight.store(false, Ordering::Release);
                 match res {
                     Ok(session) => {
@@ -2013,16 +2183,79 @@ pub async fn push_chunks_with_pool(
                 }
             }
 
+            Some((overlay, overlay_hex, underlay, seed_radius, res, rtt_ms))
+                = aor_dial_inflight.next(),
+                if !aor_dial_inflight.is_empty() && more_chunks =>
+            {
+                match res {
+                    Ok(session) => {
+                        debug!(target: "isheika::upload",
+                            "JIT-AOR session ready: {} (seed_radius={}, rtt={}ms)",
+                            overlay_hex, seed_radius, rtt_ms);
+                        aor_log.lock().unwrap()
+                            .insert(overlay_hex.to_lowercase(), DialResult::Success { rtt_ms });
+                        let entry = Arc::new(SessionEntry {
+                            overlay,
+                            overlay_hex,
+                            underlay,
+                            session: std::sync::Mutex::new(session),
+                            pending: std::sync::Mutex::new(None),
+                            prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
+                            failure_strikes: std::sync::atomic::AtomicU32::new(0),
+                            skip_until_unix: std::sync::atomic::AtomicU64::new(0),
+                            // Seed with the heuristic radius from the
+                            // chunk we dialed this peer for. The first
+                            // real receipt will replace it (monotonic
+                            // upward via observe_storage_radius).
+                            // Seeding here is what makes the dispatcher's
+                            // in_aor() bucket promote this entry for the
+                            // very next chunk it's a good fit for —
+                            // without the seed, in_aor() would return
+                            // None until a receipt comes back.
+                            storage_radius: std::sync::atomic::AtomicU8::new(seed_radius),
+                        });
+                        session_pool.extend_one(entry);
+                        let landed = aor_landed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if landed % 16 == 0 {
+                            info!(target: "isheika::upload",
+                                "JIT-AOR: {} session(s) landed", landed);
+                        }
+                    }
+                    Err(e) => {
+                        debug!(target: "isheika::upload",
+                            "JIT-AOR dial to {} failed: {}", overlay_hex, e);
+                        aor_log.lock().unwrap()
+                            .insert(overlay_hex.to_lowercase(), DialResult::Failure);
+                    }
+                }
+                // Keep the AOR dial window full from the plan list.
+                if let Some((overlay, overlay_hex, underlay, seed_radius))
+                    = aor_plan_iter.next()
+                {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    aor_dial_inflight.push(Box::pin(
+                        aor_dial(overlay, overlay_hex, underlay, seed_radius),
+                    )
+                        as futures::future::BoxFuture<'_, _>);
+                    #[cfg(target_arch = "wasm32")]
+                    aor_dial_inflight.push(Box::pin(
+                        aor_dial(overlay, overlay_hex, underlay, seed_radius),
+                    )
+                        as futures::future::LocalBoxFuture<'_, _>);
+                }
+            }
+
             _ = heartbeat.as_mut() => {
                 // Every 5 s, surface progress even when the main
                 // throughput hasn't crossed the next 25-chunk
                 // milestone — distinguishes a hang from a slow link.
                 let now = pushed.load(Ordering::Relaxed);
+                let entries = session_pool.snapshot();
                 if now == last_pushed_seen {
-                    let alive = (0..pool.len()).filter(|i| !pool[*i].is_dead()).count();
+                    let alive = entries.iter().filter(|e| !e.is_dead()).count();
                     info!(target: "isheika::upload",
                         "stalled at {}/{} chunks (inflight={}, alive sessions={}/{})",
-                        now, total, inflight.len(), alive, pool.len());
+                        now, total, inflight.len(), alive, entries.len());
                 } else {
                     info!(target: "isheika::upload",
                         "pushed {}/{} chunks (inflight={})",
@@ -2034,6 +2267,19 @@ pub async fn push_chunks_with_pool(
 
             else => break,
         }
+    }
+
+    // Note: any aor_dial_inflight futures still in flight are dropped
+    // along with the FuturesUnordered when this function returns,
+    // cancelling their underlying tokio dials at the next await
+    // point. We also stop landing them while `more_chunks == false`
+    // (see the arm guard) — once the upload's tail starts winding
+    // down there's nothing useful a fresh JIT session could do.
+    let landed = aor_landed.load(Ordering::Relaxed);
+    if landed > 0 {
+        info!(target: "isheika::upload",
+            "JIT-AOR: {} session(s) landed during upload (final pool size {})",
+            landed, session_pool.snapshot().len());
     }
 
     if let Some(e) = first_err {
@@ -2163,6 +2409,129 @@ async fn try_push_with_rotation(
 /// per-incoming-connection cost is cheap, and these dials only run once
 /// per upload.
 const SESSION_DIAL_PARALLELISM: usize = 32;
+
+/// Floor on the JIT-AOR seed radius. Bee mainnet's network-wide
+/// storage radius hovers around 12–14; a peer that's top-1 for a
+/// PO=4 chunk almost certainly *isn't* in that chunk's AOR (they
+/// just happen to be the best of bad options when our peerlist is
+/// sparse in that region). Refusing to seed below this floor keeps
+/// the dispatcher from over-promoting weakly-targeted JIT entries.
+const JIT_AOR_SEED_FLOOR: u8 = 11;
+
+/// Plan the candidate list for JIT-AOR dialing. For each chunk in
+/// `work`, find the closest peer in the full peerstore that isn't
+/// already in `initial_pool` and isn't recently-failed. Collapse the
+/// per-chunk top-1 picks into a unique-overlay candidate list,
+/// tracking the deepest PO seen against each peer. Sort
+/// descending-by-deepest-PO and truncate to `budget`.
+///
+/// Each candidate also gets a `seed_radius`: the dispatcher's `in_aor`
+/// will return `Some(true)` for chunks at PO ≥ `seed_radius`, so this
+/// controls when the new session bubbles to the front of the order.
+///
+/// Seeding strategy:
+///   - Use the **minimum** PO across chunks where this peer was the
+///     top-1 closest. That's the broadest PO range we're betting the
+///     peer covers: if it was closest at PO=12 *and* PO=14, the
+///     bet is it's AOR for everything ≥ PO=12.
+///   - Floor at `JIT_AOR_SEED_FLOOR` (~11) so a peer that's top-1
+///     for a single PO=4 chunk doesn't get over-promoted to every
+///     chunk in the dispatcher.
+///   - First real receipt against the JIT session will replace the
+///     seed with the peer's observed `storage_radius`
+///     (monotonic-upward via `observe_storage_radius`).
+fn plan_jit_aor_candidates(
+    peers: &PeerStore,
+    work: &[StampedChunk],
+    initial_pool: &[std::sync::Arc<SessionEntry>],
+    budget: usize,
+) -> Vec<(SwarmAddress, String, Multiaddr, u8)> {
+    if budget == 0 || work.is_empty() {
+        return Vec::new();
+    }
+    // Set of overlays already covered by the initial pool — never
+    // re-dial these as JIT candidates (we already have an open session).
+    let mut pool_overlays: std::collections::HashSet<String> =
+        std::collections::HashSet::with_capacity(initial_pool.len());
+    for e in initial_pool {
+        pool_overlays.insert(e.overlay_hex.to_lowercase());
+    }
+
+    // For each chunk: find the closest peer in the full store that
+    // isn't already in the pool. Track per-overlay min-PO (used as
+    // seed_radius) and max-PO (used for budget-truncation priority).
+    //
+    // `closest(chunk_addr, 4)` is O(N) per chunk; for a 12k-chunk
+    // upload on a 3k peerstore that's ~36M ops — well under a second
+    // and amortises against the rest of the upload's wall time. We
+    // walk 4 (not 1) so that if the literal top-1 is already in the
+    // pool or recently-failed we still pick up a useful candidate.
+    let now = crate::peers::now_unix();
+    let mut min_po: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    let mut max_po: std::collections::HashMap<String, u8> =
+        std::collections::HashMap::new();
+    let mut peer_info: std::collections::HashMap<String, (SwarmAddress, Multiaddr)> =
+        std::collections::HashMap::new();
+    for chunk in work {
+        let chunk_addr = ChunkAddress::new(chunk.addr);
+        let closest = peers.closest(&chunk_addr, 4);
+        for peer in closest {
+            let key = peer.overlay.to_lowercase();
+            if pool_overlays.contains(&key) {
+                continue;
+            }
+            if peer.is_recently_unreachable(now) {
+                continue;
+            }
+            let Some(underlay) = peer.first_dialable_underlay() else { continue };
+            let Some(overlay) = peer.overlay_address() else { continue };
+            let po = chunk_addr.proximity(&overlay);
+            min_po
+                .entry(key.clone())
+                .and_modify(|p| {
+                    if po < *p {
+                        *p = po;
+                    }
+                })
+                .or_insert(po);
+            max_po
+                .entry(key.clone())
+                .and_modify(|p| {
+                    if po > *p {
+                        *p = po;
+                    }
+                })
+                .or_insert(po);
+            peer_info.entry(key).or_insert((overlay, underlay));
+            // Only take the top-1 per chunk to keep the candidate set
+            // focused on the highest-value peers.
+            break;
+        }
+    }
+
+    // Sort by max_po descending (peers that are close to at least
+    // one chunk go first) and truncate to budget.
+    let mut candidates: Vec<(String, u8, u8)> = max_po
+        .into_iter()
+        .map(|(k, mx)| {
+            let mn = min_po.get(&k).copied().unwrap_or(mx);
+            (k, mx, mn)
+        })
+        .collect();
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.truncate(budget);
+
+    let mut out: Vec<(SwarmAddress, String, Multiaddr, u8)> = Vec::with_capacity(candidates.len());
+    for (key, _max, min) in candidates {
+        if let Some((overlay, underlay)) = peer_info.remove(&key) {
+            let seed = min.max(JIT_AOR_SEED_FLOOR);
+            let overlay_hex = hex::encode(overlay.as_bytes());
+            out.push((overlay, overlay_hex, underlay, seed));
+        }
+    }
+    out
+}
 
 /// Reorder a candidate peer list so that consecutive picks cover
 /// distinct proximity-order bins instead of clustering by overlay

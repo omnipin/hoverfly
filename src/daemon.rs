@@ -338,6 +338,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 upload_bytes_with_pool(
                     &state.transport,
                     &*pool,
+                    &*peers_guard,
                     &signer,
                     &r.batch,
                     r.depth,
@@ -358,6 +359,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 upload_file_with_manifest_with_pool(
                     &state.transport,
                     &*pool,
+                    &*peers_guard,
                     &signer,
                     &r.batch,
                     r.depth,
