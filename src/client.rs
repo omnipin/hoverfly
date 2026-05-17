@@ -1229,6 +1229,15 @@ struct SessionEntry {
     /// Unix-seconds timestamp before which this entry is considered
     /// "dead" and skipped by the dispatcher. Default `0` = always-live.
     skip_until_unix: std::sync::atomic::AtomicU64,
+    /// Storage radius advertised by this peer, learned from pushsync
+    /// receipts. Bee's AOR rule: a chunk is in peer X's reserve iff
+    /// `PO(chunk_addr, X.overlay) >= X.storage_radius`. Used by the
+    /// per-chunk dispatcher to prefer peers that will actually store
+    /// the chunk (full receipt) over peers that will only forward it
+    /// (shallow receipt → bee re-routes, adds latency). `0` =
+    /// unknown (default before any receipt); treated by the
+    /// dispatcher as "might be in AOR" (optimistic).
+    storage_radius: std::sync::atomic::AtomicU8,
 }
 
 impl SessionEntry {
@@ -1282,6 +1291,30 @@ impl SessionEntry {
             self.mark_dead(secs)
         } else {
             false
+        }
+    }
+
+    /// Monotonically bump the recorded storage radius if `value`
+    /// is higher than what's currently stored. Called whenever we
+    /// learn something new about this peer's depth.
+    fn observe_storage_radius(&self, value: u8) {
+        let prev = self.storage_radius.load(std::sync::atomic::Ordering::Relaxed);
+        if value > prev {
+            self.storage_radius
+                .store(value, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    /// Returns whether this peer is in the chunk's AOR per our latest
+    /// radius observation. `None` if no observation yet — dispatcher
+    /// treats unknown as "potentially yes" rather than excluding
+    /// (a known-out-of-AOR peer is worse than an unknown one).
+    fn in_aor(&self, chunk_po: u8) -> Option<bool> {
+        let sr = self.storage_radius.load(std::sync::atomic::Ordering::Relaxed);
+        if sr == 0 {
+            None
+        } else {
+            Some(chunk_po >= sr)
         }
     }
 
@@ -1510,10 +1543,34 @@ pub async fn push_chunks_with_pool(
             let chunk_addr = SwarmAddress::new(chunk.addr);
             let mut order: Vec<usize> =
                 (0..pool.len()).filter(|i| !pool[*i].is_dead()).collect();
+            // Storage-radius-aware bucket sort: prefer peers we've
+            // observed to be inside the chunk's AOR (they'll store
+            // the chunk directly, signing a real receipt) over peers
+            // with unknown radius, and those over peers we've seen
+            // only forward (guaranteed-shallow → bee re-routes
+            // internally, adds 1-3 RTTs).
+            //
+            //   bucket 0: known in-AOR     (sr observed AND po >= sr)
+            //   bucket 1: unknown          (no receipt observed yet)
+            //   bucket 2: known out-of-AOR (sr observed AND po <  sr)
+            //
+            // Within each bucket, sort by descending proximity. Bucket
+            // 2 stays in the order rather than being filtered, so we
+            // still have fallback candidates if both other buckets
+            // are empty (bee will forward, just with a shallow receipt).
             order.sort_by(|&a, &b| {
                 let pa = chunk_addr.proximity(&pool[a].overlay);
                 let pb = chunk_addr.proximity(&pool[b].overlay);
-                pb.cmp(&pa) // descending PO == closer first
+                let bucket = |idx: usize, po: u8| -> u8 {
+                    match pool[idx].in_aor(po) {
+                        Some(true) => 0,
+                        None => 1,
+                        Some(false) => 2,
+                    }
+                };
+                let ba = bucket(a, pa);
+                let bb = bucket(b, pb);
+                ba.cmp(&bb).then(pb.cmp(&pa))
             });
 
             let cap = max_retries.max(1).min(order.len());
@@ -2050,6 +2107,30 @@ async fn try_push_with_rotation(
                 a.copy_from_slice(&r.address);
                 a
             });
+            // Update this peer's storage-radius observation so future
+            // chunks can route around peers we know will only forward.
+            // Two cases by who signed the receipt:
+            //
+            // 1. The peer we pushed to *is* the storer (`storer ==
+            //    entry.overlay`): the receipt's `storage_radius`
+            //    field is exactly their reserve depth.
+            // 2. The peer forwarded to someone else. We only learn
+            //    that this peer chose not to store, which means
+            //    `storage_radius > PO(chunk, this_peer)`. Monotonic
+            //    lower-bound bump.
+            let mut entry_overlay = [0u8; 32];
+            entry_overlay.copy_from_slice(entry.overlay.as_bytes());
+            let chunk_po_to_entry = {
+                let mut chunk_addr = [0u8; 32];
+                chunk_addr.copy_from_slice(&r.address);
+                crate::transport::proximity(&entry_overlay, &chunk_addr)
+            };
+            if storer == entry_overlay {
+                let sr = r.storage_radius.min(u8::MAX as u32) as u8;
+                entry.observe_storage_radius(sr);
+            } else {
+                entry.observe_storage_radius(chunk_po_to_entry.saturating_add(1));
+            }
             if r.is_shallow(net) {
                 debug!(target: "isheika::upload",
                     "shallow: chunk={} storer={} po={} storage_radius={}",
@@ -2244,6 +2325,7 @@ async fn open_session_pool(
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
                     failure_strikes: std::sync::atomic::AtomicU32::new(0),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
+                    storage_radius: std::sync::atomic::AtomicU8::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
                     info!(target: "isheika::upload",
