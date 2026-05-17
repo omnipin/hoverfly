@@ -441,23 +441,100 @@ The full multi-worker code path (coordinator + worker subcommands,
 IPC protocol, ~900 LOC) was removed after this finding. Architecture
 sound, hypothesis falsified.
 
+## JIT-AOR sessions (shipped, measurement pending)
+
+The "Option B" that the storage-radius commits (`091dc5c`,
+`1913b71`) were a prerequisite for: dial address-space-targeted
+sessions to peers that are in the chunk's AOR but **not in the
+initial pool**, so each such chunk skips bee's forwarding hops and
+lands directly on an in-AOR storer.
+
+How it works:
+1. At the start of every upload, `plan_jit_aor_candidates`
+   (`client.rs:2400`) walks `work`. For each chunk it finds the
+   closest peer in the full peerstore that isn't already in the
+   initial pool and hasn't recently failed. Per-overlay min/max PO
+   is tracked across all chunks.
+2. Candidates are sorted by max-PO descending and truncated to
+   `--aor-budget` (default = `--concurrency`).
+3. The dialer runs as a `FuturesUnordered` arm inside the
+   dispatcher's outer select loop with `AOR_DIAL_PARALLELISM=32`
+   in-flight. Each successful dial appends an `Arc<SessionEntry>`
+   to the live `SessionPool` (now `Arc<RwLock<Vec<...>>>`,
+   append-only after open).
+4. Each JIT entry is seeded with `storage_radius = min(po seen,
+   floored at JIT_AOR_SEED_FLOOR=11)`. The dispatcher's `in_aor()`
+   then returns `Some(true)` for chunks where
+   `PO(chunk, peer) >= seed_radius`, promoting the entry to the
+   front of the candidate order for chunks it's a good fit for —
+   from the very first dispatch after it lands.
+5. First real receipt against the JIT session replaces the seed
+   with the peer's observed `storage_radius` via the existing
+   monotonic-upward `observe_storage_radius` path.
+6. Dropping the JIT-dial arm at upload end cancels in-flight
+   dials at their next await point — no leak.
+
+Why this works where the earlier `d17253a` (pure storage-radius
+sort within the existing pool) didn't:
+- That commit was reverted because at pool=128 only ~3% of random
+  chunks had an in-AOR peer in the *initial* pool. Storage-radius
+  routing collapsed to "noop most of the time".
+- At pool=512 (`091dc5c` measurement) it rose to ~12% in-AOR
+  coverage; the two-bucket sort (`1913b71`) keeps that gain but
+  still can't help the other 88%.
+- JIT-AOR *creates* the in-AOR session for the 88% by dialing
+  address-space-targeted peers in parallel with the chunk pushes.
+  At default budget (`--aor-budget = --concurrency`), the live
+  pool roughly doubles in size during the busy phase, and the
+  new entries are by construction close to specific chunks in
+  `work`.
+
+Cost model:
+- Extra dials: up to `--aor-budget` libp2p connections opened in
+  parallel with chunk pushes. Each one's handshake (`prep_connection`,
+  ~50-300 ms one RTT thanks to the active identify-push) is hidden
+  behind the busy-phase chunk push latency.
+- Each JIT session adds one libp2p connection from our IP; combined
+  with `--concurrency 512` the busy peak is up to 1024 simultaneous
+  connections. The earlier multi-connection sweep
+  (`ISHEIKA_CONNECTIONS_PER_PEER`) showed mainnet bees tolerate
+  multi-conn fine; ephemeral ports on a Linux VPS are 28k+ by
+  default so this is well inside any per-machine cap.
+- Each saved forwarding hop is one round trip of ~200-1500 ms
+  saved (bee mainnet forwarding RTT distribution). Expected
+  speedup at default budget: 2-4× on novel random content,
+  capped by per-chunk per-session yamux throughput once
+  forwarding stops dominating.
+
+CLI:
+- `--aor-budget N`: candidate cap; default `--concurrency`,
+  set `0` to disable.
+- `ISHEIKA_AOR_BUDGET` env var: same knob; CLI flag overrides.
+
+Pending: measure on the same `--concurrency 512 --buffer-multiplier 4`
+workload that established the 1.05 MB/s baseline. Update this
+section with throughput numbers and any per-bucket sweep.
+
 ## Further work (unblocked, ordered by expected impact)
 
-1. **Push to AOR storers directly (skip bee's forwarding hops).** For
-   each chunk, identify a peer in the discover'd set whose
-   `storage_radius` covers the chunk's address (~80% of random chunks
-   have such a peer in a 3000+ peerlist). Open a session JIT, push,
-   keep it open opportunistically. Each chunk saves 1-3 forwarding
-   RTTs (~200-1500 ms). Earlier `storage_radius` commit (`d17253a`,
-   reverted) tried this with the existing pool; with JIT sessions it
-   actually has the coverage to fire. Expected: 2-4× on novel content.
-2. **Larger-workload re-measurement of single-process knobs.** All
+1. **Larger-workload re-measurement of single-process knobs.** All
    sweeps used 5-50 MiB. A 500 MiB-5 GiB workload might surface
    different bottlenecks (push-phase dominates entirely,
    ghost-balance rotation fires repeatedly, peerlist coverage gaps
-   show up). Could move the optimal `--concurrency` / `--buffer-multiplier`
-   pairing.
-3. **Distributed workers on different IPs.** If the per-IP wall is
+   show up). Could move the optimal `--concurrency` /
+   `--buffer-multiplier` / `--aor-budget` triple.
+2. **Adaptive AOR budget per peer-store density.** At fixed
+   `--aor-budget`, a sparse peerstore exhausts the unique-overlay
+   candidate set quickly (dialing every non-pool peer) while a
+   dense one doesn't dial enough of the close-PO tail. Auto-tune
+   from histogram of `closest()` PO distribution at plan time.
+3. **JIT-AOR with daemon mode.** Currently each upload through the
+   daemon appends to the shared pool indefinitely; the JIT-AOR
+   sessions land permanently. For long-running daemons this grows
+   the pool monotonically (slow but real). Either evict idle JIT
+   entries on TTL, or skip JIT-AOR planning entirely once the pool
+   has grown past a target size.
+4. **Distributed workers on different IPs.** If the per-IP wall is
    real (we haven't tested by going past pool=512 enough to
    measure), N separate machines each running their own
    pool+buffer-scaled upload would give real linear scaling.
