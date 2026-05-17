@@ -43,12 +43,6 @@ k256 = { version = "0.13", features = ["ecdsa"] }
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Compact binary serialisation for multi-worker IPC. JSON's u8-as-int
-# array encoding inflates byte-heavy payloads (~4 KiB StampedChunk
-# wire bodies) 3-4×; bincode preserves bytes 1:1. Same length-prefixed
-# framing as the daemon's unix socket, just bincode body instead of
-# JSON.
-bincode = "1"
 
 # Crypto / encoding
 sha3 = "0.10"
@@ -86,10 +80,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", def
 libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", features = ["tokio"] }
 libp2p-websocket = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal", "process"] }
-# Unix-only multi-worker coordinator needs a temp dir for the worker
-# socket files. Mirrored in [dev-dependencies] for the protocol tests.
-tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
@@ -134,7 +125,3 @@ prost-build = "0.13"
 
 [dev-dependencies]
 tokio-test = "0.4"
-# Tests in src/multiwork/protocol.rs spin up real Unix sockets in
-# temp dirs to round-trip wire-protocol messages.
-tempfile = "3"
-tokio = { version = "1", features = ["net", "rt-multi-thread", "macros", "io-util"] }

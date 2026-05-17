@@ -1402,59 +1402,6 @@ pub async fn push_chunks_with_pool(
     max_retries: usize,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
-    push_chunks_inner(transport, session_pool, work, max_retries, progress, None).await
-}
-
-/// Per-chunk failure record from [`push_chunks_with_pool_collect`].
-/// `error` is the formatted final error after `MAX_CHUNK_RETRIES`
-/// were exhausted. Successful chunks are not included in the returned
-/// list — anything in `work` that isn't here succeeded.
-#[derive(Debug, Clone)]
-pub struct ChunkPushFailure {
-    pub addr: [u8; 32],
-    pub error: String,
-}
-
-/// Per-chunk-results variant of [`push_chunks_with_pool`]. Same
-/// dispatch + per-chunk retry logic, but instead of bailing on the
-/// first failure, every chunk gets pushed to completion (or to its
-/// own retry budget exhaustion). Returns the list of failed chunks
-/// so the caller can decide how to handle them (typical use:
-/// coordinator re-routes failed chunks to a different worker).
-///
-/// Used by the multi-worker upload path
-/// (`src/multiwork/worker.rs`); the legacy
-/// [`push_chunks_with_pool`] keeps its existing bail-on-first-error
-/// semantics for backwards compat with the in-process upload paths
-/// and the daemon.
-pub async fn push_chunks_with_pool_collect(
-    transport: &Transport,
-    session_pool: &SessionPool,
-    work: Vec<StampedChunk>,
-    max_retries: usize,
-    progress: Option<&ProgressFn>,
-) -> Vec<ChunkPushFailure> {
-    let mut failures: Vec<ChunkPushFailure> = Vec::new();
-    let _ = push_chunks_inner(
-        transport,
-        session_pool,
-        work,
-        max_retries,
-        progress,
-        Some(&mut failures),
-    )
-    .await;
-    failures
-}
-
-async fn push_chunks_inner(
-    transport: &Transport,
-    session_pool: &SessionPool,
-    work: Vec<StampedChunk>,
-    max_retries: usize,
-    progress: Option<&ProgressFn>,
-    mut collect_failures: Option<&mut Vec<ChunkPushFailure>>,
-) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
@@ -1987,28 +1934,8 @@ async fn push_chunks_inner(
                         }));
                     }
                     Err(e) => {
-                        if let Some(failures) = collect_failures.as_deref_mut() {
-                            // Collect-mode: record this chunk as
-                            // failed and keep the dispatch loop alive
-                            // so other chunks in `work` still get
-                            // pushed. Top up the in-flight window if
-                            // there are more chunks to dispatch.
-                            failures.push(ChunkPushFailure {
-                                addr: chunk.addr,
-                                error: e.to_string(),
-                            });
-                            for i in 0..pool.len() {
-                                maybe_prewarm(i, &mut prewarm_dials);
-                            }
-                            if let Some(c) = iter.next() {
-                                inflight.push(Box::pin(dispatch(c, 0)));
-                            } else {
-                                more_chunks = false;
-                            }
-                        } else {
-                            first_err = Some(e);
-                            break;
-                        }
+                        first_err = Some(e);
+                        break;
                     }
                 }
             }
