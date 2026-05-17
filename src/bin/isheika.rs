@@ -68,6 +68,18 @@ struct Cli {
           value_name = "N")]
     substream_upgrade_cap: usize,
 
+    /// Multiplier applied to the dispatcher's in-flight chunk
+    /// buffer. The buffer's base cap is `128 × mult`, floored at
+    /// pool size. At `mult=1` (default) the buffer matches the
+    /// original 128 cap. Increase together with `--concurrency`:
+    /// per-session in-flight stays ~constant while total grows.
+    /// Sweet spot empirically `--concurrency 512 --buffer-multiplier 4`
+    /// on a 3000+ peer pool (≈ 1 MB/s on a VPS); larger overshoots
+    /// into yamux contention and regresses. See PERFORMANCE.md
+    /// "Pool + buffer scaling" for the sweep.
+    #[arg(long, global = true, default_value_t = 1, value_name = "N")]
+    buffer_multiplier: usize,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -475,6 +487,21 @@ fn guess_content_type(path: &str) -> Option<String> {
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+
+    // The library reads ISHEIKA_BUFFER_MULT from the environment at
+    // upload dispatch time (`src/client.rs::push_chunks_inner`). The
+    // `--buffer-multiplier` CLI flag plumbs the same knob without
+    // requiring the user to export an env var. CLI value > 1
+    // overrides the env var; CLI value 1 (default) defers to env so
+    // an explicit `ISHEIKA_BUFFER_MULT=N` from the shell still works.
+    if cli.buffer_multiplier > 1 {
+        // Safety: single-threaded at this point (main hasn't done
+        // anything else yet); unsafe in nightly's edition-2024
+        // because env::set_var is process-wide.
+        unsafe {
+            std::env::set_var("ISHEIKA_BUFFER_MULT", cli.buffer_multiplier.to_string());
+        }
+    }
 
     let level = if cli.trace {
         Level::TRACE

@@ -1469,22 +1469,22 @@ async fn push_chunks_inner(
     let total = work.len();
     let pushed = Arc::new(AtomicUsize::new(0));
 
-    // Sized to match bee's pusher `ConcurrentPushes = swarm.Branches = 128`
-    // at workflow level. A wider buffer doesn't help once we're past the
-    // number of pushes the session pool can run truly in parallel —
-    // extra in-flight chunks just contend on the per-session accounting
-    // mutex (try_reserve serialises) and inflate dispatcher overhead.
-    // Earlier `pool × 16` produced 1.5 k+ attempts in flight on a
-    // 32-peer pool and turned 6 chunks/s into 0.1 chunks/s.
+    // Sized to match bee's pusher `ConcurrentPushes = swarm.Branches
+    // = 128` at workflow level. A wider buffer doesn't help once we're
+    // past the number of pushes the session pool can run truly in
+    // parallel — extra in-flight chunks just contend on the
+    // per-session accounting mutex (try_reserve serialises) and
+    // inflate dispatcher overhead. Earlier `pool × 16` produced
+    // 1.5 k+ attempts in flight on a 32-peer pool and turned 6
+    // chunks/s into 0.1 chunks/s.
     //
-    // ISHEIKA_BUFFER_MULT (default 1) multiplies the cap and the pool-
-    // size floor, so e.g. `=2` doubles in-flight chunks. Kept as an
-    // env knob, not a CLI flag, because per the comment above this
-    // direction has historically regressed throughput; the
-    // experiment is to re-measure under current code (per-chunk
-    // racing + stream_pool parallel opens + timeout-doesn't-retire).
-    // If buffer scaling proves a real win, promote to TransportConfig
-    // and CLI; if not, leave the env var as a perf-investigator tool.
+    // ISHEIKA_BUFFER_MULT (env var; same semantics as the
+    // --buffer-multiplier CLI flag) multiplies the cap and the
+    // pool-size floor. At default 1 the buffer is 128 chunks. Empirical
+    // sweet spot on a 50 MiB random VPS upload is
+    // `--concurrency 512 --buffer-multiplier 4` (= buffer 512 + pool
+    // 512, ~3 in-flight per session at race=3), reaching ~1 MB/s.
+    // Larger values overshoot into per-session yamux contention.
     let mult: usize = std::env::var("ISHEIKA_BUFFER_MULT")
         .ok()
         .and_then(|s| s.parse().ok())

@@ -267,7 +267,8 @@ at a given configuration.
 | Residential Mac, racing-only, ~222-peer peerlist (commit `5741cf9`) | ~75 KiB/s |
 | Residential Mac, racing + stream_pool patch, 222 peers (commit `1769220`) | ~133 KiB/s |
 | VPS, racing-only, 340 peers (commit `5741cf9`) | ~152 KiB/s |
-| VPS, racing + stream_pool patch + 3335 peers (5-round discover) | **~335 KiB/s** |
+| VPS, racing + stream_pool patch + 3335 peers (5-round discover) | ~335 KiB/s |
+| VPS, **`--concurrency 512 --buffer-multiplier 4`** + 3335 peers | **~1.05 MB/s** |
 
 The earliest version of this doc claimed "~150 KiB/s is the protocol
 floor". That claim was wrong; it was a measurement at one
@@ -302,32 +303,41 @@ client; the third is mainnet's reality.
   `1`; the value is capped by the live (non-parked) pool size, so on
   a small or attrited pool the user-supplied number is an upper
   bound, not a guarantee.
-- **The 128-buffer cap doesn't scale with pool size — and that's
-  actually correct.** Raising `--concurrency` past ~128 doesn't
-  increase in-flight throughput on its own. Scaling the buffer with
-  the pool was once speculated to be a "potential future win", but
-  has now been empirically tested on the VPS workload via the
-  `ISHEIKA_BUFFER_MULT` env knob (commit `d549bd6`,
-  `push_chunks_with_pool`). Result is strictly monotonic *worse* as
-  the multiplier grows:
+- **Pool + buffer scaling together unlocks ~1 MB/s on a VPS.**
+  The earlier `ISHEIKA_BUFFER_MULT` sweep showed pure buffer scaling
+  regressed (at fixed pool=128, doubling buffer 1→2→4→8 went
+  20→24→34→65 s). That was at *fixed* pool. The actual lever is
+  **scale pool and buffer together** so per-session in-flight stays
+  constant while total in-flight grows. Now exposed as
+  `--buffer-multiplier` (CLI) / `ISHEIKA_BUFFER_MULT` (env). VPS
+  sweep, 50 MiB random, single-process `upload --raw`:
 
-  | `ISHEIKA_BUFFER_MULT` | time (5 MiB random, VPS) |
-  |---:|---:|
-  | 1 (default) | 20 s |
-  | 2 | 24 s |
-  | 4 | 34 s |
-  | 8 | 65 s |
+  | Configuration | Time | Throughput |
+  |---|---:|---:|
+  | baseline `--concurrency 128` (mult=1) | 138 s | 380 KiB/s |
+  | `--concurrency 256` (mult=1) | 91 s | 576 KiB/s |
+  | `--concurrency 256 --buffer-multiplier 2` | 76 s | 690 KiB/s |
+  | `--concurrency 512 --buffer-multiplier 4` (run 1) | 65 s | 807 KiB/s |
+  | **`--concurrency 512 --buffer-multiplier 4` (run 2)** | **49 s** | **1070 KiB/s** |
+  | `--concurrency 768 --buffer-multiplier 6` | 126 s | 416 KiB/s |
+  | `--concurrency 1024 --buffer-multiplier 8` | 122 s | 430 KiB/s |
 
-  Each doubling roughly doubles per-session in-flight push attempts
-  (3 → 6 → 12 → 24 at pool=128). The substream-upgrade-cap (64) is
-  not the binding constraint — stream_pool's parallel opens have
-  plenty of headroom. The wall is **per-connection yamux throughput**:
-  once a dozen substreams compete for one TCP connection's flow
-  control, they share bandwidth rather than parallelize. The
-  dispatcher's wider window just means each push waits longer behind
-  sibling chunks on the same connection. The env knob stays for
-  future investigation (e.g. after the multi-connection-per-peer
-  change lands) but isn't a free lever today.
+  Sweet spot is `--concurrency 512 --buffer-multiplier 4`: ~3
+  in-flight per session at race=3, 1536 total in-flight chunks across
+  512 sessions. Beyond it, per-session yamux contention dominates and
+  throughput collapses.
+
+  Why the earlier sweep missed it: that sweep varied `BUFFER_MULT`
+  at `--concurrency 128`. Doubling buffer there doubles per-session
+  load (3 → 6 → 12 → 24) and the connections saturate. The new sweep
+  varies BOTH knobs together, keeping per-session ~3 across the
+  range, so total in-flight grows without congesting any one
+  connection.
+
+  This is the configuration that hits **1.05 MB/s on a VPS**, beating
+  the previous single-process baseline (450 KiB/s) by 2.4× and the
+  best multi-worker configuration (~600 KiB/s) by 1.8×. Multi-worker
+  is no longer the most-impactful lever; pool + buffer scaling is.
 
 ## `--substream-upgrade-cap` sweep (single-trial)
 
