@@ -1543,34 +1543,34 @@ pub async fn push_chunks_with_pool(
             let chunk_addr = SwarmAddress::new(chunk.addr);
             let mut order: Vec<usize> =
                 (0..pool.len()).filter(|i| !pool[*i].is_dead()).collect();
-            // Storage-radius-aware bucket sort: prefer peers we've
-            // observed to be inside the chunk's AOR (they'll store
-            // the chunk directly, signing a real receipt) over peers
-            // with unknown radius, and those over peers we've seen
-            // only forward (guaranteed-shallow → bee re-routes
-            // internally, adds 1-3 RTTs).
+            // Storage-radius-aware sort: peers we've observed to be
+            // inside the chunk's AOR get promoted to the front
+            // (they'll store directly, signing a real receipt with
+            // no forwarding); everyone else falls back to plain
+            // proximity-descending order.
             //
-            //   bucket 0: known in-AOR     (sr observed AND po >= sr)
-            //   bucket 1: unknown          (no receipt observed yet)
-            //   bucket 2: known out-of-AOR (sr observed AND po <  sr)
-            //
-            // Within each bucket, sort by descending proximity. Bucket
-            // 2 stays in the order rather than being filtered, so we
-            // still have fallback candidates if both other buckets
-            // are empty (bee will forward, just with a shallow receipt).
+            // Initial design used three buckets (in-AOR / unknown /
+            // known-out-of-AOR) but that empirically *slowed* uploads
+            // ~1.6× on a 50 MiB VPS workload: bucket "unknown" gets
+            // prioritised over "known-out" but "unknown" is
+            // systematically populated by peers that never returned
+            // a receipt — slow / NATted / dead. Routing to those
+            // over high-PO known-forwarders sends chunks to far
+            // peers (many bee forwarding hops). Two-bucket version
+            // collapses unknown and known-out into a single "PO
+            // descending" tier; only the explicit in-AOR-confirmed
+            // promotion moves chunks.
             order.sort_by(|&a, &b| {
                 let pa = chunk_addr.proximity(&pool[a].overlay);
                 let pb = chunk_addr.proximity(&pool[b].overlay);
-                let bucket = |idx: usize, po: u8| -> u8 {
-                    match pool[idx].in_aor(po) {
-                        Some(true) => 0,
-                        None => 1,
-                        Some(false) => 2,
+                let aor = |idx: usize, po: u8| -> u8 {
+                    if matches!(pool[idx].in_aor(po), Some(true)) {
+                        0
+                    } else {
+                        1
                     }
                 };
-                let ba = bucket(a, pa);
-                let bb = bucket(b, pb);
-                ba.cmp(&bb).then(pb.cmp(&pa))
+                aor(a, pa).cmp(&aor(b, pb)).then(pb.cmp(&pa))
             });
 
             let cap = max_retries.max(1).min(order.len());
