@@ -96,8 +96,15 @@ enum Commands {
         #[arg(short, long, default_value = "peers.json", value_name = "FILE")]
         output: PathBuf,
 
-        /// How long to listen for hive announcements per peer (seconds)
-        #[arg(long, default_value_t = 30)]
+        /// Hard deadline (seconds) for the per-peer hive listen
+        /// window. We accept multiple `peers` envelopes from each
+        /// queried peer (bee splits gossip into 30-peer batches over
+        /// separate streams) and short-circuit out 750 ms after the
+        /// last batch lands. Bee finishes its `Announce` burst in
+        /// well under 1 s on a healthy mainnet path, so this is a
+        /// timeout for stragglers and bad links, not the expected
+        /// per-peer cost.
+        #[arg(long, default_value_t = 5)]
         wait: u64,
 
         /// Append to existing peers.json instead of overwriting
@@ -110,10 +117,11 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         rounds: usize,
 
-        /// Peers to dial in parallel per round. Each dial holds the hive
-        /// stream open for `--wait` seconds, so a higher value finishes a
-        /// 70-peer round in `ceil(70/N) × wait` seconds instead of
-        /// `70 × wait` seconds.
+        /// Peers to dial in parallel per round. Each dial holds the
+        /// hive stream open until bee finishes its gossip burst
+        /// (typically ~1 s; capped at `--wait`), so a higher value
+        /// finishes a 70-peer round in roughly `ceil(70/N) × ~1 s`
+        /// instead of `70 × ~1 s`.
         #[arg(long, default_value_t = DEFAULT_DISCOVER_CONCURRENCY)]
         discover_concurrency: usize,
 

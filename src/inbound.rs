@@ -162,7 +162,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         "inbound handshake stream from {peer_id}");
                     let res = tokio::time::timeout(
                         op_timeout,
-                        respond_to_handshake(&mut stream, &signer, None, advertised.as_ref().as_ref(), &our_peer_id, peer_id),
+                        respond_to_handshake(&mut stream, &signer, None, advertised.as_ref().as_ref(), &our_peer_id, peer_id, true),
                     ).await;
                     match res {
                         Ok(Ok(())) => info!(target: "isheika::inbound",

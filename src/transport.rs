@@ -325,6 +325,13 @@ impl Transport {
     }
 
     /// Discover peers from one node by listening on the hive stream.
+    ///
+    /// Bee's `BroadcastPeers` opens a fresh stream per 30-peer batch
+    /// (see `pkg/hive/hive.go`), so a query against a well-connected
+    /// peer typically yields 2-5 batches back-to-back. We drain all
+    /// batches that arrive before `wait` elapses, with an early-exit
+    /// after 750 ms of post-batch silence to avoid sitting idle on
+    /// the deadline once gossip has stopped.
     pub async fn discover_peers(
         &self,
         peer_addr: &Multiaddr,
@@ -351,25 +358,61 @@ impl Transport {
         .await?;
         let _peer_threshold = do_pricing(&mut swarm, peer_id, &mut control, &mut pr_in, self.config.timeout).await?;
 
-        // Wait for the first hive envelope (bee sends a single one then stops),
-        // bounded by `wait`. Exit as soon as we read it.
+        // Drain hive `peers` envelopes until either the hard deadline
+        // (`wait`) elapses, the connection drops, or we hit `QUIET_FOR`
+        // of silence after a batch.
+        //
+        // Bee's `BroadcastPeers` (`pkg/hive/hive.go::BroadcastPeers`)
+        // sends one batch of at most `maxBatchSize = 30` peers per
+        // stream and opens a fresh stream per batch. Bee's `Announce`
+        // (`pkg/topology/kademlia/kademlia.go::Announce`) aggregates
+        // up to `BroadcastBinSize × MaxBins = 64` peers across
+        // kademlia bins, plus the full neighborhood if we land
+        // in-radius, so a well-connected peer typically sends 2-5
+        // batches back-to-back within ~500 ms of the handshake
+        // completing. Breaking after the first batch (the prior
+        // behaviour) systematically lost 50-80% of the peers a single
+        // query could yield.
+        //
+        // Bee does not proactively close the connection after the
+        // gossip finishes, so without the quiet-window short-circuit
+        // we would always idle out the full `wait` window — which
+        // makes the obvious "set `wait` to capture the slowest peer"
+        // tuning unattractively expensive (per-round wall clock =
+        // `ceil(peers / concurrency) × wait`).
+        const QUIET_FOR: Duration = Duration::from_millis(750);
         let mut peers: Vec<Peer> = Vec::new();
+        let mut batches_read = 0usize;
         let deadline = web_time::Instant::now() + wait;
+        let mut last_batch_at: Option<web_time::Instant> = None;
         loop {
             let now = web_time::Instant::now();
             if now >= deadline { break; }
-            let remaining = deadline - now;
+            // Short-circuit once the gossip burst stops.
+            if let Some(t) = last_batch_at {
+                if now.duration_since(t) >= QUIET_FOR { break; }
+            }
+            let hard_remaining = deadline - now;
+            let soft_remaining = last_batch_at
+                .map(|t| QUIET_FOR.saturating_sub(now.duration_since(t)))
+                .unwrap_or(hard_remaining);
+            let remaining = hard_remaining.min(soft_remaining);
             tokio::select! {
-                _ = tokio::time::sleep(remaining) => break,
+                _ = tokio::time::sleep(remaining) => continue,
                 ev = hive_in.next() => {
                     match ev {
                         Some((pid, mut stream)) if pid == peer_id => {
-                            info!(target: "isheika::hive", "inbound hive stream opened");
+                            debug!(target: "isheika::hive",
+                                "inbound hive stream opened (batch {})", batches_read + 1);
                             match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
                                 Ok(mut batch) => {
-                                    info!(target: "isheika::hive", "read {} peers", batch.len());
+                                    let n = batch.len();
                                     peers.append(&mut batch);
-                                    break;
+                                    batches_read += 1;
+                                    last_batch_at = Some(web_time::Instant::now());
+                                    info!(target: "isheika::hive",
+                                        "read {} peers (batch {}, total {})",
+                                        n, batches_read, peers.len());
                                 }
                                 Err(e) => debug!(target: "isheika::hive", "read_peers err: {}", e),
                             }
@@ -1067,6 +1110,20 @@ async fn do_handshake(
             underlay,
             advertised,
             &local_peer_id,
+            // Advertise as full_node. Tried light_node empirically
+            // (May 2026) — bee gives light nodes a 10× lower payment
+            // threshold (`pkg/node/node.go::lightFactor = 10`) and a
+            // 10× lower refresh rate, so our `SAFE_PEER_THRESHOLD_PLUR`
+            // (9M, sized for full nodes) overshoots the 1.125M bee
+            // disconnect threshold for lights by ~8×. The pool filled
+            // in ~300 ms (bee skips bin-saturation for lights) and
+            // then collapsed to 1/128 alive sessions inside 30 s as
+            // peers blocklisted us for over-debt. Full-node sees the
+            // theoretical bin-saturation risk but in practice
+            // bee's `Pick()` only rejects when the bin is saturated
+            // *and* `forceConnection == false`; the dialer
+            // (`pkg/p2p/libp2p/libp2p.go::Connect`) forces, so
+            // outbound clients aren't actually subject to it.
             true,
         );
         // Run handshake while still draining inbound handshake/swarm events.
@@ -1078,7 +1135,7 @@ async fn do_handshake(
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
                             let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid)
+                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, true)
                             ).await;
                         }
                     }
@@ -1143,6 +1200,7 @@ pub(crate) async fn respond_to_handshake<S>(
     advertised: Option<&Multiaddr>,
     our_peer_id: &PeerId,
     remote_peer_id: PeerId,
+    full_node: bool,
 ) -> Result<(), TransportError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
@@ -1181,7 +1239,7 @@ where
         ack: Some(pb::Ack {
             address: Some(our_addr),
             network_id: signer.network_id(),
-            full_node: true,
+            full_node,
             nonce: signer.nonce().to_vec(),
             welcome_message: String::new(),
         }),
