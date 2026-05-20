@@ -80,20 +80,6 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 1, value_name = "N")]
     buffer_multiplier: usize,
 
-    /// Maximum number of JIT-AOR sessions to dial in addition to
-    /// the main `--concurrency` pool. For each chunk in the upload,
-    /// the planner finds the highest-PO peer in the full peerstore
-    /// not already in the main pool, dedupes across chunks, and
-    /// dials up to this many candidates in parallel with the chunk
-    /// pushes. Each successful dial appends a session to the live
-    /// pool, seeded with a `storage_radius` hint so the dispatcher
-    /// promotes it for chunks in its AOR. Set to 0 to disable
-    /// JIT-AOR dialing entirely (fall back to main pool only).
-    /// Default: same as `--concurrency` (= pool ~2× larger during
-    /// the busy phase of the upload).
-    #[arg(long, global = true, value_name = "N")]
-    aor_budget: Option<usize>,
-
     #[command(subcommand)]
     command: Commands,
 }
@@ -407,14 +393,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // because env::set_var is process-wide.
         unsafe {
             std::env::set_var("ISHEIKA_BUFFER_MULT", cli.buffer_multiplier.to_string());
-        }
-    }
-    // Same shape for ISHEIKA_AOR_BUDGET. Default `None` defers to env
-    // var or library default (= pool size at upload time). `--aor-budget 0`
-    // disables JIT-AOR dialing entirely.
-    if let Some(n) = cli.aor_budget {
-        unsafe {
-            std::env::set_var("ISHEIKA_AOR_BUDGET", n.to_string());
         }
     }
 
