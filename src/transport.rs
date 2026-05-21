@@ -166,6 +166,38 @@ pub const GHOST_BALANCE_LIMIT_PLUR: u64 = 12_000_000;
 pub const GHOST_BALANCE_PREWARM_NUMERATOR: u64 = 2;
 pub const GHOST_BALANCE_PREWARM_DENOMINATOR: u64 = 3;
 
+/// Diagnostic counters for session-retirement causes, surfaced at upload
+/// end. Used to evaluate whether a per-peer reconnect strategy (à la
+/// weeb-3) would recover meaningful throughput vs. the current
+/// "rotation to a fresh peer" pattern. Specifically, we want to know how
+/// often a session retires via [`is_connection_dead`] **before** its
+/// ghost balance crossed the prewarm watermark — those are the cases
+/// where bee likely didn't blocklist us and a reconnect to the same
+/// peer would succeed.
+pub mod diag {
+    use std::sync::atomic::AtomicU64;
+    /// Sessions that ended because a push task surfaced an `is_connection_dead`
+    /// error AND the session's ghost balance at the moment of retirement was
+    /// below [`super::GHOST_BALANCE_LIMIT_PLUR`] × [`super::GHOST_BALANCE_PREWARM_NUMERATOR`] /
+    /// [`super::GHOST_BALANCE_PREWARM_DENOMINATOR`] (≈8M PLUR). I.e. the connection
+    /// died for non-accounting reasons — network jitter, bee restart, NAT
+    /// keepalive expiry, etc. Candidates for reconnect-to-same-peer.
+    pub static DEAD_RETIRE_LOW_GHOST: AtomicU64 = AtomicU64::new(0);
+    /// Sessions that ended via `is_connection_dead` with ghost balance
+    /// above the prewarm watermark but below the retirement limit.
+    /// Ambiguous: bee may have started blocklisting us on the dying connection.
+    pub static DEAD_RETIRE_PREWARM_GHOST: AtomicU64 = AtomicU64::new(0);
+    /// Sessions that ended via `is_connection_dead` at-or-above the
+    /// retirement limit. Bee almost certainly blocklisted us; reconnect
+    /// would bounce.
+    pub static DEAD_RETIRE_HIGH_GHOST: AtomicU64 = AtomicU64::new(0);
+    /// Sessions that ended cleanly via the ghost-balance retirement
+    /// threshold (the prewarm path; rotation as designed).
+    pub static GHOST_RETIRE: AtomicU64 = AtomicU64::new(0);
+    /// Sessions that ended via [`super::MAX_PUSHES_PER_SESSION`].
+    pub static MAX_PUSHES_RETIRE: AtomicU64 = AtomicU64::new(0);
+}
+
 #[derive(Debug, Error)]
 pub enum TransportError {
     #[error("multiaddr is not ws/wss: {0}")]
@@ -996,6 +1028,7 @@ impl SessionDriver {
                                 // limit; reply with ConnectionClosed so the caller
                                 // dials a fresh session (resets bee's ghostBalance).
                                 let _ = reply.send(Err(TransportError::ConnectionClosed));
+                                diag::MAX_PUSHES_RETIRE.fetch_add(1, Ordering::Relaxed);
                                 accept_new = false;
                                 continue;
                             }
@@ -1007,10 +1040,11 @@ impl SessionDriver {
                                 dead
                             }));
                             let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
-                            if ghost >= GHOST_BALANCE_LIMIT_PLUR {
+                            if ghost >= GHOST_BALANCE_LIMIT_PLUR && accept_new {
                                 debug!(target: "isheika::transport",
                                     "session {} retiring at ghost_balance={} after {} pushes",
                                     self.state.peer_id, ghost, used);
+                                diag::GHOST_RETIRE.fetch_add(1, Ordering::Relaxed);
                                 accept_new = false;
                             }
                         }
@@ -1027,16 +1061,28 @@ impl SessionDriver {
 
                 Some(dead) = tasks.next(), if !tasks.is_empty() => {
                     if dead {
+                        let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
+                        let prewarm = GHOST_BALANCE_LIMIT_PLUR
+                            .saturating_mul(GHOST_BALANCE_PREWARM_NUMERATOR)
+                            / GHOST_BALANCE_PREWARM_DENOMINATOR;
+                        if ghost >= GHOST_BALANCE_LIMIT_PLUR {
+                            diag::DEAD_RETIRE_HIGH_GHOST.fetch_add(1, Ordering::Relaxed);
+                        } else if ghost >= prewarm {
+                            diag::DEAD_RETIRE_PREWARM_GHOST.fetch_add(1, Ordering::Relaxed);
+                        } else {
+                            diag::DEAD_RETIRE_LOW_GHOST.fetch_add(1, Ordering::Relaxed);
+                        }
                         debug!(target: "isheika::transport",
-                            "session {} retiring: underlying connection dead",
-                            self.state.peer_id);
+                            "session {} retiring: underlying connection dead, ghost_balance={}",
+                            self.state.peer_id, ghost);
                         accept_new = false;
                     } else {
                         let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
-                        if ghost >= GHOST_BALANCE_LIMIT_PLUR {
+                        if ghost >= GHOST_BALANCE_LIMIT_PLUR && accept_new {
                             debug!(target: "isheika::transport",
                                 "session {} retiring at ghost_balance={}",
                                 self.state.peer_id, ghost);
+                            diag::GHOST_RETIRE.fetch_add(1, Ordering::Relaxed);
                             accept_new = false;
                         }
                     }
