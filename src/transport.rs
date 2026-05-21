@@ -36,6 +36,25 @@ pub(crate) const PUSHSYNC_PROTO: StreamProtocol =
 pub(crate) const PSEUDOSETTLE_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
 
+/// Minimum interval between successive dials to the same peer-id.
+/// Bee's libp2p connection rate limiter
+/// (`pkg/p2p/libp2p/libp2p.go::connLimiter`) allows 10 RPS / burst 40
+/// per /32 source IP per bee node. Once the burst is exhausted the
+/// limiter drops further dial attempts silently, which manifests as
+/// the bee node closing the next connection mid-push.
+///
+/// The dispatcher's session-rotation pattern (popular high-PO peers
+/// are rotated on essentially every connection-dead event) can hit
+/// each top-tier peer 100+ times per upload otherwise — sustained
+/// well above bee's 10 RPS limit even spread across many bees, and
+/// concentrated on the few we keep wanting back.
+///
+/// 1 second is comfortably under any of bee's per-IP /32 limits
+/// while still leaving the rotation responsive enough that a freshly
+/// retired session's chunk can be pushed via that peer again within
+/// a chunk's typical wall-clock window.
+pub const DIAL_COOLDOWN: Duration = Duration::from_secs(1);
+
 /// Bee's per-second refresh rate granted by pseudosettle.
 /// See `pkg/node/node.go::refreshRate`.
 pub const REFRESH_RATE_PLUR: u64 = 4_500_000;
@@ -179,6 +198,14 @@ pub enum TransportError {
     NetworkMismatch { ours: u64, theirs: u64 },
     #[error("pseudosettle: {0}")]
     PseudoSettle(String),
+    /// The caller asked to dial a peer that we dialed too recently.
+    /// Surfaced by [`PeerSession::connect`] when the per-peer cooldown
+    /// hasn't elapsed yet (see [`Transport::dial_cooldown_remaining`]).
+    /// The dispatcher catches this and tries a different peer for the
+    /// chunk that triggered the rotation, so the upload doesn't stall
+    /// waiting on a single peer's rate-limit window.
+    #[error("dial too soon (try again in {wait:?})")]
+    DialTooSoon { wait: Duration },
 }
 
 #[derive(Clone, Debug)]
@@ -257,6 +284,15 @@ pub struct Transport {
     /// back to `peers.json`, so future runs skip recently-failed peers
     /// up-front. Always present so callers don't need to check.
     reachability_log: crate::peers::ReachabilityLog,
+    /// Per-peer-id last-dial timestamp. Used to enforce a minimum
+    /// interval between successive dials to the same peer so we stay
+    /// under bee's per-IP libp2p connection rate limiter
+    /// (`pkg/p2p/libp2p/libp2p.go::connLimiter` — 10 RPS, burst 40
+    /// per /32). Without this, the pool rotation pattern (popular
+    /// high-PO peers re-dialed every time their session retires)
+    /// produces 100+ dials/peer per upload and bee starts silently
+    /// dropping our connections mid-push.
+    dial_cooldown: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PeerId, web_time::Instant>>>,
 }
 
 impl Transport {
@@ -267,6 +303,9 @@ impl Transport {
             signer,
             config,
             reachability_log: crate::peers::new_log(),
+            dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -281,6 +320,9 @@ impl Transport {
             signer,
             config,
             reachability_log: crate::peers::new_log(),
+            dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            )),
         }
     }
 
@@ -300,6 +342,29 @@ impl Transport {
     /// Drain with [`crate::peers::apply_log`] to update a `PeerStore`.
     pub fn reachability_log(&self) -> &crate::peers::ReachabilityLog {
         &self.reachability_log
+    }
+
+    /// How long the caller must wait before the next dial to `peer_id`
+    /// to stay under bee's per-IP connection rate limit (10 RPS / burst
+    /// 40 per /32, see `pkg/p2p/libp2p/libp2p.go`). `None` if we're
+    /// clear to dial now.
+    fn dial_cooldown_remaining(&self, peer_id: &PeerId) -> Option<Duration> {
+        let last = self.dial_cooldown.lock().ok()?.get(peer_id).copied()?;
+        let since = web_time::Instant::now().saturating_duration_since(last);
+        if since >= DIAL_COOLDOWN {
+            None
+        } else {
+            Some(DIAL_COOLDOWN - since)
+        }
+    }
+
+    /// Record that we are about to dial `peer_id`. Called from
+    /// [`PeerSession::connect`] after the cooldown check passes so
+    /// concurrent callers can't race past it.
+    fn note_dial(&self, peer_id: &PeerId) {
+        if let Ok(mut map) = self.dial_cooldown.lock() {
+            map.insert(*peer_id, web_time::Instant::now());
+        }
     }
 
     /// Fetch a single chunk by address. Convenience for single-shot fetches —
@@ -478,6 +543,25 @@ impl PeerSession {
         transport: &Transport,
         peer_addr: &Multiaddr,
     ) -> Result<Self, TransportError> {
+        // Enforce a per-peer-id minimum gap between dials. Bee
+        // libp2p (pkg/p2p/libp2p/libp2p.go::connLimiter) rate-limits
+        // inbound connections from a single /32 IP to 10 RPS / burst
+        // 40. Without this gate, the dispatcher's session-rotation
+        // pattern (popular high-PO peers retired + re-dialed on
+        // every chunk push) typically triggers 100+ dials per peer
+        // per upload — well past the bee rate limit, after which bee
+        // silently drops our connections mid-push and we cascade
+        // into more retries.
+        //
+        // Caller surfaces this as `DialTooSoon` so the dispatcher
+        // can pick a different peer for the chunk that triggered
+        // the rotation, instead of stalling on a sleep.
+        let peer_id = ensure_ws(peer_addr)?;
+        if let Some(wait) = transport.dial_cooldown_remaining(&peer_id) {
+            return Err(TransportError::DialTooSoon { wait });
+        }
+        transport.note_dial(&peer_id);
+
         // The dial phase (connect + identify + handshake + pricing) is
         // bounded by `dial_timeout`. Healthy peers finish well under 1 s;
         // dead peers used to eat the full per-op timeout (10+ s) before

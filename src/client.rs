@@ -1954,6 +1954,14 @@ pub async fn push_chunks_with_pool(
                          idx: usize,
                          prewarm_dials: &mut FuturesUnordered<_>| {
         let entry = &entries[idx];
+        // Don't prewarm a parked entry — that's the path that gets us
+        // rate-limited by bee in the first place (`record_failure` parks
+        // the entry after 3 consecutive dial failures, almost always
+        // because of bee's per-IP libp2p connection rate limit). Let
+        // the dead window run out before we try again.
+        if entry.is_dead() {
+            return;
+        }
         let ghost = entry.snapshot().ghost_balance_plur();
         if ghost >= PREWARM_GHOST_BALANCE_PLUR
             && entry
@@ -2061,11 +2069,44 @@ pub async fn push_chunks_with_pool(
                     Ok(session) => {
                         debug!(target: "isheika::upload",
                             "pre-warm dial for {} ready", entry.overlay_hex);
+                        entry.clear_strikes();
                         entry.store_pending(session);
                     }
                     Err(e) => {
+                        // Prewarm failure is most often bee rate-limiting
+                        // us at the libp2p layer (10 RPS / burst 40 per
+                        // /32 IP, see `pkg/p2p/libp2p/libp2p.go`). The
+                        // popular high-PO peers in our pool get re-dialed
+                        // every time their session retires, so a single
+                        // upload typically dials each top-tier peer
+                        // hundreds of times — well above the rate limit,
+                        // and bee starts dropping us.
+                        //
+                        // Reuse the strike + dead-skip machinery used by
+                        // the synchronous rotation path: after
+                        // DEAD_STRIKES (=3) consecutive prewarm failures
+                        // the entry is parked for DEAD_SKIP_SECS (=60 s),
+                        // the dispatcher skips it during proximity
+                        // ordering, and we stop hammering bee with
+                        // doomed dials. Once the skip window expires
+                        // the entry rejoins the rotation.
+                        //
+                        // `DialTooSoon` excluded: that's our own per-peer
+                        // cooldown talking (`DIAL_COOLDOWN` in
+                        // `transport.rs`), not a peer fault. Prewarm is
+                        // opportunistic, so dropping the dial without
+                        // striking is fine — the next chunk that wants
+                        // this peer will trigger a fresh prewarm
+                        // attempt after the cooldown burns off.
                         debug!(target: "isheika::upload",
                             "pre-warm dial for {} failed: {}", entry.overlay_hex, e);
+                        if !matches!(&e, TransportError::DialTooSoon { .. })
+                            && entry.record_failure(DEAD_SKIP_SECS)
+                        {
+                            debug!(target: "isheika::upload",
+                                "marked {} dead for {DEAD_SKIP_SECS}s after {} consecutive prewarm failures",
+                                entry.overlay_hex, DEAD_STRIKES);
+                        }
                     }
                 }
             }
@@ -2142,7 +2183,17 @@ async fn try_push_with_rotation(
                         // momentary routing churn) doesn't shrink the
                         // live pool. Log "marked dead" exactly once
                         // per dead-window event.
-                        if entry.record_failure(DEAD_SKIP_SECS) {
+                        //
+                        // `DialTooSoon` is excluded: that's our own
+                        // per-peer cooldown saying "wait before dialing
+                        // this peer again" (so bee's libp2p connection
+                        // rate limiter doesn't blocklist us). The entry
+                        // itself isn't broken — the dispatcher just
+                        // picks the next-closest peer for this chunk
+                        // and our cooldown burns off in the background.
+                        if !matches!(&e, TransportError::DialTooSoon { .. })
+                            && entry.record_failure(DEAD_SKIP_SECS)
+                        {
                             debug!(target: "isheika::upload",
                                 "marked {} dead for {DEAD_SKIP_SECS}s after {} consecutive dial failures",
                                 entry.overlay_hex, DEAD_STRIKES);
