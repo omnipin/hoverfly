@@ -196,6 +196,18 @@ pub mod diag {
     pub static GHOST_RETIRE: AtomicU64 = AtomicU64::new(0);
     /// Sessions that ended via [`super::MAX_PUSHES_PER_SESSION`].
     pub static MAX_PUSHES_RETIRE: AtomicU64 = AtomicU64::new(0);
+    /// Prewarm dials triggered because a session's driver had already
+    /// exited (`PeerSession::is_alive() == false`) by the time the
+    /// dispatcher swept for prewarm candidates. These are the dials
+    /// that would otherwise have been paid synchronously inside
+    /// `try_push_with_rotation` on the next chunk routed through this
+    /// entry — each one represents one dial RTT (~500-1500 ms on
+    /// mainnet) of dispatcher wall time hidden in the background.
+    pub static PREWARM_ON_DEAD: AtomicU64 = AtomicU64::new(0);
+    /// Prewarm dials triggered by the ghost-balance watermark (the
+    /// pre-existing path). Reported alongside `PREWARM_ON_DEAD` so the
+    /// two prewarm causes can be told apart in the diag output.
+    pub static PREWARM_ON_GHOST: AtomicU64 = AtomicU64::new(0);
 }
 
 #[derive(Debug, Error)]
@@ -721,6 +733,23 @@ impl PeerSession {
             .await
             .map_err(|_| TransportError::ConnectionClosed)?;
         rx.await.map_err(|_| TransportError::ConnectionClosed)?
+    }
+
+    /// True if the session's driver task is still accepting commands.
+    /// False once the driver has exited (e.g. underlying libp2p
+    /// connection died, or ghost-balance / max-pushes retirement
+    /// completed and the in-flight tasks have drained).
+    ///
+    /// Used by the upload dispatcher to decide whether to enqueue a
+    /// prewarm dial for an entry even when its ghost balance is below
+    /// the prewarm watermark — a `dead_low_ghost` retirement was
+    /// empirically the dominant retirement cause on mainnet (see the
+    /// `transport::diag` counters), and waiting for the next chunk's
+    /// `pushsync_chunk_priced` call to surface the failure (and burn
+    /// a synchronous re-dial inside `try_push_with_rotation`) costs
+    /// 500-1500 ms of dispatcher wall time per dead session.
+    pub fn is_alive(&self) -> bool {
+        !self.cmd_tx.is_closed()
     }
 
     /// Fetch one chunk over a fresh substream on this session's connection.

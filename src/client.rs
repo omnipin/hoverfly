@@ -1962,8 +1962,41 @@ pub async fn push_chunks_with_pool(
         if entry.is_dead() {
             return;
         }
-        let ghost = entry.snapshot().ghost_balance_plur();
-        if ghost >= PREWARM_GHOST_BALANCE_PLUR
+        // Two triggers for a prewarm:
+        // 1. Ghost balance has crossed the prewarm watermark — the
+        //    session is on track to retire from accounting pressure.
+        //    Get a replacement ready before the rotation point so the
+        //    swap is instant.
+        // 2. The session's driver has already exited (`is_alive` is
+        //    false) for any reason. On mainnet the dominant retirement
+        //    cause is `dead_low_ghost` — the libp2p connection dies for
+        //    non-accounting reasons (NAT keepalive expiry, bee restart,
+        //    yamux idle timeout, transient network blip) well before
+        //    ghost balance approaches the prewarm watermark. Without
+        //    this trigger the next push to this entry has to do a
+        //    synchronous re-dial inside `try_push_with_rotation`,
+        //    blocking the dispatcher for one full dial RTT
+        //    (~500-1500 ms on mainnet). With the trigger, the prewarm
+        //    happens in the background and the swap is instant.
+        let session = entry.snapshot();
+        let ghost = session.ghost_balance_plur();
+        let dead = !session.is_alive();
+        // The dead-trigger is speculative: we don't know yet whether
+        // bee is willing to talk to us again. If a prior prewarm /
+        // rotation dial already failed (strikes > 0), back off the
+        // dead-trigger and let the dead-skip window run — repeatedly
+        // re-dialing a peer that already refused us once burns bee's
+        // per-IP libp2p rate limit (10 RPS / burst 40 per /32 — see
+        // `pkg/p2p/libp2p/libp2p.go::connLimiter`) and contributes
+        // nothing. The ghost-trigger still fires: that means the
+        // existing connection is being retired due to local
+        // accounting, which is independent of dial health.
+        let strikes = entry
+            .failure_strikes
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let dead_trigger_ok = dead && strikes == 0;
+        let trigger = ghost >= PREWARM_GHOST_BALANCE_PLUR || dead_trigger_ok;
+        if trigger
             && entry
                 .prewarm_inflight
                 .compare_exchange(
@@ -1974,6 +2007,15 @@ pub async fn push_chunks_with_pool(
                 )
                 .is_ok()
         {
+            // Attribute the trigger to the most-specific reason.
+            // `dead_trigger_ok` (dead + strikes == 0) takes precedence
+            // because that's the new path; ghost-only firings are the
+            // pre-existing pre-warm cause.
+            if dead_trigger_ok {
+                crate::transport::diag::PREWARM_ON_DEAD.fetch_add(1, Ordering::Relaxed);
+            } else {
+                crate::transport::diag::PREWARM_ON_GHOST.fetch_add(1, Ordering::Relaxed);
+            }
             let underlay = entry.underlay.clone();
             let entry = entry.clone();
             #[cfg(not(target_arch = "wasm32"))]
@@ -2006,15 +2048,23 @@ pub async fn push_chunks_with_pool(
             biased;
 
             Some((chunk, attempts, res)) = inflight.next(), if !inflight.is_empty() => {
+                // Opportunistically pre-warm any session that's
+                // approaching its rotation limit OR has already had its
+                // libp2p connection die (see `maybe_prewarm`'s second
+                // trigger). compare_exchange ensures only one dial per
+                // entry at a time. Run on every chunk completion, ok or
+                // err, so a dead session detected via a failed push
+                // here gets a prewarm queued before the next chunk
+                // routes through this entry and pays a synchronous
+                // re-dial in `try_push_with_rotation`.
+                {
+                    let entries = session_pool.snapshot();
+                    for i in 0..entries.len() {
+                        maybe_prewarm(&entries, i, &mut prewarm_dials);
+                    }
+                }
                 match res {
                     Ok(()) => {
-                        // Opportunistically pre-warm any session that's
-                        // approaching its rotation limit. compare_exchange
-                        // ensures only one dial per entry at a time.
-                        let entries = session_pool.snapshot();
-                        for i in 0..entries.len() {
-                            maybe_prewarm(&entries, i, &mut prewarm_dials);
-                        }
                         if let Some(c) = iter.next() {
                             inflight.push(Box::pin(dispatch(c, 0)));
                         } else {
@@ -2127,6 +2177,17 @@ pub async fn push_chunks_with_pool(
                         "pushed {}/{} chunks (inflight={})",
                         now, total, inflight.len());
                     last_pushed_seen = now;
+                }
+                // Sweep for dead sessions on every heartbeat. Covers the
+                // case where no chunk completion has fired the per-chunk
+                // sweep recently — e.g. a stall where every inflight
+                // chunk is blocked on the same dead-session
+                // synchronous-redial path. Without this, a wave of
+                // dead-low-ghost retirements that lands between chunk
+                // completions can leave the pool effectively shrunk
+                // until the next chunk finishes.
+                for i in 0..entries.len() {
+                    maybe_prewarm(&entries, i, &mut prewarm_dials);
                 }
                 heartbeat = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
             }

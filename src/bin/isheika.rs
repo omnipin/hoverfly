@@ -395,11 +395,17 @@ fn print_session_retire_diag() {
     let dead_high = diag::DEAD_RETIRE_HIGH_GHOST.load(Ordering::Relaxed);
     let ghost_retire = diag::GHOST_RETIRE.load(Ordering::Relaxed);
     let max_pushes_retire = diag::MAX_PUSHES_RETIRE.load(Ordering::Relaxed);
+    let prewarm_on_dead = diag::PREWARM_ON_DEAD.load(Ordering::Relaxed);
+    let prewarm_on_ghost = diag::PREWARM_ON_GHOST.load(Ordering::Relaxed);
     let total = dead_low + dead_prewarm + dead_high + ghost_retire + max_pushes_retire;
-    if total > 0 {
+    if total > 0 || prewarm_on_dead > 0 || prewarm_on_ghost > 0 {
         eprintln!(
             "session-retire: dead_low_ghost={} dead_prewarm_ghost={} dead_high_ghost={} ghost_threshold={} max_pushes={} total={}",
             dead_low, dead_prewarm, dead_high, ghost_retire, max_pushes_retire, total,
+        );
+        eprintln!(
+            "prewarm: on_dead={} on_ghost={}",
+            prewarm_on_dead, prewarm_on_ghost,
         );
     }
 }

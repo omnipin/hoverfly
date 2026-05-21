@@ -101,13 +101,37 @@ discipline, and graceful failure handling.
   pool, regardless of target pool size. Mainnet peerlists are
   ~50% stale; a wide dial window finds the target N reachable peers
   in O(N + stale-cluster) wall time instead of O(N × per-peer-timeout).
-- **Pre-warmed rotation** (`client.rs:1689 maybe_prewarm`). When a
-  session crosses 2/3 of `GHOST_BALANCE_LIMIT_PLUR`
-  (`transport.rs:131,137-138`), a replacement is dialed in the
-  background while the current session is still serving pushes. When
-  the active session retires, the chunk that triggered rotation finds
-  a pre-dialed replacement waiting at `entry.take_pending()` instead
-  of paying the synchronous dial cost.
+- **Pre-warmed rotation** (`client.rs::maybe_prewarm`). Two triggers:
+  1. **Ghost-balance**: when a session crosses 2/3 of
+     `GHOST_BALANCE_LIMIT_PLUR` (`transport.rs:131,137-138`), a
+     replacement is dialed in the background while the current session
+     is still serving pushes.
+  2. **Dead-session**: when a session's driver task has exited
+     (`PeerSession::is_alive() == false`) and the entry has no
+     accumulated dial-failure strikes. This catches the empirically
+     dominant retirement cause — `dead_low_ghost` (libp2p connection
+     died for non-accounting reasons: NAT keepalive expiry, bee
+     restart, yamux idle timeout) — that the ghost-balance trigger
+     never sees because the connection dies long before ghost balance
+     approaches the watermark. The strike gate prevents repeated
+     re-dials to peers that already refused us once (which would burn
+     bee's per-IP libp2p rate limit at ~10 RPS / burst 40 per /32).
+  Either way, when the active session retires, the chunk that
+  triggered rotation finds a pre-dialed replacement waiting at
+  `entry.take_pending()` instead of paying the synchronous dial cost.
+  The dispatcher sweeps for prewarm candidates after every chunk
+  completion (ok OR err) and on every 5 s heartbeat, so dead sessions
+  get a replacement queued promptly even during a stall.
+- **Session-retirement diagnostic counters** (`transport::diag`).
+  Process-global atomics distinguish retirement causes: `dead_low_ghost`
+  (driver exited at ghost < prewarm watermark — candidates for
+  per-peer reconnect), `dead_prewarm_ghost`, `dead_high_ghost`,
+  `ghost_threshold`, `max_pushes`, plus `prewarm_on_dead` /
+  `prewarm_on_ghost` to attribute prewarm dials. Printed to stderr at
+  upload end. Empirical finding: at `--concurrency 512` on mainnet,
+  100% of retirements are `dead_low_ghost`; bee never blocklists us
+  at the accounting layer. The ghost-balance retirement path is
+  effectively dead code at this concurrency.
 - **Split timeouts.** `--timeout` (per-substream, default 10 s) ≠
   `--dial-timeout` (whole session open, default 3 s). Originally one
   knob; splitting them lets dial-timeouts fail dead peers in seconds
