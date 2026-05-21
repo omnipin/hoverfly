@@ -1060,7 +1060,12 @@ impl SessionDriver {
                 }
 
                 Some(dead) = tasks.next(), if !tasks.is_empty() => {
-                    if dead {
+                    if dead && accept_new {
+                        // Only count the first dead task per session.
+                        // Subsequent in-flight tasks on the same dying
+                        // connection will also surface dead errors, but
+                        // the session is already retiring — counting
+                        // them would over-report N-fold.
                         let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
                         let prewarm = GHOST_BALANCE_LIMIT_PLUR
                             .saturating_mul(GHOST_BALANCE_PREWARM_NUMERATOR)
@@ -1076,6 +1081,13 @@ impl SessionDriver {
                             "session {} retiring: underlying connection dead, ghost_balance={}",
                             self.state.peer_id, ghost);
                         accept_new = false;
+                    } else if dead {
+                        // Subsequent dead task on already-retiring session;
+                        // not counted but log at trace for diagnostics.
+                        let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
+                        tracing::trace!(target: "isheika::transport",
+                            "session {} additional dead task on retiring session, ghost_balance={}",
+                            self.state.peer_id, ghost);
                     } else {
                         let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
                         if ghost >= GHOST_BALANCE_LIMIT_PLUR && accept_new {
