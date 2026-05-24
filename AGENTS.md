@@ -115,7 +115,19 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   daemon listener for serving retrieval requests from the local upload
   cache.
 - `src/protocols/` — bee wire protocols: `handshake`, `pricing`,
-  `retrieval`, `pushsync`, `pseudosettle`, `hive`, `framing`.
+  `retrieval`, `pushsync`, `pseudosettle`, `hive`, `framing`,
+  `swap`, `status`. The `status` responder is inbound-only;
+  bee's `pkg/salud` probes us via `/swarm/status/1.1.0/status` to
+  decide whether to mark us Healthy in its kademlia metrics
+  collector. Implementation is correct but currently inactive
+  because we don't get into bee's kademlia in the first place
+  (see PERFORMANCE.md "Status protocol responder").
+- `src/cheques.rs` — `#[cfg(not(target_arch = "wasm32"))]`. JSON-backed
+  per-peer cumulative-payout sidecar (`cheques.json`). Required to
+  persist across CLI runs because bee rejects non-strictly-increasing
+  `CumulativePayout` (`chequestore.go::ErrChequeNotIncreasing`). Loaded
+  by the CLI at startup when `--chequebook` is set, mutated under
+  `SessionState::settle_lock`, flushed on upload completion.
 - `src/peers.rs` — JSON-backed peer store. Each `Peer` carries a
   reachability cache (`last_dial_success_unix`, `last_dial_failure_unix`,
   `consecutive_failures`, `last_dial_rtt_ms`). `RECENT_FAILURE_SECS = 300`
@@ -168,7 +180,78 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   - `client.rs:1920  SESSION_DIAL_PARALLELISM = 32` — in-flight window
     while filling the session pool.
 - Network IDs: `1` = mainnet (default), `10` = testnet/sepolia. Bootnode:
-  `/dnsaddr/mainnet.ethswarm.org`.
+  `/dnsaddr/mainnet.ethswarm.org`. **EVM chain id** is separate from
+  network id (it's the `chainID` in the cheque's EIP-712 domain): 100
+  for Gnosis / Swarm mainnet, 11155111 for Sepolia. Set via
+  `--chequebook-chain-id`.
+- **Bee-citizenship features** (May 2026) for long-term kademlia
+  presence growth: stable overlay across runs (persist nonce via
+  `--nonce-file`, default `overlay-nonce` in CWD; see
+  `signer::from_bytes_with_nonce`), outbound hive self-announce on
+  every session connect (`protocols::hive::announce_self`,
+  invoked from `transport::do_hive_announce` after the bee
+  handshake), inbound status responder (`protocols::status`), and
+  inbound pullsync responder (`protocols::pullsync`,
+  cursors + sync sub-streams, replies with all-zero cursors +
+  empty offers). The pullsync responder is the only piece bee
+  actually probes — `pullsync-in: cursors=N pullsync=M` diag
+  counters in CLI output. Hive announces fire at ~160 per 5 MiB
+  upload at c=64. Single-upload throughput unchanged in
+  benchmarks; the design is a slow-burn lever — bees that learn
+  about us via gossip add us to their `knownPeers` and may dial
+  us back hours later, growing our kademlia presence beyond what
+  any single session could. See PERFORMANCE.md
+  "Pullsync inbound responder" and "Bee-citizenship".
+- **Postage stamp signature validator** (`src/stamp.rs`). Validates
+  the 113-byte wire-format stamp shape and recovers the batch
+  owner's Ethereum address from the signature. Does NOT verify
+  on-chain that the recovered address actually owns the claimed
+  batch — that would require an RPC call we deliberately don't
+  make. Currently unused (we only emit stamps via
+  `nectar-postage`, never ingest them); ready for the future
+  chunk-ingestion path (pullsync delivery, retrieval-forwarding).
+- **SWAP / chequebook** is implemented but scoped to *issuance only*:
+  no contract deploy, no cashout, no on-chain RPC. Caller supplies an
+  already-deployed chequebook via `--chequebook` whose `issuer()`
+  matches `--key`'s Ethereum address. `transport::SwapConfig` carries
+  the cheque store and per-peer cap. Sessions advertise the
+  beneficiary in a one-shot `/swarm/swap/1.0.0/swap` handshake at
+  connect time; `SessionState::try_settle_once` then emits a cheque
+  for the PLUR remainder after pseudosettle clears what it can.
+  Exchange-rate fallback is `abort and fall through to
+  pseudosettle-only` (no hardcoded rate; we trust bee's per-stream
+  `exchange`+`deduction` headers, which it derives from its on-chain
+  priceoracle poll). Bee's `chequestore.go::ReceiveCheque` does an
+  on-chain `chequebook.issuer()` + `balance()` + `paidOut()` triplet
+  per accepted cheque, so the SWAP path's marginal cost on the
+  receiving side is hundreds of ms — that's why emission is gated to
+  the existing settle path, not run on every push.
+  **Status (May 2026):** code is correct (`cheques_emitted` > 0,
+  `cheques_failed` ≈ 0 on real uploads), but no measurable throughput
+  benefit at one-shot upload workloads. The mechanism that *would*
+  pay off — bee's `notifyPaymentThresholdUpgrade` at
+  `100 × refreshRate` per-peer cumulative — is unreachable when
+  sessions die from kademlia bin pruning long before per-peer debt
+  accumulates that high. See PERFORMANCE.md "SWAP / chequebook".
+- **Connection-close cause diagnostic** (`diag::CONN_CLOSED_IO_DETAIL`,
+  added May 2026). Captures `SwarmEvent::ConnectionClosed.cause`
+  on every session death and buckets the underlying `io::Error`.
+  Empirically on mainnet 100% are `errno 104 (ECONNRESET)`, attributable
+  to bee's kademlia bin-prune path
+  (`pkg/topology/kademlia/kademlia.go:719`) preferentially disconnecting
+  peers with `ReachabilityStatusPublic != Public`. Mitigation:
+  run via `daemon + --listen + --advertise` (see PERFORMANCE.md
+  "Public reachability"). Default config is Private, gets pruned.
+- **Per-stream + per-chunk latency histograms** (May 2026):
+  `diag::PUSH_LATENCY_*` (do_pushsync wall-time buckets),
+  `diag::OPEN_STREAM_*` (multistream-select + yamux open buckets),
+  `diag::PUSH_OUTCOME_*` (ok / shallow / overdraft / error counts),
+  `diag::CHUNK_LATENCY_*` (per-chunk total wall-time including
+  retries and racing). All printed at upload end. Shape matches
+  bee's `bee_pusher_sync_time` / `bee_pushsync_push_peer_time` /
+  etc. Prometheus metrics so direct A/B comparisons are possible
+  against a co-located bee node. See PERFORMANCE.md
+  "Bee-vs-isheika end-to-end comparison" for the numbers.
 - CLI has split timeouts: `--timeout` (per-operation, default 10 s, applies
   to pushsync / retrieval / pseudosettle substreams) ≠ `--dial-timeout`
   (session open: dial + identify + handshake + pricing, default 3 s). Don't

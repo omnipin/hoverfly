@@ -23,6 +23,7 @@ use crate::protocols::hive;
 use crate::protocols::pricing;
 use crate::protocols::pushsync::{self, PushsyncReceipt};
 use crate::protocols::retrieval::{self, ChunkDelivery};
+use crate::protocols::status as status_proto;
 use crate::signer::{SignerError, SwarmSigner};
 
 pub(crate) const HANDSHAKE_PROTO: StreamProtocol =
@@ -35,6 +36,24 @@ pub(crate) const PUSHSYNC_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/pushsync/1.3.1/pushsync");
 pub(crate) const PSEUDOSETTLE_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/pseudosettle/1.0.0/pseudosettle");
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) const SWAP_PROTO: StreamProtocol = StreamProtocol::new("/swarm/swap/1.0.0/swap");
+/// Bee status protocol. Bee opens this stream periodically from its
+/// `pkg/salud` worker over any connection it has to us (including
+/// outbound connections we initiated for pushsync), so EVERY session
+/// — not just the daemon's inbound listener — has to accept it.
+/// See `protocols::status` docs for the rationale.
+pub(crate) const STATUS_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/status/1.1.3/status");
+/// Bee pull-sync cursor exchange. Initial neighbor handshake; bee
+/// opens this once it considers us a kademlia neighbor. We respond
+/// with all-zero cursors (no reserve). See `protocols::pullsync`.
+pub(crate) const PULLSYNC_CURSORS_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
+/// Bee pull-sync chunk exchange. Bee asks "what chunks do you have
+/// in bin N from cursor X?"; we reply with an empty offer.
+pub(crate) const PULLSYNC_PULLSYNC_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
 
 /// Minimum interval between successive dials to the same peer-id.
 /// Bee's libp2p connection rate limiter
@@ -129,6 +148,105 @@ pub enum PushOutcome {
 /// else in flight on it. Ghost-balance accounting still increments on
 /// timeouts (`push()` in `SessionState`), so a session that keeps
 /// timing out retires naturally via the ghost-balance threshold.
+/// Bucket an `io::Error` from `ConnectionError::IO` into a short
+/// human-readable cause string. Walks the `source()` chain so wrapped
+/// errors (most often `yamux::ConnectionError`) are visible. Returns
+/// a short string suitable as a histogram key — repeated errors
+/// collapse to the same bucket. Unrecognised errors get bucketed as
+/// `other:<first 80 chars of Debug>` so we can iterate the classifier
+/// without dropping data.
+///
+/// Common buckets we expect on mainnet:
+/// - `tcp:reset`            — bee or an intermediate closed via TCP RST
+/// - `tcp:broken-pipe`      — local side wrote to a closed socket
+/// - `tcp:eof`              — peer closed cleanly; read returned 0 bytes
+/// - `tcp:timed-out`        — local TCP send/recv timeout fired
+/// - `yamux:closed`         — yamux connection closed (clean muxer shutdown)
+/// - `yamux:decode`         — yamux frame decode failed (protocol error)
+/// - `yamux:io:<kind>`      — yamux saw an underlying io error of `<kind>`
+/// - `yamux:streams-exhausted` — `NoMoreStreamIds` or `TooManyStreams`
+pub fn classify_io_error(e: &std::io::Error) -> String {
+    // libp2p wraps connection errors through several layers
+    // (`Error<>`, `Either<L,R>`, multistream-select, yamux,
+    // `io::Error::Custom`). The innermost cause is what we actually
+    // want — usually an OS errno or a yamux frame-protocol error.
+    //
+    // Empirically the debug repr of an `io::Error` from a dropped
+    // connection looks like:
+    //   Custom { kind: Other, error:
+    //     Custom { kind: Other, error:
+    //       Error(Right(Io(Os { code: 104, kind: ConnectionReset, message: "..." })))
+    //     }
+    //   }
+    // or, for yamux protocol failures:
+    //   Custom { kind: Other, error:
+    //     Custom { kind: Other, error:
+    //       Error(Right(Decode(Io(Os { code: 104, ... })))
+    //     }
+    //   }
+    // or, for `multistream-select` negotiation failures:
+    //   Custom { kind: Other, error: NegotiationError(...) }
+    //
+    // We pattern-match on the full debug string rather than walking
+    // the source chain because the wrapping types are private to
+    // libp2p / multistream-select / yamux. String matching is fragile
+    // across libp2p versions but the alternative is downcasting against
+    // a moving target, which is worse.
+    let debug = format!("{:?}", e);
+
+    // 1. OS errno path (`Os { code: N, kind: KindName, ... }`).
+    if let Some(idx) = debug.find("Os { code: ") {
+        let rest = &debug[idx + "Os { code: ".len()..];
+        let code: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if !code.is_empty() {
+            let kind_s = if let Some(k_idx) = rest.find("kind: ") {
+                rest[k_idx + 6..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphabetic())
+                    .collect::<String>()
+                    .to_lowercase()
+            } else {
+                "unknown".into()
+            };
+            // Was the Os error reached through a yamux decode?
+            // `Error(Right(Decode(Io(Os { ... ))))` is yamux's
+            // FrameDecodeError, which is "we tried to parse a yamux
+            // frame and the underlying socket already died mid-read".
+            // Tag those separately so they aren't conflated with raw
+            // socket resets that happened between yamux frames.
+            if debug.contains("Decode(Io(") {
+                return format!("yamux-decode-mid-frame:{}:{}", kind_s, code);
+            }
+            // Raw socket error reached through yamux's normal Io path.
+            return format!("yamux-io:{}:{}", kind_s, code);
+        }
+    }
+
+    // 2. libp2p multistream-select negotiation failure (no Os errno).
+    if debug.contains("NegotiationError") {
+        return "multistream:negotiation-failed".into();
+    }
+    if debug.contains("ProtocolError") {
+        return "multistream:protocol-error".into();
+    }
+
+    // 3. Yamux semantic errors (no inner Io).
+    if debug.contains("Closed") {
+        return "yamux:closed".into();
+    }
+    if debug.contains("NoMoreStreamIds") || debug.contains("TooManyStreams") {
+        return "yamux:streams-exhausted".into();
+    }
+    if debug.contains("InvalidWindowUpdate") {
+        return "yamux:invalid-window-update".into();
+    }
+
+    // 4. Unknown — record a truncated prefix so we can extend the
+    // classifier without dropping data.
+    let trimmed: String = debug.chars().take(120).collect();
+    format!("other:{}", trimmed)
+}
+
 pub fn is_connection_dead(e: &TransportError) -> bool {
     use crate::protocols::pushsync::PushsyncError;
     match e {
@@ -163,8 +281,8 @@ pub const GHOST_BALANCE_LIMIT_PLUR: u64 = 12_000_000;
 /// We start dialing a replacement session once ghost balance reaches 2/3
 /// of the retirement limit so the dial usually completes before the
 /// active session has to be rotated.
-pub const GHOST_BALANCE_PREWARM_NUMERATOR: u64 = 2;
-pub const GHOST_BALANCE_PREWARM_DENOMINATOR: u64 = 3;
+pub const GHOST_BALANCE_PREWARM_NUMERATOR: u64 = 1;
+pub const GHOST_BALANCE_PREWARM_DENOMINATOR: u64 = 2;
 
 /// Diagnostic counters for session-retirement causes, surfaced at upload
 /// end. Used to evaluate whether a per-peer reconnect strategy (à la
@@ -208,6 +326,143 @@ pub mod diag {
     /// pre-existing path). Reported alongside `PREWARM_ON_DEAD` so the
     /// two prewarm causes can be told apart in the diag output.
     pub static PREWARM_ON_GHOST: AtomicU64 = AtomicU64::new(0);
+    /// Cheques successfully written to a peer's swap substream. A
+    /// non-zero value confirms the SWAP path is firing at runtime
+    /// (the hypothesis the chequebook feature was added to test).
+    /// Zero on an upload that did substantial pushes means
+    /// pseudosettle is covering everything — sessions retire before
+    /// debt grows large enough to need a cheque.
+    pub static CHEQUE_EMITTED: AtomicU64 = AtomicU64::new(0);
+    /// Cheque emission attempts that failed (bee reset the stream,
+    /// the peer never sent an exchange rate, our cumulative cap was
+    /// reached, etc.). Counted alongside `CHEQUE_EMITTED`; the ratio
+    /// is the SWAP-path failure rate.
+    pub static CHEQUE_FAILED: AtomicU64 = AtomicU64::new(0);
+
+    // ─── ConnectionClosed cause classification ──────────────────────────
+    //
+    // libp2p's `SwarmEvent::ConnectionClosed.cause: Option<ConnectionError>`
+    // has three observable states:
+    // - `Some(IO(_))`  → TCP/yamux IO error (reset by peer, broken pipe,
+    //                    muxer protocol error). Almost certainly bee
+    //                    closed on us for a non-accounting reason.
+    // - `Some(KeepAliveTimeout)` → libp2p connection-level keepalive
+    //                              expired. Only fires if a swarm-level
+    //                              keepalive is configured — we have not
+    //                              configured one (we rely on yamux's
+    //                              internal keepalive instead), so this
+    //                              should always be zero. If it isn't,
+    //                              that's a real finding.
+    // - `None` → clean close. Bee deliberately disconnected (e.g.
+    //            accounting blocklist) or the close was driven from our
+    //            side (e.g. session driver dropped the swarm).
+    //
+    // Counted only in the SessionDriver loop (running sessions), not in
+    // prep_connection — failures there are dial-time and already
+    // accounted for separately.
+    pub static CONN_CLOSED_IO: AtomicU64 = AtomicU64::new(0);
+    pub static CONN_CLOSED_KEEPALIVE: AtomicU64 = AtomicU64::new(0);
+    pub static CONN_CLOSED_CLEAN: AtomicU64 = AtomicU64::new(0);
+
+    /// Detailed breakdown of `ConnectionError::IO(io::Error)` causes,
+    /// keyed by `format!("{:?}", io_err)` truncated/normalised to one
+    /// of the canonical bucket strings used here. Populated alongside
+    /// `CONN_CLOSED_IO` so that bucket-by-cause counts always sum to
+    /// the total IO count. See the match in `SessionDriver` for the
+    /// mapping. Lock-protected (not atomic) because we mutate a
+    /// `BTreeMap` rather than a fixed set of counters — the cause
+    /// strings are open-ended and we discover them at runtime.
+    pub static CONN_CLOSED_IO_DETAIL: std::sync::Mutex<std::collections::BTreeMap<String, u64>> =
+        std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+    /// Outbound hive self-announcements that succeeded (bee accepted
+    /// the `Peers` envelope without resetting the stream). Bee may
+    /// still reject us at the dial-probe stage if our advertised
+    /// underlay isn't reachable — that happens asynchronously after
+    /// our stream closes and we don't see it. So a high count here
+    /// means we *tried* to register, not that bee actually added us
+    /// to `knownPeers`. Confirm via long-term metrics: incoming
+    /// connection rate from new peers over many sessions.
+    pub static HIVE_ANNOUNCE_OK: AtomicU64 = AtomicU64::new(0);
+    /// Outbound hive announcements where the stream open or the
+    /// `Peers` write itself failed. Usually means the connection died
+    /// between handshake and the hive substream open — see
+    /// `CONN_CLOSED_*` for the cause classification.
+    pub static HIVE_ANNOUNCE_FAIL: AtomicU64 = AtomicU64::new(0);
+    /// Inbound pullsync `cursors` substreams accepted from bee. Each
+    /// indicates bee has decided we're a kademlia neighbor worth
+    /// probing — a strong signal of kademlia membership. Compare to
+    /// outbound `HIVE_ANNOUNCE_OK`: hive tells bee about us, cursors
+    /// is bee acting on what it learned.
+    pub static PULLSYNC_CURSORS_IN: AtomicU64 = AtomicU64::new(0);
+    /// Inbound pullsync `pullsync` substreams accepted from bee. Each
+    /// is bee attempting to sync chunks from us. Even though we reply
+    /// with empty offers, the request count tells us bee considers
+    /// us a sync-eligible neighbor.
+    pub static PULLSYNC_PULLSYNC_IN: AtomicU64 = AtomicU64::new(0);
+
+    // ─── Per-push wall-clock histogram ──────────────────────────────────
+    //
+    // Coarse 4-bucket histogram of `do_pushsync` outer timing,
+    // bucketed by total wall-clock spent on (open_stream + push +
+    // receipt). Used to find where chunks actually spend their time —
+    // we've been guessing this is yamux flow control vs. multistream
+    // negotiation vs. bee-side forwarding latency without measuring.
+    //
+    // Bucket boundaries are deliberately broad so single-trial runs
+    // produce a clear shape. Tighten if you find a specific cliff to
+    // investigate.
+    pub static PUSH_LATENCY_LT_100MS: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_LATENCY_100_500MS: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_LATENCY_500MS_2S: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_LATENCY_2_5S: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_LATENCY_5_10S: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_LATENCY_GT_10S: AtomicU64 = AtomicU64::new(0);
+
+    // ─── Open-stream wall-clock histogram ───────────────────────────────
+    //
+    // Same buckets, but for just the open_stream portion. If pushes
+    // are slow but open_stream is fast, the bottleneck is yamux
+    // window / receipt RTT. If open_stream itself is slow, the
+    // bottleneck is the Control → Handler rendezvous channel or
+    // multistream-select negotiation.
+    pub static OPEN_STREAM_LT_10MS: AtomicU64 = AtomicU64::new(0);
+    pub static OPEN_STREAM_10_100MS: AtomicU64 = AtomicU64::new(0);
+    pub static OPEN_STREAM_100_500MS: AtomicU64 = AtomicU64::new(0);
+    pub static OPEN_STREAM_GT_500MS: AtomicU64 = AtomicU64::new(0);
+
+    // ─── Push outcome counters (bumped inside do_pushsync result handling) ───
+    //
+    // Compare with bee's `bee_pushsync_shallow_receipt` and similar
+    // counters available at bee's `/metrics` endpoint. If our shallow
+    // rate is far above bee's (5.9% in observation), that's direct
+    // evidence we route to peers further from chunk AORs than bee
+    // does, which is the structural advantage bee gets from having
+    // 133 stable kademlia neighbors.
+    pub static PUSH_OUTCOME_OK: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_OUTCOME_SHALLOW: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_OUTCOME_OVERDRAFT: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_OUTCOME_ERROR: AtomicU64 = AtomicU64::new(0);
+
+    // ─── Chunk-completion latency histogram ─────────────────────────────
+    //
+    // From "this chunk enters the dispatcher" → "this chunk gets its
+    // first non-shallow receipt (or the fallback shallow accept)".
+    // This is the per-chunk wall-clock that actually determines
+    // throughput (with `buffer` chunks in flight, we push
+    // `buffer / mean(chunk_latency)` chunks per second).
+    //
+    // Compare against bee: bee's wall-time for a 5 MiB upload is
+    // ~7s with `ConcurrentPushes=128`. That implies mean chunk
+    // latency ≈ 128 / (1280 / 7) ≈ 700ms. We've seen ~50-100s wall
+    // time, so our mean chunk latency is much higher despite mean
+    // push latency being similar — the difference must be in
+    // dispatcher overhead or chunk-level retries.
+    pub static CHUNK_LATENCY_LT_500MS: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNK_LATENCY_500MS_2S: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNK_LATENCY_2_5S: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNK_LATENCY_5_15S: AtomicU64 = AtomicU64::new(0);
+    pub static CHUNK_LATENCY_GT_15S: AtomicU64 = AtomicU64::new(0);
 }
 
 #[derive(Debug, Error)]
@@ -242,6 +497,10 @@ pub enum TransportError {
     NetworkMismatch { ours: u64, theirs: u64 },
     #[error("pseudosettle: {0}")]
     PseudoSettle(String),
+    #[error("swap: {0}")]
+    Swap(String),
+    #[error("status: {0}")]
+    Status(String),
     /// The caller asked to dial a peer that we dialed too recently.
     /// Surfaced by [`PeerSession::connect`] when the per-peer cooldown
     /// hasn't elapsed yet (see [`Transport::dial_cooldown_remaining`]).
@@ -318,10 +577,58 @@ fn behaviour(keypair: &Keypair, max_concurrent_substream_upgrades: usize) -> Beh
     }
 }
 
+/// SWAP / chequebook configuration shared across all sessions of a
+/// `Transport`. When `Some`, every newly-opened session performs a
+/// one-shot swap handshake (advertising our beneficiary = our
+/// signer's Ethereum address) and then the auto-settle path may emit
+/// cheques after pseudosettle when remaining debt > minimumPayment.
+///
+/// When `None` (default), behaviour is unchanged from the original
+/// pseudosettle-only client: sessions retire by ghost-balance or
+/// connection-death rotation instead of paying.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+pub struct SwapConfig {
+    /// 20-byte chequebook contract address on `chain_id`. MUST be a
+    /// chequebook deployed by bee's official factory
+    /// (`pkg/config/chain.go::CurrentFactoryAddress`), MUST have its
+    /// `issuer()` equal to the signer's Ethereum address. We don't
+    /// verify either of those here — bee will reject cheques otherwise,
+    /// surfacing as session resets in metrics.
+    pub chequebook: [u8; 20],
+    /// EVM chain id used in the EIP-712 domain of the cheque
+    /// signature. Mainnet Swarm (Gnosis) = 100, Sepolia testnet =
+    /// 11155111.
+    pub chain_id: u64,
+    /// Max cumulative payout (BZZ-wei) we'll ever issue to any single
+    /// peer. Once a peer's cumulative reaches this, we revert to
+    /// pseudosettle-only for that peer. Bee's
+    /// `chequestore.go:176` rejects cheques whose
+    /// `CumulativePayout - alreadyPaidOut` exceeds the chequebook
+    /// balance, so the user should set this <= chequebook deposited
+    /// balance to avoid bouncing cheques.
+    pub max_cumulative_per_peer_bzz: alloy_primitives::U256,
+    /// Persistent per-peer cumulative-payout state. Shared across all
+    /// sessions; must be loaded from disk before first session and
+    /// flushed on shutdown.
+    pub store: std::sync::Arc<tokio::sync::Mutex<crate::cheques::ChequeStore>>,
+}
+
 pub struct Transport {
     keypair: Keypair,
     signer: SwarmSigner,
     config: TransportConfig,
+    #[cfg(not(target_arch = "wasm32"))]
+    swap: Option<SwapConfig>,
+    /// Optional status-snapshot responder. When `Some`, every
+    /// outbound session accepts `/swarm/status/1.1.0/status` and
+    /// returns this snapshot in response to bee's salud probes.
+    /// When `None`, the protocol is still accepted at the
+    /// multistream-select level (so bee doesn't log "protocol not
+    /// supported") but we drop inbound status streams without
+    /// responding — same Unhealthy outcome but without the
+    /// protocol-negotiation noise. See `protocols::status` docs.
+    status_snapshot: Option<std::sync::Arc<crate::protocols::status::StatusSnapshot>>,
     /// Shared reachability log: every dial / session open / healthcheck
     /// records its (overlay → success/failure + rtt) here. The CLI drains
     /// the log after an operation completes and writes the observations
@@ -346,11 +653,42 @@ impl Transport {
             keypair,
             signer,
             config,
+            #[cfg(not(target_arch = "wasm32"))]
+            swap: None,
+            status_snapshot: None,
             reachability_log: crate::peers::new_log(),
             dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
             )),
         }
+    }
+
+    /// Attach a status snapshot used to respond to bee's salud probes.
+    /// Required for the kademlia-prune mitigation: without responding,
+    /// we stay marked Unhealthy and get preferentially disconnected.
+    /// See `protocols::status` and PERFORMANCE.md "Public reachability".
+    pub fn with_status_snapshot(
+        mut self,
+        snapshot: crate::protocols::status::StatusSnapshot,
+    ) -> Self {
+        self.status_snapshot = Some(std::sync::Arc::new(snapshot));
+        self
+    }
+
+    /// Attach SWAP/chequebook configuration. Native-only. When set,
+    /// sessions automatically advertise the chequebook beneficiary and
+    /// emit signed cheques as part of the settle path. See
+    /// [`SwapConfig`] for the prerequisites the caller is responsible
+    /// for (chequebook deployed by bee's factory, etc.).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn with_swap(mut self, swap: SwapConfig) -> Self {
+        self.swap = Some(swap);
+        self
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn swap(&self) -> Option<&SwapConfig> {
+        self.swap.as_ref()
     }
 
     /// Like [`Self::new`] but pins the libp2p keypair to a caller-
@@ -363,6 +701,9 @@ impl Transport {
             keypair,
             signer,
             config,
+            #[cfg(not(target_arch = "wasm32"))]
+            swap: None,
+            status_snapshot: None,
             reachability_log: crate::peers::new_log(),
             dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
                 std::collections::HashMap::new(),
@@ -392,7 +733,7 @@ impl Transport {
     /// to stay under bee's per-IP connection rate limit (10 RPS / burst
     /// 40 per /32, see `pkg/p2p/libp2p/libp2p.go`). `None` if we're
     /// clear to dial now.
-    fn dial_cooldown_remaining(&self, peer_id: &PeerId) -> Option<Duration> {
+    pub(crate) fn dial_cooldown_remaining(&self, peer_id: &PeerId) -> Option<Duration> {
         let last = self.dial_cooldown.lock().ok()?.get(peer_id).copied()?;
         let since = web_time::Instant::now().saturating_duration_since(last);
         if since >= DIAL_COOLDOWN {
@@ -400,6 +741,16 @@ impl Transport {
         } else {
             Some(DIAL_COOLDOWN - since)
         }
+    }
+
+    /// Same as `dial_cooldown_remaining` but takes a multiaddr.
+    /// Returns `None` if the multiaddr lacks a `/p2p/<peer_id>`
+    /// component (`open_session` would fail with `MissingPeerId`
+    /// in that case — caller can either skip or proceed and let
+    /// `open_session` surface the error).
+    pub fn dial_cooldown_for_underlay(&self, underlay: &Multiaddr) -> Option<Duration> {
+        let peer_id = extract_peer_id(underlay)?;
+        self.dial_cooldown_remaining(&peer_id)
     }
 
     /// Record that we are about to dial `peer_id`. Called from
@@ -576,6 +927,12 @@ enum SessionCommand {
         addr: [u8; 32],
         reply: tokio::sync::oneshot::Sender<Result<ChunkDelivery, TransportError>>,
     },
+    /// Outbound salud-style probe — measure this peer's response
+    /// latency on the status protocol so the caller can decide
+    /// whether to keep using them. No accounting, no settlement.
+    StatusProbe {
+        reply: tokio::sync::oneshot::Sender<Result<Duration, TransportError>>,
+    },
 }
 
 impl PeerSession {
@@ -627,9 +984,26 @@ impl PeerSession {
         let mut hs_in = accept(&mut control, HANDSHAKE_PROTO)?;
         let mut pr_in = accept(&mut control, PRICING_PROTO)?;
         let hive_in = accept(&mut control, HIVE_PROTO)?;
+        // Accept STATUS even if no snapshot is configured — bee opens
+        // this stream from its `pkg/salud` worker on every connection,
+        // and a multistream-select NACK on this protocol gets logged
+        // on bee's side as if we don't speak it (which would
+        // contribute to the Unhealthy classification). When the
+        // session driver has no snapshot configured it will simply
+        // drop the inbound stream after accepting it; bee sees an
+        // EOF, not a protocol NACK.
+        let status_in = accept(&mut control, STATUS_PROTO)?;
+        // Accept the two pullsync sub-protocols. Same rationale as
+        // STATUS_PROTO: bee opens these over outbound connections we
+        // initiated, so the per-session accept is necessary alongside
+        // the daemon inbound listener. We respond with empty cursors
+        // / empty offers — see `protocols::pullsync` module docs.
+        let pullsync_cursors_in = accept(&mut control, PULLSYNC_CURSORS_PROTO)?;
+        let pullsync_pullsync_in = accept(&mut control, PULLSYNC_PULLSYNC_PROTO)?;
         dial(&mut swarm, peer_id, peer_addr)?;
         let underlay = prep_connection(&mut swarm, peer_id, transport.config.dial_timeout).await?;
-        do_handshake(
+        #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+        let hs_result = do_handshake(
             &mut swarm,
             peer_id,
             &mut control,
@@ -657,6 +1031,96 @@ impl PeerSession {
         // queue from piling up.
         let threshold_plur = SAFE_PEER_THRESHOLD_PLUR;
 
+        // Hive self-announcement (best-effort). Tell bee about
+        // ourselves by sending a `Peers` envelope containing our own
+        // BzzAddress over a fresh `/swarm/hive/1.1.0/peers` substream.
+        // Bee's `peersHandler` reads the envelope, dial-probes each
+        // announced address to verify reachability (works because we
+        // run `--listen --advertise`), and adds successfully verified
+        // entries to `knownPeers`. From there, bee's manage loop may
+        // dial us OUTBOUND in the future, admitting us to kademlia
+        // with `forceConnection=true` — bypassing the bin-saturation
+        // check that rejects normal inbound clients.
+        //
+        // The benefit is cumulative across sessions: each bee we
+        // announce ourselves to remembers our overlay (provided
+        // overlay stability via `SwarmSigner::from_bytes_with_nonce`)
+        // and may re-establish the connection later. Over time this
+        // grows our kademlia presence beyond what any single session
+        // could achieve, which feeds back into bee's salud probes
+        // marking us Healthy, which further reduces our prune-priority.
+        //
+        // Failure here is silent: no announcement means bee's
+        // peersHandler never sees us, but the session still works
+        // for outbound pushes. We log at debug and move on.
+        #[cfg(not(target_arch = "wasm32"))]
+        if !hs_result.our_underlay.is_empty() {
+            let our_overlay = transport.signer.overlay().to_vec();
+            let our_nonce = transport.signer.nonce().to_vec();
+            let me = crate::protocols::hive::OwnBzzAddress {
+                overlay: our_overlay,
+                underlay: hs_result.our_underlay.clone(),
+                signature: hs_result.our_signature.clone(),
+                nonce: our_nonce,
+            };
+            match do_hive_announce(
+                &mut swarm,
+                peer_id,
+                &mut control,
+                transport.config.dial_timeout,
+                &me,
+            )
+            .await
+            {
+                Ok(()) => diag::HIVE_ANNOUNCE_OK.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+                Err(e) => {
+                    diag::HIVE_ANNOUNCE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    tracing::debug!(
+                        target: "isheika::transport",
+                        "hive announce to {} failed: {} — session continues",
+                        peer_id, e
+                    );
+                    0
+                }
+            };
+        }
+
+        // SWAP handshake (best-effort). If anything fails, fall back
+        // to pseudosettle-only and let the session run without cheque
+        // emission. We don't want a swap-stream hiccup to abort a
+        // session that's otherwise perfectly capable of pushing.
+        #[cfg(not(target_arch = "wasm32"))]
+        let swap = match (&transport.swap, hs_result.peer_eth_address) {
+            (Some(cfg), Some(peer_eth)) => {
+                let our_beneficiary = *transport.signer.eth_address();
+                match do_swap_handshake(
+                    &mut swarm,
+                    peer_id,
+                    &mut control,
+                    transport.config.dial_timeout,
+                    &our_beneficiary,
+                )
+                .await
+                {
+                    Ok(()) => Some(SessionSwap {
+                        peer_beneficiary: peer_eth,
+                        peer_overlay_hex: hex::encode(hs_result.peer_overlay),
+                        signer: transport.signer.clone(),
+                        config: cfg.clone(),
+                    }),
+                    Err(e) => {
+                        tracing::debug!(
+                            target: "isheika::transport",
+                            "swap handshake failed with {}: {} — falling back to pseudosettle-only",
+                            peer_id, e
+                        );
+                        None
+                    }
+                }
+            }
+            _ => None,
+        };
+
         let timeout = transport.config.timeout;
         let (cmd_tx, cmd_rx) = tokio::sync::mpsc::channel::<SessionCommand>(64);
         let state = std::sync::Arc::new(SessionState {
@@ -672,6 +1136,10 @@ impl PeerSession {
             settle_lock: tokio::sync::Mutex::new(()),
             pushes_used: std::sync::atomic::AtomicU32::new(0),
             ghost_balance_plur: std::sync::atomic::AtomicU64::new(0),
+            connection_dead: std::sync::atomic::AtomicBool::new(false),
+            dead_notify: tokio::sync::Notify::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            swap,
         });
         let session_state = state.clone();
         spawn_session_driver(SessionDriver {
@@ -681,6 +1149,25 @@ impl PeerSession {
             _hs_in: hs_in,
             _pr_in: pr_in,
             _hive_in: hive_in,
+            status_in,
+            status_snapshot: transport.status_snapshot.clone(),
+            pullsync_cursors_in,
+            pullsync_pullsync_in,
+            // Epoch is bee's notion of our reserve identity. Using
+            // session-start unix seconds (nanos would also work)
+            // means each fresh session advertises a unique epoch but
+            // the value is stable within the session.
+            pullsync_epoch: {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_secs())
+                        .unwrap_or(0)
+                }
+                #[cfg(target_arch = "wasm32")]
+                { 0u64 }
+            },
         });
         Ok(Self { cmd_tx, peer_id, state: session_state })
     }
@@ -750,6 +1237,19 @@ impl PeerSession {
     /// 500-1500 ms of dispatcher wall time per dead session.
     pub fn is_alive(&self) -> bool {
         !self.cmd_tx.is_closed()
+    }
+
+    /// Probe the peer's status-protocol responsiveness. Returns the
+    /// observed round-trip duration on success. Used by the pool to
+    /// pre-filter slow peers, mirroring bee's salud→Healthy pipeline.
+    pub async fn status_probe(&self) -> Result<Duration, TransportError> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let cmd = SessionCommand::StatusProbe { reply: tx };
+        self.cmd_tx
+            .send(cmd)
+            .await
+            .map_err(|_| TransportError::ConnectionClosed)?;
+        rx.await.map_err(|_| TransportError::ConnectionClosed)?
     }
 
     /// Fetch one chunk over a fresh substream on this session's connection.
@@ -828,6 +1328,52 @@ struct SessionState {
     /// Successful pushes don't increment — bee doesn't burn ghost
     /// balance on them.
     ghost_balance_plur: std::sync::atomic::AtomicU64,
+    /// Connection-death signal. Set to `true` by the SessionDriver
+    /// the moment it observes `SwarmEvent::ConnectionClosed` for our
+    /// peer. The `dead_notify` Notify wakes all in-flight push and
+    /// fetch tasks so they can fail fast instead of waiting up to
+    /// `--timeout` (default 10 s) for their substreams to error.
+    ///
+    /// Why this matters: when bee's kademlia prunes us, the
+    /// connection dies via `SO_LINGER=0` RST (see PERFORMANCE.md
+    /// "Session-death cause"). Every pushsync substream that's
+    /// mid-write or mid-read at that moment stalls until libp2p
+    /// surfaces the error, which can take seconds. Multiplied
+    /// across our ~256 concurrent sessions and the 100+ sessions
+    /// that die during a 5 MiB upload, this stall time is the
+    /// dominant contributor to our per-stream 2-5 s tail.
+    /// Surfacing the dead flag immediately lets the dispatcher
+    /// re-route those chunks within milliseconds.
+    connection_dead: std::sync::atomic::AtomicBool,
+    dead_notify: tokio::sync::Notify,
+    /// Per-session SWAP state. `None` if SWAP is disabled at the
+    /// `Transport` level or if the peer's BzzAddress signature
+    /// couldn't be recovered to an Ethereum address (rare; bee
+    /// always signs correctly). When `Some`, the auto-settle path
+    /// will emit cheques after pseudosettle if remaining debt warrants
+    /// one.
+    #[cfg(not(target_arch = "wasm32"))]
+    swap: Option<SessionSwap>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct SessionSwap {
+    /// Beneficiary (peer's Ethereum address recovered from their
+    /// BzzAddress signature in our handshake). Stays fixed for the
+    /// life of the session — bee re-derives our beneficiary from our
+    /// handshake signature on each connection, and our derivation of
+    /// their address is symmetric.
+    peer_beneficiary: [u8; 20],
+    /// Peer's overlay (hex, lowercase). Used to key into the cheque
+    /// store sidecar.
+    peer_overlay_hex: String,
+    /// Cloned from `Transport.signer`. Used to sign cheques —
+    /// `signer.eth_address()` MUST equal `config.chequebook`'s
+    /// on-chain `issuer()` for cheques to validate. We hold a clone
+    /// per session so the settle path doesn't need to thread the
+    /// transport's signer through `Arc<SessionState>`.
+    signer: SwarmSigner,
+    config: SwapConfig,
 }
 
 impl SessionState {
@@ -900,56 +1446,169 @@ impl SessionState {
         stamp: &[u8],
     ) -> Result<PushsyncReceipt, TransportError> {
         let t_start = web_time::Instant::now();
+        // Fail fast if the session's already known dead. Saves the
+        // open_stream round-trip on an entry whose connection died
+        // between when the dispatcher picked it and when we got
+        // scheduled.
+        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(TransportError::ConnectionClosed);
+        }
         let mut control = self.control.clone();
-        let open = tokio::time::timeout(
-            self.timeout,
-            control.open_stream(self.peer_id, PUSHSYNC_PROTO),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        // Race the stream open against the dead-notify so we bail
+        // immediately if the connection dies mid-negotiation.
+        let open = tokio::select! {
+            r = tokio::time::timeout(
+                self.timeout,
+                control.open_stream(self.peer_id, PUSHSYNC_PROTO),
+            ) => {
+                r.map_err(|_| TransportError::Timeout)?
+                    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?
+            }
+            _ = self.dead_notify.notified() => {
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         let t_opened = web_time::Instant::now();
         let mut stream = open;
-        let result = tokio::time::timeout(self.timeout, pushsync::push(&mut stream, addr, wire, stamp))
-            .await
-            .map_err(|_| TransportError::Timeout)?
-            .map_err(Into::<TransportError>::into);
+        // Same race for the push body: if the connection dies after
+        // we've opened the stream but before we've finished the
+        // read-receipt phase, we want to error immediately rather
+        // than waiting up to `--timeout` (default 10 s) for the
+        // substream to surface the closed-connection error.
+        let result = tokio::select! {
+            r = tokio::time::timeout(
+                self.timeout,
+                pushsync::push(&mut stream, addr, wire, stamp),
+            ) => {
+                r.map_err(|_| TransportError::Timeout)?
+                    .map_err(Into::<TransportError>::into)
+            }
+            _ = self.dead_notify.notified() => {
+                Err(TransportError::ConnectionClosed)
+            }
+        };
         let t_pushed = web_time::Instant::now();
+        let open_us = (t_opened - t_start).as_micros() as u64;
+        let total_us = (t_pushed - t_start).as_micros() as u64;
         tracing::trace!(
             target: "isheika::profile",
             peer = %self.peer_id,
-            open_stream_us = (t_opened - t_start).as_micros() as u64,
+            open_stream_us = open_us,
             push_total_us = (t_pushed - t_opened).as_micros() as u64,
             ok = result.is_ok(),
             "do_pushsync_outer",
         );
+        // Histogram bumping for end-of-upload diagnostic. We bucket by
+        // *successful* push only to avoid measuring error-retry noise.
+        if result.is_ok() {
+            let total_ms = total_us / 1_000;
+            if total_ms < 100 {
+                diag::PUSH_LATENCY_LT_100MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if total_ms < 500 {
+                diag::PUSH_LATENCY_100_500MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if total_ms < 2000 {
+                diag::PUSH_LATENCY_500MS_2S.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if total_ms < 5000 {
+                diag::PUSH_LATENCY_2_5S.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if total_ms < 10000 {
+                diag::PUSH_LATENCY_5_10S.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                diag::PUSH_LATENCY_GT_10S.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let open_ms = open_us / 1_000;
+            if open_ms < 10 {
+                diag::OPEN_STREAM_LT_10MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if open_ms < 100 {
+                diag::OPEN_STREAM_10_100MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if open_ms < 500 {
+                diag::OPEN_STREAM_100_500MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else {
+                diag::OPEN_STREAM_GT_500MS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
         result
     }
 
     async fn do_fetch(&self, addr: &[u8; 32]) -> Result<ChunkDelivery, TransportError> {
+        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(TransportError::ConnectionClosed);
+        }
         let mut control = self.control.clone();
-        let open = tokio::time::timeout(
-            self.timeout,
-            control.open_stream(self.peer_id, RETRIEVAL_PROTO),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        let open = tokio::select! {
+            r = tokio::time::timeout(
+                self.timeout,
+                control.open_stream(self.peer_id, RETRIEVAL_PROTO),
+            ) => {
+                r.map_err(|_| TransportError::Timeout)?
+                    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?
+            }
+            _ = self.dead_notify.notified() => {
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
         let mut stream = open;
-        tokio::time::timeout(self.timeout, retrieval::fetch(&mut stream, addr))
-            .await
-            .map_err(|_| TransportError::Timeout)?
-            .map_err(Into::into)
+        tokio::select! {
+            r = tokio::time::timeout(self.timeout, retrieval::fetch(&mut stream, addr)) => {
+                r.map_err(|_| TransportError::Timeout)?.map_err(Into::into)
+            }
+            _ = self.dead_notify.notified() => {
+                Err(TransportError::ConnectionClosed)
+            }
+        }
     }
 
-    /// Issue one pseudosettle Payment. Serialized across concurrent
-    /// pushes via `settle_lock`, gated to at most one per 1.1 seconds.
+    /// One outbound salud-style status probe. Mirrors what bee's
+    /// `pkg/salud::probe` does periodically against every connected
+    /// peer: open a `/swarm/status/1.1.0/status` substream, send Get,
+    /// read Snapshot, measure wall-clock round-trip. Caller uses the
+    /// elapsed time as a per-peer responsiveness signal; the response
+    /// payload is discarded.
+    async fn do_status_probe(&self) -> Result<Duration, TransportError> {
+        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(TransportError::ConnectionClosed);
+        }
+        let mut control = self.control.clone();
+        let started = web_time::Instant::now();
+        let open = tokio::select! {
+            r = tokio::time::timeout(
+                self.timeout,
+                control.open_stream(self.peer_id, STATUS_PROTO),
+            ) => {
+                r.map_err(|_| TransportError::Timeout)?
+                    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?
+            }
+            _ = self.dead_notify.notified() => {
+                return Err(TransportError::ConnectionClosed);
+            }
+        };
+        let mut stream = open;
+        let result = tokio::select! {
+            r = tokio::time::timeout(self.timeout, status_proto::request(&mut stream)) => {
+                r.map_err(|_| TransportError::Timeout)?
+                    .map_err(|e| TransportError::Status(e.to_string()))
+            }
+            _ = self.dead_notify.notified() => {
+                Err(TransportError::ConnectionClosed)
+            }
+        };
+        result.map(|_| started.elapsed())
+    }
+
+    /// Issue one pseudosettle Payment, then (if SWAP is configured and
+    /// the pseudosettle didn't clear our debt) issue one cheque.
+    /// Serialized across concurrent pushes via `settle_lock`. Mirrors
+    /// bee's `pkg/accounting/accounting.go::settle`, which runs the
+    /// refresh and the monetary settlement *in parallel* but always
+    /// triggers refresh first. We serialize for simplicity — the
+    /// total wall time is at most one extra substream open per
+    /// settle which is dominated by accounting RTT anyway.
+    ///
     /// Best-effort: errors are swallowed because failure to settle just
     /// means the next reserve attempt will report overdraft.
     async fn try_settle_once(&self) -> Result<(), TransportError> {
         let _guard = self.settle_lock.lock().await;
 
-        // Bee rejects two settles within the same wall-second.
+        // Bee rejects two pseudosettles within the same wall-second.
         let needs_wait = {
             let acc = self.accounting.lock().await;
             acc.last_settle
@@ -970,18 +1629,166 @@ impl SessionState {
         }
         let ack = self.do_pseudosettle(u128::from(owed)).await?;
         let accepted = ack.amount_plur.min(u128::from(u64::MAX)) as u64;
-        {
+        let remaining_after_pseudo = {
             let mut acc = self.accounting.lock().await;
             acc.last_settle = Some(web_time::Instant::now());
             acc.balance_plur = acc.balance_plur.saturating_sub(accepted);
             debug!(
                 target: "isheika::transport",
-                "settled with {}: asked={} accepted={} balance={} reserve={}",
+                "pseudosettle with {}: asked={} accepted={} balance={} reserve={}",
                 self.peer_id, owed, accepted, acc.balance_plur, acc.reserve_plur,
             );
+            acc.balance_plur
+        };
+
+        // If pseudosettle didn't cover everything and SWAP is configured
+        // for this session, emit a cheque for the remainder.
+        #[cfg(not(target_arch = "wasm32"))]
+        if remaining_after_pseudo > 0 && self.swap.is_some() {
+            if let Err(e) = self.try_emit_cheque(remaining_after_pseudo).await {
+                diag::CHEQUE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::debug!(
+                    target: "isheika::transport",
+                    "cheque emission to {} failed: {} — leaving balance in place",
+                    self.peer_id, e
+                );
+            }
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = remaining_after_pseudo;
+
         Ok(())
     }
+
+    /// Sign and emit one SWAP cheque covering `plur_to_settle` PLUR
+    /// of debt. The cheque's BZZ-wei amount is
+    /// `plur_to_settle * exchange_rate + deduction`, read from the
+    /// per-stream `exchange`/`deduction` headers bee derives from its
+    /// on-chain priceoracle. No-op if SWAP isn't configured for this
+    /// session, if the peer doesn't send a usable exchange rate, or
+    /// if our per-peer cumulative cap would be exceeded.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn try_emit_cheque(&self, plur_to_settle: u64) -> Result<(), TransportError> {
+        use crate::protocols::swap;
+        use alloy_primitives::U256;
+
+        let Some(swap_state) = self.swap.as_ref() else {
+            return Ok(());
+        };
+        if plur_to_settle == 0 {
+            return Ok(());
+        }
+
+        // Open the swap stream and read the per-stream exchange rate.
+        let mut control = self.control.clone();
+        let mut stream = tokio::time::timeout(
+            self.timeout,
+            control.open_stream(self.peer_id, SWAP_PROTO),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+
+        let rates = tokio::time::timeout(self.timeout, swap::read_settlement_rates(&mut stream))
+            .await
+            .map_err(|_| TransportError::Timeout)?
+            .map_err(|e| TransportError::Swap(e.to_string()))?;
+
+        // Compute BZZ-wei amount: bee's chequestore.go:139-143 enforces
+        // `amount - deduction >= exchange`, i.e. amount >= exchange +
+        // deduction. We compute amount = plur * exchange + deduction
+        // (mirrors swapprotocol.go:224-225, where sentAmount =
+        // paymentAmount*exchangeRate + deduction).
+        let plur_u256 = U256::from(plur_to_settle);
+        let amount_bzz = plur_u256
+            .checked_mul(rates.exchange_rate)
+            .and_then(|p| p.checked_add(rates.deduction))
+            .ok_or_else(|| TransportError::Swap("BZZ amount overflows u256".into()))?;
+        if amount_bzz < rates.exchange_rate.saturating_add(rates.deduction) {
+            // Pathological: deduction == 0 and amount < exchange would
+            // bounce as ErrChequeValueTooLow. Defensive guard for the
+            // arithmetic above.
+            return Err(TransportError::Swap("amount below minimum payable".into()));
+        }
+
+        // Bump per-peer cumulative under the store lock, then sign.
+        // The store mutation has to happen *before* we sign because
+        // we sign the new cumulative, but it has to happen *after*
+        // we know we have a usable rate so we don't bump on a
+        // doomed attempt.
+        let (cumulative, capped) = {
+            let mut store = swap_state.config.store.lock().await;
+            let cur = store.cumulative(&swap_state.peer_overlay_hex);
+            let new = U256::from(cur).saturating_add(amount_bzz);
+            if new > swap_state.config.max_cumulative_per_peer_bzz {
+                (U256::from(cur), true)
+            } else {
+                let delta: u128 = amount_bzz.try_into().map_err(|_| {
+                    TransportError::Swap("cheque amount exceeds u128".into())
+                })?;
+                let next = store
+                    .bump_and_get(&swap_state.peer_overlay_hex, delta)
+                    .map_err(|e| TransportError::Swap(e.to_string()))?;
+                if let Err(e) = store.save() {
+                    tracing::warn!(
+                        target: "isheika::transport",
+                        "cheques.json save failed: {} — continuing in-memory only", e
+                    );
+                }
+                (U256::from(next), false)
+            }
+        };
+        if capped {
+            return Err(TransportError::Swap(
+                "per-peer cumulative cap reached".into(),
+            ));
+        }
+
+        // Sign the cheque (EIP-712, our overlay signer must == chequebook issuer).
+        let chequebook = swap_state.config.chequebook;
+        let signature = swap_state
+            .signer
+            .sign_cheque(
+                &chequebook,
+                &swap_state.peer_beneficiary,
+                cumulative,
+                swap_state.config.chain_id,
+            )
+            .map_err(|e| TransportError::Swap(e.to_string()))?;
+
+        // Emit.
+        tokio::time::timeout(
+            self.timeout,
+            swap::emit_cheque(
+                &mut stream,
+                &chequebook,
+                &swap_state.peer_beneficiary,
+                cumulative,
+                &signature,
+            ),
+        )
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|e| TransportError::Swap(e.to_string()))?;
+
+        // Clear the PLUR portion we just paid off from balance_plur.
+        // We optimistically assume bee credits the full amount; if
+        // not, our next pseudosettle/cheque will see a stale balance
+        // but that's recoverable.
+        {
+            let mut acc = self.accounting.lock().await;
+            acc.balance_plur = acc.balance_plur.saturating_sub(plur_to_settle);
+        }
+        diag::CHEQUE_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        tracing::debug!(
+            target: "isheika::transport",
+            "cheque emitted to {}: {} PLUR → {} BZZ-wei (cumulative {})",
+            self.peer_id, plur_to_settle, amount_bzz, cumulative,
+        );
+        Ok(())
+    }
+
+
 
     async fn do_pseudosettle(
         &self,
@@ -1017,6 +1824,42 @@ struct SessionDriver {
     _hs_in: crate::protocols::stream_pool::IncomingStreams,
     _pr_in: crate::protocols::stream_pool::IncomingStreams,
     _hive_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound `/swarm/status/1.1.0/status` streams. Bee's `pkg/salud`
+    /// opens this stream periodically (10s..5min backoff) over any
+    /// connection it has to us — including the outbound connections
+    /// our session pool maintains. NOT responding leaves us marked
+    /// `Unhealthy` (the zero-value default), which makes us prime
+    /// candidates for kademlia bin-prune disconnection. So unlike the
+    /// other three `_*_in` slots, we actively poll this one and
+    /// respond. See `protocols::status` module docs.
+    ///
+    /// `None` when the daemon's status responder isn't configured;
+    /// the stream pool still accepts the protocol so multistream-select
+    /// negotiation succeeds (bee won't see "protocol not supported"),
+    /// but we drop the stream without writing a snapshot. That's still
+    /// better than not accepting at all (we get an EOF-style close
+    /// rather than a multistream NACK).
+    status_in: crate::protocols::stream_pool::IncomingStreams,
+    status_snapshot: Option<std::sync::Arc<crate::protocols::status::StatusSnapshot>>,
+    /// Inbound `/swarm/pullsync/1.4.0/cursors` substreams. Bee opens
+    /// this once when it considers us a kademlia neighbor, to learn
+    /// our per-bin BinID cursors. We respond with all-zeros (we have
+    /// no reserve) plus a stable session epoch. See
+    /// `protocols::pullsync::respond_cursors`.
+    pullsync_cursors_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound `/swarm/pullsync/1.4.0/pullsync` substreams. Bee opens
+    /// this periodically per kademlia neighbor to actually sync chunks
+    /// in some bin. We respond with empty offers (we have no chunks).
+    pullsync_pullsync_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Stable session epoch published in our `Ack.Epoch` response on
+    /// the cursors substream. Bee compares this across cursor probes
+    /// to detect if our reserve has been wiped; keeping it stable
+    /// across the session avoids spurious re-sync attempts. We derive
+    /// it from session start time so two sessions to the same peer
+    /// (after a session retired and we redialed) advertise different
+    /// epochs, which is correct — we genuinely have a fresh reserve
+    /// (which is empty, but bee doesn't need to know that).
+    pullsync_epoch: u64,
 }
 
 impl SessionDriver {
@@ -1085,6 +1928,15 @@ impl SessionDriver {
                                 false
                             }));
                         }
+                        SessionCommand::StatusProbe { reply } => {
+                            let state = self.state.clone();
+                            tasks.push(Box::pin(async move {
+                                let res = state.do_status_probe().await;
+                                let dead = matches!(&res, Err(e) if is_connection_dead(e));
+                                let _ = reply.send(res);
+                                dead
+                            }));
+                        }
                     }
                 }
 
@@ -1129,7 +1981,116 @@ impl SessionDriver {
                     }
                 }
 
-                _ = self.swarm.select_next_some() => {}
+                // Inbound status streams from bee's salud worker. Bee
+                // probes us periodically (10s..5min backoff) over the
+                // outbound connection this session owns. We must
+                // respond fast and with plausible values, else bee
+                // marks us Unhealthy and we become the top
+                // bin-prune target — losing the session to
+                // ECONNRESET. The handler runs in a spawned task so
+                // it can't block the dispatcher; it's bounded by
+                // `self.state.timeout` against a slow/dead stream.
+                Some((_pid, mut stream)) = self.status_in.next(), if self.status_snapshot.is_some() => {
+                    let snapshot = self.status_snapshot.clone().expect("guarded by if");
+                    let timeout = self.state.timeout;
+                    let task: TaskFuture = Box::pin(async move {
+                        let _ = tokio::time::timeout(
+                            timeout,
+                            crate::protocols::status::respond(&mut stream, &snapshot),
+                        ).await;
+                        true
+                    });
+                    tasks.push(task);
+                }
+
+                // Inbound pullsync cursor stream. One-shot per peer
+                // when bee first considers us a kademlia neighbor.
+                // We reply with all-zero per-bin cursors and a stable
+                // session epoch. See `protocols::pullsync` docs.
+                Some((_pid, mut stream)) = self.pullsync_cursors_in.next() => {
+                    let timeout = self.state.timeout;
+                    let epoch = self.pullsync_epoch;
+                    let task: TaskFuture = Box::pin(async move {
+                        let _ = tokio::time::timeout(
+                            timeout,
+                            crate::protocols::pullsync::respond_cursors(&mut stream, epoch),
+                        ).await;
+                        true
+                    });
+                    tasks.push(task);
+                    diag::PULLSYNC_CURSORS_IN.fetch_add(1, Ordering::Relaxed);
+                }
+
+                // Inbound pullsync chunk-fetch stream. Bee asks
+                // "what chunks do you have in bin N starting at X?"
+                // We reply with an empty offer; bee's handler
+                // short-circuits on empty offers.
+                Some((_pid, mut stream)) = self.pullsync_pullsync_in.next() => {
+                    let timeout = self.state.timeout;
+                    let task: TaskFuture = Box::pin(async move {
+                        let _ = tokio::time::timeout(
+                            timeout,
+                            crate::protocols::pullsync::respond_pullsync_empty(&mut stream),
+                        ).await;
+                        true
+                    });
+                    tasks.push(task);
+                    diag::PULLSYNC_PULLSYNC_IN.fetch_add(1, Ordering::Relaxed);
+                }
+
+                ev = self.swarm.select_next_some() => {
+                    // We don't care about most events here (identify
+                    // pushes, behaviour events, dial outcomes etc.
+                    // are all handled either at session-setup time or
+                    // are no-ops at this stage). The one we DO care
+                    // about is `ConnectionClosed`, because its `cause`
+                    // field is the only place libp2p tells us *why*
+                    // the underlying connection died — and the
+                    // `dead_low_ghost` retirement counter has been
+                    // showing this is the dominant retirement cause
+                    // at high concurrency without telling us whether
+                    // bee closed us (`IO`), libp2p timed us out
+                    // (`KeepAliveTimeout`), or someone clean-closed
+                    // (`None`). See `diag::CONN_CLOSED_*`.
+                    if let libp2p::swarm::SwarmEvent::ConnectionClosed { peer_id, cause, .. } = ev {
+                        if peer_id == self.state.peer_id {
+                            use libp2p::swarm::ConnectionError;
+                            match cause {
+                                Some(ConnectionError::IO(io_err)) => {
+                                    diag::CONN_CLOSED_IO.fetch_add(1, Ordering::Relaxed);
+                                    let bucket = classify_io_error(&io_err);
+                                    if let Ok(mut map) = diag::CONN_CLOSED_IO_DETAIL.lock() {
+                                        *map.entry(bucket).or_insert(0) += 1;
+                                    }
+                                }
+                                Some(ConnectionError::KeepAliveTimeout) => {
+                                    diag::CONN_CLOSED_KEEPALIVE.fetch_add(1, Ordering::Relaxed);
+                                }
+                                None => {
+                                    diag::CONN_CLOSED_CLEAN.fetch_add(1, Ordering::Relaxed);
+                                }
+                            }
+                            // Wake in-flight push/fetch tasks so they
+                            // bail out immediately rather than waiting
+                            // up to `--timeout` (default 10 s) for
+                            // their pushsync substreams to error.
+                            // `notify_waiters()` (NOT `notify_one()`)
+                            // wakes every currently-awaiting task —
+                            // we may have dozens of concurrent pushes
+                            // mid-stream on this session.
+                            self.state
+                                .connection_dead
+                                .store(true, Ordering::Relaxed);
+                            self.state.dead_notify.notify_waiters();
+                            // Also stop the driver from accepting new
+                            // commands. Without this, the dispatcher
+                            // may queue a new push onto a known-dead
+                            // session if the snapshot used here
+                            // hasn't refreshed yet.
+                            accept_new = false;
+                        }
+                    }
+                }
             }
 
             // Once we've stopped accepting new commands and drained all
@@ -1267,13 +2228,13 @@ async fn do_handshake(
     underlay: &Multiaddr,
     signer: &SwarmSigner,
     advertised: Option<&Multiaddr>,
-) -> Result<(), TransportError> {
+) -> Result<handshake::HandshakeResult, TransportError> {
     let local_peer_id = *swarm.local_peer_id();
     info!(target: "isheika::transport", "opening outbound handshake");
     let mut stream = poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO))
         .await
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-    {
+    let hs_result = {
         let hs_run = handshake::run(
             &mut stream,
             signer,
@@ -1301,7 +2262,7 @@ async fn do_handshake(
         tokio::pin!(hs_run);
         loop {
             tokio::select! {
-                r = &mut hs_run => { r?; break; }
+                r = &mut hs_run => { break r?; }
                 ev = hs_in.next() => {
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
@@ -1314,10 +2275,10 @@ async fn do_handshake(
                 _ = swarm.select_next_some() => {}
             }
         }
-    }
+    };
     close_stream_polled(swarm, &mut stream).await;
     info!(target: "isheika::transport", "outbound handshake complete");
-    Ok(())
+    Ok(hs_result)
 }
 
 async fn do_pricing(
@@ -1362,6 +2323,71 @@ async fn do_pricing(
     info!(target: "isheika::transport",
         "outbound pricing complete (peer threshold {} PLUR)", peer_threshold);
     Ok(peer_threshold)
+}
+
+/// One-shot outbound SWAP handshake. Open `/swarm/swap/1.0.0/swap`,
+/// exchange empty headers, send `Handshake { Beneficiary }`, close.
+/// Bee's `swapprotocol.go::init` is called on every new connection
+/// regardless of who dialed; bee's own outbound handshake to us is
+/// served by the inbound stream-pool listener for `SWAP_PROTO` (which
+/// we accept and discard, since this client is send-only — see
+/// PERFORMANCE.md SWAP scope).
+#[cfg(not(target_arch = "wasm32"))]
+async fn do_swap_handshake(
+    swarm: &mut Swarm<Behaviour>,
+    peer_id: PeerId,
+    control: &mut crate::protocols::stream_pool::Control,
+    timeout: Duration,
+    beneficiary: &[u8; 20],
+) -> Result<(), TransportError> {
+    use crate::protocols::swap;
+    let mut stream = tokio::time::timeout(
+        timeout,
+        poll_until(swarm, control.open_stream(peer_id, SWAP_PROTO)),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout)?
+    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+    tokio::time::timeout(timeout, poll_until(swarm, swap::send_handshake(&mut stream, beneficiary)))
+        .await
+        .map_err(|_| TransportError::Timeout)?
+        .map_err(|e| TransportError::Swap(e.to_string()))?;
+    close_stream_polled(swarm, &mut stream).await;
+    Ok(())
+}
+
+/// Open a fresh `/swarm/hive/1.1.0/peers` substream to `peer_id` and
+/// announce ourselves via a `Peers` envelope. Best-effort — bee's
+/// `peersHandler` reads the envelope, then bee verifies the
+/// advertised address asynchronously via its reacher's dial-probe.
+/// We don't wait for any acknowledgement; bee's hive doesn't reply.
+///
+/// See `protocols::hive::announce_self` for the wire-level detail
+/// (empty-headers preamble, then one `Peers` message).
+#[cfg(not(target_arch = "wasm32"))]
+async fn do_hive_announce(
+    swarm: &mut Swarm<Behaviour>,
+    peer_id: PeerId,
+    control: &mut crate::protocols::stream_pool::Control,
+    timeout: Duration,
+    me: &crate::protocols::hive::OwnBzzAddress,
+) -> Result<(), TransportError> {
+    let mut stream = tokio::time::timeout(
+        timeout,
+        poll_until(swarm, control.open_stream(peer_id, HIVE_PROTO)),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout)?
+    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+    tokio::time::timeout(
+        timeout,
+        poll_until(swarm, crate::protocols::hive::announce_self(&mut stream, me)),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout)?
+    .map_err(TransportError::Hive)?;
+    close_stream_polled(swarm, &mut stream).await;
+    Ok(())
 }
 
 pub(crate) async fn respond_to_handshake<S>(

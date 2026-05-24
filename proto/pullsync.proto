@@ -1,0 +1,74 @@
+// Bee pull-sync protocol — `/swarm/pullsync/1.4.0/{cursors,pullsync}`.
+//
+// Wire-compatible with bee's `pkg/pullsync/pb/pullsync.proto`. We
+// implement only the INBOUND-RESPOND path: bee opens streams to us
+// to either learn our reserve cursors or pull chunks from us. We
+// reply with empty-cursor / empty-offer responses, which is a valid
+// bee response from a peer that hasn't synced any chunks yet (a
+// fresh node in warmup, for instance).
+//
+// The point is to **respond** at all — bee's salud probe gates
+// healthy-marking on connected peers, and bee's kademlia membership
+// gates salud probing, and bee's neighbor-set inclusion gates a lot
+// of routing decisions. A peer that doesn't speak pullsync is a
+// less-credible kademlia citizen than one that does, even if its
+// inventory is empty.
+//
+// See PERFORMANCE.md "Bee-citizenship: pullsync" for the strategic
+// rationale and `protocols::pullsync` module docs for the wire flow.
+
+syntax = "proto3";
+
+package pullsync;
+
+// Empty sentinel sent by the dialer on the `cursors` stream.
+message Syn {}
+
+// Response on the `cursors` stream. `Cursors` carries one u64 per
+// PO bin (32 bins total). A non-bee participant typically reports
+// all zeros — "I've synced no chunks in any bin" — which is a
+// valid response that bee will accept without rejecting us.
+message Ack {
+    repeated uint64 Cursors = 1;
+    uint64 Epoch = 2;
+}
+
+// Request on the `pullsync` stream: "what chunks do you have in
+// bin `Bin` starting from BinID `Start`?"
+message Get {
+    int32 Bin = 1;
+    uint64 Start = 2;
+}
+
+// One entry in an offer — bee identifies a chunk by its swarm
+// address. The actual data is exchanged in a later `Delivery`
+// message if the requester sends a matching `Want` bit.
+message Chunk {
+    bytes Address = 1;
+    bytes BatchID = 2;
+    bytes StampHash = 3;
+}
+
+// Reply on the `pullsync` stream: "here are the chunks I have
+// in the requested bin and range." An empty list ends the exchange
+// (no `Want` is read back).
+message Offer {
+    uint64 Topmost = 1;
+    repeated Chunk Chunks = 2;
+}
+
+// Sent by the requester to indicate which offered chunks it wants
+// (bit i = 1 means "I want offer.Chunks[i]"). We don't read this
+// in inbound-empty-offer mode since our offers are always empty
+// and bee's `handler` short-circuits at offer length 0.
+message Want {
+    bytes BitVector = 1;
+}
+
+// One chunk delivery in response to a Want bit. We don't send any
+// in inbound-empty-offer mode (no chunks to deliver).
+message Delivery {
+    bytes Address = 1;
+    bytes Data = 2;
+    bytes Stamp = 3;
+}

@@ -26,9 +26,11 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ChunkCache;
 use crate::client::{
-    fetch_bytes_ex, fetch_manifest_path_ex, upload_bytes_with_pool, upload_collection,
-    upload_file_with_manifest_with_pool, SessionPool,
+    discover_recursive_with_progress, fetch_bytes_ex, fetch_manifest_path_ex,
+    upload_bytes_with_pool, upload_collection, upload_file_with_manifest_with_pool,
+    SessionPool,
 };
+use crate::doh::Doh;
 use crate::peers::{apply_log, PeerStore};
 use crate::signer::SwarmSigner;
 use crate::transport::Transport;
@@ -107,6 +109,10 @@ struct State {
     /// freshly uploaded roots are retrievable through bzz.limo / any
     /// bee peer that routes a retrieval request back to us.
     cache: ChunkCache,
+    /// Optional DoH resolver + bootnode for live peer discovery
+    /// before pool fill.
+    doh: Option<Doh>,
+    bootnode: Option<libp2p::Multiaddr>,
 }
 
 /// Optional inbound listener configuration for [`run`].
@@ -121,6 +127,11 @@ pub struct ListenConfig {
     /// listener and as the bee handshake signer (overlay derived from
     /// its eth address + a random nonce).
     pub identity: SwarmSigner,
+    /// Snapshot served on every inbound `/swarm/status/1.1.0/status`
+    /// probe. Required for bee's `salud` to mark us Healthy and
+    /// therefore stop preferentially selecting us for kademlia
+    /// bin-prune disconnection. See `crate::protocols::status::StatusSnapshot`.
+    pub status_snapshot: crate::protocols::status::StatusSnapshot,
 }
 
 /// Run a daemon listening on `socket_path`. Blocks until a `Shutdown`
@@ -139,6 +150,12 @@ pub async fn run(
     dial_timeout: std::time::Duration,
     op_timeout: std::time::Duration,
     listen: Option<ListenConfig>,
+    swap: Option<crate::transport::SwapConfig>,
+    // Optional DoH + bootnode for live peer discovery before
+    // pool fill. When set, the daemon does a quick 1-round
+    // discover before opening the session pool, ensuring fresh
+    // peers instead of stale file entries.
+    discover: Option<(Doh, libp2p::Multiaddr)>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove any stale socket from a previous crashed run. The daemon
     // owns the socket file for its lifetime.
@@ -161,12 +178,35 @@ pub async fn run(
         max_concurrent_substream_upgrades:
             crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
     };
+    // Status snapshot is configured at the daemon level (here) AND
+    // separately at the listener level (via ListenConfig). Outbound
+    // sessions need it because bee opens salud probes over the
+    // outbound connection that the session pool maintains — NOT only
+    // over the inbound listener (which never holds bee's "real"
+    // connection to us anyway; bee's reacher uses a one-shot ping
+    // dialer that closes immediately after).
+    let status_snapshot = listen
+        .as_ref()
+        .map(|lc| lc.status_snapshot.clone())
+        .unwrap_or_default();
     let transport = match listen.as_ref() {
         Some(lc) => {
             let kp = crate::inbound::libp2p_keypair_from_identity(&lc.identity);
-            Arc::new(Transport::new_with_keypair(lc.identity.clone(), cfg, kp))
+            let mut t = Transport::new_with_keypair(lc.identity.clone(), cfg, kp);
+            if let Some(sc) = swap.clone() {
+                t = t.with_swap(sc);
+            }
+            t = t.with_status_snapshot(status_snapshot.clone());
+            Arc::new(t)
         }
-        None => Arc::new(Transport::new(crate::SwarmSigner::random(network_id), cfg)),
+        None => {
+            let mut t = Transport::new(crate::SwarmSigner::random(network_id), cfg);
+            if let Some(sc) = swap.clone() {
+                t = t.with_swap(sc);
+            }
+            t = t.with_status_snapshot(status_snapshot.clone());
+            Arc::new(t)
+        }
     };
     let peers = PeerStore::load_or_create(&peerlist_path);
     if peers.is_empty() {
@@ -175,6 +215,7 @@ pub async fn run(
             peerlist_path.display());
     }
     let cache = ChunkCache::new();
+    let (doh, bootnode) = discover.map(|(d, b)| (Some(d), Some(b))).unwrap_or((None, None));
     let state = Arc::new(State {
         transport,
         signer_network_id: network_id,
@@ -183,6 +224,8 @@ pub async fn run(
         pool: RwLock::new(None),
         pool_target,
         cache: cache.clone(),
+        doh,
+        bootnode,
     });
 
     // Spawn the inbound bee-protocol listener if configured. Failure
@@ -195,6 +238,7 @@ pub async fn run(
             op_timeout,
             idle_timeout: op_timeout,
             cache: cache.clone(),
+            status_snapshot: lc.status_snapshot,
         };
         tokio::spawn(async move {
             if let Err(e) = crate::inbound::run(inbound_cfg).await {
@@ -285,8 +329,6 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
         let data = std::fs::read(&r.file).map_err(|e| ClientError::File(e.to_string()))?;
         let bytes = data.len();
 
-        let peers_guard = state.peers.read().await;
-
         // Collections / single-entry manifests still build their own
         // pool via the existing helpers (they handle dedup + multiple
         // pre-stamp passes). Only the raw / single-file path benefits
@@ -315,9 +357,10 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 .as_deref()
                 .map(|s| if s.is_empty() { None } else { Some(s) })
                 .unwrap_or(Some("index.html"));
+            let peers = state.peers.read().await;
             upload_collection(
                 &state.transport,
-                &*peers_guard,
+                &*peers,
                 &signer,
                 &r.batch,
                 r.depth,
@@ -333,12 +376,13 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
             // Raw and single-file-with-manifest uploads go through the
             // persistent pool. First request lazily fills it; subsequent
             // ones reuse it with zero dial-fill cost.
-            let pool = ensure_pool(state, &*peers_guard).await?;
+            let pool = ensure_pool(state).await?;
+            let peers = state.peers.read().await;
             if r.raw {
                 upload_bytes_with_pool(
                     &state.transport,
                     &*pool,
-                    &*peers_guard,
+                    &*peers,
                     &signer,
                     &r.batch,
                     r.depth,
@@ -359,7 +403,7 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
                 upload_file_with_manifest_with_pool(
                     &state.transport,
                     &*pool,
-                    &*peers_guard,
+                    &*peers,
                     &signer,
                     &r.batch,
                     r.depth,
@@ -386,7 +430,6 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
 /// dial-fill cost.
 async fn ensure_pool(
     state: &Arc<State>,
-    peers: &PeerStore,
 ) -> Result<Arc<SessionPool>, ClientError> {
     {
         let guard = state.pool.read().await;
@@ -402,7 +445,37 @@ async fn ensure_pool(
             return Ok(p.clone());
         }
     }
-    let pool = Arc::new(SessionPool::open(&state.transport, peers, state.pool_target).await?);
+
+    // Quick 1-round discover before pool fill, so we dial fresh
+    // peers instead of stale file entries.
+    if let (Some(doh), Some(bootnode)) = (state.doh.as_ref(), state.bootnode.as_ref()) {
+        match discover_recursive_with_progress(
+            &state.transport,
+            doh,
+            bootnode,
+            std::time::Duration::from_secs(5),
+            1,
+            16,
+            None::<crate::client::DiscoverProgressFn>,
+        )
+        .await
+        {
+            Ok(fresh) if !fresh.is_empty() => {
+                info!(target: "isheika::daemon",
+                    "discovered {} fresh peer(s) before pool fill", fresh.len());
+                let mut peers = state.peers.write().await;
+                for p in fresh {
+                    peers.upsert(p);
+                }
+            }
+            Ok(_) => debug!(target: "isheika::daemon", "discover returned no new peers"),
+            Err(e) => warn!(target: "isheika::daemon",
+                "pre-fill discover failed (falling back to saved peerlist): {e}"),
+        }
+    }
+
+    let peers = state.peers.read().await;
+    let pool = Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?);
     info!(target: "isheika::daemon",
         "warm pool: {} session(s) open", pool.len());
     *guard = Some(pool.clone());

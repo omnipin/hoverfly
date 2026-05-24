@@ -4,12 +4,15 @@
 //! only (websys on wasm32). DNS resolution is DoH-only.
 
 pub mod cache;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod cheques;
 pub mod cid;
 pub mod doh;
 pub mod dnsaddr;
 pub mod mime;
 pub mod peers;
 pub mod signer;
+pub mod stamp;
 
 pub mod proto {
     pub mod handshake {
@@ -32,6 +35,15 @@ pub mod proto {
     }
     pub mod pseudosettle {
         include!(concat!(env!("OUT_DIR"), "/pseudosettle.rs"));
+    }
+    pub mod swap {
+        include!(concat!(env!("OUT_DIR"), "/swap.rs"));
+    }
+    pub mod status {
+        include!(concat!(env!("OUT_DIR"), "/status.rs"));
+    }
+    pub mod pullsync {
+        include!(concat!(env!("OUT_DIR"), "/pullsync.rs"));
     }
 }
 

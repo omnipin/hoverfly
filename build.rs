@@ -10,6 +10,9 @@ fn main() -> Result<()> {
             "proto/retrieval.proto",
             "proto/pushsync.proto",
             "proto/pseudosettle.proto",
+            "proto/swap.proto",
+            "proto/status.proto",
+            "proto/pullsync.proto",
         ],
         &["proto/"],
     )?;

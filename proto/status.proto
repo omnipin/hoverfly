@@ -1,0 +1,43 @@
+// Bee status protocol — `/swarm/status/1.1.0/status`.
+//
+// Bee's `pkg/salud` package probes every connected peer for a status
+// snapshot. Peers whose response is missing, slow, or carries
+// values that fall below the per-network percentile thresholds are
+// marked `Unhealthy` in bee's kademlia metrics collector. Unhealthy
+// peers are picked first when bee's kademlia layer prunes
+// oversaturated bins (`pkg/topology/kademlia/kademlia.go:700-704`),
+// which empirically is the dominant cause of our session deaths.
+//
+// Serving this protocol is therefore a survival mechanism: if we
+// don't respond, bee marks us Unhealthy (the zero-value default for
+// new peers), and we become the first candidate for disconnection.
+//
+// Wire-compatible with bee's `pkg/status/internal/pb/status.proto`.
+
+syntax = "proto3";
+
+package status;
+
+// Inbound request: bee asks "give me your status".
+message Get {}
+
+// Outbound response: we serve plausible-looking values. The fields
+// that bee's `salud.go::salud()` actually checks against the network
+// medians are CommittedDepth, ConnectedPeers, BatchCommitment, and
+// response duration (measured externally). Other fields are reported
+// but not gated on. See `cheques.rs` module docs for the gating
+// formulae.
+message Snapshot {
+    uint64 ReserveSize             = 1;
+    double PullsyncRate            = 2;
+    uint32 StorageRadius           = 3;
+    uint64 ConnectedPeers          = 4;
+    uint64 NeighborhoodSize        = 5;
+    string BeeMode                 = 6;
+    uint64 BatchCommitment         = 7;
+    bool   IsReachable             = 8;
+    uint64 ReserveSizeWithinRadius = 9;
+    uint64 LastSyncedBlock         = 10;
+    uint32 CommittedDepth          = 11;
+    map<string, string> Metrics    = 12;
+}

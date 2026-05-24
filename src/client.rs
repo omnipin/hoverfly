@@ -1243,6 +1243,18 @@ struct SessionEntry {
     /// unknown (default before any receipt); treated by the
     /// dispatcher as "might be in AOR" (optimistic).
     storage_radius: std::sync::atomic::AtomicU8,
+    /// EWMA of observed push round-trip latency in microseconds.
+    /// Updated after every push attempt (success OR failure — a
+    /// failed-via-timeout attempt also signals a slow peer). The
+    /// dispatcher's proximity sort uses this as a tie-breaker
+    /// secondary key and applies a PO penalty to peers whose EWMA
+    /// crosses thresholds, shifting load to faster peers within
+    /// the same PO tier.
+    ///
+    /// Value `0` means "no samples yet" — treated as optimistic
+    /// (no penalty) so newly-discovered peers aren't penalized
+    /// before they have a chance to prove themselves.
+    push_latency_ewma_us: std::sync::atomic::AtomicU64,
 }
 
 impl SessionEntry {
@@ -1310,6 +1322,57 @@ impl SessionEntry {
         }
     }
 
+    /// Record an observed push latency. Updates the EWMA with
+    /// `alpha = 0.25` (fast adaptation — recent samples dominate
+    /// after ~4 pushes). A push that ends in timeout / error counts
+    /// as a 5s sample so the slow-peer penalty kicks in quickly.
+    ///
+    /// Empirical from the trace data: ~10 peers contribute >40% of
+    /// the 5s tail. Without this signal the proximity sort sends
+    /// them as much work as fast peers, since they have the same
+    /// PO from any given chunk address.
+    fn observe_push_latency(&self, observed_us: u64) {
+        let prev = self
+            .push_latency_ewma_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+        // Integer EWMA: new = (prev*3 + observed) / 4 (alpha = 0.25)
+        let new = if prev == 0 {
+            observed_us
+        } else {
+            (prev.saturating_mul(3).saturating_add(observed_us)) / 4
+        };
+        self.push_latency_ewma_us
+            .store(new, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Penalty (in PO units) applied to this peer's effective PO
+    /// during proximity sorting, based on its push-latency EWMA.
+    /// Slow peers get demoted so faster peers within the same PO
+    /// tier (or close to it) are preferred. `0` if no samples yet
+    /// (newly-discovered peers aren't penalized until they fail).
+    ///
+    /// Thresholds chosen from the trace data: median push is ~60ms,
+    /// p95 is ~5s. Anything above 1s is firmly in the tail.
+    ///
+    /// Currently unused — bee's per-entry skiplist (`record_failure`
+    /// + DEAD_SKIP_SECS=300) is the primary mechanism for shifting
+    /// load away from slow peers. Kept as a building block for a
+    /// future "demote without parking" path that might be useful
+    /// when the pool is too small to afford parking peers entirely.
+    #[allow(dead_code)]
+    fn latency_penalty(&self) -> u8 {
+        let us = self
+            .push_latency_ewma_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match us {
+            0 => 0,                  // unknown — give the benefit of the doubt
+            n if n < 500_000 => 0,   // <500ms = fast, no penalty
+            n if n < 1_500_000 => 1, // 500ms–1.5s = mildly slow
+            n if n < 3_000_000 => 3, // 1.5–3s = noticeably slow
+            _ => 6,                  // >3s = avoid unless no alternative
+        }
+    }
+
     /// Returns whether this peer is in the chunk's AOR per our latest
     /// radius observation. `None` if no observation yet — dispatcher
     /// treats unknown as "potentially yes" rather than excluding
@@ -1344,7 +1407,7 @@ impl SessionEntry {
 /// window (~20-60 s). Too short and a parked entry revives straight
 /// into more strikes; too long and a transiently-down peer stays out
 /// of rotation longer than necessary.
-const DEAD_SKIP_SECS: u64 = 60;
+const DEAD_SKIP_SECS: u64 = 15;
 
 /// Number of consecutive rotation-dial failures we tolerate on a
 /// single entry before flagging it dead. A single transient hiccup
@@ -1551,7 +1614,7 @@ pub async fn push_chunks_with_pool(
     /// blip (every session in the pool ghost-balance-retiring at
     /// once, brief peer routing churn) aborts an otherwise-successful
     /// 3 000-chunk upload.
-    const MAX_CHUNK_RETRIES: u8 = 10;
+    const MAX_CHUNK_RETRIES: u8 = 60;
 
     let dispatch = |chunk: Arc<StampedChunk>, attempts: u8| {
         let session_pool = session_pool;
@@ -1560,6 +1623,7 @@ pub async fn push_chunks_with_pool(
         let progress = progress.cloned();
         let chunk_for_result = chunk.clone();
         async move {
+            let t_chunk_start = std::time::Instant::now();
             // Inner result; the outer arm returns the chunk + retry
             // count alongside so the dispatch driver can re-queue
             // failed chunks for another round (bee's pusher does the
@@ -1789,9 +1853,12 @@ pub async fn push_chunks_with_pool(
             // overdrafted (no real errors), prefer trying more peers
             // beyond `cap` over sleeping — the pool has many peers, and
             // a fresh peer's credit ceiling is uncorrelated with our
-            // already-attempted ones'. Only fall back to a 1.1 s
+            // already-attempted ones'. Only fall back to a 600 ms
             // refresh-wait + closest-N retry if there genuinely are no
             // more peers in the pool.
+            //
+            // 600ms matches bee's `overDraftRefresh` constant
+            // (`pkg/pushsync/pushsync.go:51`).
             if errors == 0 && (overdrafts > 0 || shallows > 0) {
                 let already_attempted = attempt_no;
                 let extra: Vec<usize> = order.iter().skip(already_attempted).copied().collect();
@@ -1828,7 +1895,7 @@ pub async fn push_chunks_with_pool(
                 } else if overdrafts > 0 {
                     debug!(target: "isheika::upload",
                         "all peers overdrafted and no more candidates; waiting for refresh");
-                    tokio::time::sleep(Duration::from_millis(1100)).await;
+                    tokio::time::sleep(Duration::from_millis(600)).await;
                     for idx in order.iter().take(cap).copied() {
                         let entry = &pool[idx];
                         let mut peer_overlay = [0u8; 32];
@@ -1891,6 +1958,26 @@ pub async fn push_chunks_with_pool(
                     .unwrap_or_else(|| "all overdraft/shallow".into())
             )))
             }.await;
+            // Chunk-latency histogram — full wall time from dispatch
+            // entry to receipt-or-give-up. Bucketed to be directly
+            // comparable to bee's `bee_pusher_sync_time` histogram.
+            let chunk_ms = t_chunk_start.elapsed().as_millis() as u64;
+            if chunk_ms < 500 {
+                crate::transport::diag::CHUNK_LATENCY_LT_500MS
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if chunk_ms < 2000 {
+                crate::transport::diag::CHUNK_LATENCY_500MS_2S
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if chunk_ms < 5000 {
+                crate::transport::diag::CHUNK_LATENCY_2_5S
+                    .fetch_add(1, Ordering::Relaxed);
+            } else if chunk_ms < 15000 {
+                crate::transport::diag::CHUNK_LATENCY_5_15S
+                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                crate::transport::diag::CHUNK_LATENCY_GT_15S
+                    .fetch_add(1, Ordering::Relaxed);
+            }
             (chunk_for_result, attempts, result)
         }
     };
@@ -2093,9 +2180,7 @@ pub async fn push_chunks_with_pool(
                         // window. 500 ms × 6 = 10.5 s used to abort
                         // the upload inside the blocklist window
                         // every time at higher --concurrency.
-                        let backoff = Duration::from_millis(
-                            (1000u64 * (1 + next as u64)).min(10_000),
-                        );
+                        let backoff = Duration::from_millis(500);
                         info!(target: "isheika::upload",
                             "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
                             hex::encode(chunk.addr), e, next, MAX_CHUNK_RETRIES,
@@ -2202,6 +2287,129 @@ pub async fn push_chunks_with_pool(
     Ok(())
 }
 
+/// Probe every session in a freshly-opened pool with the
+/// status-protocol round-trip, measure response time, and park
+/// sessions slower than the 40th percentile via
+/// [`SessionEntry::mark_dead`].
+///
+/// Mirrors bee's `pkg/salud` pre-filter (see
+/// `pkg/salud/salud.go::salud()`). Bee's `pkg/pushsync` only
+/// considers `{Reachable: true, Healthy: true}` peers in
+/// `ClosestPeer`; without this pre-filter we keep sending pushes
+/// to slow peers and they dominate p95 latency.
+///
+/// **Currently unused — disabled in `SessionPool::open` because
+/// in practice bee resets the status substream on most of our
+/// outbound peers (likely because we're not in their kademlia
+/// table at all by the time the probe runs, or because the
+/// connections have already started dying from bee's bin-prune
+/// before pool fill completes — see PERFORMANCE.md "Salud
+/// pre-filter").**
+///
+/// Probes are independent of each other and any one peer that
+/// hangs / errors out doesn't block the rest — we simply treat
+/// it as "very slow" (above any threshold) and park it.
+#[allow(dead_code)]
+async fn salud_prefilter(entries: &[std::sync::Arc<SessionEntry>]) {
+    use futures::stream::{FuturesUnordered, StreamExt};
+    if entries.len() < 4 {
+        // Tiny pools: nothing to filter against. Skip.
+        return;
+    }
+
+    // Per-bee match: 40th percentile is the threshold for unhealthy.
+    // Bee's salud uses `DefaultDurPercentile = 0.4` (i.e. peers with
+    // RTT in the slowest 60% get marked unhealthy). That seems
+    // aggressive but is what bee actually does.
+    const HEALTH_PERCENTILE: f64 = 0.4;
+    // Per-peer probe timeout — must be much shorter than the
+    // upload's `--timeout` so the probe phase is bounded, but
+    // long enough that an actually-fast peer with a one-off
+    // ~500 ms hiccup still passes. 2 s mirrors bee's salud
+    // `requestTimeout = 10 s` ÷ ~5 (we're more impatient than
+    // a long-running daemon).
+    const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+    let mut inflight: FuturesUnordered<_> = entries
+        .iter()
+        .enumerate()
+        .map(|(i, e)| {
+            let entry = e.clone();
+            async move {
+                let session = entry.snapshot();
+                let probe = session.status_probe();
+                let result = tokio::time::timeout(PROBE_TIMEOUT, probe).await;
+                let rtt = match result {
+                    Ok(Ok(d)) => Some(d),
+                    Ok(Err(e)) => {
+                        debug!(target: "isheika::upload",
+                            "salud: probe of {} failed: {}", entry.overlay_hex, e);
+                        None
+                    }
+                    Err(_) => {
+                        debug!(target: "isheika::upload",
+                            "salud: probe of {} timed out", entry.overlay_hex);
+                        None
+                    }
+                };
+                (i, rtt)
+            }
+        })
+        .collect();
+
+    let mut rtts: Vec<(usize, Duration)> = Vec::with_capacity(entries.len());
+    let mut failed: Vec<usize> = Vec::new();
+    while let Some((i, rtt)) = inflight.next().await {
+        match rtt {
+            Some(d) => rtts.push((i, d)),
+            None => failed.push(i),
+        }
+    }
+
+    // A failed status probe is NOT a reliable health signal here:
+    // sessions opened in the first half of pool-fill have been alive
+    // for several minutes by the time salud runs, and many die from
+    // bee's kademlia bin-prune in that window. Parking everyone who
+    // fails the probe would gut the pool. So we only use the probe
+    // as a *positive* health signal (peers that DO respond) and
+    // leave the rest as the dispatcher's job to filter via
+    // `is_dead()` from real push attempts.
+    let _failed = failed; // observed for debug logging via per-probe trace
+
+    if rtts.len() < 4 {
+        // Not enough responding peers to compute a percentile.
+        // Don't filter further — better to use the slow ones
+        // than to have a tiny pool.
+        info!(target: "isheika::upload",
+            "salud: only {} of {} sessions responded — skipping percentile filter",
+            rtts.len(), entries.len());
+        return;
+    }
+
+    // Sort RTTs and pick the 40th percentile as the threshold.
+    let mut sorted = rtts.clone();
+    sorted.sort_by_key(|(_, d)| *d);
+    let threshold_idx = ((sorted.len() as f64) * HEALTH_PERCENTILE) as usize;
+    let threshold = sorted[threshold_idx.min(sorted.len() - 1)].1;
+
+    let mut parked = 0usize;
+    for (i, rtt) in rtts {
+        if rtt > threshold {
+            let entry = &entries[i];
+            let _ = entry.mark_dead(DEAD_SKIP_SECS);
+            parked += 1;
+        }
+    }
+
+    info!(target: "isheika::upload",
+        "salud: probed {} session(s), 40th-percentile RTT = {:?}, parked {} slow + {} unresponsive ({} healthy)",
+        entries.len(),
+        threshold,
+        parked,
+        entries.len() - sorted.len(),
+        sorted.len() - parked);
+}
+
 /// Send one push, transparently rotating the underlying libp2p
 /// connection when the driver retires. After a successful pushsync,
 /// validates the receipt against the chunk's storage radius — a
@@ -2217,6 +2425,7 @@ async fn try_push_with_rotation(
 ) -> Result<PushOutcome, TransportError> {
     let session = entry.snapshot();
     let net = transport.config().network_id;
+    let t_start = web_time::Instant::now();
     let result = match session
         .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
         .await
@@ -2269,6 +2478,43 @@ async fn try_push_with_rotation(
                 .await
         }
     };
+    // Update per-peer push-latency EWMA so the dispatcher's
+    // proximity sort can demote slow peers via `latency_penalty()`.
+    // Error / timeout counts as a 5 s sample — that's the empirical
+    // p95 from the trace, and treating errors as "very slow" makes
+    // the EWMA converge toward "avoid this peer" after a couple
+    // failures. DialTooSoon is excluded: it's a fast-fail with no
+    // signal about the peer's actual responsiveness.
+    let elapsed_us = t_start.elapsed().as_micros() as u64;
+    let sample_us = match &result {
+        Ok(_) => elapsed_us,
+        Err(TransportError::DialTooSoon { .. }) => {
+            // Don't pollute EWMA with our own cooldown — fall
+            // through without observing.
+            0
+        }
+        Err(_) => elapsed_us.max(5_000_000),
+    };
+    if sample_us > 0 {
+        entry.observe_push_latency(sample_us);
+    }
+
+    // Wire-level outcome diagnostics — mirrors bee's
+    // `bee_pushsync_*` counters at /metrics. Bumped here (not at
+    // the chunk dispatcher) so we capture every per-stream attempt,
+    // including losing racers that still produced a receipt.
+    let result = result;
+    match &result {
+        Ok(PushOutcome::Overdraft) => {
+            crate::transport::diag::PUSH_OUTCOME_OVERDRAFT
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        Err(_) => {
+            crate::transport::diag::PUSH_OUTCOME_ERROR
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        _ => {}
+    }
     Ok(match result? {
         PushOutcome::Receipt(r) => {
             let storer = r.storer_overlay(net).unwrap_or([0u8; 32]);
@@ -2302,11 +2548,15 @@ async fn try_push_with_rotation(
                 entry.observe_storage_radius(chunk_po_to_entry.saturating_add(1));
             }
             if r.is_shallow(net) {
+                crate::transport::diag::PUSH_OUTCOME_SHALLOW
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!(target: "isheika::upload",
                     "shallow: chunk={} storer={} po={} storage_radius={}",
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
                 PushOutcome::Shallow(r)
             } else {
+                crate::transport::diag::PUSH_OUTCOME_OK
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 // Real receipt — peer is alive and serving. Clear any
                 // accumulated failure strikes so a previously-flaky
                 // peer fully re-enters rotation.
@@ -2459,7 +2709,7 @@ async fn open_session_pool(
         candidates
     };
 
-    let dial_parallelism = SESSION_DIAL_PARALLELISM.max(max_sessions);
+    let dial_parallelism = SESSION_DIAL_PARALLELISM.min(max_sessions);
     let mut iter = candidates.into_iter();
     let mut dialing = FuturesUnordered::new();
     let dial = |overlay: SwarmAddress, overlay_hex: String, underlay: Multiaddr| async move {
@@ -2496,6 +2746,7 @@ async fn open_session_pool(
                     failure_strikes: std::sync::atomic::AtomicU32::new(0),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                     storage_radius: std::sync::atomic::AtomicU8::new(0),
+                    push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
                     info!(target: "isheika::upload",

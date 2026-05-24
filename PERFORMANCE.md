@@ -555,16 +555,746 @@ Open follow-ups around this finding:
   enough recently-failed entries to dent target size, retry them
   inline instead of skipping straight to the next-closest.
 
+## SWAP / chequebook (built, tested, no measured benefit)
+
+Hypothesis (from Swarm infra team): uploads are 3× faster when the
+client pays peers in BZZ via SWAP cheques instead of relying on
+time-based pseudosettle refresh.
+
+Implementation scope: **issuance only**. No contract deploy, no
+cashout, no on-chain RPC from this client. See `AGENTS.md` SWAP
+section for the wire pieces. Activation:
+
+```
+# Caller is responsible for the chequebook contract existing and
+# being funded with BZZ. Its issuer() must equal --key's eth address.
+isheika upload \
+  --batch <BATCH> --key <HEX_KEY> \
+  --chequebook 0xYOUR_CHEQUEBOOK_ADDR \
+  --chequebook-per-peer-cap-bzz 100000000000000000 \
+  --cheques-file ./cheques.json \
+  ./file.bin
+```
+
+Diagnostic output at upload end:
+
+```
+swap: cheques_emitted=N cheques_failed=M
+```
+
+### Measurement (May 2026 mainnet, VPS, 771-peer pool, c=64, 5 MiB random files)
+
+Interleaved A/B, 4 trials each:
+
+| Mode | Throughputs (KiB/s) | Median |
+|---|---|---:|
+| Unpaid | 97, 290, 195, 290 | 195 |
+| Paid (cheques fire) | 282, 82, 80, 238 | 160 |
+
+The two distributions overlap completely. Mainnet variance is ~3×
+trial-to-trial at this workload size, so we cannot distinguish a
+real signal from noise without dozens of trials. The first trial
+showed paid 2.9× faster than unpaid; the second pair inverted with
+unpaid 2.2× faster. The "fast" run in any pair was the second one,
+suggesting an **ordering artifact** — peer caches warm up between
+back-to-back runs regardless of payment.
+
+**Verdict: hypothesis not confirmed on this client at this workload.**
+SWAP code is correct (cheques sign, are accepted, persist correctly
+across runs — see `cheques_emitted=117` / `cheques_failed=0-2`
+typical), but produces no measurable throughput improvement.
+
+### Why it doesn't help here
+
+Reading bee's accounting (`pkg/accounting/accounting.go`), payment
+actually has effect via `notifyPaymentThresholdUpgrade` —
+cumulative cheque value of `100 × refreshRate = 450M PLUR` per peer
+triggers a +`refreshRate` upgrade to that peer's
+`paymentThresholdForPeer` (and consequently their `disconnectLimit`).
+
+Our cheques to any single peer total a few million PLUR before the
+session dies — three orders of magnitude short of triggering even
+one threshold upgrade. Sessions die from external causes (see next
+section) long before per-peer cumulative reaches the threshold-
+growth gate. The 3× claim is consistent with **long-lived sessions
+on a daemon** where one peer accumulates 100s of MiB of paid
+traffic and ratchets up the threshold over hours.
+
+### What to look for if re-measuring
+
+- **`cheques_emitted = 0`** on a substantial upload: settle path
+  never reached the cheque branch. Pseudosettle covers everything.
+- **`cheques_failed >> cheques_emitted`**: signer key mismatch
+  (`--key`'s eth address ≠ chequebook's `issuer()`). Verify with
+  `cast call <chequebook> "issuer()" --rpc-url https://rpc.gnosischain.com`.
+- **`cheques_failed = 0` but throughput unchanged**: expected at
+  one-shot upload scales. Try daemon mode with persistent peer
+  set + much larger total upload volume.
+
+## Session-death cause (RST analysis)
+
+`conn-closed-io-detail` diagnostic classifies every
+`SwarmEvent::ConnectionClosed` by its `cause` field. On mainnet at
+c=64-128:
+
+```
+conn-closed: io=207 keepalive=0 clean=0
+conn-closed-io-detail: yamux-io:connectionreset:104=166 yamux-decode-mid-frame:connectionreset:104=38 yamux:closed=3
+```
+
+**100% of session deaths are TCP `ECONNRESET` (errno 104)**. Zero
+clean closes, zero keepalive timeouts.
+
+**Important correction:** the ECONNRESET rate does NOT, by itself,
+prove bee is "abusively" terminating us. Reading
+`go-libp2p/p2p/transport/tcp/tcp.go::tryLinger`, bee's libp2p TCP
+listener sets `SO_LINGER=0` on every accepted connection. This
+means **every libp2p-go connection close becomes a TCP RST**,
+regardless of reason — clean close, accounting blocklist, kademlia
+bin prune, NAT keepalive expiry all surface to us as ECONNRESET.
+The cause classifier can distinguish IO vs. keepalive vs. clean
+internal-libp2p closes, but it can't distinguish *which* bee
+subsystem chose to close us, because they all use the same TCP
+path.
+
+What we *can* attribute from the data:
+
+- `keepalive=0` rules out libp2p connection-level idle timeout.
+- `clean=0` rules out us closing first.
+- `yamux:closed` minority rules out yamux protocol fatal errors
+  in most cases.
+
+The dominant disconnect path is therefore some bee-side decision to
+call `Disconnect → host.Network().ClosePeer()`, surfaced through
+`SO_LINGER=0` as RST. Candidate paths in bee
+(`grep -rE 'Disconnect\(' pkg/`):
+
+- `kademlia.go:719` "pruned from oversaturated bin"
+- `kademlia.go:1194` "kicking out random peer to accommodate node" (bootnode-only)
+- `libp2p.go:702` "unable to find peer slot for light node" (not us; we're full-node)
+- `libp2p.go:743` "unknown inbound peer"
+- Accounting blocklist on overdraft (ruled out by our `ghost_balance` counters)
+
+`pkg/topology/kademlia/kademlia.go:700-704` selects prune targets
+in this priority:
+
+1. **Unhealthy** peers (failed bee's `pkg/salud` health probe)
+2. **Non-Public** reachability (no public underlay)
+3. Random fallback
+
+So both unhealthy and non-public-reachable peers are
+disproportionately disconnected. We can mitigate (2) by running
+`daemon --listen --advertise` (measured below, 1.74× speedup). We
+cannot reliably mitigate (1) because of the kademlia-membership
+chicken-and-egg described in the next section.
+
+## Public reachability (`--listen` + `--advertise`)
+
+The fix for the bin-prune effect: be `Public`-reachable to bee.
+This requires daemon mode because we need to actually accept
+inbound connections — bee's reacher pings us back on the advertised
+underlay, and only marks us Public if the ping succeeds. There's no
+"advertise-without-listen" mode that works.
+
+### Measurement (May 2026, same mainnet conditions as above)
+
+5 trials each at c=64, 5 MiB random files, same 771-peer peerlist:
+
+| Configuration | Throughputs (KiB/s) | Median | Range |
+|---|---|---:|---|
+| One-shot baseline | 96, 118, 115, 93, 118 | 115 | wide (1.27×) |
+| Daemon, no `--listen` | 170, 54, 79, 42, 88 | 79 | very wide (4×) |
+| Daemon + `--listen` + `--advertise` | 158, 208, 188, 220, 200 | **200** | tight (1.4×) |
+
+**Daemon with public reachability is 1.74× the one-shot baseline
+median and has the tightest distribution.** Activation:
+
+```
+isheika daemon \
+  --socket /tmp/isheika.sock \
+  --peerlist peers.json \
+  --pool-size 64 \
+  --listen /ip4/0.0.0.0/tcp/1634 \
+  --identity 0x<HEX_KEY> \
+  --advertise /ip4/<PUBLIC_IP>/tcp/1634 &
+
+isheika upload \
+  --batch <BATCH> --key 0x<HEX_KEY> \
+  --concurrency 64 \
+  --daemon /tmp/isheika.sock \
+  ./file.bin
+```
+
+The bee reacher pings our advertised address shortly after
+connection; once the ping round-trips, bee marks us
+`ReachabilityStatusPublic` and stops preferentially picking us for
+bin-prune disconnects.
+
+### Daemon without listen is *worse* than one-shot — why?
+
+Counterintuitive but reproducible: median 79 KiB/s vs 115 for
+one-shot. Hypothesis: between uploads, the daemon's persistent pool
+sits idle. Sessions in the pool die from RST during idle time (the
+same kademlia pruning that kills us during uploads). On the next
+upload, many "warm pool" entries are actually dead. The dispatcher
+then pays both the dead-session detection cost AND the re-dial
+cost, which the one-shot path didn't incur (it just dials fresh).
+
+This suggests an opportunity: a background heartbeat-prober in the
+daemon that detects and replaces dead sessions during idle. Not
+implemented; tracked in Further Work.
+
+## Status protocol responder (`/swarm/status/1.1.0/status`)
+
+Hypothesis: bee's `pkg/salud` periodically probes connected peers
+via `/swarm/status/1.1.0/status`. Peers that don't respond (or
+respond with bad values) are marked `Counters.Healthy = false`,
+which makes them prune-target #1 in `kademlia.go:700-704`. Serving
+the protocol — defaulting `BeeMode="full"` and plausible percentile
+values — should reduce our prune rate.
+
+Implementation: `proto/status.proto`, `src/protocols/status.rs`,
+inbound-only responder plumbed through both the `Transport`
+(outbound sessions accept on the same connection bee opened to us)
+and the daemon `--listen` listener. See `src/protocols/status.rs`
+module docs for the percentile-passing default values.
+
+### Measurement (May 2026)
+
+Same A/B layout as the daemon+listen test. 5 trials × 3 configs,
+fresh 5 MiB random files, c=64, fresh peerlist:
+
+| Configuration | Median throughput | Trials |
+|---|---:|---|
+| One-shot (no status responder) | 115 KiB/s | 96, 118, 115, 93, 118 |
+| One-shot + status responder | 121 KiB/s | 89, 159, 121 |
+| Daemon + listen (no status responder) | 200 KiB/s | 158, 208, 188, 220, 200 |
+| Daemon + listen + status responder | 134 KiB/s | 113, 152, 134, 137, 156 |
+
+Result: **status responder produces no measurable improvement.**
+
+### Why it doesn't help (the kademlia-membership chicken-and-egg)
+
+Reading bee's inbound-connection path
+(`pkg/p2p/libp2p/libp2p.go:712`), bee calls
+`notifier.Connected(ctx, peer, forceConnection=false)`. In kademlia
+(`pkg/topology/kademlia/kademlia.go:1188`), if the bin for our PO
+is at `OverSaturationPeers = 18`, bee returns `ErrOversaturated`
+and **we are silently NOT added to `connectedPeers`**. We're still
+libp2p-connected, but kademlia-invisible.
+
+`pkg/salud/salud.go:145` iterates `s.topology.EachConnectedPeer`,
+which reads from `connectedPeers`. **A kademlia-invisible peer is
+never probed.** Our status responder is correctly implemented
+(verified via local log: protocol advertised in identify push,
+accept call returns successfully), but bee never opens the stream
+because we're not in its kademlia. Confirmed by zero
+`status responded to {peer_id}` log entries across multiple test
+runs against ~1000 connected bee peers.
+
+To become kademlia-visible, we'd have to either:
+1. Be in a bin that has room (< 18 peers). Our PO depends on our
+   overlay; rotating to a less-saturated bin is possible but the
+   client doesn't currently do this.
+2. Be discovered by bee's outbound `connect()` path (called from
+   bee's manage loop based on hive announcements). This adds us
+   with `forceConnection=true`, bypassing the saturation check.
+   Slow and out of our control.
+
+The status responder code stays as a long-term defense — if we
+ever do become kademlia-visible (e.g. via a future overlay-rotation
+feature, or a bee whose bin has room), serving status correctly
+prevents the secondary Unhealthy mark. But it cannot fix
+present-day mainnet throughput.
+
+## Bee-vs-isheika end-to-end comparison (May 2026)
+
+Apples-to-apples: bee 2.7.1 vs isheika, **same VPS, same identity,
+same batch, 5 MiB random files, end-to-end retrievability via
+`bzz.limo` (NOT local bee API "uploaded" — that's a deferred-upload
+lie which returns in ~0.7s before chunks actually propagate)**.
+
+| Client | Trials (KiB/s end-to-end) | Median |
+|---|---|---:|
+| Bee 2.7.1 HTTP `/bytes` (deferred=true) | 540, 375, 333, 320 | **354** |
+| Bee 2.7.1 HTTP `/bytes` (deferred=false, sync) | wire=720, e2e=510 | **510** |
+| isheika one-shot c=64 | 137, 114, 137 | **137** |
+| isheika c=256 mult=2 timeout=3 | 111, 80, 100 | **100** |
+
+**Bee is 2.6-7× faster end-to-end depending on configuration.**
+
+### Where the gap lives — instrumented (May 2026)
+
+We added end-of-upload histograms that mirror bee's
+`bee_pusher_sync_time`, `bee_pushsync_push_peer_time`,
+`bee_pushsync_total_send_attempts`, etc. metrics at
+`http://<bee>:1633/metrics`. Same shape, directly comparable.
+
+**Per-stream RTT (wall-clock for one pushsync substream):**
+
+| Bucket | Bee (4114 pushes) | isheika (2069 pushes, c=256 mult=2) |
+|---|---:|---:|
+| <100 ms | 71% | 77% |
+| 100-500 ms | 28% | 4% |
+| 500ms-2s | 1% | 3% |
+| 2-5s | 0.05% | **22%** |
+| 5-10s | 0% | 1.5% |
+| Mean | 86 ms | ~640 ms |
+
+Our median per-stream is actually faster than bee's, but our **tail
+is 30× worse**: ~22% of our pushes take 2-5 seconds vs bee's 0.05%.
+
+**Per-chunk wall-clock (entry to dispatcher → receipt):**
+
+| Bucket | isheika (1354 chunks, c=256 mult=2) |
+|---|---:|
+| <500ms | 54% (chunks that landed first-racer fast) |
+| 500ms-2s | 6% |
+| 2-5s | 12% |
+| 5-15s | **23%** |
+| >15s | 5% |
+| Mean | ~6 sec/chunk |
+
+vs. bee's mean ~452 ms/chunk. **13× worse mean chunk latency** —
+our racing helps with the median (54% land <500ms via the
+first racer), but our tail dominates the mean.
+
+**Push outcomes (1978 attempts for a 5 MiB upload):**
+- ok: 65%
+- shallow: 5%
+- overdraft: 18%
+- error: <1%
+
+vs. bee: ok 99%, shallow 6%, overdraft 11%. Our **overdraft rate is
+1.6× bee's**, indicating per-peer accounting is throttling us more.
+
+### Why bee wins, in one sentence
+
+The bee node we benchmarked against is `beeMode: "light"` (per
+`~/.bee.yaml` `full-node: false`, confirmed via `/status` showing
+`reserveSize: 0, storageRadius: 0, pullsyncRate: 0`). **Light bee
+does no chunk storage** — every upload travels via pushsync to
+other peers, same as us. The 7× throughput gap is therefore NOT
+about local storage. The actual difference is:
+
+- Bee-light maintains **131 stable kademlia peers**, all of which
+  treat bee-light as a `Public`-reachable kademlia neighbor with
+  full-citizen accounting state. Connections survive hours+.
+- Our **256-peer pool churns rapidly**: peers RST our connection
+  within seconds (kademlia bin-prune of non-citizen peers).
+- Bee-light's per-stream RTT is consistent (median ~50ms, tail
+  ≤250ms in 99% of streams). Our per-stream RTT has the same
+  median but **a 22% tail at 2-5 seconds** — those slow streams
+  are presumably peers that don't have accounting state for us
+  ready, so they refresh credit before responding, or forward
+  through more hops because they don't trust our chunk's stamp
+  validation pipeline as much.
+
+In other words: bee-light got its 131 kademlia memberships by being
+"adopted" by other bees over time — `forceConnection=true` outbound
+dials from the manage loops of other bees that learned about it
+via hive. We're trying to short-circuit that via outbound hive
+announce, but bees admit us into kademlia slowly (6 pullsync probes
+observed in 15 min of idle daemon = roughly 24/hr admission rate).
+
+The fix isn't more tuning — it's **time**. Run the daemon
+continuously and let kademlia memberships accumulate. See
+"Further work #2: long-duration bee-citizenship measurement".
+
+### Tuning experiments (no fix, just calibration)
+
+5-MiB random files, freshly-discovered 1407-peer peerlist, May 2026:
+
+| Config | Median (KiB/s wire) |
+|---|---:|
+| baseline `c=64 --raw` | 137 |
+| `c=256 mult=2` | 100 |
+| `c=256 mult=2 --timeout=3` | 100 |
+| `c=512 mult=4` | 63 (degrades, overdraft surges) |
+| `c=1024 mult=4` | 45 (much worse, pool churn) |
+| `c-peer=2` (racing 2 instead of 3) | 70 |
+| `c-peer=4` | very variable, 17-125 |
+
+The empirical sweet spot today is `c=256 mult=2`, racing 3 peers
+per chunk, default `--timeout=10`. `--timeout=3` shaves the tail
+slightly but introduces error retries that wash out the gain.
+
+The historic 1 MB/s number from earlier PERFORMANCE.md is not
+reproducing on today's mainnet. Either mainnet has degraded or
+the configuration we measured then included peer-set conditions
+we haven't reproduced.
+
+Push-vs-retrievable gap (what fraction of "upload time" is just
+waiting for propagation after the API/client returns):
+
+- **Bee**: 0.74s POST → 16s retrievable. Bee returns 22× faster
+  than chunks are actually durable. The HTTP API hard-lies about
+  completion via deferred-upload semantics (default ON).
+- **isheika**: 32-41s push → 37-45s retrievable. We're only
+  9-15% slower than fully durable — we don't lie, we wait for
+  receipts before returning.
+
+Reasons bee outperforms us at the end-to-end measurement, in
+descending order of probable impact:
+
+1. **133 stable kademlia neighbors** (queried via bee
+   `/topology`). Every pushsync routes through bee's persistent
+   long-lived neighbor connections — bees that treat bee as a
+   permanent member, never bin-prune-disconnect it. Our pool
+   has transient sessions: ~64 active at any time, each dies
+   within seconds to RST (see "Session-death cause"). The
+   network treats bee as a citizen; isheika as a tourist.
+2. **Local AOR storage at depth ~9.** ~1/512 of chunks bee
+   uploads land in its own AOR (`pkg/pusher/pusher.go:266`,
+   `ErrWantSelf` short-circuit) and are stored locally with no
+   network push. Small but real.
+3. **Pull-sync between neighbors** propagates pushed chunks in
+   the background. When bee pushes a chunk to one AOR neighbor,
+   that neighbor's pull-sync replicates to others; bee doesn't
+   wait. We only get receipts from peers we directly push to.
+4. **Mature pusher implementation.** Years of empirical tuning
+   on retry, parallelism, shallow-receipt handling, backoff. We
+   mirror most of it but likely have rougher edges.
+
+## Bee-citizenship: stable overlay + hive self-announce (built, tested)
+
+After confirming the status responder doesn't fire because we're
+not in bee's kademlia (`pkg/topology/kademlia/kademlia.go:1188`
+rejects oversaturated-bin inbound peers), the next attempt was to
+get into bee's kademlia *over time* by mimicking a real bee
+participant:
+
+- **Stable overlay across daemon restarts.** Overlay is
+  `keccak256(eth_addr || network_id || nonce)`; previously the
+  nonce randomized each process, so every restart looked like a
+  new peer to bee. Now persisted via `--nonce-file` (default
+  `overlay-nonce` in CWD). See `signer::from_bytes_with_nonce`.
+- **Outbound hive announce on every session connect.** Send a
+  `Peers` envelope containing our own BzzAddress to every bee we
+  connect to. Bee's `peersHandler` reads, dial-probes (via reacher
+  ping to our `--advertise` underlay), and adds us to `knownPeers`
+  on success. Bee's manage loop may then dial us OUTBOUND, which
+  admits us to kademlia with `forceConnection=true` — bypassing the
+  bin-saturation gate. See `protocols::hive::announce_self` and
+  `transport::do_hive_announce`.
+
+### Measurement (May 2026, VPS, 2941-peer pool from 5-round discover)
+
+5 trials × 4 configs, fresh 5 MiB random files, hive announce
+enabled and firing at ~160 announces per upload (verified via
+`hive-announce: ok=N fail=M` diag):
+
+| Configuration | Trials (KiB/s) | Median |
+|---|---|---:|
+| One-shot c=64 | 48, 118, 158, 114, 110 | 114 |
+| Daemon+listen+advertise pool=64 c=64 | 69, 160, 69, 164, 120 | 120 |
+| Daemon+listen+advertise pool=256 c=256 mult=2 | 91, 131, 266, 83, 91 | 91 |
+| Daemon+listen+advertise pool=512 c=512 mult=4 | 92, 190, 189, 178, 113 | 178 |
+
+**Single-upload throughput is unchanged.** Compare to historical
+1070 KiB/s at pool=512 mult=4 on 3335 peers (`PERFORMANCE.md`
+empirical-ceiling table) — we're 6× below that despite having a
+similar-sized peerlist, suggesting **mainnet itself is in a worse
+state** than during the historical measurement, or the historical
+number depended on conditions we haven't reproduced.
+
+### Why hive announce didn't visibly help (yet)
+
+Hive announces fire successfully (~160 per 5 MiB upload, ~0
+failures). Bee's `peersHandler` accepts the envelope. But over 5
+minutes of idle daemon (just listening, not pushing), **0 inbound
+connections from new peers** were observed.
+
+Candidate explanations:
+
+1. **Bee's manage loop is slow.** Bees that learn about us via
+   hive add us to `knownPeers`, but their manage-loop iteration
+   that picks new peers to dial may run on a multi-minute cadence,
+   or prefer peers learned through other paths. We'd need to leave
+   the daemon running for hours and re-measure.
+2. **Bee's reacher dial-probe fails.** Bee may attempt to ping our
+   advertised address and fail — though we verified our port is
+   open externally and bees do reach us via outbound-initiated
+   connections. Possibly an issue specific to the reacher's dial
+   path.
+3. **The compounding effect is real but takes longer than our
+   test window.** Bee-citizenship is a slow-burn intervention by
+   design; the network has to learn about us, and that learning
+   is rate-limited per peer.
+
+The code stays — it's correct, doesn't measurably regress single
+uploads, and is the prerequisite for any long-term kademlia-
+membership growth. If you want to validate it for real, leave a
+daemon running for ~6+ hours, then run a measurement batch.
+
+## Pullsync inbound responder (built, partially active)
+
+The strategic question: bee's `pkg/salud` (status protocol) didn't
+probe us because we never made it into bee's `connectedPeers` slice.
+Pullsync is opened by bee on a DIFFERENT trigger — early in the
+connection lifecycle when bee considers us a new peer worth syncing
+from. If we accept pullsync, bee gives us its first signal that we
+exist in its kademlia.
+
+Implementation (May 2026, see `protocols::pullsync`):
+
+- `proto/pullsync.proto` — wire-compatible with bee's
+  `pkg/pullsync/pb/pullsync.proto`.
+- Two stream protocols accepted:
+  `/swarm/pullsync/1.4.0/cursors` (one-shot per-peer
+  initial-handshake) and `/swarm/pullsync/1.4.0/pullsync`
+  (periodic chunk-sync probe).
+- Cursor responder: reply with `Ack{Cursors: [0; 32], Epoch: <session_start_unix_secs>}`.
+  Bee accepts all-zero as "no chunks synced yet" — a valid empty
+  reserve, not a malformed response.
+- Pullsync responder: reply with `Offer{Topmost: Get.Start, Chunks: []}`.
+  Bee's handler short-circuits on empty offers
+  (`pkg/pullsync/pullsync.go:183`); the dialer doesn't send a `Want`
+  and the exchange ends without delivering chunks.
+- Accepted on both the outbound session (`transport::PeerSession::connect`)
+  and the daemon inbound listener — bee may probe pullsync over either.
+- BMT chunk-address verification is already done in
+  `client.rs::NetworkedStore::fetch` (line 224, `chunk.address() != &address`).
+  Stamp signature validator (`src/stamp.rs`) recovers the batch
+  owner from the 113-byte stamp; ready for use when we add chunk
+  ingestion paths, but unused in the current upload-only code.
+
+### Measurement (May 2026)
+
+**This is the first bee-citizenship intervention that actually
+fires.** Status protocol probes never arrived; hive announces went
+out but no return dials. Pullsync DOES get probed:
+
+| Measurement window | Cursor probes received | Chunk probes |
+|---|---:|---:|
+| Daemon idle (~15 min) | 6 | 0 |
+
+Chunk probes stay at 0 because we always offer-empty. Cursor
+probes from bee mean **bee opened a substream specifically to ask
+us for our reserve cursors**, which it only does for peers it's
+treating as kademlia neighbors. This is direct evidence that the
+combination of stable overlay + hive announce + listen+advertise +
+pullsync accept gets us into bee's kademlia from at least some
+bees.
+
+### Single-upload throughput unchanged
+
+Three trials, daemon mode, c=64, 5 MiB end-to-end via bzz.limo:
+
+| Trial | Wire push | End-to-end (bzz.limo) |
+|---|---:|---:|
+| 1 | 110.27s (46.4 KiB/s) | 114.60s (44.7 KiB/s) |
+| 2 | 22.30s (229.6 KiB/s) | **TIMEOUT (>600s)** |
+| 3 | 23.19s (220.8 KiB/s) | 25.56s (200.3 KiB/s) |
+
+Median: ~120 KiB/s end-to-end of the two successful trials.
+
+**Trial 2 is concerning:** push reported completion in 22s
+(receipts received from ~64 peers) but bzz.limo never served the
+content after 10 minutes. This means we got receipts from peers
+that didn't propagate the chunks to the actual AOR storers — a
+real protocol gap. Bee's pushsync should retry on shallow
+receipts (`pushsync.ErrShallowReceipt`), and we do this
+(`client.rs:1463-1471`), but apparently not all "successful"
+receipts indicate durable storage.
+
+The 200 KiB/s third trial is the best single end-to-end number
+we've measured. But variance is still large and bee is still
+2-2.5× faster on median.
+
+### What we've learned about bee-citizenship as a strategy
+
+The full stack we now have running:
+- Stable overlay (--nonce-file)
+- Outbound hive announce per session (~160/upload)
+- Inbound status responder (still never probed)
+- Inbound pullsync responder (now actively probed — 6/15min)
+- --listen --advertise (Public reachability)
+- SWAP cheque emission (cheques accepted by bee, no measurable impact)
+
+This is enough to be **partially recognized** as a kademlia
+neighbor by some bees. But "partially" means a fraction of the
+sustained-neighbor benefits a real bee gets:
+- We don't hold long-lived connections — they still RST after
+  seconds due to `SO_LINGER=0` on bee's libp2p TCP transport.
+- We don't store chunks, so the pullsync probes that DO arrive
+  return empty offers and don't graduate into actual sync traffic.
+- Without sync traffic, bees don't have a reason to maintain a
+  long-lived connection to us beyond the initial handshake +
+  cursor exchange.
+
+To close the remaining gap to bee (2-2.5× as of this measurement),
+we'd need to actually start STORING chunks (so our pullsync offers
+become non-empty and bees pull-sync real content from us, building
+a sustained-traffic relationship that bee's connection manager
+wants to keep alive). That's the chunk-storage feature we
+deliberately scoped out — see "Further work" #4 below.
+
 ## Further work (unblocked, ordered by expected impact)
 
-1. **Peerlist freshness fixes.** See "Peerlist freshness" above.
-   Shorter cache TTL or inline retry of recently-failed peers
-   during pool fill. Highest expected impact: a 6× swing was
-   observed just by removing stale lockouts.
+1. **Daemon + public reachability is the recommended config.** This
+   was the only measurable improvement (1.74× at c=64 in earlier
+   testing on a different peerlist iteration). Make `--listen` /
+   `--advertise` more prominent in CLI help and recommend them for
+   any sustained-upload workload.
 
-2. **Distributed workers on different IPs.** If the per-IP wall is
+2. **Long-duration bee-citizenship measurement.** Leave a
+   `daemon --listen --advertise --identity --nonce-file` running
+   for 6-12 hours, monitor `inbound connection from` log lines
+   to gauge whether bees are dialing us due to hive learning.
+   Then run an upload batch and compare to a cold-start daemon.
+   This is the test the section above couldn't run in a single
+   bench session.
+
+3. **Background pool maintenance in daemon mode.** The "daemon
+   without listen is worse than one-shot" finding above. A periodic
+   probe of pool entries (e.g. once per N seconds: pick K entries,
+   check `is_alive()`, prewarm-dial replacements for the dead ones)
+   would let the warm pool actually stay warm.
+
+4. **Peerlist freshness fixes.** See "Peerlist freshness" above.
+   Shorter cache TTL or inline retry of recently-failed peers
+   during pool fill. Independent of public reachability and would
+   compose with it: a 6× swing was observed just by removing
+   stale lockouts.
+
+5. **Re-measure SWAP impact in the daemon+public regime.** SWAP at
+   one-shot didn't help, but the failure mode (sessions die before
+   per-peer cumulative reaches the threshold-growth gate) is
+   exactly what daemon mode amortizes. A multi-GB upload workload
+   running through `daemon + --listen + --advertise + --chequebook`
+   is the configuration where SWAP *might* finally show measurable
+   benefit. Not yet tested.
+
+6. **Distributed workers on different IPs.** If the per-IP wall is
    real (we haven't tested by going past pool=512 enough to
    measure), N separate machines each running their own
    pool+buffer-scaled upload would give real linear scaling.
    Coordinator + worker over TCP instead of Unix sockets; harder
    than the deleted local multiwork because of NAT, auth, latency.
+
+## Vanity overlay (built, measured, 2.2× over random baseline)
+
+**Hypothesis (validated):** Bee mainnet kademlia bins are
+saturated at `defaultOverSaturationPeers = 18`
+(`pkg/topology/kademlia/kademlia.go:55`). Most of our random-overlay
+dials hit `topology.ErrOversaturated` because we land in the
+already-full bin 0 of every peer we dial — they accept the
+TCP+handshake then immediately disconnect us in
+`Kad.Connected()` at line 1192.
+
+A nonce that gives our overlay high PO to specific stable peers
+puts us in their *deeper*, undersaturated bins (PO=8+ typically
+has 0-3 peers in the bin), so those peers accept and keep our
+connection.
+
+### Wire-level diagnosis (the data that drove this)
+
+Running the daemon with default random nonce against the same
+batch + key + bench file we use everywhere, with
+`RUST_LOG=isheika::profile=trace`:
+
+- **2841 `pushsync_phases` events for 1293 chunks** = 2.2 push
+  attempts per chunk on average (3.5× overhead).
+- **Per-attempt outcomes:** 1238 ok, 87 shallow, 34 overdraft,
+  3163 errors. Of the errors, **3065 were `dial too soon`** —
+  libp2p's per-peer 1 s cooldown rejecting redials of peers
+  whose connection bee already RST'd.
+- **Median push latency: 60 ms.** When a push succeeds, it's
+  sub-bee speed. The bottleneck isn't the protocol.
+- **p95 push latency: 4.9 s.** 5 % of pushes take ~5 s because
+  the receiving peer's accounting takes forever or its forwarder
+  chain stalls. Concentrated on ~10 specific peers (30-48 % slow
+  rate each).
+- **70 of 256 sessions delivered receipts.** ~73 % of dialed
+  peers were either dead-on-arrival or RST'd before we could
+  push anything through them.
+
+The smoking gun: the 73 % of sessions that don't deliver are bee
+peers whose bin 0 is full. Bee accepts our TCP+handshake then
+calls `notifier.Connected → Kad.Connected → SaturationFunc`,
+which returns true (bin full), and bee disconnects with
+`ErrOversaturated`.
+
+### Peer-diversity sanity check (not the bottleneck)
+
+We checked whether the gap could be peer diversity — 100 random
+chunk addresses → 100 / 100 of them have a peer in our pool at
+PO ≥ 9 (inside bee's storage radius of 9). So we're not short on
+"close enough to the chunk" peers. The bottleneck was always
+the bins our peers put us into.
+
+### Multi-target search
+
+The `vanity-overlay` subcommand brute-forces a nonce that
+maximizes PO to one or more known target overlays. Two modes:
+
+- **anchored** (one or more `--target-overlay`): maximize the
+  *minimum* PO across the listed targets. Cheap when targets
+  are themselves close (~`2^k` tries for PO≥k against
+  prefix-sharing targets).
+- **coverage** (no targets, uses `peers.json`): maximize the
+  count of peers at PO ≥ `--target-po`. Bounded by uniform
+  expectation `N × 2^-target_po`; can outperform by ~2-3× before
+  diminishing returns.
+
+For our identity key, anchoring against 5 peers from a previous
+upload's top-pushers list (sharing the `d9` prefix in the
+trace data) found a nonce that gives PO ≥ 8 to all 5 of them
+in **442 attempts (instant)**:
+
+    POs = [8, 8, 8, 8, 9]    min = 8
+    overlay = d9dd0fcc640528946cb6225517b6f72ef11616149ac0db3fc8fdf46bd78f3c8f
+
+### Measured impact
+
+5 MiB random upload via daemon, 10 warm runs each:
+
+| Config | Median KiB/s | Best | vs bee-light (822) |
+|--------|-------------:|-----:|-------------------:|
+| Random overlay (today) | 120 | 159 | 14-19 % |
+| Single-target vanity (PO=13 to 1 peer) | 215 | 336 | 26-41 % |
+| **Multi-target vanity (PO≥8 to 5 peers)** | **269** | **349** | **33-42 %** |
+
+Single-target alone is **2.0× over random**. Multi-target is
+**2.2× over random + 25 % over single-target**, with lower
+variance (worst run 153 vs single-target's 103).
+
+### Caveats
+
+- Anchors must be **stable peers**. If the anchor goes offline,
+  the vanity advantage evaporates. Multi-target trades
+  per-anchor PO for redundancy.
+- Anchors must be **chosen empirically.** The best ones come from
+  the top-pusher list of a previous upload run on the same key.
+  Picking arbitrary peers from a discovery dump gives no benefit
+  — they may be dead/NATted/light-mode.
+- The advantage is **per-peer, not network-wide.** Our vanity
+  overlay is at PO=8 to the 5 anchors, but at PO≈0 to most
+  random peers. So bee peers not in our anchor list still drop us
+  on dial. The win is that our top performers stay connected.
+
+### Workflow
+
+    # 1. Run a normal-overlay upload to populate peers.json and
+    # generate a trace with top-pusher info.
+    isheika daemon --identity 0xXXX --advertise ... -v ...
+
+    # 2. Identify the top 5-10 peers from the daemon log
+    # (`pushed N/M chunks (latest via <overlay> po=K)` lines,
+    # or the `do_pushsync_outer` traces if RUST_LOG=isheika::profile=trace).
+
+    # 3. Run vanity-overlay search against those targets:
+    isheika vanity-overlay --key 0xXXX \
+      --target-overlay <peer1_overlay> \
+      --target-overlay <peer2_overlay> \
+      --target-overlay <peer3_overlay> \
+      --target-po 6 \
+      --output overlay-nonce
+
+    # 4. Restart daemon with the new nonce file:
+    isheika --nonce-file overlay-nonce daemon ...
+
+Higher target_po = stronger anchor but exponentially more search
+cost. Above ~12-14 the search starts taking minutes; above ~20 it
+becomes infeasible without distributed search.

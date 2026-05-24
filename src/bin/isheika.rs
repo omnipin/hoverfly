@@ -80,6 +80,74 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 1, value_name = "N")]
     buffer_multiplier: usize,
 
+    /// SWAP chequebook contract address (20 bytes hex, 0x-optional).
+    /// When set, every session emits signed cheques after pseudosettle
+    /// to cover remaining debt — see the SWAP section in
+    /// `PERFORMANCE.md` for the hypothesis (Swarm infra team reports
+    /// 3× upload speedup when paying).
+    ///
+    /// PREREQUISITES (we don't verify them — bee will reject the
+    /// cheque otherwise):
+    /// 1. The chequebook contract must already be deployed by bee's
+    ///    official factory (mainnet:
+    ///    `0xc2d5a532cf69aa9a1378737d8ccdef884b6e7420`).
+    /// 2. Its `issuer()` must equal `--key`'s derived Ethereum
+    ///    address (we sign cheques with `--key`).
+    /// 3. It must have deposited BZZ ≥ what we'll cumulatively pay
+    ///    any single peer (see `--chequebook-per-peer-cap-bzz`).
+    #[arg(long, global = true, value_name = "ADDR")]
+    chequebook: Option<String>,
+
+    /// Max cumulative payout per peer (in BZZ-wei) we'll issue
+    /// before falling back to pseudosettle-only with that peer.
+    /// Bee's `chequestore.go:176` bounces cheques whose
+    /// `cumulative - paidOut` exceeds the chequebook balance; this
+    /// cap is the operator's per-peer ceiling regardless of how
+    /// much is left in the chequebook. Defaults to 10^16 BZZ-wei
+    /// (= 1 BZZ), which is generous for most workloads — bee will
+    /// only ever ask us for a fraction of this in any single upload.
+    #[arg(long, global = true, default_value = "10000000000000000", value_name = "WEI")]
+    chequebook_per_peer_cap_bzz: String,
+
+    /// Path to the cheque-issuance sidecar (`cheques.json`).
+    /// Persists per-peer cumulative-payout state across runs. Bee
+    /// rejects any cheque whose CumulativePayout is not strictly
+    /// greater than the last one it accepted from us
+    /// (`ErrChequeNotIncreasing`, chequestore.go:30), so this file
+    /// **must** survive between runs that target the same peer set.
+    #[arg(long, global = true, default_value = "cheques.json", value_name = "FILE")]
+    cheques_file: PathBuf,
+
+    /// EVM chain id used in the EIP-712 domain of cheque signatures.
+    /// Defaults to 100 (Gnosis chain — Swarm mainnet). Use 11155111
+    /// for Sepolia testnet. The chain id is part of the domain
+    /// separator that bee's chequestore verifies against, so a
+    /// mismatch silently invalidates every cheque we send.
+    #[arg(long, global = true, default_value_t = 100, value_name = "ID")]
+    chequebook_chain_id: u64,
+
+    /// Path to the 32-byte overlay nonce file. The Swarm overlay is
+    /// derived as `keccak256(eth_addr || network_id || nonce)`, so a
+    /// stable nonce gives a stable overlay across daemon restarts.
+    /// This is essential for bee-citizenship: bee gossips peer
+    /// overlays via the hive protocol and learned overlays only
+    /// match across restarts if our overlay stays the same. With a
+    /// fresh nonce each run, every restart looks like a new peer to
+    /// bee and we never accumulate kademlia membership over time.
+    ///
+    /// Behaviour:
+    /// - File exists: load the 32-byte nonce from it (hex format,
+    ///   `0x` optional). If the file is malformed, fail loudly.
+    /// - File missing: generate a random nonce, write it to the file
+    ///   before doing any network I/O, then use it.
+    ///
+    /// Default: `overlay-nonce` in the current working directory.
+    /// Daemon operators should treat this file like an identity
+    /// secret — losing it means losing the overlay (and therefore
+    /// any kademlia memberships built up over time).
+    #[arg(long, global = true, default_value = "overlay-nonce", value_name = "FILE")]
+    nonce_file: PathBuf,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -305,6 +373,101 @@ enum Commands {
         advertise: Option<String>,
     },
 
+    /// Search for a vanity overlay nonce that targets bee mainnet's
+    /// kademlia bin structure.
+    ///
+    /// Bee mainnet bins are saturated at the default
+    /// `defaultOverSaturationPeers = 18` per kademlia bin
+    /// (`pkg/topology/kademlia/kademlia.go:55`). When we dial a bee
+    /// peer with a random overlay, our PO to that peer is typically
+    /// 0-2 — meaning we drop into their bin 0/1/2, which is the
+    /// most-saturated. Bee rejects us with `topology.ErrOversaturated`
+    /// before any upload happens.
+    ///
+    /// Two operating modes:
+    ///
+    /// **Single-target mode** (`--target-overlay`): find a nonce
+    /// that maximizes PO to ONE specific peer. Useful for anchoring
+    /// near a known stable peer (bootnode, Swarm Foundation
+    /// infrastructure). Expected cost: ~2^k tries for PO=k.
+    ///
+    /// **Coverage mode** (default, uses `peers.json`): find a nonce
+    /// that maximizes PO to MANY peers at once. Realistic targets
+    /// here are PO=3 against ~15-20% of the pool — beyond that the
+    /// search hits the bound `expected_matches = N × 2^-PO` and you
+    /// can't significantly outperform the uniform distribution.
+    ///
+    /// The search is keccak256-bound: ~1 µs per candidate on a
+    /// modern x86 core, so brute-forcing PO≥10 against ONE peer
+    /// (~1024 tries) is instant; PO≥4 with 15% coverage against
+    /// 3000 peers takes a few minutes.
+    ///
+    /// Writes the winning nonce to `--output` (default
+    /// `overlay-nonce`) so the daemon's `--nonce-file` flag picks it
+    /// up on next start.
+    VanityOverlay {
+        /// Private key (hex secp256k1, 32 bytes) — same key used for
+        /// the daemon's `--identity`. We need it because the overlay
+        /// is `keccak256(eth_address || network_id || nonce)`, so the
+        /// key determines half the input. Different keys → different
+        /// vanity nonces.
+        #[arg(long, value_name = "HEX")]
+        key: String,
+
+        /// Target overlay(s) for anchored mode (hex, 32 bytes each;
+        /// pass multiple times). When set, the search maximizes
+        /// PO against this set of overlays instead of the peers.json
+        /// pool.
+        ///
+        /// Single target: search maximizes PO against that one
+        /// overlay. Anchors us near a specific known stable peer
+        /// (e.g. a bootnode).
+        ///
+        /// Multiple targets: search maximizes the *minimum* PO
+        /// across the set. The result anchors us close enough to
+        /// EVERY peer in the list that we land in their deep bins,
+        /// trading per-target PO for redundancy. Best with 3-10
+        /// peers that are themselves close in overlay space (e.g.
+        /// the top-K most-used peers from a previous upload trace).
+        #[arg(long, value_name = "HEX")]
+        target_overlay: Vec<String>,
+
+        /// `peers.json` path. Used as the target set in coverage
+        /// mode (when `--target-overlay` is not set).
+        #[arg(long, default_value = "peers.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Target proximity-order. The search succeeds when the
+        /// candidate overlay's PO to the target is ≥ this value
+        /// (single-target mode) or when `--min-coverage` peers
+        /// reach this PO (coverage mode).
+        #[arg(long, default_value_t = 10)]
+        target_po: u8,
+
+        /// Coverage mode only: stop once this fraction of peers in
+        /// `peerlist` reach PO ≥ `target_po`. Beware: the natural
+        /// uniform expectation is `2^-target_po`, so meaningful
+        /// targets are `2-3×` that (e.g. coverage=0.15 with
+        /// target_po=3, since 2^-3 = 0.125).
+        #[arg(long, default_value_t = 0.15)]
+        min_coverage: f64,
+
+        /// Output file for the chosen nonce. Pass this same path as
+        /// `--nonce-file` when starting the daemon.
+        #[arg(short, long, default_value = "overlay-nonce", value_name = "FILE")]
+        output: PathBuf,
+
+        /// Hard ceiling on search attempts. Default 10M; with a
+        /// ~1 µs/keccak rate that's ~10 s budget on a single core.
+        /// Raise for higher `--target-po`.
+        #[arg(long, default_value_t = 10_000_000u64)]
+        max_attempts: u64,
+
+        /// Network ID (1 = mainnet, 10 = testnet). Must match the
+        /// daemon's `--network-id`.
+        #[arg(long, default_value_t = 1)]
+        network_id: u64,
+    },
 }
 
 /// Parse a tar archive into a flat list of `UploadFile`s (regular files
@@ -387,6 +550,100 @@ fn guess_content_type(path: &str) -> Option<String> {
 
 /// Print the session-retirement-cause counters to stderr at upload end.
 /// See `isheika::transport::diag` for what each counter means.
+/// Format `bytes / elapsed` as a human-readable throughput line.
+/// Uses binary units (KiB/MiB) to match every other "throughput"
+/// number in `PERFORMANCE.md`. Elapsed is captured at the CLI call
+/// site, so it includes the wall-clock time spent stamping +
+/// dispatching + waiting for the last receipt — i.e. exactly what
+/// the user sees as "how long the upload took". This is the same
+/// quantity `time` would report for `real`, but printed by the
+/// binary so it can survive `> file` redirection without bash
+/// timing-output going to stderr.
+fn print_upload_throughput(bytes: usize, elapsed: std::time::Duration) {
+    let secs = elapsed.as_secs_f64();
+    if secs <= 0.0 || bytes == 0 {
+        println!("upload took {:.2}s ({} bytes)", secs, bytes);
+        return;
+    }
+    let bps = bytes as f64 / secs;
+    let (rate, unit) = if bps >= 1024.0 * 1024.0 {
+        (bps / (1024.0 * 1024.0), "MiB/s")
+    } else if bps >= 1024.0 {
+        (bps / 1024.0, "KiB/s")
+    } else {
+        (bps, "B/s")
+    };
+    println!(
+        "upload: {} bytes in {:.2}s = {:.2} {}",
+        bytes, secs, rate, unit,
+    );
+}
+
+/// Load a 32-byte overlay nonce from `path`. Creates the file with
+/// a fresh random nonce on first call. Subsequent calls return the
+/// same nonce. Stored as hex (0x-prefixed) for human inspection; the
+/// file is rewritten atomically via write-rename to avoid partial
+/// writes on crash.
+///
+/// See the `--nonce-file` CLI documentation for why a stable overlay
+/// matters for bee citizenship.
+fn load_or_create_nonce(path: &std::path::Path) -> Result<[u8; 32], Box<dyn std::error::Error>> {
+    use std::io::Write;
+    if let Ok(s) = std::fs::read_to_string(path) {
+        let trimmed = s.trim().trim_start_matches("0x").trim_start_matches("0X");
+        let bytes = hex::decode(trimmed)
+            .map_err(|e| format!("--nonce-file {}: bad hex: {e}", path.display()))?;
+        if bytes.len() != 32 {
+            return Err(format!(
+                "--nonce-file {}: expected 32 bytes, got {}",
+                path.display(),
+                bytes.len()
+            )
+            .into());
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&bytes);
+        return Ok(out);
+    }
+    // Missing — generate, persist, return. Atomic write-rename so a
+    // crash mid-write can't leave a half-written file that loads
+    // differently next time.
+    let mut nonce = [0u8; 32];
+    getrandom::fill(&mut nonce).map_err(|e| format!("os rng: {e}"))?;
+    let tmp = path.with_extension("tmp");
+    let mut f = std::fs::File::create(&tmp)
+        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    f.write_all(format!("0x{}\n", hex::encode(nonce)).as_bytes())
+        .map_err(|e| format!("write {}: {e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+    eprintln!(
+        "overlay-nonce: generated fresh nonce, persisted to {}",
+        path.display()
+    );
+    Ok(nonce)
+}
+
+/// Parse a 20-byte Ethereum / chequebook address from hex with
+/// optional `0x` prefix. Case-insensitive (we don't enforce EIP-55
+/// checksumming because chequebook addresses are often copy-pasted
+/// from bee logs in lowercase). Returns `Err` on length or charset
+/// failure.
+fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
+    let trimmed = s.trim_start_matches("0x").trim_start_matches("0X");
+    if trimmed.len() != 40 {
+        return Err(format!(
+            "expected 40 hex chars (20 bytes), got {} chars",
+            trimmed.len()
+        ));
+    }
+    let bytes = hex::decode(trimmed).map_err(|e| format!("bad hex: {e}"))?;
+    let mut out = [0u8; 20];
+    out.copy_from_slice(&bytes);
+    Ok(out)
+}
+
 fn print_session_retire_diag() {
     use std::sync::atomic::Ordering;
     use isheika::transport::diag;
@@ -397,6 +654,8 @@ fn print_session_retire_diag() {
     let max_pushes_retire = diag::MAX_PUSHES_RETIRE.load(Ordering::Relaxed);
     let prewarm_on_dead = diag::PREWARM_ON_DEAD.load(Ordering::Relaxed);
     let prewarm_on_ghost = diag::PREWARM_ON_GHOST.load(Ordering::Relaxed);
+    let cheque_emitted = diag::CHEQUE_EMITTED.load(Ordering::Relaxed);
+    let cheque_failed = diag::CHEQUE_FAILED.load(Ordering::Relaxed);
     let total = dead_low + dead_prewarm + dead_high + ghost_retire + max_pushes_retire;
     if total > 0 || prewarm_on_dead > 0 || prewarm_on_ghost > 0 {
         eprintln!(
@@ -407,6 +666,94 @@ fn print_session_retire_diag() {
             "prewarm: on_dead={} on_ghost={}",
             prewarm_on_dead, prewarm_on_ghost,
         );
+    }
+    if cheque_emitted > 0 || cheque_failed > 0 {
+        eprintln!(
+            "swap: cheques_emitted={} cheques_failed={}",
+            cheque_emitted, cheque_failed,
+        );
+    }
+    let conn_io = diag::CONN_CLOSED_IO.load(Ordering::Relaxed);
+    let conn_ka = diag::CONN_CLOSED_KEEPALIVE.load(Ordering::Relaxed);
+    let conn_clean = diag::CONN_CLOSED_CLEAN.load(Ordering::Relaxed);
+    if conn_io > 0 || conn_ka > 0 || conn_clean > 0 {
+        eprintln!(
+            "conn-closed: io={} keepalive={} clean={}",
+            conn_io, conn_ka, conn_clean,
+        );
+    }
+    let hive_ok = diag::HIVE_ANNOUNCE_OK.load(Ordering::Relaxed);
+    let hive_fail = diag::HIVE_ANNOUNCE_FAIL.load(Ordering::Relaxed);
+    if hive_ok > 0 || hive_fail > 0 {
+        eprintln!("hive-announce: ok={} fail={}", hive_ok, hive_fail);
+    }
+    let ps_cur = diag::PULLSYNC_CURSORS_IN.load(Ordering::Relaxed);
+    let ps_sync = diag::PULLSYNC_PULLSYNC_IN.load(Ordering::Relaxed);
+    if ps_cur > 0 || ps_sync > 0 {
+        // Per-session inbound pullsync activity. Non-zero values mean
+        // bee considers us a kademlia neighbor worth probing for
+        // sync — the strongest available signal that the
+        // bee-citizenship work has actually paid off.
+        eprintln!("pullsync-in: cursors={} pullsync={}", ps_cur, ps_sync);
+    }
+    let push_a = diag::PUSH_LATENCY_LT_100MS.load(Ordering::Relaxed);
+    let push_b = diag::PUSH_LATENCY_100_500MS.load(Ordering::Relaxed);
+    let push_c = diag::PUSH_LATENCY_500MS_2S.load(Ordering::Relaxed);
+    let push_d = diag::PUSH_LATENCY_2_5S.load(Ordering::Relaxed);
+    let push_e = diag::PUSH_LATENCY_5_10S.load(Ordering::Relaxed);
+    let push_f = diag::PUSH_LATENCY_GT_10S.load(Ordering::Relaxed);
+    let push_total = push_a + push_b + push_c + push_d + push_e + push_f;
+    if push_total > 0 {
+        eprintln!(
+            "push-latency-buckets: <100ms={} 100-500ms={} 500ms-2s={} 2-5s={} 5-10s={} >10s={}",
+            push_a, push_b, push_c, push_d, push_e, push_f
+        );
+    }
+    let open_a = diag::OPEN_STREAM_LT_10MS.load(Ordering::Relaxed);
+    let open_b = diag::OPEN_STREAM_10_100MS.load(Ordering::Relaxed);
+    let open_c = diag::OPEN_STREAM_100_500MS.load(Ordering::Relaxed);
+    let open_d = diag::OPEN_STREAM_GT_500MS.load(Ordering::Relaxed);
+    let open_total = open_a + open_b + open_c + open_d;
+    if open_total > 0 {
+        eprintln!(
+            "open-stream-buckets: <10ms={} 10-100ms={} 100-500ms={} >500ms={}",
+            open_a, open_b, open_c, open_d
+        );
+    }
+    let out_ok = diag::PUSH_OUTCOME_OK.load(Ordering::Relaxed);
+    let out_shallow = diag::PUSH_OUTCOME_SHALLOW.load(Ordering::Relaxed);
+    let out_overdraft = diag::PUSH_OUTCOME_OVERDRAFT.load(Ordering::Relaxed);
+    let out_error = diag::PUSH_OUTCOME_ERROR.load(Ordering::Relaxed);
+    let out_total = out_ok + out_shallow + out_overdraft + out_error;
+    if out_total > 0 {
+        eprintln!(
+            "push-outcomes: ok={} shallow={} overdraft={} error={} (total={})",
+            out_ok, out_shallow, out_overdraft, out_error, out_total,
+        );
+    }
+    let ch_a = diag::CHUNK_LATENCY_LT_500MS.load(Ordering::Relaxed);
+    let ch_b = diag::CHUNK_LATENCY_500MS_2S.load(Ordering::Relaxed);
+    let ch_c = diag::CHUNK_LATENCY_2_5S.load(Ordering::Relaxed);
+    let ch_d = diag::CHUNK_LATENCY_5_15S.load(Ordering::Relaxed);
+    let ch_e = diag::CHUNK_LATENCY_GT_15S.load(Ordering::Relaxed);
+    let ch_total = ch_a + ch_b + ch_c + ch_d + ch_e;
+    if ch_total > 0 {
+        eprintln!(
+            "chunk-latency: <500ms={} 500ms-2s={} 2-5s={} 5-15s={} >15s={} (total={})",
+            ch_a, ch_b, ch_c, ch_d, ch_e, ch_total,
+        );
+    }
+    if let Ok(map) = diag::CONN_CLOSED_IO_DETAIL.lock() {
+        if !map.is_empty() {
+            // Sort descending by count so the dominant cause is first.
+            let mut rows: Vec<(&String, &u64)> = map.iter().collect();
+            rows.sort_by(|a, b| b.1.cmp(a.1));
+            let parts: Vec<String> = rows
+                .iter()
+                .map(|(k, v)| format!("{}={}", k, v))
+                .collect();
+            eprintln!("conn-closed-io-detail: {}", parts.join(" "));
+        }
     }
 }
 
@@ -452,6 +799,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_substream_upgrades: cli.substream_upgrade_cap,
     };
     let doh = Doh::with_url(&cli.doh_url);
+
+    // Build SWAP config once if a chequebook is provided; reused across
+    // all `Transport`s spawned by subcommands below. Failing to parse
+    // any of the user-supplied values is a fatal CLI error — we'd
+    // rather refuse to start than silently downgrade to
+    // pseudosettle-only when the user expected to pay.
+    let swap_cfg = if let Some(cb_hex) = cli.chequebook.as_ref() {
+        let cb = parse_address_hex(cb_hex)
+            .map_err(|e| format!("--chequebook: {e}"))?;
+        let per_peer_cap = alloy_primitives::U256::from_str_radix(
+            cli.chequebook_per_peer_cap_bzz.trim_start_matches("0x"),
+            if cli.chequebook_per_peer_cap_bzz.starts_with("0x") { 16 } else { 10 },
+        )
+        .map_err(|e| format!("--chequebook-per-peer-cap-bzz: {e}"))?;
+        let store = isheika::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
+            .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
+        eprintln!(
+            "swap: chequebook=0x{} chain_id={} per_peer_cap_bzz={} cheques_file={}",
+            hex::encode(cb),
+            cli.chequebook_chain_id,
+            per_peer_cap,
+            cli.cheques_file.display(),
+        );
+        Some(isheika::transport::SwapConfig {
+            chequebook: cb,
+            chain_id: cli.chequebook_chain_id,
+            max_cumulative_per_peer_bzz: per_peer_cap,
+            store: std::sync::Arc::new(tokio::sync::Mutex::new(store)),
+        })
+    } else {
+        None
+    };
 
     match cli.command {
         Commands::Discover { peer, output, wait, append, rounds, discover_concurrency, healthcheck, healthcheck_concurrency } => {
@@ -597,7 +976,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     index_document: index_document.clone(),
                     error_document: error_document.clone(),
                 });
+                // Time the daemon round-trip end-to-end on the client
+                // side. Includes IPC and any daemon-side work; mirrors
+                // exactly what the user perceives. The daemon itself
+                // doesn't report timing, so this is the only way to
+                // get a throughput number for daemon-mode runs (used
+                // in PERFORMANCE.md A/B comparisons).
+                let upload_started = std::time::Instant::now();
                 let resp = isheika::daemon::call(&sock, &req).await?;
+                let elapsed = upload_started.elapsed();
                 match resp {
                     isheika::daemon::Response::Uploaded { root, bytes } => {
                         let cid = root_hex_to_cid(&root);
@@ -606,6 +993,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             println!("bzz.limo:   https://bzz.limo/bzz/{root}/");
                             println!("subdomain:  https://{c}.bzz.limo/");
                         }
+                        print_upload_throughput(bytes, elapsed);
                         return Ok(());
                     }
                     isheika::daemon::Response::Err { message } => {
@@ -615,8 +1003,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            let signer = SwarmSigner::from_hex(&key, cli.network_id)?;
-            let transport = Transport::new(signer.clone(), cfg);
+            // Load (or create) a stable overlay nonce. See the
+            // `--nonce-file` CLI documentation and the bee-citizenship
+            // notes in `signer::from_bytes_with_nonce` for why this
+            // matters for upload throughput on long-running peer sets.
+            let nonce = load_or_create_nonce(&cli.nonce_file)?;
+            let signer = SwarmSigner::from_hex_with_nonce(
+                &key,
+                &format!("0x{}", hex::encode(nonce)),
+                cli.network_id,
+            )?;
+            // Attach SWAP if configured. We don't validate that the
+            // signer's Ethereum address matches the chequebook's
+            // on-chain `issuer()` — that requires an RPC call we
+            // intentionally don't make (see PERFORMANCE.md SWAP scope).
+            // If they don't match, every cheque bee receives will fail
+            // `chequestore.go:160 issuer != expectedIssuer` and reset
+            // the swap substream; you'll see this in the
+            // `cheque_failed` diag counter.
+            // Always attach a default status snapshot. Bee opens
+            // `/swarm/status/1.1.0/status` over our outbound
+            // connections via its `pkg/salud` worker; if we don't
+            // respond, bee marks us Unhealthy and we get
+            // preferentially disconnected via the kademlia bin-prune
+            // path (`pkg/topology/kademlia/kademlia.go:700-704`).
+            // The default snapshot uses best-effort plausible values
+            // for the percentile-gated fields (see
+            // `protocols::status::StatusSnapshot::default`).
+            let status_snapshot = isheika::protocols::status::StatusSnapshot::default();
+            let transport = match swap_cfg.clone() {
+                Some(sc) => Transport::new(signer.clone(), cfg)
+                    .with_swap(sc)
+                    .with_status_snapshot(status_snapshot),
+                None => Transport::new(signer.clone(), cfg).with_status_snapshot(status_snapshot),
+            };
             let mut peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!("peerlist {} is empty", peerlist.display()).into());
@@ -676,6 +1096,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             let data = std::fs::read(&file)?;
+            // Wall-clock for "real upload time" — covers stamp +
+            // dispatch + wait-for-final-receipt. Reported alongside
+            // throughput so the user doesn't need to wrap with
+            // `time`. Captured here (not inside the library) so we
+            // don't need to thread a return-time through every
+            // `upload_*` signature.
+            let upload_started = std::time::Instant::now();
             if raw {
                 let progress = make_progress_bar();
                 let root = upload_bytes_ex(
@@ -691,11 +1118,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 drop(progress);
+                let elapsed = upload_started.elapsed();
                 let root_hex = hex::encode(root.as_bytes());
                 println!("uploaded {} bytes — root (raw): {}", data.len(), root_hex);
                 if let Some(c) = root_hex_to_cid(&root_hex) {
                     println!("cid: {c}");
                 }
+                print_upload_throughput(data.len(), elapsed);
             } else {
                 let path = manifest_path.unwrap_or_else(|| {
                     file.file_name()
@@ -720,6 +1149,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 drop(progress);
+                let elapsed = upload_started.elapsed();
                 let display_ct = ct.as_deref().unwrap_or("-");
                 let root_hex = hex::encode(root.as_bytes());
                 println!(
@@ -731,10 +1161,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("subdomain:  https://{c}.bzz.limo/{path}");
                 }
                 println!("retrieve with: isheika fetch {root_hex} --path {path} -o {path}");
+                print_upload_throughput(data.len(), elapsed);
             }
 
             isheika::peers::apply_log(&mut peers, transport.reachability_log());
             let _ = peers.save(&peerlist);
+            // Persist cheques.json so the next run's cumulative payouts
+            // stay strictly increasing (bee rejects otherwise — see
+            // `cheques.rs` module docs).
+            if let Some(sc) = transport.swap() {
+                if let Err(e) = sc.store.lock().await.save() {
+                    eprintln!("warning: cheques.json save failed: {e}");
+                }
+            }
             print_session_retire_diag();
         }
 
@@ -759,7 +1198,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map_err(|e| format!("invalid --listen multiaddr: {e}"))?;
                     let id_hex = identity
                         .ok_or("--identity <HEX> is required when --listen is set")?;
-                    let signer = SwarmSigner::from_hex(&id_hex, cli.network_id)?;
+                    // Stable overlay nonce — same rationale as the
+                    // upload command. The daemon especially benefits
+                    // because it's the long-running configuration
+                    // most likely to accumulate kademlia memberships
+                    // over time.
+                    let nonce = load_or_create_nonce(&cli.nonce_file)?;
+                    let signer = SwarmSigner::from_hex_with_nonce(
+                        &id_hex,
+                        &format!("0x{}", hex::encode(nonce)),
+                        cli.network_id,
+                    )?;
                     let advertised = advertise
                         .map(|s| -> Result<Multiaddr, Box<dyn std::error::Error>> {
                             let base: Multiaddr = s.parse()
@@ -784,11 +1233,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         listen: ma,
                         advertise: advertised,
                         identity: signer,
+                        // Status snapshot served on inbound salud
+                        // probes. Defaults are best-effort plausible
+                        // for mainnet May 2026. Future: expose CLI
+                        // flags for the percentile-critical fields if
+                        // the defaults start failing.
+                        status_snapshot:
+                            isheika::protocols::status::StatusSnapshot::default(),
                     })
                 }
                 None => None,
             };
 
+            let doh = Doh::with_url(&cli.doh_url);
+            let bootnode: Multiaddr = MAINNET_BOOTNODE.parse()?;
             isheika::daemon::run(
                 socket,
                 peerlist,
@@ -797,10 +1255,242 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_secs(cli.dial_timeout),
                 Duration::from_secs(cli.timeout),
                 listen_cfg,
+                swap_cfg.clone(),
+                Some((doh, bootnode)),
             )
             .await?;
         }
 
+        Commands::VanityOverlay {
+            key,
+            target_overlay,
+            peerlist,
+            target_po,
+            min_coverage,
+            output,
+            max_attempts,
+            network_id,
+        } => {
+            use isheika::signer::derive_overlay;
+            use isheika::transport::proximity;
+            use alloy_signer_local::PrivateKeySigner;
+
+            // Derive our eth_address from the key — this is the input
+            // half of the overlay hash that's fixed by our identity.
+            let key_bytes = hex::decode(key.trim_start_matches("0x"))?;
+            if key_bytes.len() != 32 {
+                return Err(format!("key must be 32 bytes hex, got {}", key_bytes.len()).into());
+            }
+            let signing_key = PrivateKeySigner::from_slice(&key_bytes)?;
+            let eth_address: [u8; 20] = signing_key.address().0.0;
+            eprintln!(
+                "vanity-overlay: eth_address={} network_id={} target_po={}",
+                hex::encode(eth_address),
+                network_id,
+                target_po,
+            );
+
+            // Three distinct search modes:
+            //
+            // - **anchored / multi-target** (`--target-overlay` set
+            //   one or more times): maximize the *minimum* PO across
+            //   the listed targets. Anchors us near a specific
+            //   peer or cluster of peers. Search cost: ~2^(k×n) for
+            //   PO=k across n targets if the targets are far apart;
+            //   much cheaper if the targets are themselves close.
+            //
+            // - **coverage** (no `--target-overlay`, uses peers.json):
+            //   maximize the count of peers at PO≥target. Bounded
+            //   by uniform expectation `N × 2^-target_po`; the best
+            //   we can do is ~2-3× that.
+            let parsed_targets: Vec<[u8; 32]> = target_overlay
+                .iter()
+                .map(|hex_addr| {
+                    let bytes = hex::decode(hex_addr.trim_start_matches("0x"))?;
+                    if bytes.len() != 32 {
+                        return Err(format!(
+                            "target-overlay must be 32 bytes hex, got {}",
+                            bytes.len()
+                        )
+                        .into());
+                    }
+                    let mut a = [0u8; 32];
+                    a.copy_from_slice(&bytes);
+                    Ok::<_, Box<dyn std::error::Error>>(a)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+
+            let (targets, anchored_mode): (Vec<[u8; 32]>, bool) = if !parsed_targets.is_empty() {
+                eprintln!(
+                    "vanity-overlay: anchored mode, {} target(s):",
+                    parsed_targets.len()
+                );
+                for (i, t) in parsed_targets.iter().enumerate() {
+                    eprintln!("  [{}] {}", i, hex::encode(t));
+                }
+                (parsed_targets, true)
+            } else {
+                let store = isheika::PeerStore::load_or_create(&peerlist);
+                let peers: Vec<[u8; 32]> = store
+                    .iter()
+                    .filter_map(|p| {
+                        let bytes = hex::decode(p.overlay.trim_start_matches("0x")).ok()?;
+                        if bytes.len() != 32 {
+                            return None;
+                        }
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&bytes);
+                        Some(a)
+                    })
+                    .collect();
+                if peers.len() < 50 {
+                    eprintln!(
+                        "warning: peers.json has only {} peers — run `discover` first for a meaningful coverage-mode search",
+                        peers.len()
+                    );
+                }
+                eprintln!(
+                    "vanity-overlay: coverage mode against {} target peers (min-coverage={:.2})",
+                    peers.len(), min_coverage
+                );
+                (peers, false)
+            };
+
+            let min_matches = if anchored_mode {
+                targets.len() // anchored: need all targets at PO≥target
+            } else {
+                ((targets.len() as f64) * min_coverage) as usize
+            };
+
+            // Brute-force search. nonce is just a counter we serialize
+            // into 32 bytes; no need for randomness (the hash diffuses
+            // any sequential pattern). Counter-based is also
+            // reproducible — same key + same target list → same
+            // winning nonce.
+            let start = std::time::Instant::now();
+            // For anchored mode, we score on the *minimum* PO across
+            // the target set (we want EVERY anchor to be reachable in
+            // its deep bin). For coverage mode, we score on the
+            // count of peers ≥ target_po.
+            let mut best_score = 0i64;
+            let mut best_min_po = 0u8;
+            let mut best_matches = 0usize;
+            let mut best_nonce = [0u8; 32];
+            let mut best_overlay = [0u8; 32];
+            for attempt in 0..max_attempts {
+                let mut nonce = [0u8; 32];
+                nonce[..8].copy_from_slice(&attempt.to_le_bytes());
+                nonce[8..16].copy_from_slice(&attempt.to_le_bytes());
+                nonce[16..24].copy_from_slice(&attempt.to_le_bytes());
+                nonce[24..32].copy_from_slice(&attempt.to_le_bytes());
+
+                let overlay = derive_overlay(&eth_address, network_id, &nonce);
+                let mut matches = 0usize;
+                let mut min_po = u8::MAX;
+                for p in &targets {
+                    let po = proximity(&overlay, p);
+                    if po >= target_po {
+                        matches += 1;
+                    }
+                    if po < min_po {
+                        min_po = po;
+                    }
+                }
+
+                // Score: for anchored, sum of POs (rewards lifting
+                // weak links). For coverage, just the match count.
+                let score: i64 = if anchored_mode {
+                    targets.iter().map(|p| proximity(&overlay, p) as i64).sum()
+                } else {
+                    matches as i64
+                };
+
+                if score > best_score {
+                    best_score = score;
+                    best_min_po = min_po;
+                    best_matches = matches;
+                    best_nonce = nonce;
+                    best_overlay = overlay;
+                    let elapsed = start.elapsed();
+                    if anchored_mode {
+                        // Print per-target PO for visibility.
+                        let pos: Vec<u8> =
+                            targets.iter().map(|p| proximity(&overlay, p)).collect();
+                        eprintln!(
+                            "vanity-overlay: attempt {} ({:.0} k/s): overlay={} → POs={:?} min={}",
+                            attempt + 1,
+                            (attempt as f64 + 1.0) / elapsed.as_secs_f64() / 1000.0,
+                            hex::encode(overlay),
+                            pos,
+                            min_po
+                        );
+                    } else {
+                        eprintln!(
+                            "vanity-overlay: attempt {} ({:.0} k/s): overlay={} → {} peers at PO≥{} ({:.1}%)",
+                            attempt + 1,
+                            (attempt as f64 + 1.0) / elapsed.as_secs_f64() / 1000.0,
+                            hex::encode(overlay),
+                            matches,
+                            target_po,
+                            100.0 * matches as f64 / targets.len() as f64
+                        );
+                    }
+                    let done = if anchored_mode {
+                        min_po >= target_po
+                    } else {
+                        matches >= min_matches
+                    };
+                    if done {
+                        eprintln!(
+                            "vanity-overlay: target reached after {} attempts in {:.1}s",
+                            attempt + 1,
+                            elapsed.as_secs_f64()
+                        );
+                        break;
+                    }
+                }
+                if attempt > 0 && attempt % 1_000_000 == 0 {
+                    eprintln!(
+                        "vanity-overlay: progress {}/{} ({:.0} k/s) — best matches={} min_po={} score={}",
+                        attempt,
+                        max_attempts,
+                        (attempt as f64) / start.elapsed().as_secs_f64() / 1000.0,
+                        best_matches,
+                        best_min_po,
+                        best_score,
+                    );
+                }
+            }
+
+            if best_matches == 0 && best_min_po == 0 {
+                return Err("vanity-overlay: no overlay matched — try lower --target-po".into());
+            }
+            std::fs::write(&output, hex::encode(best_nonce))?;
+            if anchored_mode {
+                let pos: Vec<u8> = targets
+                    .iter()
+                    .map(|p| proximity(&best_overlay, p))
+                    .collect();
+                println!(
+                    "wrote {} → nonce={} overlay={} (POs={:?}, min={})",
+                    output.display(),
+                    hex::encode(best_nonce),
+                    hex::encode(best_overlay),
+                    pos,
+                    best_min_po,
+                );
+            } else {
+                println!(
+                    "wrote {} → nonce={} overlay={} ({} peers at PO≥{} = {:.1}%)",
+                    output.display(),
+                    hex::encode(best_nonce),
+                    hex::encode(best_overlay),
+                    best_matches,
+                    target_po,
+                    100.0 * best_matches as f64 / targets.len() as f64
+                );
+            }
+        }
     }
 
     Ok(())

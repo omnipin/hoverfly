@@ -38,6 +38,21 @@ pub struct HandshakeResult {
     pub peer_eth_signature: Vec<u8>,
     pub peer_full_node: bool,
     pub peer_nonce: Vec<u8>,
+    /// Recovered 20-byte Ethereum address of the peer (their cheque
+    /// beneficiary). `None` if recovery failed (malformed signature);
+    /// SWAP cheque issuance is skipped in that case.
+    pub peer_eth_address: Option<[u8; 20]>,
+    /// The multiaddr bytes WE sent as our own underlay in the Ack.
+    /// Mirrors what bee stored in its addressbook for us. Needed for
+    /// outbound hive announcement so we send a self-BzzAddress
+    /// whose signature matches bee's verification expectation. See
+    /// `protocols::hive::announce_self`.
+    pub our_underlay: Vec<u8>,
+    /// 65-byte EIP-191 signature over our handshake payload. Stored
+    /// alongside `our_underlay` so the caller can rebuild the same
+    /// `BzzAddress { underlay, signature, overlay, nonce }` we sent
+    /// in the Ack, without recomputing the signature.
+    pub our_signature: Vec<u8>,
 }
 
 /// Run the bee handshake on an open libp2p stream.
@@ -89,7 +104,7 @@ where
     };
     let our_signature = signer.sign_handshake(&our_underlay)?;
     let our_addr = pb::BzzAddress {
-        underlay: our_underlay,
+        underlay: our_underlay.clone(),
         signature: our_signature.to_vec(),
         overlay: signer.overlay().to_vec(),
     };
@@ -111,12 +126,27 @@ where
         arr
     };
 
+    // Recover the peer's Ethereum address from the BzzAddress
+    // signature so we can use it as the cheque beneficiary later.
+    // Best-effort: a malformed signature shouldn't fail the handshake
+    // (the peer is otherwise usable for pseudosettle-only).
+    let peer_eth_address = crate::signer::recover_eth_address_from_handshake(
+        &their_addr.underlay,
+        &peer_overlay,
+        network_id,
+        &their_addr.signature,
+    )
+    .ok();
+
     Ok(HandshakeResult {
         peer_overlay,
         peer_underlay: their_addr.underlay,
         peer_eth_signature: their_addr.signature,
         peer_full_node: their_ack.full_node,
         peer_nonce: their_ack.nonce,
+        peer_eth_address,
+        our_underlay,
+        our_signature: our_signature.to_vec(),
     })
 }
 

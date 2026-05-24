@@ -69,6 +69,56 @@ where
     Ok(out)
 }
 
+/// A BzzAddress encoded for the wire (overlay + underlay + signature
+/// + nonce). Built once per session by the caller from the
+/// `HandshakeResult` of our outbound bee handshake (where signature
+/// and nonce are produced) plus our advertised underlay.
+#[derive(Clone, Debug)]
+pub struct OwnBzzAddress {
+    pub overlay: Vec<u8>,
+    pub underlay: Vec<u8>,
+    pub signature: Vec<u8>,
+    pub nonce: Vec<u8>,
+}
+
+/// Open the hive stream to bee as DIALER and broadcast ourselves.
+/// Bee's `peersHandler` reads one `Peers` envelope, verifies each
+/// announced address by dial-probing it, and adds successfully
+/// verified entries to its `knownPeers`. From `knownPeers` the
+/// manage loop may later dial us OUTBOUND, which admits us to
+/// kademlia with `forceConnection=true` — bypassing the
+/// bin-saturation check that rejects normal inbound clients.
+///
+/// This is the key bee-citizenship lever: a stable overlay (see
+/// `SwarmSigner::from_bytes_with_nonce`) plus active hive
+/// announcement causes the network to *remember* us, so bees
+/// progressively dial us in over time and we accumulate kademlia
+/// membership beyond what a single-session client could ever build.
+///
+/// Bee's libp2p framework runs `sendHeaders` automatically on the
+/// dialer side: we write empty request headers, read empty response
+/// headers, then write the actual `Peers` message. Mirrors what
+/// `pkg/p2p/libp2p/headers.go::sendHeaders` does internally.
+pub async fn announce_self<S>(stream: &mut S, me: &OwnBzzAddress) -> Result<(), HiveError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    // Framework preamble: empty headers exchange.
+    write_message(stream, &hdr::Headers { headers: vec![] }).await?;
+    let _: hdr::Headers = read_message(stream).await?;
+
+    let envelope = pb::Peers {
+        peers: vec![pb::BzzAddress {
+            overlay: me.overlay.clone(),
+            underlay: me.underlay.clone(),
+            signature: me.signature.clone(),
+            nonce: me.nonce.clone(),
+        }],
+    };
+    write_message(stream, &envelope).await?;
+    Ok(())
+}
+
 /// Server-side hive: bee opens an inbound `peers` stream to us
 /// expecting an empty `Peers` envelope (or our list of known peers).
 /// We respond with an empty list — bee's hive lets us indicate "I

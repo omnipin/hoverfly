@@ -10,6 +10,9 @@ pub mod pricing;
 pub mod retrieval;
 pub mod pushsync;
 pub mod pseudosettle;
+pub mod pullsync;
+pub mod status;
+pub mod swap;
 
 pub mod framing;
 

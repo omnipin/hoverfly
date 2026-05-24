@@ -33,8 +33,16 @@ nectar-postage-issuer = { git = "https://github.com/nxm-rs/nectar", rev = "650e6
 
 # alloy crypto (matches nectar's signer)
 alloy-primitives = { version = "1.5.4", default-features = false, features = ["getrandom"] }
-alloy-signer = { version = "1.5.2", default-features = false }
+alloy-signer = { version = "1.5.2", default-features = false, features = ["eip712"] }
 alloy-signer-local = { version = "1.5.2", default-features = false }
+# alloy-sol-types is pulled transitively but we depend on its `sol!` macro
+# and `Eip712Domain` / `SolStruct` directly for cheque signing. Keep it
+# default-features-off for the same wasm-getrandom reasons as the rest of
+# the alloy stack.
+alloy-sol-types = { version = "1.5", default-features = false }
+# JSON-encodes `[]byte` as base64-STANDARD; needed for cheque wire
+# compatibility with bee (`SignedCheque.Signature` field).
+base64 = { version = "0.22", default-features = false, features = ["alloc"] }
 
 # Wire protocols
 prost = "0.13"

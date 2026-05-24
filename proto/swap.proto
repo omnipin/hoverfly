@@ -1,0 +1,26 @@
+// Bee SWAP protocol — `/swarm/swap/1.0.0/swap`.
+//
+// Wire-compatible with bee's `pkg/settlement/swap/swapprotocol/pb/swap.proto`.
+// The `Cheque` field of `EmitCheque` is a JSON-encoded `SignedCheque`
+// (bee uses JSON: "for simplicity we use json marshaller. can be
+// replaced by a binary encoding in the future." —
+// swapprotocol.go:230).
+
+syntax = "proto3";
+
+package swap;
+
+// Sent once per peer connection (ConnectIn/ConnectOut) to advertise
+// the Ethereum address that owns/controls the cheques we issue. On
+// bee's side this populates `Swap.Handshake(peer, beneficiary)`.
+message Handshake {
+    bytes Beneficiary = 1;
+}
+
+// Sent on a fresh `swap` substream every time we want to pay a peer.
+// `Cheque` is JSON of `chequebook.SignedCheque{Chequebook, Beneficiary,
+// CumulativePayout, Signature}`. The receiver verifies the EIP-712
+// signature recovers to `chequebook.issuer()` (on-chain).
+message EmitCheque {
+    bytes Cheque = 1;
+}
