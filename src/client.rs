@@ -55,6 +55,17 @@ pub enum ClientError {
     NoPeers(String),
     #[error("invalid batch id length: {0}")]
     BadBatchLen(usize),
+    /// Bee peers reject every chunk push with
+    /// `invalid stamp: batchstore get: ... storage: not found`,
+    /// meaning the postage batch isn't known on-chain (or has expired,
+    /// or the per-chunk balance ran out under the price oracle). No
+    /// number of retries against other peers will help — they all read
+    /// from the same batchstore replication. We detect the first such
+    /// response and abort the upload immediately so the user gets a
+    /// clear error in seconds instead of MAX_CHUNK_RETRIES × 500 ms ×
+    /// chunk_count of wasted retries.
+    #[error("batch not on-chain or expired: {0}")]
+    BatchNotFound(String),
     #[error("stamp: {0}")]
     Stamp(String),
     #[error("manifest: {0}")]
@@ -71,6 +82,22 @@ impl From<nectar_primitives::file::FileError> for ClientError {
     fn from(e: nectar_primitives::file::FileError) -> Self {
         Self::File(e.to_string())
     }
+}
+
+/// Recognise bee's batchstore-not-found error so the dispatcher can
+/// fast-fail an upload instead of running MAX_CHUNK_RETRIES against
+/// every peer. The bee error message ends up wrapped as
+/// `TransportError::Pushsync(PushsyncError::Peer("invalid stamp:
+/// batchstore get: get batch <hex>: storage: not found, not found"))`.
+/// We match on the two stable substrings (`batchstore get` + `storage:
+/// not found`) — they straddle the batch hex and bee's internal error
+/// chain formatting that could change between versions.
+fn is_batch_not_found(e: &TransportError) -> bool {
+    use crate::protocols::pushsync::PushsyncError;
+    let TransportError::Pushsync(PushsyncError::Peer(msg)) = e else {
+        return false;
+    };
+    msg.contains("batchstore get") && msg.contains("storage: not found")
 }
 
 /// Default number of peers raced in parallel per chunk fetch. Each peer
@@ -2071,6 +2098,18 @@ pub async fn push_chunks_with_pool(
                 return Ok::<_, ClientError>(());
             }
 
+            // Fast-fail when every peer rejects the batch. Bee peers
+            // share a replicated batchstore (postage events from the
+            // chain), so if ONE peer reports `invalid stamp: batchstore
+            // get: ... storage: not found`, every other peer will too.
+            // Bail out as a fatal `BatchNotFound` rather than burning
+            // MAX_CHUNK_RETRIES × 500 ms × chunk_count on doomed
+            // retries — the user gets a clear error in <1 s.
+            if let Some(ref e) = last_err {
+                if is_batch_not_found(e) {
+                    return Err(ClientError::BatchNotFound(e.to_string()));
+                }
+            }
             Err(ClientError::NoPeers(format!(
                 "all {} attempts failed ({} overdraft, {} shallow, {} err): {}",
                 cap,
@@ -2281,6 +2320,20 @@ pub async fn push_chunks_with_pool(
                         } else {
                             more_chunks = false;
                         }
+                    }
+                    // Don't retry batch-not-found: the batch is either
+                    // expired, never paid into the chain, or its
+                    // per-chunk balance was drained by the price
+                    // oracle. Every bee shares the same batchstore
+                    // gossip, so retrying against more peers cannot
+                    // change the answer. Surface the typed error so
+                    // the upload caller can present it cleanly.
+                    Err(e @ ClientError::BatchNotFound(_)) => {
+                        warn!(target: "isheika::upload",
+                            "batch not found on-chain — aborting upload after {}/{} chunks pushed: {}",
+                            pushed.load(Ordering::Relaxed), total, e);
+                        first_err = Some(e);
+                        break;
                     }
                     Err(e) if attempts + 1 < MAX_CHUNK_RETRIES => {
                         // Per-chunk pusher-layer retry. The proximity-
