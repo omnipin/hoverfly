@@ -344,15 +344,17 @@ at a given configuration.
 | VPS, **`--concurrency 512 --buffer-multiplier 4`** + 3335 peers | **~1.05 MB/s** |
 | VPS, daemon + vanity overlay (PO=10 single-target), pool=64 | ~194 KiB/s median, 282 best |
 | VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | ~515 KiB/s median, 557 best |
-| VPS, all of the above + **`--pool-size 128 --buffer-multiplier 2`** | **~665 KiB/s median, 954 best** |
+| VPS, all of the above + **`--pool-size 128 --buffer-multiplier 2`** | ~665 KiB/s median, 954 best |
+| VPS, all of the above + **latency-aware cap** + `--pool-size 256` | **~827 KiB/s median, 1106 best (1.08 MiB/s)** |
 
 For context, bee-light reports ~822 KiB/s on the same 5 MiB random
 upload — but that's its `deferred-upload` time which returns ~22×
 faster than chunks are actually retrievable (see "Bee-vs-isheika
 end-to-end comparison" below). On a fully-durable-receipt basis
-(we wait for every receipt before returning) our 665 KiB/s median
-**exceeds** bee-light's real ~320 KiB/s durable rate, and our
-954 KiB/s best beats bee-light's reported deferred-upload number.
+(we wait for every receipt before returning) our **827 KiB/s
+median beats bee-light's own reported deferred-upload number**,
+and our 1.08 MiB/s best beats it by ~38%. Against bee-light's
+real ~320 KiB/s durable rate, our median is ~2.6×.
 
 ### Recommended config (mid-2026)
 
@@ -363,21 +365,31 @@ For daemon mode on a VPS with a reasonable upload workload:
       --buffer-multiplier 2 \
       daemon \
       --socket /tmp/isheika.sock \
-      --pool-size 128 \
+      --pool-size 256 \
       --listen /ip4/0.0.0.0/tcp/1635 \
       --identity 0xYOUR_KEY \
       --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635
 
 Key knobs:
-- `--pool-size 128` doubles the candidate peer pool (more high-PO
-  candidates, better fan-out under cap).
+- `--pool-size 256` quadruples the candidate peer pool vs the
+  pre-cap default of 64. More candidates → fan-out is wider →
+  latency-aware cap can pick fast peers more easily.
 - `--buffer-multiplier 2` doubles in-flight chunks (128 → 256), so
   the dispatcher can keep more sessions saturated within their
   per-peer in-flight cap.
-- `IN_FLIGHT_CAP=4` (hardcoded) keeps per-peer concurrent debt
-  under bee's per-peer refresh rate.
+- **Latency-aware `inflight_cap()`** (hardcoded in `SessionEntry`):
+  cap = 8 for fast peers (EWMA < 200ms), 4 for medium, 2 for slow
+  (EWMA ≥ 2s). Concentrates load on proven-fast peers without
+  inflating yamux contention.
 - Stable overlay + vanity nonce + `--listen --advertise` are
   prerequisites for the citizenship-adjacent behavior bee expects.
+
+Cold-start cost: pool=256 takes ~80 s to fill vs ~30 s for pool=128
+on the residential VPS we test on. For daemon mode this only
+matters once per daemon-lifetime — the eager pool fill runs in
+the background before the first upload arrives, so it's invisible
+to the first request unless you start the daemon and upload
+immediately.
 
 The earliest version of this doc claimed "~150 KiB/s is the protocol
 floor". That claim was wrong; it was a measurement at one
