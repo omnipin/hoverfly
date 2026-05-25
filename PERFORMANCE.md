@@ -146,10 +146,22 @@ discipline, and graceful failure handling.
 
 ### Per-chunk dispatch
 
-- **Proximity-sorted candidate list.** Each chunk's dispatcher walks
-  sessions in descending PO to the chunk address (`client.rs:1366`),
-  so the closest peer (often inside the chunk's AOR) is tried first;
-  bee stores directly without forwarding.
+- **3-bucket storage-radius-aware sort.** Each chunk's dispatcher
+  ranks pool entries into three buckets, then by descending PO
+  to the chunk address within each bucket:
+
+  | Bucket | Entry classification |
+  |---|---|
+  | 0 (front) | confirmed in-AOR storer (`storage_radius ≤ chunk_PO`) |
+  | 1 (middle) | unknown (no observation yet — fresh session) |
+  | 2 (back) | confirmed forwarder for this PO range |
+
+  Earlier the same 3-bucket design regressed ~1.6× because
+  "unknown" was contaminated with slow/NAT'd/dead peers. The mid-
+  2026 stack pre-filters those out (`is_dead`, cooldown filter,
+  `inflight_cap`) so "unknown" is now a clean pool of fresh
+  sessions — worth trying ahead of known forwarders. Empirically
+  bumps median +28% on a pool=256 setup (827 → 1055 KiB/s).
 - **In-flight buffer.** `buffer = 128.min(total).max(pool.len())`
   (`client.rs:1315`). Sized to match bee's pusher
   `ConcurrentPushes = swarm.Branches = 128`. Earlier `pool × 16` was
@@ -223,6 +235,24 @@ discipline, and graceful failure handling.
   temporarily at cap, chunk waits 500ms and retries". Acceptable
   trade: the upload still finishes in 9-12 s for 5 MiB instead of
   22-35 s.
+
+  **Cap composes with two extensions** (each commit-and-measured):
+
+  | Stack | Median KiB/s | Best |
+  |---|---:|---:|
+  | uniform `cap=4`, pool=64 | 515 | 557 |
+  | + `--pool-size 128 --buffer-multiplier 2` | 665 | 954 |
+  | + latency-aware `inflight_cap()` + `--pool-size 256` | 827 | 1106 |
+  | + 3-bucket AOR sort | **1055** | **1075** |
+
+  Latency-aware cap: fast peers (EWMA < 200ms) get cap=8, medium
+  cap=4, slow (EWMA ≥ 2s) cap=2. Slow peers self-throttle without
+  the dispatcher having to model them explicitly.
+
+  3-bucket sort: confirmed in-AOR storers first, unknown next,
+  confirmed forwarders last. Sends chunks to the most likely
+  storer in fewer hops; only fall back to known forwarders when
+  the front-of-line candidates are saturated or dead.
 
 ### Accounting + connection lifecycle
 
@@ -345,16 +375,17 @@ at a given configuration.
 | VPS, daemon + vanity overlay (PO=10 single-target), pool=64 | ~194 KiB/s median, 282 best |
 | VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | ~515 KiB/s median, 557 best |
 | VPS, all of the above + **`--pool-size 128 --buffer-multiplier 2`** | ~665 KiB/s median, 954 best |
-| VPS, all of the above + **latency-aware cap** + `--pool-size 256` | **~827 KiB/s median, 1106 best (1.08 MiB/s)** |
+| VPS, all of the above + **latency-aware cap** + `--pool-size 256` | ~827 KiB/s median, 1106 best (1.08 MiB/s) |
+| VPS, all of the above + **3-bucket storage-radius sort** | **~1055 KiB/s median (1.03 MiB/s), 1075 best** |
 
 For context, bee-light reports ~822 KiB/s on the same 5 MiB random
 upload — but that's its `deferred-upload` time which returns ~22×
 faster than chunks are actually retrievable (see "Bee-vs-isheika
 end-to-end comparison" below). On a fully-durable-receipt basis
-(we wait for every receipt before returning) our **827 KiB/s
-median beats bee-light's own reported deferred-upload number**,
-and our 1.08 MiB/s best beats it by ~38%. Against bee-light's
-real ~320 KiB/s durable rate, our median is ~2.6×.
+(we wait for every receipt before returning) our **1.03 MiB/s
+median beats bee-light's own reported deferred-upload number by
+~28%**, and our 1.05 MiB/s best by ~33%. Against bee-light's real
+~320 KiB/s durable rate, our median is ~3.3×.
 
 ### Recommended config (mid-2026)
 
