@@ -170,10 +170,59 @@ discipline, and graceful failure handling.
   retries the closest-N peers, since pseudosettle has had a chance to
   refresh credit on each. Distinguished from error-fallback so we
   don't burn the sleep when the issue is actually network failure.
-- **Single-attempt per peer per chunk.** `CHUNK_PEER_PARALLELISM = 1`
-  (`client.rs:1324`). An earlier per-chunk 3-way peer race tripled
-  session-mutex pressure and slowed the tail; shallow-retry already
-  handles the case where the chosen peer isn't a real AOR storer.
+- **Per-chunk 3-way peer race.** `CHUNK_PEER_PARALLELISM = 3`
+  (`client.rs:1813`). Each chunk dispatches to the top-3 closest
+  peers concurrently; the first valid receipt wins, the losers
+  finish their accounting silently in the background. Mid-2026
+  reversal of an earlier "single-attempt" finding: with the
+  pipeline buffer now hard-capped at 128 (was `pool × 16` = 1.5k+
+  in flight), session-mutex pressure no longer dominates the tail,
+  and racing collapses the per-chunk RTT from N peers' worth of
+  serial walks to roughly one peer's RTT for most chunks. Wire-cost
+  trade is ~3× pushes per chunk, but bee credits all 3 hops, so it
+  pays for ~2-3× throughput. See "Per-peer in-flight cap" below for
+  the load-distribution fix that makes this work without
+  saturating top-PO peers.
+- **Per-peer in-flight cap** (`client.rs:1505 IN_FLIGHT_CAP = 4`).
+  Each pool entry tracks live concurrent pushes via an atomic
+  counter (`SessionEntry.inflight_pushes`); the dispatcher's
+  `order` filter excludes entries whose count has reached the cap,
+  forcing fan-out to lower-PO peers in the same dispatch. RAII
+  guard around each push attempt keeps the counter honest under
+  cancellation. The cap value 4 is sized so per-peer push rate
+  (`4 / 60ms × 6.75K` = ~450K PLUR/s, bee's *light*-node refresh
+  rate) stays at or under bee's per-peer accounting budget even
+  during fast-RTT bursts; for full nodes it's ~10× under.
+
+  **Why this is the dominant throughput lever** (mid-2026
+  measurement on a 64-peer pool, residential VPS, multi-target
+  vanity overlay):
+
+  | Config | Median KiB/s | Best | Notes |
+  |---|---:|---:|---|
+  | No cap (buffer=128, 3-way race) | 194 | 282 | Pre-2026 baseline |
+  | **`IN_FLIGHT_CAP = 4`** | **515** | **557** | **2.66× median** |
+
+  Mechanism: without the cap, the dispatcher stacks 5-7 concurrent
+  pushes on the top-PO peers per upload — at 6.75K PLUR/chunk and
+  60ms median push latency, that's ~675K PLUR/s of debt per
+  saturated peer, well above bee's full-node refresh rate
+  (4.5M/s) for *each* peer (since accounting is per-peer, not
+  global). The peer's accounting goes into overdraft → bee returns
+  `ErrOverdraft` on subsequent pushes → dispatcher rotates →
+  effective throughput drops to refresh-rate-per-saturated-peer.
+
+  Bee-light avoids this naturally because its kademlia routes each
+  chunk to ONE neighbor per the AOR rule, spreading load across
+  all 131 connected peers. We don't have a kademlia table, but the
+  in-flight cap is a cheap approximation: forces wider fan-out
+  when top candidates are busy. After the change, the
+  `PUSH_OUTCOME_OVERDRAFT` counter goes from 18% of pushes to
+  zero. The 1398 "dispatch failed" events that remain are all
+  `(0 overdraft, 0 shallow, 0 err)` — meaning "all candidate peers
+  temporarily at cap, chunk waits 500ms and retries". Acceptable
+  trade: the upload still finishes in 9-12 s for 5 MiB instead of
+  22-35 s.
 
 ### Accounting + connection lifecycle
 
@@ -293,6 +342,16 @@ at a given configuration.
 | VPS, racing-only, 340 peers (commit `5741cf9`) | ~152 KiB/s |
 | VPS, racing + stream_pool patch + 3335 peers (5-round discover) | ~335 KiB/s |
 | VPS, **`--concurrency 512 --buffer-multiplier 4`** + 3335 peers | **~1.05 MB/s** |
+| VPS, daemon + vanity overlay (PO=10 single-target), pool=64 | ~194 KiB/s median, 282 best |
+| VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | **~515 KiB/s median, 557 best** |
+
+For context, bee-light reports ~822 KiB/s on the same 5 MiB random
+upload — but that's its `deferred-upload` time which returns ~22×
+faster than chunks are actually retrievable (see "Bee-vs-isheika
+end-to-end comparison" below). On a fully-durable-receipt basis
+(we wait for every receipt before returning) our 515 KiB/s median
+matches or slightly exceeds bee-light's real ~320 KiB/s durable
+rate.
 
 The earliest version of this doc claimed "~150 KiB/s is the protocol
 floor". That claim was wrong; it was a measurement at one
@@ -868,6 +927,13 @@ first racer), but our tail dominates the mean.
 vs. bee: ok 99%, shallow 6%, overdraft 11%. Our **overdraft rate is
 1.6× bee's**, indicating per-peer accounting is throttling us more.
 
+**Obsoleted by `IN_FLIGHT_CAP=4` (mid-2026)**: the 18% overdraft
+rate fell to zero after capping concurrent pushes per peer. See
+"Per-peer in-flight cap" in the Upload (pushsync) section. The
+diagnosis "per-peer accounting is throttling us more" was correct
+but the fix turned out to be on OUR side (limiting concurrent
+debits per peer), not bee's (negotiating higher thresholds).
+
 ### Why bee wins, in one sentence
 
 The bee node we benchmarked against is `beeMode: "light"` (per
@@ -900,6 +966,22 @@ observed in 15 min of idle daemon = roughly 24/hr admission rate).
 The fix isn't more tuning — it's **time**. Run the daemon
 continuously and let kademlia memberships accumulate. See
 "Further work #2: long-duration bee-citizenship measurement".
+
+**OBSOLETED by `IN_FLIGHT_CAP=4` (mid-2026)**: the diagnosis above
+was incorrect. Bee-light's 131 stable peers vs our churning pool
+*is* a real difference, but the throughput gap wasn't dominated by
+connection lifetime — it was dominated by per-peer accounting
+saturation during bursts. Bee-light's 131 peers naturally
+distributed load such that each peer saw maybe 1.5 pushes/sec; our
+64-peer pool with top-K-closest dispatching stacked 5-7 pushes
+concurrently on the top peers, exceeding bee's per-peer refresh
+rate (4.5M PLUR/s full-node, 450K/s light-node) and triggering
+overdrafts. A per-peer in-flight cap of 4 forces our dispatcher to
+fan out wider — same effect as kademlia routing without
+implementing kademlia. Result: 194 → 515 KiB/s median, on par
+with bee-light's *durable* throughput. The "wait hours for bee
+citizenship" plan was therefore unnecessary; the load-balance fix
+is enough.
 
 ### Tuning experiments (no fix, just calibration)
 
@@ -1138,19 +1220,18 @@ deliberately scoped out — see "Further work" #4 below.
    `--advertise` more prominent in CLI help and recommend them for
    any sustained-upload workload.
 
-2. **Long-duration bee-citizenship measurement.** Leave a
-   `daemon --listen --advertise --identity --nonce-file` running
-   for 6-12 hours, monitor `inbound connection from` log lines
-   to gauge whether bees are dialing us due to hive learning.
-   Then run an upload batch and compare to a cold-start daemon.
-   This is the test the section above couldn't run in a single
-   bench session.
+2. **~~Long-duration bee-citizenship measurement.~~** OBSOLETED by
+   `IN_FLIGHT_CAP=4` (mid-2026). The hypothesis was that bee's
+   kademlia memberships had to accumulate over hours of hive
+   announcing for us to reach bee-light throughput. Turns out the
+   real bottleneck was load distribution (we concentrated pushes on
+   top-PO peers, hitting per-peer accounting saturation), and
+   capping concurrent pushes per peer closes the gap in a single
+   benchmark session. Kept here for historical context.
 
-3. **Background pool maintenance in daemon mode.** The "daemon
-   without listen is worse than one-shot" finding above. A periodic
-   probe of pool entries (e.g. once per N seconds: pick K entries,
-   check `is_alive()`, prewarm-dial replacements for the dead ones)
-   would let the warm pool actually stay warm.
+3. **~~Background pool maintenance in daemon mode.~~** DONE. The
+   daemon now runs a 5-min tick that prunes dead entries and
+   refills from peers.json (`src/daemon.rs::maintain_pool`).
 
 4. **Peerlist freshness fixes.** See "Peerlist freshness" above.
    Shorter cache TTL or inline retry of recently-failed peers
@@ -1172,6 +1253,16 @@ deliberately scoped out — see "Further work" #4 below.
    pool+buffer-scaled upload would give real linear scaling.
    Coordinator + worker over TCP instead of Unix sockets; harder
    than the deleted local multiwork because of NAT, auth, latency.
+
+7. **Per-peer in-flight cap tuning.** The current `IN_FLIGHT_CAP=4`
+   is sized for bee-light's 450K-PLUR/s refresh rate as a worst
+   case. For full-node peers (4.5M/s refresh) the cap could be 8-16
+   without saturating; benchmarking that on a workload large
+   enough to amortize the wider concurrency might lift the ceiling
+   further. Likewise: making the cap a function of recently-observed
+   per-peer push latency (faster peer → higher cap) would let
+   genuinely fast peers carry more load without rebalancing onto
+   slow ones.
 
 ## Vanity overlay (built, measured, 2.2× over random baseline)
 
