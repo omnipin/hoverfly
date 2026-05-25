@@ -1454,6 +1454,44 @@ impl SessionEntry {
         }
     }
 
+    /// Latency-aware per-peer in-flight cap. Fast peers (proven by
+    /// their observed push EWMA) get a wider cap so they carry more
+    /// of the upload's load; slow peers get a tighter cap so their
+    /// tail latency doesn't drown the dispatcher.
+    ///
+    /// Buckets (EWMA push latency):
+    /// - 0 (unknown / fresh peer): [`IN_FLIGHT_CAP`] = 4. Default
+    ///   trust until proven otherwise.
+    /// - < 200 ms (fast — at or near bee's 60 ms median): 2 ×
+    ///   [`IN_FLIGHT_CAP`] = 8. Fast peers can handle more
+    ///   concurrent substreams without yamux contention because
+    ///   each push completes before the next stacks on.
+    /// - 200 ms – 2 s (medium): [`IN_FLIGHT_CAP`] = 4. Base cap.
+    /// - ≥ 2 s (slow tail — likely many retries, NAT'd, or
+    ///   ghost-overdrawing): [`IN_FLIGHT_CAP`] / 2 = 2. Half the
+    ///   base so the dispatcher walks past them faster when picking
+    ///   fan-out targets.
+    ///
+    /// Why this works where uniform `cap = 8` failed (590 KiB/s
+    /// median vs 665 at cap = 4): the regression was yamux substream
+    /// contention per session — running 8 simultaneous pushsync
+    /// substreams over a single connection competed for the same
+    /// yamux flow-control window. Fast peers don't have this
+    /// problem because their pushes complete quickly enough that the
+    /// 8 substreams aren't all simultaneous in practice; slow peers
+    /// do, and they're the ones we tighten here.
+    fn inflight_cap(&self) -> u32 {
+        let us = self
+            .push_latency_ewma_us
+            .load(std::sync::atomic::Ordering::Relaxed);
+        match us {
+            0 => IN_FLIGHT_CAP,
+            n if n < 200_000 => IN_FLIGHT_CAP * 2,
+            n if n < 2_000_000 => IN_FLIGHT_CAP,
+            _ => (IN_FLIGHT_CAP / 2).max(1),
+        }
+    }
+
     /// Returns whether this peer is in the chunk's AOR per our latest
     /// radius observation. `None` if no observation yet — dispatcher
     /// treats unknown as "potentially yes" rather than excluding
@@ -1892,11 +1930,13 @@ pub async fn push_chunks_with_pool(
                     if e.is_dead() {
                         return false;
                     }
-                    // Per-peer in-flight push cap. Skip peers already
-                    // saturated with concurrent pushes; the dispatcher
-                    // will spread to less-busy peers in the same PO tier.
-                    // See `IN_FLIGHT_CAP` doc-comment for the rationale.
-                    if e.inflight_pushes() >= IN_FLIGHT_CAP {
+                    // Per-peer in-flight push cap, latency-aware:
+                    // fast peers carry more load (cap ×2), slow peers
+                    // carry less (cap /2). Skip entries at their
+                    // current cap; the dispatcher fans out to
+                    // less-busy peers in the same PO tier. See
+                    // `inflight_cap()` and `IN_FLIGHT_CAP` doc-comments.
+                    if e.inflight_pushes() >= e.inflight_cap() {
                         return false;
                     }
                     let session_alive = e.snapshot().is_alive();
