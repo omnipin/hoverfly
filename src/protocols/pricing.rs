@@ -1,9 +1,14 @@
 //! Bee pricing protocol — `/swarm/pricing/1.0.0/pricing`.
 //!
 //! Both peers exchange a payment threshold after handshake. We send a
-//! sensible default (`13_500_000` PLUR, in the bee-valid range) and read
-//! the peer's threshold without acting on it — chunk fetches in this
-//! micro-client are well below any threshold.
+//! sensible default (`13_500_000` PLUR, in the bee-valid range) and
+//! read the peer's threshold without acting on it — chunk fetches in
+//! this micro-client are well below any threshold.
+//!
+//! The value MUST be ≥ bee's `minPaymentThreshold = 2 × refreshRate
+//! = 9M` for full-mode receiving peers, otherwise bee returns
+//! `ErrThresholdTooLow` and disconnects us
+//! (`pkg/pricing/pricing.go:102-105`).
 
 use crate::proto::pricing as pb;
 use crate::protocols::framing::{read_message, write_message, FrameError};
