@@ -1288,6 +1288,27 @@ struct SessionEntry {
     /// targets — peers that consistently deliver receipts are
     /// the ones we want to anchor to next time.
     push_success_count: std::sync::atomic::AtomicU64,
+    /// Live count of in-flight pushes currently dispatched to this
+    /// peer. Incremented before each push attempt, decremented when
+    /// the push future completes (success or fail). The dispatcher
+    /// skips entries whose `inflight_pushes >= IN_FLIGHT_CAP` from
+    /// the candidate list, forcing load distribution across more
+    /// peers instead of stacking many concurrent pushes on the top-
+    /// PO subset.
+    ///
+    /// Why this matters: at our buffer=128 chunks × CHUNK_PEER_PARALLELISM=3
+    /// fan-out, the same handful of "top-PO" peers gets 5-7 concurrent
+    /// pushes during bursts. Each push debits the peer ~6.75K PLUR;
+    /// bee's per-peer refresh rate (4.5M/s full, 450K/s light) is the
+    /// natural rate-limit per peer. When concurrent pushes overshoot
+    /// the per-peer refresh budget the peer's accounting goes into
+    /// overdraft → bee returns Overdraft → dispatcher rotates → tail
+    /// latency. Bee-light avoids this by routing each chunk to a
+    /// single neighbor per its kademlia AOR rule, distributing load
+    /// across all 131 connected peers. We don't have kademlia, but
+    /// the cap is a cheap approximation: it caps concurrent debt
+    /// per peer, forcing fan-out wider when a few peers saturate.
+    inflight_pushes: std::sync::atomic::AtomicU32,
 }
 
 impl SessionEntry {
@@ -1396,6 +1417,15 @@ impl SessionEntry {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Current in-flight push count on this entry. The dispatcher
+    /// reads this to skip entries already at [`IN_FLIGHT_CAP`] when
+    /// picking peers for a chunk, forcing load distribution across
+    /// more peers (closer to bee's kademlia AOR routing).
+    fn inflight_pushes(&self) -> u32 {
+        self.inflight_pushes
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Penalty (in PO units) applied to this peer's effective PO
     /// during proximity sorting, based on its push-latency EWMA.
     /// Slow peers get demoted so faster peers within the same PO
@@ -1466,6 +1496,30 @@ const DEAD_SKIP_SECS: u64 = 15;
 /// the live pool; a peer that errors three pushes in a row is
 /// genuinely broken for the moment.
 const DEAD_STRIKES: u32 = 3;
+
+/// Maximum concurrent pushes per pool entry. Capped at 4: with our
+/// CHUNK_PEER_PARALLELISM=3 fan-out and buffer=128 chunks in flight,
+/// the dispatcher would otherwise stack 5-7 concurrent pushes on the
+/// few top-PO peers per upload. At ~6.75K PLUR per chunk and 60ms
+/// median push latency, that's ~675K PLUR/s of debt per saturated
+/// peer — already overshooting bee's per-peer refresh rate (450K/s
+/// for light nodes, 4.5M/s for full nodes), causing accounting
+/// overdrafts and forcing dispatcher rotation.
+///
+/// Bee-light avoids this by routing each chunk to ONE peer per its
+/// kademlia AOR rule, distributing load across all 131 connected
+/// peers. We don't have kademlia, but capping per-peer in-flight
+/// pushes forces our dispatcher to fan out wider when the top
+/// candidates are busy. The cap value 4 is chosen as the largest
+/// number that keeps per-peer push rate (4 × 1/60ms = 67 pushes/sec
+/// × 6.75K = 450K PLUR/s) at or under the light-node refresh rate
+/// even in worst case bursts; for full nodes it's ~10× under.
+///
+/// Tradeoff: dispatcher may have to wait for a capped peer to drain
+/// before retrying that peer, but the alternative was overdraft +
+/// 500 ms retry penalty per failed dispatch, so the cap is a net
+/// improvement for typical workloads.
+const IN_FLIGHT_CAP: u32 = 4;
 
 const PREWARM_GHOST_BALANCE_PLUR: u64 =
     GHOST_BALANCE_LIMIT_PLUR * GHOST_BALANCE_PREWARM_NUMERATOR / GHOST_BALANCE_PREWARM_DENOMINATOR;
@@ -1838,6 +1892,13 @@ pub async fn push_chunks_with_pool(
                     if e.is_dead() {
                         return false;
                     }
+                    // Per-peer in-flight push cap. Skip peers already
+                    // saturated with concurrent pushes; the dispatcher
+                    // will spread to less-busy peers in the same PO tier.
+                    // See `IN_FLIGHT_CAP` doc-comment for the rationale.
+                    if e.inflight_pushes() >= IN_FLIGHT_CAP {
+                        return false;
+                    }
                     let session_alive = e.snapshot().is_alive();
                     if session_alive {
                         return true;
@@ -1904,6 +1965,22 @@ pub async fn push_chunks_with_pool(
                             Err(TransportError::ConnectionClosed),
                         );
                     }
+                    // RAII counter: increment in-flight, decrement on
+                    // drop (whether the push succeeds, errors, or the
+                    // future is cancelled by the racing dispatcher).
+                    // Keeps the per-peer cap honest under cancellation.
+                    struct InFlightGuard<'a>(&'a SessionEntry);
+                    impl<'a> Drop for InFlightGuard<'a> {
+                        fn drop(&mut self) {
+                            self.0
+                                .inflight_pushes
+                                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    entry
+                        .inflight_pushes
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _guard = InFlightGuard(&entry);
                     let outcome = try_push_with_rotation(&entry, &chunk, price, transport).await;
                     (idx, attempt_no, price, outcome)
                 }
@@ -2998,6 +3075,7 @@ async fn open_session_pool_filtered(
                     storage_radius: std::sync::atomic::AtomicU8::new(0),
                     push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
                     push_success_count: std::sync::atomic::AtomicU64::new(0),
+                    inflight_pushes: std::sync::atomic::AtomicU32::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
                     info!(target: "isheika::upload",
