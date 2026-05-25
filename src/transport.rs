@@ -45,15 +45,14 @@ pub(crate) const SWAP_PROTO: StreamProtocol = StreamProtocol::new("/swarm/swap/1
 /// See `protocols::status` docs for the rationale.
 pub(crate) const STATUS_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/status/1.1.3/status");
-/// Bee pull-sync cursor exchange. Initial neighbor handshake; bee
-/// opens this once it considers us a kademlia neighbor. We respond
-/// with all-zero cursors (no reserve). See `protocols::pullsync`.
-pub(crate) const PULLSYNC_CURSORS_PROTO: StreamProtocol =
-    StreamProtocol::new("/swarm/pullsync/1.4.0/cursors");
-/// Bee pull-sync chunk exchange. Bee asks "what chunks do you have
-/// in bin N from cursor X?"; we reply with an empty offer.
-pub(crate) const PULLSYNC_PULLSYNC_PROTO: StreamProtocol =
-    StreamProtocol::new("/swarm/pullsync/1.4.0/pullsync");
+/// Bee pull-sync protocol identifiers. We deliberately do NOT accept
+/// these substreams (see [`PeerSession::connect`] for the rationale).
+/// Kept here as documentation; the strings are referenced nowhere
+/// in the codebase after dropping the inbound responder.
+#[allow(dead_code)]
+pub(crate) const PULLSYNC_CURSORS_PROTO: &str = "/swarm/pullsync/1.4.0/cursors";
+#[allow(dead_code)]
+pub(crate) const PULLSYNC_PULLSYNC_PROTO: &str = "/swarm/pullsync/1.4.0/pullsync";
 
 /// Minimum interval between successive dials to the same peer-id.
 /// Bee's libp2p connection rate limiter
@@ -993,13 +992,32 @@ impl PeerSession {
         // drop the inbound stream after accepting it; bee sees an
         // EOF, not a protocol NACK.
         let status_in = accept(&mut control, STATUS_PROTO)?;
-        // Accept the two pullsync sub-protocols. Same rationale as
-        // STATUS_PROTO: bee opens these over outbound connections we
-        // initiated, so the per-session accept is necessary alongside
-        // the daemon inbound listener. We respond with empty cursors
-        // / empty offers — see `protocols::pullsync` module docs.
-        let pullsync_cursors_in = accept(&mut control, PULLSYNC_CURSORS_PROTO)?;
-        let pullsync_pullsync_in = accept(&mut control, PULLSYNC_PULLSYNC_PROTO)?;
+        // We deliberately do NOT accept pullsync substreams (cursors
+        // or pullsync). isheika is an upload client, not a reserve
+        // maintainer — we have no chunks to offer back. Earlier we
+        // accepted both and responded with empty cursors / empty
+        // offers to "look like a citizen", but:
+        //
+        //  - Salud doesn't probe pullsync (only the status protocol),
+        //    so empty offers don't help health checks.
+        //  - Bee's puller runs a live-sync worker per bin per
+        //    connected peer that loops as fast as our response
+        //    arrives. Empty offers are cheap to respond to but bee
+        //    immediately re-asks → constant noise, no rate limit
+        //    backpressure on bee's side because `WaitN(ctx, 0)` is
+        //    instant.
+        //  - Honest rejection (no accept → bee gets multistream
+        //    ErrNotSupported → bee's `IncompatibleStreamError`) is
+        //    handled by bee's puller as a regular error and just
+        //    logged. Bee doesn't escalate to disconnect/blocklist,
+        //    so our outbound session survives.
+        //
+        // Net: dropping pullsync acceptance saves CPU and memory
+        // (no per-substream tokio task) without throughput penalty.
+        // The bee-light pattern (`p2p.WithBlocklistStreams` at
+        // pkg/node/node.go:1057-1059) doesn't apply directly because
+        // bee-light DISCONNECTS the requester; we can't afford to
+        // burn our outbound connection for each unwanted pullsync.
         dial(&mut swarm, peer_id, peer_addr)?;
         let underlay = prep_connection(&mut swarm, peer_id, transport.config.dial_timeout).await?;
         #[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
@@ -1151,23 +1169,6 @@ impl PeerSession {
             _hive_in: hive_in,
             status_in,
             status_snapshot: transport.status_snapshot.clone(),
-            pullsync_cursors_in,
-            pullsync_pullsync_in,
-            // Epoch is bee's notion of our reserve identity. Using
-            // session-start unix seconds (nanos would also work)
-            // means each fresh session advertises a unique epoch but
-            // the value is stable within the session.
-            pullsync_epoch: {
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0)
-                }
-                #[cfg(target_arch = "wasm32")]
-                { 0u64 }
-            },
         });
         Ok(Self { cmd_tx, peer_id, state: session_state })
     }
@@ -1841,25 +1842,6 @@ struct SessionDriver {
     /// rather than a multistream NACK).
     status_in: crate::protocols::stream_pool::IncomingStreams,
     status_snapshot: Option<std::sync::Arc<crate::protocols::status::StatusSnapshot>>,
-    /// Inbound `/swarm/pullsync/1.4.0/cursors` substreams. Bee opens
-    /// this once when it considers us a kademlia neighbor, to learn
-    /// our per-bin BinID cursors. We respond with all-zeros (we have
-    /// no reserve) plus a stable session epoch. See
-    /// `protocols::pullsync::respond_cursors`.
-    pullsync_cursors_in: crate::protocols::stream_pool::IncomingStreams,
-    /// Inbound `/swarm/pullsync/1.4.0/pullsync` substreams. Bee opens
-    /// this periodically per kademlia neighbor to actually sync chunks
-    /// in some bin. We respond with empty offers (we have no chunks).
-    pullsync_pullsync_in: crate::protocols::stream_pool::IncomingStreams,
-    /// Stable session epoch published in our `Ack.Epoch` response on
-    /// the cursors substream. Bee compares this across cursor probes
-    /// to detect if our reserve has been wiped; keeping it stable
-    /// across the session avoids spurious re-sync attempts. We derive
-    /// it from session start time so two sessions to the same peer
-    /// (after a session retired and we redialed) advertise different
-    /// epochs, which is correct — we genuinely have a fresh reserve
-    /// (which is empty, but bee doesn't need to know that).
-    pullsync_epoch: u64,
 }
 
 impl SessionDriver {
@@ -2001,41 +1983,6 @@ impl SessionDriver {
                         true
                     });
                     tasks.push(task);
-                }
-
-                // Inbound pullsync cursor stream. One-shot per peer
-                // when bee first considers us a kademlia neighbor.
-                // We reply with all-zero per-bin cursors and a stable
-                // session epoch. See `protocols::pullsync` docs.
-                Some((_pid, mut stream)) = self.pullsync_cursors_in.next() => {
-                    let timeout = self.state.timeout;
-                    let epoch = self.pullsync_epoch;
-                    let task: TaskFuture = Box::pin(async move {
-                        let _ = tokio::time::timeout(
-                            timeout,
-                            crate::protocols::pullsync::respond_cursors(&mut stream, epoch),
-                        ).await;
-                        true
-                    });
-                    tasks.push(task);
-                    diag::PULLSYNC_CURSORS_IN.fetch_add(1, Ordering::Relaxed);
-                }
-
-                // Inbound pullsync chunk-fetch stream. Bee asks
-                // "what chunks do you have in bin N starting at X?"
-                // We reply with an empty offer; bee's handler
-                // short-circuits on empty offers.
-                Some((_pid, mut stream)) = self.pullsync_pullsync_in.next() => {
-                    let timeout = self.state.timeout;
-                    let task: TaskFuture = Box::pin(async move {
-                        let _ = tokio::time::timeout(
-                            timeout,
-                            crate::protocols::pullsync::respond_pullsync_empty(&mut stream),
-                        ).await;
-                        true
-                    });
-                    tasks.push(task);
-                    diag::PULLSYNC_PULLSYNC_IN.fetch_add(1, Ordering::Relaxed);
                 }
 
                 ev = self.swarm.select_next_some() => {

@@ -33,7 +33,7 @@ use crate::protocols::{hive, pricing, retrieval, status};
 use crate::signer::SwarmSigner;
 use crate::transport::{
     build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO, HIVE_PROTO,
-    PRICING_PROTO, PULLSYNC_CURSORS_PROTO, PULLSYNC_PULLSYNC_PROTO, RETRIEVAL_PROTO, STATUS_PROTO,
+    PRICING_PROTO, RETRIEVAL_PROTO, STATUS_PROTO,
 };
 
 #[derive(Debug, Error)]
@@ -123,17 +123,13 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
     let mut status_in = control
         .accept(STATUS_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept status: {e:?}")))?;
-    // Pullsync (two sub-streams). Accepted on the inbound listener
-    // so bee peers that dial us directly can run their pullsync
-    // probes against us. Same protocol path is also accepted on the
-    // outbound `transport.rs::PeerSession::connect`. See
-    // `protocols::pullsync` docs for rationale.
-    let mut pullsync_cursors_in = control
-        .accept(PULLSYNC_CURSORS_PROTO)
-        .map_err(|e| InboundError::StreamControl(format!("accept pullsync cursors: {e:?}")))?;
-    let mut pullsync_pullsync_in = control
-        .accept(PULLSYNC_PULLSYNC_PROTO)
-        .map_err(|e| InboundError::StreamControl(format!("accept pullsync pullsync: {e:?}")))?;
+    // Pullsync substreams (`cursors` + `pullsync`) are NOT accepted.
+    // isheika is an upload client, not a reserve maintainer; we have
+    // no chunks to offer back. See [`PeerSession::connect`] for the
+    // detailed rationale — when bee opens pullsync to us it gets a
+    // multistream `ErrNotSupported`, which bee's puller logs and
+    // retries (no escalation), saving us the per-substream tokio
+    // task work without harming throughput or salud health.
 
     info!(
         target: "isheika::inbound",
@@ -148,15 +144,6 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
     let op_timeout = cfg.op_timeout;
     let advertised = Arc::new(cfg.advertise);
     let status_snapshot = Arc::new(cfg.status_snapshot);
-    // Stable epoch advertised on our pullsync cursor responses for
-    // the lifetime of this listener. Bee compares this across cursor
-    // probes to detect reserve identity changes; keeping it stable
-    // for the listener's lifetime is the right semantics for us (we
-    // have a single empty reserve that persists until daemon exit).
-    let pullsync_epoch: u64 = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
 
     loop {
         tokio::select! {
@@ -298,53 +285,6 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 });
             }
 
-            // Inbound pullsync `cursors`: bee asks for our per-bin
-            // BinID cursors. We respond with all-zeros and a stable
-            // epoch derived from the listener start time. See
-            // `protocols::pullsync` docs.
-            Some((peer_id, mut stream)) = pullsync_cursors_in.next() => {
-                tokio::spawn(async move {
-                    use crate::protocols::pullsync;
-                    crate::transport::diag::PULLSYNC_CURSORS_IN
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let res = tokio::time::timeout(
-                        op_timeout,
-                        pullsync::respond_cursors(&mut stream, pullsync_epoch),
-                    ).await;
-                    match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
-                            "pullsync cursors responded to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
-                            "pullsync cursors from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
-                            "pullsync cursors from {peer_id} timed out"),
-                    }
-                });
-            }
-
-            // Inbound pullsync `pullsync`: bee asks for chunks in a
-            // bin range. We respond with empty offers (we don't have
-            // a reserve). Bee's handler accepts the empty response
-            // without complaint.
-            Some((peer_id, mut stream)) = pullsync_pullsync_in.next() => {
-                tokio::spawn(async move {
-                    use crate::protocols::pullsync;
-                    crate::transport::diag::PULLSYNC_PULLSYNC_IN
-                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    let res = tokio::time::timeout(
-                        op_timeout,
-                        pullsync::respond_pullsync_empty(&mut stream),
-                    ).await;
-                    match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
-                            "pullsync chunks (empty) responded to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
-                            "pullsync chunks from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
-                            "pullsync chunks from {peer_id} timed out"),
-                    }
-                });
-            }
         }
     }
 }
