@@ -343,15 +343,41 @@ at a given configuration.
 | VPS, racing + stream_pool patch + 3335 peers (5-round discover) | ~335 KiB/s |
 | VPS, **`--concurrency 512 --buffer-multiplier 4`** + 3335 peers | **~1.05 MB/s** |
 | VPS, daemon + vanity overlay (PO=10 single-target), pool=64 | ~194 KiB/s median, 282 best |
-| VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | **~515 KiB/s median, 557 best** |
+| VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | ~515 KiB/s median, 557 best |
+| VPS, all of the above + **`--pool-size 128 --buffer-multiplier 2`** | **~665 KiB/s median, 954 best** |
 
 For context, bee-light reports ~822 KiB/s on the same 5 MiB random
 upload — but that's its `deferred-upload` time which returns ~22×
 faster than chunks are actually retrievable (see "Bee-vs-isheika
 end-to-end comparison" below). On a fully-durable-receipt basis
-(we wait for every receipt before returning) our 515 KiB/s median
-matches or slightly exceeds bee-light's real ~320 KiB/s durable
-rate.
+(we wait for every receipt before returning) our 665 KiB/s median
+**exceeds** bee-light's real ~320 KiB/s durable rate, and our
+954 KiB/s best beats bee-light's reported deferred-upload number.
+
+### Recommended config (mid-2026)
+
+For daemon mode on a VPS with a reasonable upload workload:
+
+    isheika \
+      --nonce-file overlay-nonce \
+      --buffer-multiplier 2 \
+      daemon \
+      --socket /tmp/isheika.sock \
+      --pool-size 128 \
+      --listen /ip4/0.0.0.0/tcp/1635 \
+      --identity 0xYOUR_KEY \
+      --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635
+
+Key knobs:
+- `--pool-size 128` doubles the candidate peer pool (more high-PO
+  candidates, better fan-out under cap).
+- `--buffer-multiplier 2` doubles in-flight chunks (128 → 256), so
+  the dispatcher can keep more sessions saturated within their
+  per-peer in-flight cap.
+- `IN_FLIGHT_CAP=4` (hardcoded) keeps per-peer concurrent debt
+  under bee's per-peer refresh rate.
+- Stable overlay + vanity nonce + `--listen --advertise` are
+  prerequisites for the citizenship-adjacent behavior bee expects.
 
 The earliest version of this doc claimed "~150 KiB/s is the protocol
 floor". That claim was wrong; it was a measurement at one
