@@ -1510,10 +1510,10 @@ const DEAD_STRIKES: u32 = 3;
 /// kademlia AOR rule, distributing load across all 131 connected
 /// peers. We don't have kademlia, but capping per-peer in-flight
 /// pushes forces our dispatcher to fan out wider when the top
-/// candidates are busy. The cap value 4 is chosen as the largest
-/// number that keeps per-peer push rate (4 × 1/60ms = 67 pushes/sec
-/// × 6.75K = 450K PLUR/s) at or under the light-node refresh rate
-/// even in worst case bursts; for full nodes it's ~10× under.
+/// candidates are busy. The cap value 4 is the empirical sweet
+/// spot — bumping to 8 trades wait-for-cap dispatch failures for
+/// yamux substream contention per session, and median throughput
+/// regresses ~10% (515 → 590 with pool=64, 665 → 590 with pool=128).
 ///
 /// Tradeoff: dispatcher may have to wait for a capped peer to drain
 /// before retrying that peer, but the alternative was overdraft +
