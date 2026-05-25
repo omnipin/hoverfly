@@ -1,0 +1,248 @@
+name: bench
+
+# Benchmark isheika daemon-mode upload throughput against bee mainnet
+# from a GitHub-hosted runner. Manually triggered (workflow_dispatch)
+# only — uploads cost real BZZ via the postage batch, and runner IPs
+# rotate so peer warmup cost gets paid every run.
+#
+# Required repository secrets:
+#   BENCH_BATCH    Postage batch ID (32-byte hex, no 0x prefix)
+#   BENCH_KEY      Signer private key (32-byte hex, 0x prefix optional)
+#   BENCH_NONCE    Vanity overlay nonce (32-byte hex, no 0x prefix)
+#                  Generate locally with `isheika vanity-overlay
+#                  --key <BENCH_KEY> --target-overlay <stable-peer-overlay>
+#                  --target-po 10 --output overlay-nonce`, then
+#                  `cat overlay-nonce`.
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_size_mib:
+        description: "Random upload size in MiB"
+        required: false
+        default: "5"
+        type: string
+      n_uploads:
+        description: "Number of uploads to median"
+        required: false
+        default: "5"
+        type: string
+      pool_size:
+        description: "Daemon --pool-size"
+        required: false
+        default: "256"
+        type: string
+      buffer_multiplier:
+        description: "Daemon --buffer-multiplier (1, 2, or 4)"
+        required: false
+        default: "2"
+        type: string
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Cache cargo registry + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Build release binary
+        run: cargo build --release --bin isheika
+
+      - name: Verify binary
+        run: |
+          ./target/release/isheika --version || true
+          ./target/release/isheika --help | head -3
+
+      - name: Validate secrets
+        env:
+          BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
+          BENCH_KEY: ${{ secrets.BENCH_KEY }}
+          BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+        run: |
+          missing=()
+          [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
+          [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
+          [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Missing required secret(s): %s\n' "${missing[*]}"
+            exit 1
+          fi
+          # Don't echo the secrets — just confirm they parse.
+          [ "${#BENCH_BATCH}" -ge 64 ] || { echo "::error::BENCH_BATCH too short"; exit 1; }
+          [ "${#BENCH_KEY}"   -ge 64 ] || { echo "::error::BENCH_KEY too short";   exit 1; }
+          [ "${#BENCH_NONCE}" -ge 64 ] || { echo "::error::BENCH_NONCE too short"; exit 1; }
+          echo "All secrets present and within expected length."
+
+      - name: Write vanity overlay nonce
+        env:
+          BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+        run: |
+          # Strip optional 0x prefix and any whitespace.
+          NONCE_HEX="${BENCH_NONCE#0x}"
+          NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
+          if [ "${#NONCE_HEX}" -ne 64 ]; then
+            echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
+            exit 1
+          fi
+          printf "%s" "$NONCE_HEX" > overlay-nonce
+          echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+
+      - name: Discover mainnet peers
+        run: |
+          ./target/release/isheika -v discover \
+            /dnsaddr/mainnet.ethswarm.org \
+            --output peers.json \
+            --rounds 5 \
+            --discover-concurrency 32 \
+            --healthcheck \
+            --healthcheck-concurrency 64 \
+            --wait 20 \
+          | tail -20
+          wc -l peers.json || true
+          echo "peers.json size: $(wc -c < peers.json) bytes"
+
+      - name: Start daemon
+        env:
+          BENCH_KEY: ${{ secrets.BENCH_KEY }}
+        run: |
+          rm -f /tmp/isheika.sock
+          nohup ./target/release/isheika \
+            --nonce-file overlay-nonce \
+            --buffer-multiplier ${{ inputs.buffer_multiplier }} \
+            daemon \
+            --socket /tmp/isheika.sock \
+            --peerlist peers.json \
+            --pool-size ${{ inputs.pool_size }} \
+            --listen /ip4/0.0.0.0/tcp/1635 \
+            --identity "$BENCH_KEY" \
+            -v \
+            > /tmp/daemon.log 2>&1 &
+          DAEMON_PID=$!
+          echo "DAEMON_PID=$DAEMON_PID" >> "$GITHUB_ENV"
+          echo "started daemon pid $DAEMON_PID"
+
+      - name: Wait for warm pool
+        run: |
+          # Pool fill duration scales with --pool-size and IP-to-mainnet
+          # latency. GH runners are usually US-east, so this is roughly
+          # comparable to the VPS test environment. Cap wait at 5 min.
+          for i in $(seq 1 60); do
+            if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
+              echo "pool warm after ${i}x5s waits"
+              grep "pool fill: done" /tmp/daemon.log | tail -1
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "::warning::pool did not warm in 5 min; proceeding anyway"
+          tail -50 /tmp/daemon.log
+
+      - name: Run benchmark uploads
+        env:
+          BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
+          BENCH_KEY: ${{ secrets.BENCH_KEY }}
+        run: |
+          : > /tmp/bench.results
+          for i in $(seq 1 ${{ inputs.n_uploads }}); do
+            rm -f /tmp/bench-${{ inputs.file_size_mib }}mib.bin
+            dd if=/dev/urandom \
+               of=/tmp/bench-${{ inputs.file_size_mib }}mib.bin \
+               bs=1M count=${{ inputs.file_size_mib }} status=none
+
+            echo "=== Run $i ==="
+            ./target/release/isheika upload \
+              --daemon /tmp/isheika.sock \
+              --batch "$BENCH_BATCH" \
+              --key "$BENCH_KEY" \
+              /tmp/bench-${{ inputs.file_size_mib }}mib.bin 2>&1 \
+              | tee -a /tmp/bench.results \
+              | grep -E '^upload:|^uploaded' || true
+
+            # Brief pause so back-to-back uploads don't share warm caches.
+            sleep 3
+          done
+
+      - name: Summarize throughput
+        run: |
+          echo "## Benchmark summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- file size: ${{ inputs.file_size_mib }} MiB" >> "$GITHUB_STEP_SUMMARY"
+          echo "- n uploads: ${{ inputs.n_uploads }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- pool size: ${{ inputs.pool_size }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- buffer multiplier: ${{ inputs.buffer_multiplier }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| run | seconds | throughput |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----|---------|------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          # Parse rows of the form:
+          #   upload: 5242880 bytes in 5.04s = 1016.60 KiB/s
+          # OR the MiB/s variant.
+          # Emit median, best, worst at the end.
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import re
+          rates = []
+          row_idx = 0
+          with open("/tmp/bench.results") as f:
+              for line in f:
+                  m = re.search(r'upload: \d+ bytes in ([\d.]+)s = ([\d.]+) (KiB|MiB)/s', line)
+                  if not m: continue
+                  row_idx += 1
+                  secs, val, unit = float(m.group(1)), float(m.group(2)), m.group(3)
+                  kibs = val if unit == "KiB" else val * 1024.0
+                  rates.append(kibs)
+                  print(f"| {row_idx} | {secs:.2f} | {val:.2f} {unit}/s |")
+          if rates:
+              rs = sorted(rates)
+              med = rs[len(rs)//2] if len(rs)%2==1 else (rs[len(rs)//2-1]+rs[len(rs)//2])/2
+              print()
+              print(f"**Median: {med:.2f} KiB/s**")
+              print(f"Best: {max(rates):.2f} KiB/s")
+              print(f"Worst: {min(rates):.2f} KiB/s")
+          else:
+              print()
+              print("**No successful uploads parsed from results.**")
+          PY
+
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Stop daemon and capture diagnostics
+        if: always()
+        run: |
+          if [ -n "${DAEMON_PID:-}" ]; then
+            kill -INT "$DAEMON_PID" 2>/dev/null || true
+            sleep 1
+            kill -9 "$DAEMON_PID" 2>/dev/null || true
+          fi
+          # Last few hundred lines of daemon log into the step summary
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "### Last daemon log lines" >> "$GITHUB_STEP_SUMMARY"
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+          tail -100 /tmp/daemon.log >> "$GITHUB_STEP_SUMMARY" 2>/dev/null || true
+          echo '```' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload daemon log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: daemon-log-${{ github.run_id }}
+          path: |
+            /tmp/daemon.log
+            /tmp/bench.results
+            peers.json
+          retention-days: 7
