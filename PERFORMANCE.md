@@ -689,6 +689,26 @@ SWAP code is correct (cheques sign, are accepted, persist correctly
 across runs — see `cheques_emitted=117` / `cheques_failed=0-2`
 typical), but produces no measurable throughput improvement.
 
+The code stays. Two reasons:
+
+1. **Retrieval path uses the same accounting.** bee's
+   `pkg/retrieval/retrieval.go:497-500` debits OUR balance for each
+   chunk we fetch via the same `debitAction.Apply()` as pushsync.
+   Threshold-upgrade via cumulative cheques is independent of
+   direction, so a long-running fetch worker (archive sync, video
+   hosting) would benefit by the same mechanism as a long-running
+   upload worker.
+
+2. **The accounting headroom may matter at much higher pool/buffer
+   scales.** Mid-2026's `IN_FLIGHT_CAP=4` + pool=128 + buffer=256
+   regime keeps per-peer concurrent debt at ~500K PLUR (well under
+   bee's 11.25M full-node disconnect limit), so the upgrade path is
+   moot. If we push further (cap=8 trial at 590 KiB/s median was a
+   yamux contention regression, not an accounting one — suggests
+   the next ceiling is per-session substream throughput, addressable
+   by spreading across more peers with even more pool, which would
+   eventually let SWAP matter again).
+
 ### Why it doesn't help here
 
 Reading bee's accounting (`pkg/accounting/accounting.go`), payment
