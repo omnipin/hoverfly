@@ -1309,6 +1309,15 @@ impl SessionEntry {
         self.pending.lock().expect("pending mutex poisoned").take()
     }
 
+    /// True if a pre-warmed session is already waiting in the slot.
+    /// Used by the dispatcher's cooldown pre-filter to keep entries
+    /// whose live session is dead but whose rotation path can swap in
+    /// the pre-warm without paying a fresh dial (so DIAL_COOLDOWN
+    /// doesn't apply).
+    fn has_pending(&self) -> bool {
+        self.pending.lock().expect("pending mutex poisoned").is_some()
+    }
+
     /// Store a freshly-dialed session as the pre-warmed replacement.
     fn store_pending(&self, session: PeerSession) {
         let mut guard = self.pending.lock().expect("pending mutex poisoned");
@@ -1798,8 +1807,49 @@ pub async fn push_chunks_with_pool(
             // single broken peer dominates the warning noise on
             // mainnet.
             let chunk_addr = SwarmAddress::new(chunk.addr);
-            let mut order: Vec<usize> =
-                (0..pool.len()).filter(|i| !pool[*i].is_dead()).collect();
+            // Filter out entries that can't possibly serve this push
+            // right now:
+            //
+            // - `is_dead()`: parked by the dead-skip window after
+            //   DEAD_STRIKES failed dials.
+            // - Cooldown pre-filter: the entry's current session is
+            //   dead (driver task exited, cmd_tx closed) AND there's
+            //   no pre-warmed replacement waiting AND the transport's
+            //   per-peer DIAL_COOLDOWN is still active. Without this,
+            //   we burn a full chunk-dispatch attempt only for
+            //   `try_push_with_rotation` to discover the session is
+            //   dead, attempt the rotation dial, and get DialTooSoon
+            //   back from `Transport::open_session`. Each one of
+            //   those wastes one of the `cap` attempts and adds a
+            //   500ms retry penalty downstream. Trace data on a stalled
+            //   upload showed all 8 chunk-fan-out attempts hitting
+            //   this exact pattern simultaneously (every peer in the
+            //   pool went into cooldown together after a maintenance
+            //   burst).
+            //
+            // We keep entries whose session is alive even if cooldown
+            // is active — those don't need to dial. We also keep
+            // dead-session entries that have a pending pre-warm: the
+            // rotation path will use it via `take_pending` without
+            // calling `Transport::open_session`.
+            let mut order: Vec<usize> = (0..pool.len())
+                .filter(|i| {
+                    let e = &pool[*i];
+                    if e.is_dead() {
+                        return false;
+                    }
+                    let session_alive = e.snapshot().is_alive();
+                    if session_alive {
+                        return true;
+                    }
+                    // Session dead. Keep only if a pending replacement
+                    // is waiting OR the cooldown has burned off.
+                    if e.has_pending() {
+                        return true;
+                    }
+                    transport.dial_cooldown_for_underlay(&e.underlay).is_none()
+                })
+                .collect();
             // Storage-radius-aware sort: peers we've observed to be
             // inside the chunk's AOR get promoted to the front
             // (they'll store directly, signing a real receipt with
