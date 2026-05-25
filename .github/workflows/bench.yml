@@ -23,9 +23,9 @@ on:
         default: "5"
         type: string
       n_uploads:
-        description: "Number of uploads to median"
+        description: "Number of uploads to median (each costs real BZZ)"
         required: false
-        default: "5"
+        default: "3"
         type: string
       pool_size:
         description: "Daemon --pool-size"
@@ -111,21 +111,13 @@ jobs:
           printf "%s" "$NONCE_HEX" > overlay-nonce
           echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
 
-      - name: Discover mainnet peers
-        run: |
-          ./target/release/isheika -v discover \
-            /dnsaddr/mainnet.ethswarm.org \
-            --output peers.json \
-            --rounds 5 \
-            --discover-concurrency 32 \
-            --healthcheck \
-            --healthcheck-concurrency 64 \
-            --wait 20 \
-          | tail -20
-          wc -l peers.json || true
-          echo "peers.json size: $(wc -c < peers.json) bytes"
-
       - name: Start daemon
+        # No explicit `discover` step: daemon::ensure_pool runs its
+        # own 1-round discover against the configured bootnode
+        # before filling the session pool (see src/daemon.rs:557-578).
+        # peers.json starts empty; the daemon populates it organically
+        # via the eager pool fill. This avoids spending ~3-5 min on
+        # a redundant 5-round + healthcheck pass before benchmarking.
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
@@ -146,11 +138,11 @@ jobs:
           echo "started daemon pid $DAEMON_PID"
 
       - name: Wait for warm pool
+        # Daemon-side discover + pool fill from cold takes
+        # ~80s on a VPS for pool=256; GH runners are slower with
+        # smaller bandwidth, so cap wait at 8 min.
         run: |
-          # Pool fill duration scales with --pool-size and IP-to-mainnet
-          # latency. GH runners are usually US-east, so this is roughly
-          # comparable to the VPS test environment. Cap wait at 5 min.
-          for i in $(seq 1 60); do
+          for i in $(seq 1 96); do
             if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
               echo "pool warm after ${i}x5s waits"
               grep "pool fill: done" /tmp/daemon.log | tail -1
@@ -158,7 +150,7 @@ jobs:
             fi
             sleep 5
           done
-          echo "::warning::pool did not warm in 5 min; proceeding anyway"
+          echo "::warning::pool did not warm in 8 min; proceeding anyway"
           tail -50 /tmp/daemon.log
 
       - name: Run benchmark uploads
