@@ -1951,31 +1951,52 @@ pub async fn push_chunks_with_pool(
                     transport.dial_cooldown_for_underlay(&e.underlay).is_none()
                 })
                 .collect();
-            // Storage-radius-aware sort: peers we've observed to be
-            // inside the chunk's AOR get promoted to the front
-            // (they'll store directly, signing a real receipt with
-            // no forwarding); everyone else falls back to plain
-            // proximity-descending order.
+            // Storage-radius-aware sort: three buckets, primary key.
             //
-            // Initial design used three buckets (in-AOR / unknown /
-            // known-out-of-AOR) but that empirically *slowed* uploads
-            // ~1.6× on a 50 MiB VPS workload: bucket "unknown" gets
-            // prioritised over "known-out" but "unknown" is
-            // systematically populated by peers that never returned
-            // a receipt — slow / NATted / dead. Routing to those
-            // over high-PO known-forwarders sends chunks to far
-            // peers (many bee forwarding hops). Two-bucket version
-            // collapses unknown and known-out into a single "PO
-            // descending" tier; only the explicit in-AOR-confirmed
-            // promotion moves chunks.
+            //   0 (front): in-AOR — peer's observed storage radius
+            //              places this chunk inside its reserve, so
+            //              bee at that peer stores directly and signs
+            //              a real receipt with no forwarding hop.
+            //   1:         unknown — no observation yet for this peer.
+            //              Bee may forward or store; ambiguous.
+            //   2 (back):  known-out — we got a shallow receipt from
+            //              this peer for a chunk with similar PO, so
+            //              this chunk will also forward. Wasted hop.
+            //
+            // Within each bucket, sort by proximity descending so the
+            // closer peer wins the tiebreak.
+            //
+            // Earlier this 3-bucket design was reverted (~1.6× slower
+            // on a 50 MiB VPS workload) because "unknown" was
+            // systematically populated by slow/NATted/dead peers —
+            // routing chunks to them over known-out forwarders pushed
+            // chunks to far peers and stalled the upload.
+            //
+            // It's now safe to re-introduce because the dispatcher
+            // pre-filters those problem peers out of `order` before
+            // sorting:
+            //   - `is_dead()` parks peers after DEAD_STRIKES dial
+            //     failures.
+            //   - Cooldown filter excludes peers whose dial cooldown
+            //     hasn't burned off.
+            //   - `inflight_pushes() >= inflight_cap()` excludes
+            //     saturated peers, and the latency-aware cap tightens
+            //     to 2 for slow-EWMA peers — so genuinely slow peers
+            //     consume at most 2 push slots while we explore other
+            //     candidates.
+            //
+            // So "unknown" is now a clean pool of peers we just
+            // haven't talked to yet for THIS chunk's PO range,
+            // dominated by fresh-session entries waiting for their
+            // first receipt. Worth trying ahead of confirmed-forwarders.
             order.sort_by(|&a, &b| {
                 let pa = chunk_addr.proximity(&pool[a].overlay);
                 let pb = chunk_addr.proximity(&pool[b].overlay);
                 let aor = |idx: usize, po: u8| -> u8 {
-                    if matches!(pool[idx].in_aor(po), Some(true)) {
-                        0
-                    } else {
-                        1
+                    match pool[idx].in_aor(po) {
+                        Some(true) => 0,   // confirmed in-AOR storer
+                        None => 1,         // unknown — give the benefit of the doubt
+                        Some(false) => 2,  // confirmed forwarder for this PO
                     }
                 };
                 aor(a, pa).cmp(&aor(b, pb)).then(pb.cmp(&pa))
