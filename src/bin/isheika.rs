@@ -1257,6 +1257,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 listen_cfg,
                 swap_cfg.clone(),
                 Some((doh, bootnode)),
+                Some(cli.nonce_file.clone()),
             )
             .await?;
         }

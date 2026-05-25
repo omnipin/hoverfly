@@ -1255,6 +1255,12 @@ struct SessionEntry {
     /// (no penalty) so newly-discovered peers aren't penalized
     /// before they have a chance to prove themselves.
     push_latency_ewma_us: std::sync::atomic::AtomicU64,
+    /// Lifetime count of successful pushsync receipts on this
+    /// session entry. Used by the daemon's auto-iteration loop
+    /// to rank entries when picking new vanity-overlay anchor
+    /// targets — peers that consistently deliver receipts are
+    /// the ones we want to anchor to next time.
+    push_success_count: std::sync::atomic::AtomicU64,
 }
 
 impl SessionEntry {
@@ -1343,6 +1349,15 @@ impl SessionEntry {
         };
         self.push_latency_ewma_us
             .store(new, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Lifetime count of successful pushsync receipts on this entry.
+    /// Read by the daemon's auto-iteration loop to identify the top
+    /// peers across a session and propose them as new vanity-overlay
+    /// anchors.
+    pub fn push_success_count(&self) -> u64 {
+        self.push_success_count
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Penalty (in PO units) applied to this peer's effective PO
@@ -1472,6 +1487,115 @@ impl SessionPool {
             .clone()
     }
 
+    /// Count entries whose underlying session is currently alive
+    /// (cmd_tx still open AND not in the dead-skip window). Used by
+    /// the daemon's maintenance loop to decide whether to top up.
+    pub fn live_count(&self) -> usize {
+        self.sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .iter()
+            .filter(|e| !e.is_dead() && e.snapshot().is_alive())
+            .count()
+    }
+
+    /// Set of overlay hex strings currently in the pool — used as the
+    /// dedup filter when topping up. Lower-cased for stable matching
+    /// against `PeerStore` entries (overlays there are also stored as
+    /// lower-case hex).
+    pub fn entry_overlays(&self) -> std::collections::HashSet<String> {
+        self.sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .iter()
+            .map(|e| e.overlay_hex.to_lowercase())
+            .collect()
+    }
+
+    /// Snapshot of (overlay_hex, push_success_count) for every entry
+    /// currently in the pool, sorted descending by success count.
+    /// Used by the daemon's auto-iteration loop to identify the best
+    /// peers across a session and propose them as new vanity-overlay
+    /// anchor targets.
+    pub fn top_peers_by_success(&self, limit: usize) -> Vec<(String, u64)> {
+        let mut stats: Vec<(String, u64)> = self
+            .sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .iter()
+            .map(|e| (e.overlay_hex.clone(), e.push_success_count()))
+            .filter(|(_, n)| *n > 0)
+            .collect();
+        stats.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        stats.truncate(limit);
+        stats
+    }
+
+    /// Garbage-collect dead entries from the pool. A session whose
+    /// driver task has exited (cmd_tx closed, see [`PeerSession::is_alive`])
+    /// or whose dead-skip window is active is unreachable for any
+    /// future push — removing it keeps the live pool from being
+    /// dominated by tombstones, and lets [`Self::top_up`] make
+    /// useful headroom comparisons.
+    ///
+    /// Returns the number of entries removed.
+    pub fn prune_dead(&self) -> usize {
+        let mut guard = self.sessions.write().expect("session pool rwlock poisoned");
+        let before = guard.len();
+        guard.retain(|e| !e.is_dead() && e.snapshot().is_alive());
+        before - guard.len()
+    }
+
+    /// Dial new sessions to fresh peers (overlays not already in the
+    /// pool, not in `--healthcheck`-recorded recent-failure window) and
+    /// append them to the pool. Used by the daemon's maintenance loop
+    /// to keep the pool at `target_size` against steady-state churn.
+    ///
+    /// Returns the number of new sessions added.
+    ///
+    /// Callers should run [`Self::prune_dead`] first; otherwise dead
+    /// entries are counted as occupants and `top_up` won't dial enough
+    /// replacements.
+    ///
+    /// The dial concurrency mirrors `open_session_pool`'s heuristic
+    /// (capped at `SESSION_DIAL_PARALLELISM`); the work is bounded by
+    /// `additional` requested entries, not by walking the full
+    /// peers.json. Peers that are reachable but oversaturated will
+    /// time out at the libp2p layer; those failures are absorbed
+    /// silently and the maintenance loop will retry next tick.
+    pub async fn top_up(
+        &self,
+        transport: &Transport,
+        peers: &PeerStore,
+        target_size: usize,
+    ) -> usize {
+        let current = {
+            let g = self.sessions.read().expect("session pool rwlock poisoned");
+            g.len()
+        };
+        if current >= target_size {
+            return 0;
+        }
+        let additional = target_size - current;
+        let existing = self.entry_overlays();
+        let new_entries = open_session_pool_filtered(
+            transport,
+            peers,
+            additional,
+            &existing,
+        )
+        .await
+        .unwrap_or_default();
+        if new_entries.is_empty() {
+            return 0;
+        }
+        let added = new_entries.len();
+        let wrapped: Vec<std::sync::Arc<SessionEntry>> =
+            new_entries.into_iter().map(std::sync::Arc::new).collect();
+        let mut guard = self.sessions.write().expect("session pool rwlock poisoned");
+        guard.extend(wrapped);
+        added
+    }
 }
 
 /// Build a one-shot pool sized for `work.len()` and push everything
@@ -2561,6 +2685,9 @@ async fn try_push_with_rotation(
                 // accumulated failure strikes so a previously-flaky
                 // peer fully re-enters rotation.
                 entry.clear_strikes();
+                entry
+                    .push_success_count
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 debug!(target: "isheika::upload",
                     "receipt OK: chunk={} storer={} po={} storage_radius={}",
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
@@ -2620,6 +2747,25 @@ async fn open_session_pool(
     peers: &PeerStore,
     max_sessions: usize,
 ) -> Result<Vec<SessionEntry>, ClientError> {
+    open_session_pool_filtered(
+        transport,
+        peers,
+        max_sessions,
+        &std::collections::HashSet::new(),
+    )
+    .await
+}
+
+/// Identical to [`open_session_pool`] but excludes peers whose overlay
+/// (lowercase hex) is in `exclude`. Used by [`SessionPool::top_up`]
+/// for the daemon's background maintenance loop — we want to dial
+/// *new* peers, not re-dial the ones already in the pool.
+async fn open_session_pool_filtered(
+    transport: &Transport,
+    peers: &PeerStore,
+    max_sessions: usize,
+    exclude: &std::collections::HashSet<String>,
+) -> Result<Vec<SessionEntry>, ClientError> {
     let log = transport.reachability_log();
     use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -2648,6 +2794,7 @@ async fn open_session_pool(
     let mut all: Vec<(SwarmAddress, String, Multiaddr, bool)> = peers
         .closest(&ChunkAddress::new([0u8; 32]), usize::MAX)
         .into_iter()
+        .filter(|p| !exclude.contains(&p.overlay.to_lowercase()))
         .filter_map(|p| {
             let underlay = p.first_dialable_underlay()?;
             let overlay = p.overlay_address()?;
@@ -2747,6 +2894,7 @@ async fn open_session_pool(
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                     storage_radius: std::sync::atomic::AtomicU8::new(0),
                     push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
+                    push_success_count: std::sync::atomic::AtomicU64::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
                     info!(target: "isheika::upload",

@@ -113,6 +113,15 @@ struct State {
     /// before pool fill.
     doh: Option<Doh>,
     bootnode: Option<libp2p::Multiaddr>,
+    /// Daemon identity ETH address. Used by the auto-iteration loop
+    /// to compute vanity overlays for proposed anchor sets.
+    /// `None` when the daemon runs without `--identity` (purely
+    /// outbound, ephemeral overlay).
+    identity_eth_address: Option<[u8; 20]>,
+    /// Current overlay-nonce file path. Auto-iteration writes the
+    /// suggested next-nonce here (with `.next` suffix) so an operator
+    /// can opt into it by renaming and restarting the daemon.
+    nonce_file_path: Option<PathBuf>,
 }
 
 /// Optional inbound listener configuration for [`run`].
@@ -156,6 +165,11 @@ pub async fn run(
     // discover before opening the session pool, ensuring fresh
     // peers instead of stale file entries.
     discover: Option<(Doh, libp2p::Multiaddr)>,
+    // Path of the overlay-nonce file the daemon was started with.
+    // The auto-iteration loop writes the suggested next-nonce to
+    // `<path>.next` (next to the current nonce) so an operator
+    // can opt into it by mv'ing it over and restarting.
+    nonce_file_path: Option<PathBuf>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove any stale socket from a previous crashed run. The daemon
     // owns the socket file for its lifetime.
@@ -216,6 +230,10 @@ pub async fn run(
     }
     let cache = ChunkCache::new();
     let (doh, bootnode) = discover.map(|(d, b)| (Some(d), Some(b))).unwrap_or((None, None));
+    // Pluck the daemon's identity eth_address out of listen (if any)
+    // BEFORE we move `listen` into the inbound spawn. Auto-iteration
+    // needs the eth address to compute candidate vanity overlays.
+    let identity_eth_address = listen.as_ref().map(|lc| *lc.identity.eth_address());
     let state = Arc::new(State {
         transport,
         signer_network_id: network_id,
@@ -226,6 +244,8 @@ pub async fn run(
         cache: cache.clone(),
         doh,
         bootnode,
+        identity_eth_address,
+        nonce_file_path: nonce_file_path.clone(),
     });
 
     // Spawn the inbound bee-protocol listener if configured. Failure
@@ -251,6 +271,91 @@ pub async fn run(
     info!(target: "isheika::daemon",
         "listening on {} (peerlist {}, pool_target {})",
         socket_path.display(), peerlist_path.display(), pool_target);
+
+    // Eager pool fill at startup. A bee node maintains its kademlia
+    // continuously; our daemon should too. Without this, the first
+    // upload pays the 60-300 s pool-fill cost synchronously, while
+    // every subsequent upload reuses the warm pool. By dialing in the
+    // background at startup, the first upload is fast as well.
+    //
+    // The same task also runs the background maintenance loop:
+    // periodically re-checks `is_alive()` on every pool entry and
+    // dispatches prewarm dials for dead ones, keeping the pool
+    // at target size against the steady-state churn of bee bin-prune
+    // RSTs (see PERFORMANCE.md "Session-death cause"). Without
+    // maintenance the pool only shrinks over time; with it, the
+    // pool holds steady at `pool_target` for as long as the daemon
+    // runs.
+    {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // Fire the lazy `ensure_pool` immediately. After it
+            // returns, the warm pool is open and subsequent uploads
+            // skip the fill.
+            if let Err(e) = ensure_pool(&state).await {
+                warn!(target: "isheika::daemon",
+                    "eager pool fill failed: {e} (will retry lazily on first request)");
+                return;
+            }
+            // Maintenance tick. Bee RSTs most random-overlay
+            // connections within seconds (see PERFORMANCE.md "Session-
+            // death cause" + "Vanity overlay"), so naïve top-up-to-
+            // target dials more pruned peers than the deep-bin
+            // anchors can ever offset, saturating dial parallelism
+            // and competing with chunk pushsync streams for the
+            // per-IP libp2p rate limit (bee 10 RPS / burst 40 per
+            // /32). Two countermeasures:
+            //
+            // - **Long interval** (5 min, not 30 s): give bee's
+            //   per-IP rate limiter time to refill between bursts,
+            //   and don't run maintenance while an upload is in
+            //   flight (5 min > most upload durations).
+            // - **Bounded refill** (`maintain_pool` only adds up to
+            //   `pool_target / 8` new dials per tick): a 256-target
+            //   pool can lose 32 entries per tick and recover within
+            //   one tick, but never schedules 200+ simultaneous
+            //   dials that would starve uploads.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            tick.tick().await; // skip the immediate-tick semantics
+            loop {
+                tick.tick().await;
+                if let Err(e) = maintain_pool(&state).await {
+                    debug!(target: "isheika::daemon",
+                        "pool maintenance tick failed: {e}");
+                }
+            }
+        });
+    }
+
+    // Auto-iteration loop. Periodically inspect the pool's per-peer
+    // push-success counters, pick the top-K peers, run a vanity-overlay
+    // search against their overlays, and write the suggested next
+    // nonce to `<nonce_file>.next` for the operator to opt into via
+    // `mv <nonce_file>.next <nonce_file>` + restart.
+    //
+    // Why next-nonce-as-file rather than apply-at-runtime: the daemon's
+    // libp2p identity (and therefore the advertised overlay) is fixed
+    // for the lifetime of the listener — bee peers reach us via the
+    // overlay they learned through hive, and reseeding mid-run would
+    // strand inflight connections + invalidate all SWAP cheques we've
+    // already signed against the old overlay.
+    if let (Some(_), Some(_)) = (state.identity_eth_address, state.nonce_file_path.as_ref()) {
+        let state = state.clone();
+        tokio::spawn(async move {
+            // First evaluation after ~3 minutes — enough time for the
+            // initial pool to fill and for upload activity (if any) to
+            // populate per-peer success counts.
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(180));
+            tick.tick().await; // skip the immediate-tick semantics
+            loop {
+                tick.tick().await;
+                if let Err(e) = auto_iterate_anchors(&state).await {
+                    debug!(target: "isheika::daemon",
+                        "auto-iterate tick failed: {e}");
+                }
+            }
+        });
+    }
 
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
 
@@ -480,6 +585,256 @@ async fn ensure_pool(
         "warm pool: {} session(s) open", pool.len());
     *guard = Some(pool.clone());
     Ok(pool)
+}
+
+/// Background auto-iteration tick: identify the daemon's current
+/// top-K performing peers (by `push_success_count`), run a vanity-overlay
+/// search against their overlays, and write the suggested next-nonce
+/// to `<nonce_file>.next`. Operator opts in by `mv`ing the file and
+/// restarting the daemon.
+///
+/// The search uses the same multi-anchor algorithm as the
+/// `vanity-overlay` subcommand (maximize the minimum PO across the
+/// target set). Target PO is chosen adaptively: half of the average
+/// PO of the current overlay to the top-K, rounded up — i.e. we aim
+/// to be at PO ≥ (current_avg / 2) to every top peer, which is much
+/// looser than a single-target deep anchor but spreads us across
+/// multiple deep bins.
+///
+/// The tick is a no-op if:
+/// - Pool has no peers with successful pushes yet.
+/// - Our current overlay already meets the proposed target PO.
+/// - The search budget exhausts without finding an improvement.
+async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
+    use crate::signer::derive_overlay;
+    use crate::transport::proximity;
+
+    // Snapshot the pool. If it doesn't exist or has no successful
+    // pushes recorded, there's nothing to iterate against.
+    let pool = {
+        let guard = state.pool.read().await;
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => return Ok(()),
+        }
+    };
+    let top = pool.top_peers_by_success(5);
+    if top.is_empty() {
+        debug!(target: "isheika::daemon",
+            "auto-iterate: no peers with successful pushes yet, skipping");
+        return Ok(());
+    }
+
+    let Some(eth_address) = state.identity_eth_address else {
+        return Ok(());
+    };
+    let Some(nonce_file) = state.nonce_file_path.as_ref() else {
+        return Ok(());
+    };
+
+    // Parse target overlays.
+    let targets: Vec<[u8; 32]> = top
+        .iter()
+        .filter_map(|(hex_str, _)| {
+            let bytes = hex::decode(hex_str).ok()?;
+            if bytes.len() != 32 {
+                return None;
+            }
+            let mut a = [0u8; 32];
+            a.copy_from_slice(&bytes);
+            Some(a)
+        })
+        .collect();
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    // Compute the current overlay (the one the daemon is actually
+    // running with) so we can compare. We don't have direct access
+    // to the daemon's overlay here without the SwarmSigner, but we
+    // can read it from the nonce file + eth_address + network_id.
+    let current_overlay = match std::fs::read_to_string(nonce_file) {
+        Ok(s) => match hex::decode(s.trim()) {
+            Ok(bytes) if bytes.len() == 32 => {
+                let mut nonce = [0u8; 32];
+                nonce.copy_from_slice(&bytes);
+                derive_overlay(&eth_address, state.signer_network_id, &nonce)
+            }
+            _ => return Ok(()),
+        },
+        Err(_) => return Ok(()),
+    };
+
+    let current_pos: Vec<u8> = targets
+        .iter()
+        .map(|t| proximity(&current_overlay, t))
+        .collect();
+    let current_min_po = *current_pos.iter().min().unwrap_or(&0);
+    let current_avg_po =
+        (current_pos.iter().map(|p| *p as f64).sum::<f64>() / current_pos.len() as f64).floor()
+            as u8;
+
+    info!(target: "isheika::daemon",
+        "auto-iterate: top {} peers by push success — current overlay POs={:?} (min={}, avg={})",
+        targets.len(), current_pos, current_min_po, current_avg_po);
+
+    // Aim for min-PO equal to current_avg + 1: meaningful improvement
+    // without being unrealistic to find. Bounded by 16 (single-target
+    // PO above that takes minutes-hours of search per peer).
+    let target_po = (current_avg_po + 1).min(16);
+    if target_po <= current_min_po {
+        debug!(target: "isheika::daemon",
+            "auto-iterate: current overlay already meets target PO {} — no search needed",
+            target_po);
+        return Ok(());
+    }
+
+    // Brute-force counter-keyed nonce search, identical to
+    // `vanity-overlay` subcommand. Budget: 5 M tries (~5 s on a
+    // modern core). At PO=8 across 5 peers this is well within
+    // expected search cost; if we can't find one in 5 s, the
+    // tick gives up and retries next round (peer set may have
+    // shifted).
+    const MAX_ATTEMPTS: u64 = 5_000_000;
+    let start = std::time::Instant::now();
+    let mut best_min_po = current_min_po;
+    let mut best_score: i64 = current_pos.iter().map(|p| *p as i64).sum();
+    let mut best_nonce: Option<[u8; 32]> = None;
+    for attempt in 0..MAX_ATTEMPTS {
+        let mut nonce = [0u8; 32];
+        nonce[..8].copy_from_slice(&attempt.to_le_bytes());
+        nonce[8..16].copy_from_slice(&attempt.to_le_bytes());
+        nonce[16..24].copy_from_slice(&attempt.to_le_bytes());
+        nonce[24..32].copy_from_slice(&attempt.to_le_bytes());
+        let overlay = derive_overlay(&eth_address, state.signer_network_id, &nonce);
+        let mut min_po = u8::MAX;
+        let mut score: i64 = 0;
+        for t in &targets {
+            let po = proximity(&overlay, t);
+            if po < min_po {
+                min_po = po;
+            }
+            score += po as i64;
+        }
+        if min_po > best_min_po || (min_po == best_min_po && score > best_score) {
+            best_min_po = min_po;
+            best_score = score;
+            best_nonce = Some(nonce);
+            if min_po >= target_po {
+                info!(target: "isheika::daemon",
+                    "auto-iterate: reached target PO {} after {} attempts ({:.1}s)",
+                    target_po,
+                    attempt + 1,
+                    start.elapsed().as_secs_f64());
+                break;
+            }
+        }
+    }
+
+    let Some(winning_nonce) = best_nonce else {
+        debug!(target: "isheika::daemon",
+            "auto-iterate: no improvement over current overlay in {} attempts", MAX_ATTEMPTS);
+        return Ok(());
+    };
+    // Only write a suggestion if the new overlay STRICTLY improves
+    // the min PO. The intra-search tie-breaker on score (sum of POs)
+    // can pick a candidate with same min PO but better high tail
+    // (e.g. PO=[0, 2, 0, 22, 7] beats [0, 2, 0, 4, 4] on score
+    // but its min is still 0 — anchoring at 22 to one peer doesn't
+    // help us with the bin-0 peers, which is where the bottleneck
+    // is). Writing such "improvements" would spam the suggestion
+    // file with noise an operator can't act on.
+    if best_min_po <= current_min_po {
+        debug!(target: "isheika::daemon",
+            "auto-iterate: no min-PO improvement (best={}, current={}) — not writing suggestion",
+            best_min_po, current_min_po);
+        return Ok(());
+    }
+    let winning_overlay =
+        derive_overlay(&eth_address, state.signer_network_id, &winning_nonce);
+    let pos: Vec<u8> = targets
+        .iter()
+        .map(|t| proximity(&winning_overlay, t))
+        .collect();
+
+    // Write `<nonce_file>.next` for operator opt-in. Keep the
+    // current overlay-nonce untouched — the daemon would have to
+    // restart to pick up a new identity overlay anyway, and we
+    // don't want to silently overwrite the operator's chosen file.
+    let mut next_path = nonce_file.clone();
+    let mut filename = next_path
+        .file_name()
+        .map(|s| s.to_os_string())
+        .unwrap_or_default();
+    filename.push(".next");
+    next_path.set_file_name(filename);
+    if let Err(e) = std::fs::write(&next_path, hex::encode(winning_nonce)) {
+        warn!(target: "isheika::daemon",
+            "auto-iterate: failed to write {}: {e}", next_path.display());
+        return Ok(());
+    }
+
+    info!(target: "isheika::daemon",
+        "auto-iterate: improvement available — POs={:?} (min={}, vs current min={}). \
+         wrote {} — to adopt: mv {} {} && restart",
+        pos, best_min_po, current_min_po,
+        next_path.display(),
+        next_path.display(),
+        nonce_file.display());
+
+    Ok(())
+}
+
+/// Background maintenance tick: if the pool has dropped below
+/// `pool_target` (sessions died from bee bin-prune RSTs, ghost-balance
+/// retirement, etc.), dial fresh peers to top up. Mirrors what bee's
+/// kademlia does continuously — bee always tries to fill empty bins
+/// via `connectNeighbours`. Without this, our pool only shrinks over
+/// time and uploads slow down proportionally.
+///
+/// Errors are non-fatal: a transient failure just means the next tick
+/// will retry. The pool is left at whatever size we managed to reach.
+async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
+    let pool = {
+        let guard = state.pool.read().await;
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            // No pool yet — eager_pool_fill task will populate one
+            // soon, nothing for maintenance to do.
+            None => return Ok(()),
+        }
+    };
+    // Step 1: garbage-collect dead entries. Bee RSTs the majority of
+    // our random-overlay-PO=0 connections within seconds of handshake
+    // (see PERFORMANCE.md "Session-death cause"); without pruning,
+    // those tombstones occupy pool slots forever and `top_up` thinks
+    // the pool is full.
+    let pruned = pool.prune_dead();
+    let after_prune = pool.len();
+    let target = state.pool_target;
+    if pruned == 0 && after_prune >= target {
+        debug!(target: "isheika::daemon",
+            "pool maintenance: {} live, no top-up needed", after_prune);
+        return Ok(());
+    }
+    // Cap per-tick refill at `target / 8` (e.g. 32 new dials for a
+    // 256-target pool). A 5-minute tick interval at 32 dials per
+    // tick gives ~6 dials/min sustained, well under bee's per-IP
+    // burst limit (40 / 4 s). The pool converges to steady-state
+    // over a handful of ticks rather than spamming bee's rate
+    // limiter into temporary blocklisting.
+    let max_per_tick = (target / 8).max(8);
+    let refill_target = (after_prune + max_per_tick).min(target);
+    info!(target: "isheika::daemon",
+        "pool maintenance: pruned {} dead, {} live, topping up to {} (cap {} per tick)",
+        pruned, after_prune, refill_target, max_per_tick);
+    // Step 2: dial fresh peers to refill.
+    let peers = state.peers.read().await;
+    let added = pool.top_up(&state.transport, &*peers, refill_target).await;
+    info!(target: "isheika::daemon",
+        "pool maintenance: added {} session(s), pool now {}",
+        added, pool.len());
+    Ok(())
 }
 
 async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
