@@ -159,12 +159,12 @@ jobs:
           name: Start tcpdump capture
           # Capture outbound TCP (excluding HTTPS/SSH/HTTP) during daemon
           # startup so we can confirm whether the alternate bootnode is
-          # accepting our handshake from a CircleCI IP.
+          # accepting our handshake from a CircleCI IP. `-i any` avoids
+          # depending on iproute2 (the cimg/rust image ships without
+          # the `ip` command).
           background: true
           command: |
-            IFACE=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -1)
-            echo "capturing on $IFACE"
-            sudo tcpdump -i "$IFACE" -s 256 -w /tmp/bench.pcap \
+            sudo tcpdump -i any -s 256 -w /tmp/bench.pcap \
               'tcp and not (port 443 or port 22 or port 80)' \
               > /tmp/tcpdump.log 2>&1
 
