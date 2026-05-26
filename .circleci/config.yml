@@ -108,20 +108,43 @@ jobs:
           name: Drop possibly-stale binary from cargo cache
           command: rm -f target/release/isheika
 
+      # bin-v3: invalidates contaminated bin-v1/v2 caches from
+      # before the `rm -f` guard above. An earlier pipeline saved a
+      # binary built from cargo-cache fallthrough (stale .rs files)
+      # under bin-v1's hash, and subsequent pipelines with that hash
+      # kept restoring the broken binary.
       - restore_cache:
           name: Restore built binary
           keys:
-            - bin-v1-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
+            - bin-v3-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
 
       - run:
-          name: Build release binary (if not cached)
+          name: Build release binary (if not cached or broken)
+          # Even on a binary cache hit, verify the binary actually
+          # matches the source by running a smoke test that exercises
+          # at least one recently-changed CLI flag. If the smoke test
+          # fails, the cached binary is stale — delete it and rebuild.
           command: |
-            if [ -x target/release/isheika ]; then
+            smoke_test() {
+              # Confirm clap accepts multiple --bootnode entries (added
+              # in commit 8f48f53). A stale binary will exit nonzero.
+              ./target/release/isheika daemon \
+                --socket /tmp/_smoke \
+                --bootnode /ip4/1.2.3.4/tcp/1/p2p/QmAAA \
+                --bootnode /ip4/5.6.7.8/tcp/2/p2p/QmBBB \
+                --help > /dev/null 2>&1
+            }
+            if [ -x target/release/isheika ] && smoke_test; then
               echo "binary cache hit — skipping build"
               ./target/release/isheika --version 2>/dev/null || \
                 ./target/release/isheika --help | head -1
             else
-              echo "binary cache miss — running cargo build"
+              if [ -x target/release/isheika ]; then
+                echo "cached binary failed smoke test — rebuilding"
+                rm -f target/release/isheika
+              else
+                echo "binary cache miss — running cargo build"
+              fi
               cargo build --release --bin isheika
             fi
 
@@ -135,7 +158,7 @@ jobs:
 
       - save_cache:
           name: Save built binary
-          key: bin-v1-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
+          key: bin-v3-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
           paths:
             - target/release/isheika
 
