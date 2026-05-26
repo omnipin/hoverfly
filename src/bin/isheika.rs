@@ -385,6 +385,18 @@ enum Commands {
         /// every bootnode on a fresh runner.
         #[arg(long, default_value_t = 1, value_name = "N")]
         discover_rounds: usize,
+
+        /// Bootstrap peer multiaddr for the daemon's eager pool fill
+        /// discover. Default `/dnsaddr/mainnet.ethswarm.org` resolves
+        /// to the Swarm Foundation bootnodes. Override with a specific
+        /// `/ip4/.../tcp/.../p2p/...` if those bootnodes are
+        /// unreachable from your network (May 2026: GitHub Actions
+        /// runners and at least one VPS provider saw the official
+        /// mainnet bootnodes reject the handshake substream while
+        /// regular peers still accepted it — bypassing the bootnode
+        /// with a stable known peer worked around the issue).
+        #[arg(long, default_value = MAINNET_BOOTNODE, value_name = "MULTIADDR")]
+        bootnode: String,
     },
 
     /// Search for a vanity overlay nonce that targets bee mainnet's
@@ -1192,7 +1204,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
-        Commands::Daemon { socket, peerlist, pool_size, listen, identity, advertise, discover_rounds } => {
+        Commands::Daemon { socket, peerlist, pool_size, listen, identity, advertise, discover_rounds, bootnode } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
             let sock_path = socket.clone();
@@ -1260,7 +1272,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let doh = Doh::with_url(&cli.doh_url);
-            let bootnode: Multiaddr = MAINNET_BOOTNODE.parse()?;
+            let bootnode: Multiaddr = bootnode.parse()
+                .map_err(|e| format!("invalid --bootnode multiaddr: {e}"))?;
             isheika::daemon::run(
                 socket,
                 peerlist,

@@ -188,6 +188,15 @@ jobs:
           # `-d` (debug) lets us see the actual handshake / discover
           # error messages, not just "round done with 0 peers". Heavy
           # log volume but bounded by the warm-pool wait (8 min cap).
+          #
+          # `--bootnode` overrides the default `/dnsaddr/mainnet.ethswarm.org`
+          # because (as of May 2026) the official Swarm bootnodes are
+          # silently rejecting our handshake substream from both GH
+          # runners and a known-good VPS — empirically verified in pcap.
+          # Regular bee peers still accept us, so we bootstrap from a
+          # specific stable mainnet peer instead. If THIS peer becomes
+          # unreachable, swap the multiaddr for another from a recent
+          # successful peers.json snapshot.
           nohup ./target/release/isheika \
             --nonce-file overlay-nonce \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
@@ -198,6 +207,7 @@ jobs:
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
             --discover-rounds 3 \
+            --bootnode '/ip4/65.109.112.157/tcp/20474/p2p/QmSYwqAMAb9VfrTWzXxJ6APxWTjgtjyxxpMT8rXNKNjDXi' \
             -d \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!
