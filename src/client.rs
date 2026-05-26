@@ -1924,10 +1924,20 @@ pub async fn push_chunks_with_pool(
             // dead-session entries that have a pending pre-warm: the
             // rotation path will use it via `take_pending` without
             // calling `Transport::open_session`.
+            // Per-chunk eligibility filter — count which reason kicks
+            // out each pool entry so we can surface a useful error
+            // when the candidate list ends up empty. Without this,
+            // an "all 0 attempts failed" error is opaque about
+            // whether the pool is genuinely saturated, full of dead
+            // sessions, or stuck behind dial cooldowns.
+            let mut filter_dead = 0usize;
+            let mut filter_cap = 0usize;
+            let mut filter_dead_session_cooldown = 0usize;
             let mut order: Vec<usize> = (0..pool.len())
                 .filter(|i| {
                     let e = &pool[*i];
                     if e.is_dead() {
+                        filter_dead += 1;
                         return false;
                     }
                     // Per-peer in-flight push cap, latency-aware:
@@ -1937,6 +1947,7 @@ pub async fn push_chunks_with_pool(
                     // less-busy peers in the same PO tier. See
                     // `inflight_cap()` and `IN_FLIGHT_CAP` doc-comments.
                     if e.inflight_pushes() >= e.inflight_cap() {
+                        filter_cap += 1;
                         return false;
                     }
                     let session_alive = e.snapshot().is_alive();
@@ -1948,7 +1959,12 @@ pub async fn push_chunks_with_pool(
                     if e.has_pending() {
                         return true;
                     }
-                    transport.dial_cooldown_for_underlay(&e.underlay).is_none()
+                    if transport.dial_cooldown_for_underlay(&e.underlay).is_none() {
+                        true
+                    } else {
+                        filter_dead_session_cooldown += 1;
+                        false
+                    }
                 })
                 .collect();
             // Storage-radius-aware sort: three buckets, primary key.
@@ -2298,12 +2314,26 @@ pub async fn push_chunks_with_pool(
                     return Err(ClientError::BatchNotFound(e.to_string()));
                 }
             }
+            // Include filter-rejection breakdown so cap=0 errors
+            // become diagnosable. dead = sessions parked from 3+
+            // dial failures; cap = sessions at their per-peer
+            // inflight_pushes ceiling; dead_session_cd = sessions
+            // whose libp2p connection died and whose underlay is
+            // still in dial cooldown.
             Err(ClientError::NoPeers(format!(
-                "all {} attempts failed ({} overdraft, {} shallow, {} err): {}",
+                "all {} attempts failed ({} overdraft, {} shallow, {} err); \
+                 pool={} eligible={} \
+                 (filtered: dead={} cap={} dead_session_cd={}): {}",
                 cap,
                 overdrafts,
                 shallows,
                 errors,
+                pool.len(),
+                pool.len()
+                    .saturating_sub(filter_dead + filter_cap + filter_dead_session_cooldown),
+                filter_dead,
+                filter_cap,
+                filter_dead_session_cooldown,
                 last_err
                     .map(|e| e.to_string())
                     .unwrap_or_else(|| "all overdraft/shallow".into())
@@ -2618,10 +2648,35 @@ pub async fn push_chunks_with_pool(
                 let now = pushed.load(Ordering::Relaxed);
                 let entries = session_pool.snapshot();
                 if now == last_pushed_seen {
-                    let alive = entries.iter().filter(|e| !e.is_dead()).count();
+                    // Recompute the eligibility breakdown so we can
+                    // tell, on every stall, whether sessions are
+                    // dead, saturated, or stuck in dial cooldown.
+                    // This mirrors the filter inside the per-chunk
+                    // dispatcher; the numbers should match what each
+                    // chunk's order_iter sees.
+                    let mut dead = 0usize;
+                    let mut cap_full = 0usize;
+                    let mut dead_cd = 0usize;
+                    let mut eligible = 0usize;
+                    for e in entries.iter() {
+                        if e.is_dead() { dead += 1; continue; }
+                        if e.inflight_pushes() >= e.inflight_cap() { cap_full += 1; continue; }
+                        let alive = e.snapshot().is_alive();
+                        if alive || e.has_pending() {
+                            eligible += 1;
+                            continue;
+                        }
+                        if transport.dial_cooldown_for_underlay(&e.underlay).is_none() {
+                            eligible += 1;
+                        } else {
+                            dead_cd += 1;
+                        }
+                    }
                     info!(target: "isheika::upload",
-                        "stalled at {}/{} chunks (inflight={}, alive sessions={}/{})",
-                        now, total, inflight.len(), alive, entries.len());
+                        "stalled at {}/{} chunks (inflight={}, pool={} \
+                         eligible={} dead={} cap={} dead_cd={})",
+                        now, total, inflight.len(), entries.len(),
+                        eligible, dead, cap_full, dead_cd);
                 } else {
                     info!(target: "isheika::upload",
                         "pushed {}/{} chunks (inflight={})",
