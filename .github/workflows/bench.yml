@@ -185,6 +185,9 @@ jobs:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
           rm -f /tmp/isheika.sock
+          # `-d` (debug) lets us see the actual handshake / discover
+          # error messages, not just "round done with 0 peers". Heavy
+          # log volume but bounded by the warm-pool wait (8 min cap).
           nohup ./target/release/isheika \
             --nonce-file overlay-nonce \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
@@ -195,7 +198,7 @@ jobs:
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
             --discover-rounds 3 \
-            -v \
+            -d \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!
           echo "DAEMON_PID=$DAEMON_PID" >> "$GITHUB_ENV"
