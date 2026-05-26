@@ -42,8 +42,16 @@ jobs:
   bench:
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      # Disable incremental compilation in release mode. Combined with
+      # Swatinem/rust-cache, this makes cargo trust the fingerprint
+      # cache and skip recompiling unchanged source on cache hit —
+      # workaround for the well-known "checkout updates mtimes,
+      # cargo thinks source is newer than artifacts" CI rebuild bug.
+      CARGO_INCREMENTAL: "0"
+
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - name: Install Rust toolchain
         run: |
@@ -58,24 +66,37 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
           protoc --version
 
-      # `Swatinem/rust-cache` knows the right Cargo paths to cache:
-      # `.cargo/{bin,registry/index,registry/cache,git/db}` plus the
-      # workspace `target/<profile>/{deps,build,examples,incremental}`.
-      # It prunes intermediates before saving so the cache stays
-      # small (~hundreds of MB vs multi-GB for raw `target/` archives),
-      # and it keys on Cargo.lock + rust-toolchain + workspace layout
-      # so partial dep updates still reuse most of the cache.
+      # Two-tier cache strategy:
+      #
+      # 1. `Swatinem/rust-cache` handles the standard Cargo paths
+      #    (.cargo/{bin,registry/index,registry/cache,git/db} + the
+      #    workspace target/{deps,build,...}). Prunes intermediates
+      #    so the cache stays small, keys on Cargo.lock so partial
+      #    dep updates still reuse most of the cache.
+      #
+      # 2. We additionally cache the final built binary keyed on a
+      #    hash of every input that affects the build output:
+      #    Cargo.{toml,lock}, the entire src/ tree, build.rs, and
+      #    proto/ files. If hit, we skip `cargo build` entirely.
+      #    This dodges the well-known mtime issue where actions/checkout
+      #    rewrites file timestamps, making cargo think source is
+      #    newer than cached artifacts and forcing a rebuild even
+      #    though nothing actually changed.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2.9.1
         with:
-          # Tag the cache so multiple workflows in this repo (e.g.
-          # a future test workflow) can opt in or out of sharing.
           shared-key: bench-release
-          # Only save fresh caches on main; PR runs reuse but don't
-          # bust the 10GB-per-repo cache budget with their branches.
           save-if: ${{ github.ref == 'refs/heads/main' }}
 
+      - name: Cache built binary
+        id: bin-cache
+        uses: actions/cache@v5
+        with:
+          path: target/release/isheika
+          key: bin-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'build.rs', 'proto/**') }}
+
       - name: Build release binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
         run: cargo build --release --bin isheika
 
       - name: Verify binary
