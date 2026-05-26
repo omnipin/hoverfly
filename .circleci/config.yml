@@ -253,7 +253,7 @@ jobs:
             echo "buffer multiplier: << pipeline.parameters.buffer_multiplier >>"
             echo ""
 
-            python3 - <<'PY'
+            python3 - \<<'PY'
             import re
             rates = []
             with open("/tmp/bench.results") as f:
