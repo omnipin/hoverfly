@@ -2531,38 +2531,21 @@ pub async fn push_chunks_with_pool(
                         // session in the pool ghost-balance-retiring at
                         // once, brief routing churn, or a small pool
                         // (sparse peerlist) that all timed out. Sleep
-                        // and re-dispatch the chunk through the whole
-                        // proximity list. Dead-marked entries will have
-                        // expired their skip windows by the time we
-                        // retry the later attempts.
+                        // with linear backoff and re-dispatch the chunk
+                        // through the whole proximity list. Dead-marked
+                        // entries will have expired their skip windows
+                        // by the time we retry.
                         let next = attempts + 1;
-                        // Adaptive backoff. Two distinct cases:
-                        //
-                        // 1. "all N attempts failed" with N > 0 — real
-                        //    push errors / timeouts / shallow receipts.
-                        //    A short backoff is fine because each
-                        //    attempt cost an RTT, so the previous
-                        //    iteration already consumed real time.
-                        //
-                        // 2. "all 0 attempts failed" — the order_iter
-                        //    was empty: every session was filtered out
-                        //    by is_dead / inflight cap / dial cooldown.
-                        //    The session pool is briefly saturated by
-                        //    other chunks' pushes. Retrying after 500ms
-                        //    spins because the dial cooldown is ~1 s
-                        //    and most chunks haven't finished. Wait
-                        //    longer so the in-flight wave drains and
-                        //    cooldowns expire. Grows with each retry
-                        //    so a deeply-stuck chunk doesn't spin
-                        //    burning CPU.
-                        let backoff = if e.to_string().contains("all 0 attempts") {
-                            // 1.2 s, 1.7 s, 2.2 s, … capped at 5 s.
-                            Duration::from_millis(
-                                (1200 + 500 * next as u64).min(5000),
-                            )
-                        } else {
-                            Duration::from_millis(500)
-                        };
+                        // Linear backoff capped at 10 s. Total wait
+                        // across MAX_CHUNK_RETRIES retries is
+                        // ~1+2+3+...+10+10 ≈ 55 s, which outlasts both
+                        // DEAD_SKIP_SECS (60 s, close enough — entries
+                        // start reviving in the last retry slot) and
+                        // bee's typical ghost-overdraw blocklist
+                        // window. 500 ms × 6 = 10.5 s used to abort
+                        // the upload inside the blocklist window
+                        // every time at higher --concurrency.
+                        let backoff = Duration::from_millis(500);
                         info!(target: "isheika::upload",
                             "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
                             hex::encode(chunk.addr), e, next, MAX_CHUNK_RETRIES,
