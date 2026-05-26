@@ -415,6 +415,19 @@ enum Commands {
         bootnode: Vec<String>,
     },
 
+    /// Send a SavePeers request to a running daemon, forcing it to
+    /// write its in-memory peerlist (plus accumulated reachability
+    /// observations) to the daemon's `--peerlist` file. Useful to
+    /// harvest the live peer set of a long-running daemon without
+    /// interrupting it. Equivalent to what graceful shutdown does
+    /// (via SIGINT), minus the actual shutdown.
+    #[cfg(unix)]
+    SavePeers {
+        /// Unix socket path of the running daemon.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+    },
+
     /// Search for a vanity overlay nonce that targets bee mainnet's
     /// kademlia bin structure.
     ///
@@ -1310,6 +1323,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 discover_rounds,
             )
             .await?;
+        }
+
+        #[cfg(unix)]
+        Commands::SavePeers { socket } => {
+            let resp = isheika::daemon::call(
+                &socket,
+                &isheika::daemon::Request::SavePeers,
+            )
+            .await
+            .map_err(|e| format!("daemon call failed: {e}"))?;
+            match resp {
+                isheika::daemon::Response::Ok => {
+                    println!("daemon saved peerlist");
+                }
+                isheika::daemon::Response::Err { message } => {
+                    return Err(format!("daemon refused save: {message}").into());
+                }
+                other => {
+                    return Err(format!("unexpected daemon response: {other:?}").into());
+                }
+            }
         }
 
         Commands::VanityOverlay {
