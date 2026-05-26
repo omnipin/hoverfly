@@ -97,6 +97,17 @@ jobs:
             ) | sha256sum | awk '{print $1}' > /tmp/source.sha256
             echo "source hash: $(cat /tmp/source.sha256)"
 
+      # Drop any binary the cargo cache may have brought back from a
+      # previous run. The cargo cache covers the whole `target/` dir
+      # for incremental compile state, so a stale binary will be there
+      # even when the source has changed. The binary cache (next step)
+      # legitimately restores it only when the current source hash
+      # matches — by removing it first and then restoring, we get a
+      # reliable "binary exists iff source hash hit" invariant.
+      - run:
+          name: Drop possibly-stale binary from cargo cache
+          command: rm -f target/release/isheika
+
       - restore_cache:
           name: Restore built binary
           keys:
@@ -106,9 +117,11 @@ jobs:
           name: Build release binary (if not cached)
           command: |
             if [ -x target/release/isheika ]; then
-              echo "binary already cached, skipping build"
-              ./target/release/isheika --version 2>/dev/null || ./target/release/isheika --help | head -1
+              echo "binary cache hit — skipping build"
+              ./target/release/isheika --version 2>/dev/null || \
+                ./target/release/isheika --help | head -1
             else
+              echo "binary cache miss — running cargo build"
               cargo build --release --bin isheika
             fi
 
