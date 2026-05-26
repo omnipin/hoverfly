@@ -1930,44 +1930,79 @@ pub async fn push_chunks_with_pool(
             // an "all 0 attempts failed" error is opaque about
             // whether the pool is genuinely saturated, full of dead
             // sessions, or stuck behind dial cooldowns.
+            //
+            // The filter is closed-over by `build_order` so we can
+            // re-evaluate it after a brief wait if the pool was
+            // momentarily saturated when the chunk first asked for
+            // candidates. Without the rebuild, an early-burst chunk
+            // would bubble up `Err(NoPeers)` with 0 attempts and
+            // rely on the outer 500 ms retry, wasting that 500 ms
+            // even when the pool drains in 50 ms.
             let mut filter_dead = 0usize;
             let mut filter_cap = 0usize;
             let mut filter_dead_session_cooldown = 0usize;
-            let mut order: Vec<usize> = (0..pool.len())
-                .filter(|i| {
-                    let e = &pool[*i];
-                    if e.is_dead() {
-                        filter_dead += 1;
-                        return false;
-                    }
-                    // Per-peer in-flight push cap, latency-aware:
-                    // fast peers carry more load (cap ×2), slow peers
-                    // carry less (cap /2). Skip entries at their
-                    // current cap; the dispatcher fans out to
-                    // less-busy peers in the same PO tier. See
-                    // `inflight_cap()` and `IN_FLIGHT_CAP` doc-comments.
-                    if e.inflight_pushes() >= e.inflight_cap() {
-                        filter_cap += 1;
-                        return false;
-                    }
-                    let session_alive = e.snapshot().is_alive();
-                    if session_alive {
-                        return true;
-                    }
-                    // Session dead. Keep only if a pending replacement
-                    // is waiting OR the cooldown has burned off.
-                    if e.has_pending() {
-                        return true;
-                    }
-                    if transport.dial_cooldown_for_underlay(&e.underlay).is_none() {
-                        true
-                    } else {
-                        filter_dead_session_cooldown += 1;
-                        false
-                    }
-                })
-                .collect();
-            // Storage-radius-aware sort: three buckets, primary key.
+            let build_order = |
+                filter_dead: &mut usize,
+                filter_cap: &mut usize,
+                filter_dead_session_cooldown: &mut usize,
+            | -> Vec<usize> {
+                *filter_dead = 0;
+                *filter_cap = 0;
+                *filter_dead_session_cooldown = 0;
+                let mut order: Vec<usize> = (0..pool.len())
+                    .filter(|i| {
+                        let e = &pool[*i];
+                        if e.is_dead() {
+                            *filter_dead += 1;
+                            return false;
+                        }
+                        // Per-peer in-flight push cap, latency-aware:
+                        // fast peers carry more load (cap ×2), slow peers
+                        // carry less (cap /2). Skip entries at their
+                        // current cap; the dispatcher fans out to
+                        // less-busy peers in the same PO tier. See
+                        // `inflight_cap()` and `IN_FLIGHT_CAP` doc-comments.
+                        if e.inflight_pushes() >= e.inflight_cap() {
+                            *filter_cap += 1;
+                            return false;
+                        }
+                        let session_alive = e.snapshot().is_alive();
+                        if session_alive {
+                            return true;
+                        }
+                        // Session dead. Keep only if a pending replacement
+                        // is waiting OR the cooldown has burned off.
+                        if e.has_pending() {
+                            return true;
+                        }
+                        if transport.dial_cooldown_for_underlay(&e.underlay).is_none() {
+                            true
+                        } else {
+                            *filter_dead_session_cooldown += 1;
+                            false
+                        }
+                    })
+                    .collect();
+                // Storage-radius-aware sort (3 buckets, see long comment
+                // below). Sort lives inside build_order so the rebuilt
+                // candidate list is also PO-prioritised.
+                order.sort_by(|&a, &b| {
+                    let pa = chunk_addr.proximity(&pool[a].overlay);
+                    let pb = chunk_addr.proximity(&pool[b].overlay);
+                    let aor = |idx: usize, po: u8| -> u8 {
+                        match pool[idx].in_aor(po) {
+                            Some(true) => 0,
+                            None => 1,
+                            Some(false) => 2,
+                        }
+                    };
+                    aor(a, pa).cmp(&aor(b, pb)).then(pb.cmp(&pa))
+                });
+                order
+            };
+            // Storage-radius-aware 3-bucket sort lives inside
+            // `build_order` so a rebuild keeps the same PO priority.
+            // The original comment block:
             //
             //   0 (front): in-AOR — peer's observed storage radius
             //              places this chunk inside its reserve, so
@@ -2005,21 +2040,35 @@ pub async fn push_chunks_with_pool(
             // haven't talked to yet for THIS chunk's PO range,
             // dominated by fresh-session entries waiting for their
             // first receipt. Worth trying ahead of confirmed-forwarders.
-            order.sort_by(|&a, &b| {
-                let pa = chunk_addr.proximity(&pool[a].overlay);
-                let pb = chunk_addr.proximity(&pool[b].overlay);
-                let aor = |idx: usize, po: u8| -> u8 {
-                    match pool[idx].in_aor(po) {
-                        Some(true) => 0,   // confirmed in-AOR storer
-                        None => 1,         // unknown — give the benefit of the doubt
-                        Some(false) => 2,  // confirmed forwarder for this PO
-                    }
-                };
-                aor(a, pa).cmp(&aor(b, pb)).then(pb.cmp(&pa))
-            });
 
-            let cap = max_retries.max(1).min(order.len());
-            let mut order_iter = order.iter().take(cap).copied();
+            let mut order = build_order(
+                &mut filter_dead,
+                &mut filter_cap,
+                &mut filter_dead_session_cooldown,
+            );
+
+            // `cap` caps how many distinct peers a single chunk
+            // attempts before giving up. With max_retries=DEFAULT=6
+            // and a 100+ session pool, we'd otherwise dispatch to
+            // every session — but most chunks land via the first 3-6
+            // peers, so cap keeps the candidate window bounded.
+            // Recomputed below if `order` is rebuilt after an empty
+            // initial filter.
+            let mut cap = max_retries.max(1).min(order.len());
+            // Index-based candidate cursor instead of an iterator
+            // borrow, so `order` can be reassigned in the
+            // wait-for-capacity block below without fighting the
+            // borrow checker. `next_candidate()` returns the next
+            // usize in `order[..cap]`, or None when exhausted.
+            let mut order_idx: usize = 0;
+            let next_candidate = |order: &Vec<usize>, cap: usize, idx: &mut usize| -> Option<usize> {
+                if *idx >= cap {
+                    return None;
+                }
+                let v = order[*idx];
+                *idx += 1;
+                Some(v)
+            };
 
             let attempt = |idx: usize, attempt_no: usize| {
                 let entry = pool[idx].clone();
@@ -2070,10 +2119,55 @@ pub async fn push_chunks_with_pool(
             // so the chunk's race is wide immediately rather than
             // depending on the preempt timer to fan out gradually.
             for _ in 0..CHUNK_PEER_PARALLELISM {
-                if let Some(idx) = order_iter.next() {
+                if let Some(idx) = next_candidate(&order, cap, &mut order_idx) {
                     attempt_no += 1;
                     inflight.push(attempt(idx, attempt_no));
                 } else {
+                    break;
+                }
+            }
+
+            // If the initial order_iter was empty (every session in
+            // the pool was filtered out: dead, at inflight_cap, or in
+            // dial cooldown), spin-wait briefly and rebuild before
+            // bubbling up `NoPeers`. The outer dispatcher's retry
+            // already does this with a 500 ms backoff, but most often
+            // the pool drains within 50-200 ms: another chunk's push
+            // finishes and decrements `inflight_pushes`, or a dial
+            // cooldown burns off. Polling locally avoids re-entering
+            // the whole dispatch path for the chunk; we just refresh
+            // `order` in place and seed the same FuturesUnordered.
+            //
+            // Cap at 30 × 100 ms = 3 s so a deeply-stuck chunk still
+            // bubbles up and lets the outer loop apply its retry
+            // counter / backoff strategy. If we get past the cap with
+            // no eligible peer, the post-loop NoPeers error fires and
+            // the chunk re-dispatches the normal way.
+            if attempt_no == 0 {
+                for _ in 0..30 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    order = build_order(
+                        &mut filter_dead,
+                        &mut filter_cap,
+                        &mut filter_dead_session_cooldown,
+                    );
+                    if order.is_empty() {
+                        continue;
+                    }
+                    // Recompute cap now that order has entries
+                    // (initial cap was clamped to 0 by .min(0)).
+                    // Reset order_idx — the rebuilt order is a fresh
+                    // candidate list, not a continuation.
+                    cap = max_retries.max(1).min(order.len());
+                    order_idx = 0;
+                    for _ in 0..CHUNK_PEER_PARALLELISM {
+                        if let Some(idx) = next_candidate(&order, cap, &mut order_idx) {
+                            attempt_no += 1;
+                            inflight.push(attempt(idx, attempt_no));
+                        } else {
+                            break;
+                        }
+                    }
                     break;
                 }
             }
@@ -2157,7 +2251,7 @@ pub async fn push_chunks_with_pool(
                             }
                         }
                         // Top up the in-flight window with the next-closest peer.
-                        match order_iter.next() {
+                        match next_candidate(&order, cap, &mut order_idx) {
                             Some(idx) => {
                                 attempt_no += 1;
                                 inflight.push(attempt(idx, attempt_no));
@@ -2183,7 +2277,7 @@ pub async fn push_chunks_with_pool(
                     _ = sleep.as_mut(), if inflight.len() < CHUNK_PEER_PARALLELISM => {
                         // Preemptive fanout: closest peer hasn't returned within
                         // `PREEMPT_INTERVAL`, so race another peer in parallel.
-                        match order_iter.next() {
+                        match next_candidate(&order, cap, &mut order_idx) {
                             Some(idx) => {
                                 attempt_no += 1;
                                 inflight.push(attempt(idx, attempt_no));
