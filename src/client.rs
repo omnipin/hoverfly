@@ -3099,7 +3099,19 @@ async fn try_push_with_rotation(
 /// in-flight window to find `max_sessions` reachable ones quickly. Bee's
 /// per-incoming-connection cost is cheap, and these dials only run once
 /// per upload.
-const SESSION_DIAL_PARALLELISM: usize = 32;
+/// How many session dials we keep in flight at once while filling
+/// the session pool. Mainnet peerlists are heavy with unreachable
+/// peers (NAT'd, gone offline since being announced, bin-saturated
+/// against our overlay so handshake substream gets rejected — see
+/// `daemon.rs`'s discover fallback handling). For a 1500-peer
+/// peers.seed.json (harvested from swarmscan.io) where ~97% of
+/// peers reject us, a wide window finds reachable ones quickly
+/// without bottlenecking on dial timeouts.
+///
+/// Tuning history:
+///   32   — was fine for ≤300-peer lists
+///   128  — current, for cold-start with swarmscan-derived seeds
+const SESSION_DIAL_PARALLELISM: usize = 128;
 
 /// Reorder a candidate peer list so that consecutive picks cover
 /// distinct proximity-order bins instead of clustering by overlay
