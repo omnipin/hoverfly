@@ -58,16 +58,22 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
           protoc --version
 
-      - name: Cache cargo registry + target
-        uses: actions/cache@v4
+      # `Swatinem/rust-cache` knows the right Cargo paths to cache:
+      # `.cargo/{bin,registry/index,registry/cache,git/db}` plus the
+      # workspace `target/<profile>/{deps,build,examples,incremental}`.
+      # It prunes intermediates before saving so the cache stays
+      # small (~hundreds of MB vs multi-GB for raw `target/` archives),
+      # and it keys on Cargo.lock + rust-toolchain + workspace layout
+      # so partial dep updates still reuse most of the cache.
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
         with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
+          # Tag the cache so multiple workflows in this repo (e.g.
+          # a future test workflow) can opt in or out of sharing.
+          shared-key: bench-release
+          # Only save fresh caches on main; PR runs reuse but don't
+          # bust the 10GB-per-repo cache budget with their branches.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - name: Build release binary
         run: cargo build --release --bin isheika
