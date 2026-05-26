@@ -173,36 +173,37 @@ jobs:
           # `--bootnode` overrides /dnsaddr/mainnet.ethswarm.org because
           # (as of May 2026) the official bootnodes silently reject the
           # handshake substream from both GH runners and a known-good
-          # VPS. Regular bee peers still accept us, so we bootstrap from
-          # one specific stable mainnet peer.
+          # VPS. Even non-bootnode mainnet peers sometimes reject us
+          # via kademlia bin-saturation (depends on which bin our
+          # overlay falls in vs which bins the peer has filled), and
+          # CircleCI runners get a new public IP per job so we can't
+          # rely on one specific peer.
           #
-          # --dial-timeout 8 (vs default 3): CircleCI runners are in
-          # AWS us-east, mainnet peers concentrate in EU (~150ms RTT).
-          # The full libp2p connect chain (tcp + noise + yamux +
-          # identify + pricing + /swarm/handshake) is ~7 RTTs, so a 3 s
-          # budget cuts off too many otherwise-reachable peers.
-          # Cold-run analysis: 276 of 279 pool-fill failures were dial
-          # timeouts. Raising the budget should lift pool fill from
-          # ~31% to ~70% success.
+          # Workaround: pass 5 diverse known-good mainnet peers as
+          # bootnodes. Discover tries each one and accumulates their
+          # hive responses, so a single bin-saturation rejection
+          # doesn't break cold-start.
           #
-          # --discover-rounds 5 (vs 3): more rounds = larger candidate
-          # set, important since pool fill exhausted candidates before
-          # reaching pool-size.
+          # --discover-rounds 3: enough rounds for the hive frontier
+          # to reach hundreds of peers across all 5 bootnodes.
           background: true
           command: |
             rm -f /tmp/isheika.sock
             ./target/release/isheika \
               --nonce-file overlay-nonce \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
-              --dial-timeout 8 \
               daemon \
               --socket /tmp/isheika.sock \
               --peerlist peers.json \
               --pool-size << pipeline.parameters.pool_size >> \
               --listen /ip4/0.0.0.0/tcp/1635 \
               --identity "$BENCH_KEY" \
-              --discover-rounds 5 \
+              --discover-rounds 3 \
               --bootnode '/ip4/65.109.112.157/tcp/20474/p2p/QmSYwqAMAb9VfrTWzXxJ6APxWTjgtjyxxpMT8rXNKNjDXi' \
+              --bootnode '/ip4/65.108.192.81/tcp/15024/p2p/QmUgivFBB9uHxajgA8fU9e7kge4t2RBYd6GBugpUTA67TB' \
+              --bootnode '/ip4/65.21.80.13/tcp/8014/p2p/QmRMf2xeQKsRx5A5XMFfp6iUHKiS14UnMco888zYWBf1E8' \
+              --bootnode '/ip4/142.132.214.211/tcp/3414/p2p/QmdWfNoHPGW7GebhH5V9S256nNNqY9HdDffjmaePVnk4ZT' \
+              --bootnode '/ip4/194.44.2.143/tcp/1634/p2p/QmYqpovBNhCrGDM4NpmkENQZj2bHVXPBtyrLoMUt64kbj2' \
               -d \
               > /tmp/daemon.log 2>&1
 
