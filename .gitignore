@@ -2,5 +2,11 @@
 /node_modules
 *.tmp
 peers.json
+# `peers.seed.json` is checked in: a small (~140 peer) cold-start
+# seed harvested from a long-running daemon. Used by CI (which has
+# no persistent peerlist) and by fresh local installs. Lives
+# alongside the gitignored `peers.json` that gets written at
+# daemon shutdown / SavePeers. CI copies it into place before
+# starting the daemon.
 .DS_Store
 image.jpg
