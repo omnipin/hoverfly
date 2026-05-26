@@ -192,6 +192,27 @@ jobs:
             echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
 
       - run:
+          name: Seed peers.json from committed seed
+          # CircleCI runners have no persistent peerlist. Without a
+          # seed, the daemon's pre-fill discover has to negotiate
+          # the libp2p /swarm/handshake substream from a fresh IP
+          # against bee mainnet peers — which currently almost
+          # always rejects us due to kademlia bin saturation.
+          # peers.seed.json is a ~140-peer snapshot harvested from
+          # a long-running daemon on a VPS that holds established
+          # kademlia memberships. Copying it into place lets the
+          # daemon skip discover and go straight to pool fill
+          # against known reachable peers.
+          command: |
+            if [ ! -f peers.seed.json ]; then
+              echo "ERROR peers.seed.json missing from checkout"
+              exit 1
+            fi
+            cp peers.seed.json peers.json
+            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
+            echo "seeded peers.json with $PEER_COUNT peers"
+
+      - run:
           name: Start tcpdump capture
           # Capture outbound TCP (excluding HTTPS/SSH/HTTP) during daemon
           # startup so we can confirm whether the alternate bootnode is
