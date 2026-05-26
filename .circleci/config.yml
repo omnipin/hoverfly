@@ -34,12 +34,12 @@ parameters:
     description: "Number of uploads to median (each costs real BZZ)"
   pool_size:
     type: string
-    default: "256"
-    description: "Daemon --pool-size"
+    default: "64"
+    description: "Daemon --pool-size — capped at ~3× the number of unique /32 IPs in peers.seed.json (~21), so bee's per-/32 connLimiter (10 RPS / burst 40) doesn't ConnectionReset most of the dials"
   buffer_multiplier:
     type: string
-    default: "2"
-    description: "Daemon --buffer-multiplier (1, 2, or 4)"
+    default: "1"
+    description: "Daemon --buffer-multiplier (1, 2, or 4) — at pool=64, buffer=128 is comfortable headroom over per-session inflight cap"
 
 jobs:
   bench:
@@ -227,27 +227,22 @@ jobs:
 
       - run:
           name: Start daemon
-          # With peers.seed.json copied to peers.json (previous step),
-          # the daemon already has 143 known-reachable peers to dial.
-          # Discover is still configured as a fallback (one round
-          # against 5 diverse known-good non-bootnode peers), but it
-          # mostly returns 0 peers from bee mainnet's current bin-
-          # saturation policy. The seed file is what makes cold-start
-          # actually work.
+          # peers.seed.json is an IP-diverse subset: ~33 peers across
+          # 21 unique IPs (max 2 peers per /32). Earlier seed listed
+          # 143 peers but concentrated on a few IPs — 95 of 143 were
+          # on just 2 IPs — and bee's `connLimiter` rate-limits
+          # incoming connections per /32 at 10 RPS, burst 40. Dialing
+          # the same /32 four times in a second got us
+          # ConnectionReset-by-peer on most attempts.
           #
-          # ISHEIKA_CONNECTIONS_PER_PEER=2 doubles dial attempts per
-          # peer: each successful dial opens a separate libp2p
-          # connection with its own yamux pipe, so two dials to peer X
-          # become two independent SessionEntries. From a 143-peer
-          # candidate list with ~50% dial success, M=2 grows the
-          # pool from ~70 sessions to ~140 — enough headroom that
-          # bursts don't saturate the inflight_cap on every session
-          # simultaneously.
+          # CONNECTIONS_PER_PEER=1 (default): one libp2p connection
+          # per peer. Multi-connection-per-peer makes the per-/32
+          # rate limit worse since same operator = same /32 most of
+          # the time.
           background: true
           command: |
             rm -f /tmp/isheika.sock
-            ISHEIKA_CONNECTIONS_PER_PEER=2 \
-              ./target/release/isheika \
+            ./target/release/isheika \
               --nonce-file overlay-nonce \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
               daemon \
