@@ -113,6 +113,12 @@ struct State {
     /// before pool fill.
     doh: Option<Doh>,
     bootnode: Option<libp2p::Multiaddr>,
+    /// Number of recursive discovery hops to run during eager
+    /// pool fill. Default 1 — enough for warm peers.json. Larger
+    /// values seed a much bigger candidate set when peers.json is
+    /// cold (CI, fresh VPS). Caller-supplied via the daemon
+    /// command's `--discover-rounds` flag.
+    discover_rounds: usize,
     /// Daemon identity ETH address. Used by the auto-iteration loop
     /// to compute vanity overlays for proposed anchor sets.
     /// `None` when the daemon runs without `--identity` (purely
@@ -161,7 +167,7 @@ pub async fn run(
     listen: Option<ListenConfig>,
     swap: Option<crate::transport::SwapConfig>,
     // Optional DoH + bootnode for live peer discovery before
-    // pool fill. When set, the daemon does a quick 1-round
+    // pool fill. When set, the daemon does a `discover_rounds`-round
     // discover before opening the session pool, ensuring fresh
     // peers instead of stale file entries.
     discover: Option<(Doh, libp2p::Multiaddr)>,
@@ -170,6 +176,14 @@ pub async fn run(
     // `<path>.next` (next to the current nonce) so an operator
     // can opt into it by mv'ing it over and restarting.
     nonce_file_path: Option<PathBuf>,
+    // Number of recursive discovery hops to perform during the
+    // pre-pool-fill discover. 1 is enough when peers.json already
+    // has thousands of entries; 3-5 helps cold-start runs (CI,
+    // fresh VPS) where the daemon's discover is the only source.
+    // The discover happens under the daemons stable identity
+    // when `--listen` + `--identity` are set, so bees don't reject
+    // it via kademlia saturation.
+    discover_rounds: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
     // Remove any stale socket from a previous crashed run. The daemon
     // owns the socket file for its lifetime.
@@ -244,6 +258,7 @@ pub async fn run(
         cache: cache.clone(),
         doh,
         bootnode,
+        discover_rounds: discover_rounds.max(1),
         identity_eth_address,
         nonce_file_path: nonce_file_path.clone(),
     });
@@ -551,15 +566,26 @@ async fn ensure_pool(
         }
     }
 
-    // Quick 1-round discover before pool fill, so we dial fresh
-    // peers instead of stale file entries.
+    // Multi-round discover before pool fill, so we dial fresh peers
+    // instead of stale file entries. The discover happens under the
+    // daemon's stable signer — so when running with `--listen` +
+    // `--identity` + `--nonce-file`, our vanity overlay carries
+    // through, and bootnodes don't reject us with kademlia
+    // saturation at handshake time.
+    //
+    // The 5-MIB-PER-DISCOVER wait was kept short (5s per peer) for
+    // the original 1-round case; longer would needlessly pad the
+    // first-upload cost on a warm peers.json. With >1 round the
+    // total wall clock is roughly `rounds × ceil(frontier/16) ×
+    // 5s` in the worst case, but practically bounded by the
+    // QUIET_FOR short-circuit inside `discover_peers`.
     if let (Some(doh), Some(bootnode)) = (state.doh.as_ref(), state.bootnode.as_ref()) {
         match discover_recursive_with_progress(
             &state.transport,
             doh,
             bootnode,
             std::time::Duration::from_secs(5),
-            1,
+            state.discover_rounds,
             16,
             None::<crate::client::DiscoverProgressFn>,
         )
@@ -567,7 +593,8 @@ async fn ensure_pool(
         {
             Ok(fresh) if !fresh.is_empty() => {
                 info!(target: "isheika::daemon",
-                    "discovered {} fresh peer(s) before pool fill", fresh.len());
+                    "discovered {} fresh peer(s) in {} round(s) before pool fill",
+                    fresh.len(), state.discover_rounds);
                 let mut peers = state.peers.write().await;
                 for p in fresh {
                     peers.upsert(p);

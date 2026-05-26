@@ -371,6 +371,20 @@ enum Commands {
         /// from bee but bee never adds us to its routing tables.
         #[arg(long, value_name = "MULTIADDR")]
         advertise: Option<String>,
+
+        /// Number of recursive discovery hops the daemon's eager
+        /// pool fill performs against the bootnode before opening
+        /// sessions. Default 1 (bootnode only) — enough when
+        /// `peers.json` is already populated. Set to 3-5 on a cold
+        /// peerlist (no prior `discover` run) so the eager pool
+        /// fill has thousands of candidates to dial. The discover
+        /// happens under the daemon's stable identity (when
+        /// `--listen` + `--identity` are set), so bees don't
+        /// reject it via kademlia saturation — unlike the ephemeral
+        /// `isheika discover` subcommand which can be RST'd by
+        /// every bootnode on a fresh runner.
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        discover_rounds: usize,
     },
 
     /// Search for a vanity overlay nonce that targets bee mainnet's
@@ -1178,7 +1192,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
-        Commands::Daemon { socket, peerlist, pool_size, listen, identity, advertise } => {
+        Commands::Daemon { socket, peerlist, pool_size, listen, identity, advertise, discover_rounds } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
             let sock_path = socket.clone();
@@ -1258,6 +1272,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 swap_cfg.clone(),
                 Some((doh, bootnode)),
                 Some(cli.nonce_file.clone()),
+                discover_rounds,
             )
             .await?;
         }

@@ -117,31 +117,18 @@ jobs:
           printf "%s" "$NONCE_HEX" > overlay-nonce
           echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
 
-      - name: Discover mainnet peers
-        # The daemon does ITS OWN 1-round discover before pool fill,
-        # but it only seeds from the bootnode and ends up with ~30-40
-        # candidates — way too small a candidate pool for pool=256.
-        # Run an explicit multi-round discover here to seed peers.json
-        # with thousands of candidates, so the daemon's eager pool
-        # fill has enough peers to choose from.
-        #
-        # `--healthcheck` is skipped: it probes every discovered peer
-        # via a dial+disconnect, which on a GH runner takes minutes
-        # because each per-peer dial has a 3s timeout and we run 64
-        # in parallel. The daemon's pool fill organically validates
-        # peers by trying to open sessions; unreachable ones fail
-        # fast and don't enter the pool.
-        run: |
-          ./target/release/isheika -v discover \
-            /dnsaddr/mainnet.ethswarm.org \
-            --output peers.json \
-            --rounds 3 \
-            --discover-concurrency 32 \
-            --wait 20 \
-          | tail -5
-          echo "peers.json size: $(wc -c < peers.json) bytes"
-
       - name: Start daemon
+        # No standalone `discover` step: the explicit `isheika discover`
+        # uses an EPHEMERAL signer per process, which lands in bin 0
+        # of every bee bootnode and gets rejected via Pick saturation
+        # before any hive batch is sent (observed in prior run: 0 peers
+        # in 3 seconds vs 37 peers in the daemons internal discover).
+        #
+        # Instead, run the daemon with `--discover-rounds 3`. The
+        # daemons own eager-pool-fill discover uses the STABLE vanity
+        # overlay from `--nonce-file` + `--identity`, which bees
+        # accept. 3 rounds typically yields 1500-3000 peers, enough
+        # to fill pool=256 to ~200+ live sessions.
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
@@ -155,6 +142,7 @@ jobs:
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
+            --discover-rounds 3 \
             -v \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!
