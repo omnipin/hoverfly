@@ -406,7 +406,12 @@ enum Commands {
         /// least one Hetzner VPS saw the official mainnet bootnodes
         /// reject the handshake substream while regular peers still
         /// accepted it.
-        #[arg(long, default_values_t = [MAINNET_BOOTNODE.to_string()], value_name = "MULTIADDR")]
+        #[arg(
+            long,
+            value_name = "MULTIADDR",
+            action = clap::ArgAction::Append,
+            default_values_t = [MAINNET_BOOTNODE.to_string()],
+        )]
         bootnode: Vec<String>,
     },
 
