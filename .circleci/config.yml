@@ -34,12 +34,12 @@ parameters:
     description: "Number of uploads to median (each costs real BZZ)"
   pool_size:
     type: string
-    default: "64"
-    description: "Daemon --pool-size — capped at ~3× the number of unique /32 IPs in peers.seed.json (~21), so bee's per-/32 connLimiter (10 RPS / burst 40) doesn't ConnectionReset most of the dials"
+    default: "256"
+    description: "Daemon --pool-size. peers.seed.json now lists 1492 unique IPs (1 peer per IP from swarmscan.io), so 256 is well within bee's per-/32 connLimiter even after dial fan-out — at most 1 dial per IP, no rate-limit pressure."
   buffer_multiplier:
     type: string
-    default: "1"
-    description: "Daemon --buffer-multiplier (1, 2, or 4) — at pool=64, buffer=128 is comfortable headroom over per-session inflight cap"
+    default: "2"
+    description: "Daemon --buffer-multiplier (1, 2, or 4). With pool=256 and per-session inflight_cap of 2-8, buffer=512 keeps the dispatcher saturated without overshooting any single session's capacity."
 
 jobs:
   bench:
