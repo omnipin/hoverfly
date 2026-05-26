@@ -1,36 +1,307 @@
-# This config was automatically generated from your source code
-# Stacks detected: cicd:github-actions:.github/workflows,deps:node:.,deps:rust:.
+# Benchmark isheika daemon-mode upload throughput against bee mainnet
+# from a CircleCI Docker executor. Mirrors the GitHub Actions workflow
+# in `.github/workflows/bench.yml` for cross-CI comparison.
+#
+# Runs manually only — guarded by the `run_bench` pipeline parameter
+# so every push to main doesn't spend real BZZ. Trigger via the
+# CircleCI UI "Trigger Pipeline" button with `run_bench=true`, or via
+# the API:
+#
+#   curl -X POST https://circleci.com/api/v2/project/gh/v1rtl/isheika/pipeline \
+#     -H "Circle-Token: $CIRCLE_TOKEN" \
+#     -H "Content-Type: application/json" \
+#     -d '{"parameters": {"run_bench": true}}'
+#
+# Required project environment variables (set in Project Settings → Env Vars):
+#   BENCH_BATCH   Postage batch ID (32-byte hex, no 0x prefix)
+#   BENCH_KEY     Signer private key (32-byte hex, 0x prefix optional)
+#   BENCH_NONCE   Vanity overlay nonce (32-byte hex, no 0x prefix)
+
 version: 2.1
+
+parameters:
+  run_bench:
+    type: boolean
+    default: false
+    description: "Run the mainnet upload benchmark"
+  file_size_mib:
+    type: string
+    default: "5"
+    description: "Random upload size in MiB"
+  n_uploads:
+    type: string
+    default: "3"
+    description: "Number of uploads to median (each costs real BZZ)"
+  pool_size:
+    type: string
+    default: "256"
+    description: "Daemon --pool-size"
+  buffer_multiplier:
+    type: string
+    default: "2"
+    description: "Daemon --buffer-multiplier (1, 2, or 4)"
+
 jobs:
-  test-rust:
+  bench:
     docker:
-      - image: cimg/rust:1.70
+      - image: cimg/rust:1.95.0
+    # `large` = 4 vCPU / 8 GB RAM, comparable to GitHub-hosted ubuntu-latest.
+    # `medium` (the default) is 2 vCPU which makes Rust release builds slow.
+    resource_class: large
+
+    environment:
+      # Disable incremental compilation in release mode. Combined with
+      # the cargo + built-binary caches, this makes cargo trust the
+      # fingerprint cache and skip recompiling unchanged source on hit.
+      CARGO_INCREMENTAL: "0"
+
     steps:
       - checkout
+
+      - run:
+          name: Install protoc
+          # nectar-primitives / prost-build call `protoc` from their build
+          # scripts; the cimg/rust image doesnt ship it.
+          command: |
+            sudo apt-get update -y
+            sudo apt-get install -y --no-install-recommends protobuf-compiler tcpdump
+            protoc --version
+            tcpdump --version | head -1
+
+      # Two-tier cache strategy:
+      #
+      # 1. Cargo registry + target dir, keyed on Cargo.lock. Restores
+      #    incremental build artifacts so a Cargo.lock-unchanged
+      #    rebuild only relinks.
+      #
+      # 2. Built binary keyed on hash of every input that affects the
+      #    build output. If hit, skip `cargo build` entirely — sidesteps
+      #    the well-known mtime-bumps-from-checkout rebuild issue.
       - restore_cache:
-          key: cargo-{{ checksum "Cargo.lock" }}
+          name: Restore cargo cache
+          keys:
+            - cargo-v2-{{ arch }}-{{ checksum "Cargo.lock" }}
+            - cargo-v2-{{ arch }}-
+
+      # Aggregate hash of inputs that determine the build output.
+      # Used as the key for the built-binary cache.
       - run:
-          command: cargo test
+          name: Compute source hash
+          command: |
+            # Stable across reruns of the same commit. find sorts paths
+            # alphabetically so the hash is deterministic regardless of
+            # filesystem iteration order.
+            (
+              cat Cargo.toml Cargo.lock build.rs 2>/dev/null
+              find src proto -type f \( -name '*.rs' -o -name '*.proto' \) | sort | xargs cat
+            ) | sha256sum | awk '{print $1}' > /tmp/source.sha256
+            echo "source hash: $(cat /tmp/source.sha256)"
+
+      - restore_cache:
+          name: Restore built binary
+          keys:
+            - bin-v1-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
+
+      - run:
+          name: Build release binary (if not cached)
+          command: |
+            if [ -x target/release/isheika ]; then
+              echo "binary already cached, skipping build"
+              ./target/release/isheika --version 2>/dev/null || ./target/release/isheika --help | head -1
+            else
+              cargo build --release --bin isheika
+            fi
+
       - save_cache:
-          key: cargo-{{ checksum "Cargo.lock" }}
+          name: Save cargo cache
+          key: cargo-v2-{{ arch }}-{{ checksum "Cargo.lock" }}
           paths:
-            - ~/.cargo
-  deploy:
-    # This is an example deploy job, not actually used by the workflow
-    docker:
-      - image: cimg/base:stable
-    steps:
-      # Replace this with steps to deploy to users
+            - ~/.cargo/registry
+            - ~/.cargo/git
+            - target
+
+      - save_cache:
+          name: Save built binary
+          key: bin-v1-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
+          paths:
+            - target/release/isheika
+
       - run:
-          name: deploy
-          command: '#e.g. ./deploy.sh'
+          name: Validate secrets
+          command: |
+            missing=()
+            [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
+            [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
+            [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
+            if [ "${#missing[@]}" -gt 0 ]; then
+              printf 'ERROR Missing required env var(s): %s\n' "${missing[*]}"
+              exit 1
+            fi
+            [ "${#BENCH_BATCH}" -ge 64 ] || { echo "ERROR BENCH_BATCH too short"; exit 1; }
+            [ "${#BENCH_KEY}"   -ge 64 ] || { echo "ERROR BENCH_KEY too short";   exit 1; }
+            [ "${#BENCH_NONCE}" -ge 64 ] || { echo "ERROR BENCH_NONCE too short"; exit 1; }
+            echo "All secrets present and within expected length."
+
       - run:
-          name: found github actions config
-          command: ':'
+          name: Write vanity overlay nonce
+          command: |
+            # Strip optional 0x prefix and whitespace.
+            NONCE_HEX="${BENCH_NONCE#0x}"
+            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
+            if [ "${#NONCE_HEX}" -ne 64 ]; then
+              echo "ERROR BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
+              exit 1
+            fi
+            printf "%s" "$NONCE_HEX" > overlay-nonce
+            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+
+      - run:
+          name: Start tcpdump capture
+          # Capture outbound TCP (excluding HTTPS/SSH/HTTP) during daemon
+          # startup so we can confirm whether the alternate bootnode is
+          # accepting our handshake from a CircleCI IP.
+          background: true
+          command: |
+            IFACE=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -1)
+            echo "capturing on $IFACE"
+            sudo tcpdump -i "$IFACE" -s 256 -w /tmp/bench.pcap \
+              'tcp and not (port 443 or port 22 or port 80)' \
+              > /tmp/tcpdump.log 2>&1
+
+      - run:
+          name: Start daemon
+          # `--bootnode` overrides /dnsaddr/mainnet.ethswarm.org because
+          # (as of May 2026) the official bootnodes silently reject the
+          # handshake substream from both GH runners and a known-good
+          # VPS. Regular bee peers still accept us, so we bootstrap from
+          # one specific stable mainnet peer.
+          background: true
+          command: |
+            rm -f /tmp/isheika.sock
+            ./target/release/isheika \
+              --nonce-file overlay-nonce \
+              --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
+              daemon \
+              --socket /tmp/isheika.sock \
+              --peerlist peers.json \
+              --pool-size << pipeline.parameters.pool_size >> \
+              --listen /ip4/0.0.0.0/tcp/1635 \
+              --identity "$BENCH_KEY" \
+              --discover-rounds 3 \
+              --bootnode '/ip4/65.109.112.157/tcp/20474/p2p/QmSYwqAMAb9VfrTWzXxJ6APxWTjgtjyxxpMT8rXNKNjDXi' \
+              -d \
+              > /tmp/daemon.log 2>&1
+
+      - run:
+          name: Wait for warm pool
+          # Daemon-side discover + pool fill from cold takes ~80s on a
+          # VPS for pool=256. CircleCI Docker may be slower with
+          # smaller bandwidth, so cap wait at 8 min.
+          command: |
+            for i in $(seq 1 96); do
+              if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
+                echo "pool warm after ${i}x5s waits"
+                grep "pool fill: done" /tmp/daemon.log | tail -1
+                exit 0
+              fi
+              sleep 5
+            done
+            echo "WARN pool did not warm in 8 min; proceeding anyway"
+            tail -50 /tmp/daemon.log
+
+      - run:
+          name: Stop tcpdump capture
+          when: always
+          command: |
+            sudo pkill -INT tcpdump 2>/dev/null || true
+            sleep 2
+            sudo pkill -9 tcpdump 2>/dev/null || true
+            sudo chmod 644 /tmp/bench.pcap 2>/dev/null || true
+            ls -la /tmp/bench.pcap /tmp/tcpdump.log 2>/dev/null || true
+
+      - run:
+          name: Run benchmark uploads
+          command: |
+            : > /tmp/bench.results
+            for i in $(seq 1 << pipeline.parameters.n_uploads >>); do
+              rm -f /tmp/bench-<< pipeline.parameters.file_size_mib >>mib.bin
+              dd if=/dev/urandom \
+                 of=/tmp/bench-<< pipeline.parameters.file_size_mib >>mib.bin \
+                 bs=1M count=<< pipeline.parameters.file_size_mib >> status=none
+
+              echo "=== Run $i ==="
+              ./target/release/isheika upload \
+                --daemon /tmp/isheika.sock \
+                --batch "$BENCH_BATCH" \
+                --key "$BENCH_KEY" \
+                /tmp/bench-<< pipeline.parameters.file_size_mib >>mib.bin 2>&1 \
+                | tee -a /tmp/bench.results \
+                | grep -E '^upload:|^uploaded' || true
+
+              sleep 3
+            done
+
+      - run:
+          name: Summarize throughput
+          command: |
+            echo "===================="
+            echo "Benchmark summary"
+            echo "===================="
+            echo "file size: << pipeline.parameters.file_size_mib >> MiB"
+            echo "n uploads: << pipeline.parameters.n_uploads >>"
+            echo "pool size: << pipeline.parameters.pool_size >>"
+            echo "buffer multiplier: << pipeline.parameters.buffer_multiplier >>"
+            echo ""
+
+            python3 - <<'PY'
+            import re
+            rates = []
+            with open("/tmp/bench.results") as f:
+                for line in f:
+                    m = re.search(r'upload: \d+ bytes in ([\d.]+)s = ([\d.]+) (KiB|MiB)/s', line)
+                    if not m: continue
+                    secs, val, unit = float(m.group(1)), float(m.group(2)), m.group(3)
+                    kibs = val if unit == "KiB" else val * 1024.0
+                    rates.append(kibs)
+                    print(f"  {secs:.2f}s = {val:.2f} {unit}/s")
+            if rates:
+                rs = sorted(rates)
+                med = rs[len(rs)//2] if len(rs)%2==1 else (rs[len(rs)//2-1]+rs[len(rs)//2])/2
+                print()
+                print(f"Median: {med:.2f} KiB/s")
+                print(f"Best:   {max(rates):.2f} KiB/s")
+                print(f"Worst:  {min(rates):.2f} KiB/s")
+            else:
+                print("No successful uploads parsed from results.")
+            PY
+
+      - run:
+          name: Capture daemon diagnostics
+          when: always
+          command: |
+            echo "===================="
+            echo "Last 100 daemon log lines"
+            echo "===================="
+            tail -100 /tmp/daemon.log 2>/dev/null || echo "no daemon log"
+
+      - store_artifacts:
+          path: /tmp/daemon.log
+          destination: daemon.log
+      - store_artifacts:
+          path: /tmp/bench.results
+          destination: bench.results
+      - store_artifacts:
+          path: /tmp/bench.pcap
+          destination: bench.pcap
+      - store_artifacts:
+          path: /tmp/tcpdump.log
+          destination: tcpdump.log
+      - store_artifacts:
+          path: peers.json
+          destination: peers.json
+
 workflows:
-  build-and-test:
+  bench:
+    when: << pipeline.parameters.run_bench >>
     jobs:
-      - test-rust
-    # - deploy:
-    #     requires:
-    #       - test-rust
+      - bench
