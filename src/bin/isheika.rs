@@ -387,16 +387,27 @@ enum Commands {
         discover_rounds: usize,
 
         /// Bootstrap peer multiaddr for the daemon's eager pool fill
-        /// discover. Default `/dnsaddr/mainnet.ethswarm.org` resolves
-        /// to the Swarm Foundation bootnodes. Override with a specific
-        /// `/ip4/.../tcp/.../p2p/...` if those bootnodes are
-        /// unreachable from your network (May 2026: GitHub Actions
-        /// runners and at least one VPS provider saw the official
-        /// mainnet bootnodes reject the handshake substream while
-        /// regular peers still accepted it — bypassing the bootnode
-        /// with a stable known peer worked around the issue).
-        #[arg(long, default_value = MAINNET_BOOTNODE, value_name = "MULTIADDR")]
-        bootnode: String,
+        /// discover. Pass `--bootnode` multiple times to supply
+        /// fallbacks: discover tries each in order until one returns
+        /// a non-empty peer set. Defaults to a single entry,
+        /// `/dnsaddr/mainnet.ethswarm.org`, which resolves to the
+        /// Swarm Foundation bootnodes.
+        ///
+        /// Multiple bootnodes are useful because bee performs
+        /// kademlia bin-saturation gating at the handshake substream:
+        /// our overlay can be silently rejected by one peer (the
+        /// `/swarm/handshake/14.0.0/handshake` substream returns
+        /// `UnsupportedProtocol` even though identify completed),
+        /// while a peer in a different bin accepts us. Listing a
+        /// handful of stable peers across different ASes / regions
+        /// makes cold-start robust against this random rejection.
+        ///
+        /// May 2026: GitHub Actions runners, CircleCI runners, and at
+        /// least one Hetzner VPS saw the official mainnet bootnodes
+        /// reject the handshake substream while regular peers still
+        /// accepted it.
+        #[arg(long, default_values_t = [MAINNET_BOOTNODE.to_string()], value_name = "MULTIADDR")]
+        bootnode: Vec<String>,
     },
 
     /// Search for a vanity overlay nonce that targets bee mainnet's
@@ -1272,8 +1283,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
 
             let doh = Doh::with_url(&cli.doh_url);
-            let bootnode: Multiaddr = bootnode.parse()
-                .map_err(|e| format!("invalid --bootnode multiaddr: {e}"))?;
+            let bootnodes: Vec<Multiaddr> = bootnode
+                .iter()
+                .map(|s| s.parse::<Multiaddr>()
+                    .map_err(|e| format!("invalid --bootnode multiaddr {s}: {e}")))
+                .collect::<Result<_, _>>()?;
+            if bootnodes.is_empty() {
+                return Err("at least one --bootnode is required".into());
+            }
             isheika::daemon::run(
                 socket,
                 peerlist,
@@ -1283,7 +1300,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_secs(cli.timeout),
                 listen_cfg,
                 swap_cfg.clone(),
-                Some((doh, bootnode)),
+                Some((doh, bootnodes)),
                 Some(cli.nonce_file.clone()),
                 discover_rounds,
             )

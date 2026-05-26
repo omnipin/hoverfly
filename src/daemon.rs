@@ -109,10 +109,13 @@ struct State {
     /// freshly uploaded roots are retrievable through bzz.limo / any
     /// bee peer that routes a retrieval request back to us.
     cache: ChunkCache,
-    /// Optional DoH resolver + bootnode for live peer discovery
-    /// before pool fill.
+    /// Optional DoH resolver + bootnodes for live peer discovery
+    /// before pool fill. Multiple bootnodes are tried in order during
+    /// each discover round, accumulating their peer lists, so a peer
+    /// that bin-saturates and rejects our handshake substream doesn't
+    /// block us — others can still supply hive responses.
     doh: Option<Doh>,
-    bootnode: Option<libp2p::Multiaddr>,
+    bootnodes: Vec<libp2p::Multiaddr>,
     /// Number of recursive discovery hops to run during eager
     /// pool fill. Default 1 — enough for warm peers.json. Larger
     /// values seed a much bigger candidate set when peers.json is
@@ -166,11 +169,14 @@ pub async fn run(
     op_timeout: std::time::Duration,
     listen: Option<ListenConfig>,
     swap: Option<crate::transport::SwapConfig>,
-    // Optional DoH + bootnode for live peer discovery before
-    // pool fill. When set, the daemon does a `discover_rounds`-round
-    // discover before opening the session pool, ensuring fresh
-    // peers instead of stale file entries.
-    discover: Option<(Doh, libp2p::Multiaddr)>,
+    // Optional DoH + one-or-more bootnodes for live peer discovery
+    // before pool fill. When set, the daemon does a `discover_rounds`-
+    // round discover before opening the session pool, ensuring fresh
+    // peers instead of stale file entries. With multiple bootnodes,
+    // every round dials all bootnodes in parallel (in addition to the
+    // accumulated frontier), so cold-start is robust against one peer
+    // rejecting our handshake.
+    discover: Option<(Doh, Vec<libp2p::Multiaddr>)>,
     // Path of the overlay-nonce file the daemon was started with.
     // The auto-iteration loop writes the suggested next-nonce to
     // `<path>.next` (next to the current nonce) so an operator
@@ -243,7 +249,9 @@ pub async fn run(
             peerlist_path.display());
     }
     let cache = ChunkCache::new();
-    let (doh, bootnode) = discover.map(|(d, b)| (Some(d), Some(b))).unwrap_or((None, None));
+    let (doh, bootnodes) = discover
+        .map(|(d, b)| (Some(d), b))
+        .unwrap_or((None, Vec::new()));
     // Pluck the daemon's identity eth_address out of listen (if any)
     // BEFORE we move `listen` into the inbound spawn. Auto-iteration
     // needs the eth address to compute candidate vanity overlays.
@@ -257,7 +265,7 @@ pub async fn run(
         pool_target,
         cache: cache.clone(),
         doh,
-        bootnode,
+        bootnodes,
         discover_rounds: discover_rounds.max(1),
         identity_eth_address,
         nonce_file_path: nonce_file_path.clone(),
@@ -579,30 +587,57 @@ async fn ensure_pool(
     // total wall clock is roughly `rounds × ceil(frontier/16) ×
     // 5s` in the worst case, but practically bounded by the
     // QUIET_FOR short-circuit inside `discover_peers`.
-    if let (Some(doh), Some(bootnode)) = (state.doh.as_ref(), state.bootnode.as_ref()) {
-        match discover_recursive_with_progress(
-            &state.transport,
-            doh,
-            bootnode,
-            std::time::Duration::from_secs(5),
-            state.discover_rounds,
-            16,
-            None::<crate::client::DiscoverProgressFn>,
-        )
-        .await
-        {
-            Ok(fresh) if !fresh.is_empty() => {
-                info!(target: "isheika::daemon",
-                    "discovered {} fresh peer(s) in {} round(s) before pool fill",
-                    fresh.len(), state.discover_rounds);
-                let mut peers = state.peers.write().await;
-                for p in fresh {
-                    peers.upsert(p);
+    if let Some(doh) = state.doh.as_ref() {
+        // Iterate every configured bootnode, accumulating their
+        // hive responses. A peer that bin-saturates and rejects our
+        // /swarm/handshake/14.0.0/handshake substream contributes
+        // zero peers; the next bootnode in the list typically
+        // succeeds, so we still warm a candidate set.
+        use std::collections::HashSet;
+        let mut all_fresh: Vec<crate::peers::Peer> = Vec::new();
+        let mut seen_overlays: HashSet<String> = HashSet::new();
+        for bootnode in state.bootnodes.iter() {
+            match discover_recursive_with_progress(
+                &state.transport,
+                doh,
+                bootnode,
+                std::time::Duration::from_secs(5),
+                state.discover_rounds,
+                16,
+                None::<crate::client::DiscoverProgressFn>,
+            )
+            .await
+            {
+                Ok(fresh) => {
+                    let mut added = 0usize;
+                    for p in fresh {
+                        let key = p.overlay.to_lowercase();
+                        if seen_overlays.insert(key) {
+                            all_fresh.push(p);
+                            added += 1;
+                        }
+                    }
+                    debug!(target: "isheika::daemon",
+                        "discover via {} contributed {} new peer(s)",
+                        bootnode, added);
                 }
+                Err(e) => warn!(target: "isheika::daemon",
+                    "pre-fill discover via {} failed: {e}", bootnode),
             }
-            Ok(_) => debug!(target: "isheika::daemon", "discover returned no new peers"),
-            Err(e) => warn!(target: "isheika::daemon",
-                "pre-fill discover failed (falling back to saved peerlist): {e}"),
+        }
+        if !all_fresh.is_empty() {
+            info!(target: "isheika::daemon",
+                "discovered {} fresh peer(s) across {} bootnode(s) in {} round(s) before pool fill",
+                all_fresh.len(), state.bootnodes.len(), state.discover_rounds);
+            let mut peers = state.peers.write().await;
+            for p in all_fresh {
+                peers.upsert(p);
+            }
+        } else {
+            warn!(target: "isheika::daemon",
+                "pre-fill discover returned no peers from any of the {} bootnode(s); \
+                 falling back to saved peerlist",
+                state.bootnodes.len());
         }
     }
 
