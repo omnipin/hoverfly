@@ -175,19 +175,33 @@ jobs:
           # handshake substream from both GH runners and a known-good
           # VPS. Regular bee peers still accept us, so we bootstrap from
           # one specific stable mainnet peer.
+          #
+          # --dial-timeout 8 (vs default 3): CircleCI runners are in
+          # AWS us-east, mainnet peers concentrate in EU (~150ms RTT).
+          # The full libp2p connect chain (tcp + noise + yamux +
+          # identify + pricing + /swarm/handshake) is ~7 RTTs, so a 3 s
+          # budget cuts off too many otherwise-reachable peers.
+          # Cold-run analysis: 276 of 279 pool-fill failures were dial
+          # timeouts. Raising the budget should lift pool fill from
+          # ~31% to ~70% success.
+          #
+          # --discover-rounds 5 (vs 3): more rounds = larger candidate
+          # set, important since pool fill exhausted candidates before
+          # reaching pool-size.
           background: true
           command: |
             rm -f /tmp/isheika.sock
             ./target/release/isheika \
               --nonce-file overlay-nonce \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
+              --dial-timeout 8 \
               daemon \
               --socket /tmp/isheika.sock \
               --peerlist peers.json \
               --pool-size << pipeline.parameters.pool_size >> \
               --listen /ip4/0.0.0.0/tcp/1635 \
               --identity "$BENCH_KEY" \
-              --discover-rounds 3 \
+              --discover-rounds 5 \
               --bootnode '/ip4/65.109.112.157/tcp/20474/p2p/QmSYwqAMAb9VfrTWzXxJ6APxWTjgtjyxxpMT8rXNKNjDXi' \
               -d \
               > /tmp/daemon.log 2>&1
