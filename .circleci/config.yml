@@ -227,21 +227,14 @@ jobs:
 
       - run:
           name: Start daemon
-          # With bee 2.8.0's handshake v15 + hive v2 support, the
-          # official bootnodes at /dnsaddr/mainnet.ethswarm.org once
-          # again accept our handshake. Previously we had to override
-          # the bootnode with a specific stable peer because the v14
-          # protocol was being rejected as bin-saturated (it was
-          # actually just version-incompatible all along — bee 2.8.0
-          # only registers /swarm/handshake/15.0.0/handshake, not the
-          # old /14.0.0). With dnsaddr resolution back on, we get the
-          # full set of mainnet bootnodes instead of one hand-picked
-          # peer.
-          #
-          # peers.seed.json (706 peers across 706 unique /32 IPs,
-          # harvested from a v15 daemon) handles the cold-start
-          # candidate list; --discover-rounds 1 picks up whatever
-          # the dnsaddr bootnodes additionally gossip.
+          # peers.seed.json (706 peers across 706 unique /32 IPs from
+          # a v15 hive harvest) is the primary cold-start source.
+          # --bootnode is set to two known-good non-bootnode peers
+          # so discover adds some incremental fresh peers without
+          # depending on the dnsaddr resolution path (which, from
+          # CircleCI runners, mostly fails to reach the official
+          # bootnodes' TCP ports — at most 40 peers gossipped vs
+          # 130+ from these direct peers).
           background: true
           command: |
             rm -f /tmp/isheika.sock
@@ -255,7 +248,8 @@ jobs:
               --listen /ip4/0.0.0.0/tcp/1635 \
               --identity "$BENCH_KEY" \
               --discover-rounds 1 \
-              --bootnode '/dnsaddr/mainnet.ethswarm.org' \
+              --bootnode '/ip4/142.132.214.211/tcp/3414/p2p/QmdWfNoHPGW7GebhH5V9S256nNNqY9HdDffjmaePVnk4ZT' \
+              --bootnode '/ip4/65.108.192.81/tcp/15024/p2p/QmUgivFBB9uHxajgA8fU9e7kge4t2RBYd6GBugpUTA67TB' \
               -d \
               > /tmp/daemon.log 2>&1
 
