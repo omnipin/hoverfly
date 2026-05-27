@@ -538,6 +538,18 @@ impl EthRpc {
         method: &str,
         params: P,
     ) -> Result<R, BatchError> {
+        let v = self.raw_opt::<P, R>(method, params).await?;
+        v.ok_or_else(|| BatchError::Rpc(format!("{method}: empty result")))
+    }
+
+    /// Like `raw` but tolerates a JSON `null` `result` — converts it
+    /// to `Ok(None)` instead of an error. Used for poll-style methods
+    /// (`eth_getTransactionReceipt`) where `null` means "not mined yet".
+    async fn raw_opt<P: Serialize, R: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: P,
+    ) -> Result<Option<R>, BatchError> {
         let body = RpcReq {
             jsonrpc: "2.0",
             id: 1,
@@ -548,7 +560,7 @@ impl EthRpc {
         if let Some(e) = resp.error {
             return Err(BatchError::Rpc(format!("{}: {} (code {})", method, e.message, e.code)));
         }
-        resp.result.ok_or_else(|| BatchError::Rpc(format!("{method}: empty result")))
+        Ok(resp.result)
     }
 
     /// `eth_call`-based view call. Returns the decoded sol return type.
@@ -643,7 +655,7 @@ impl EthRpc {
         let start = std::time::Instant::now();
         loop {
             let r: Option<ReceiptResp> = self
-                .raw(
+                .raw_opt(
                     "eth_getTransactionReceipt",
                     [format!("0x{}", hex::encode(tx_hash))],
                 )
