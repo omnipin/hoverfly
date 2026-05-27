@@ -2908,6 +2908,7 @@ dependencies = [
  "libp2p-mdns",
  "libp2p-metrics",
  "libp2p-noise",
+ "libp2p-ping",
  "libp2p-quic",
  "libp2p-swarm",
  "libp2p-tcp",
@@ -3047,6 +3048,7 @@ dependencies = [
  "libp2p-core",
  "libp2p-identify",
  "libp2p-identity",
+ "libp2p-ping",
  "libp2p-swarm",
  "pin-project",
  "prometheus-client",
@@ -3073,6 +3075,21 @@ dependencies = [
  "tracing",
  "x25519-dalek",
  "zeroize",
+]
+
+[[package]]
+name = "libp2p-ping"
+version = "0.48.0"
+source = "git+https://github.com/libp2p/rust-libp2p?branch=master#c4efffcf6733b761eae9a2bb69306b34e37a005f"
+dependencies = [
+ "futures",
+ "futures-timer",
+ "libp2p-core",
+ "libp2p-identity",
+ "libp2p-swarm",
+ "rand 0.8.6",
+ "tracing",
+ "web-time",
 ]
 
 [[package]]

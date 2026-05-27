@@ -565,6 +565,16 @@ impl Default for TransportConfig {
 pub struct Behaviour {
     pub stream: crate::protocols::stream_pool::Behaviour,
     pub identify: libp2p::identify::Behaviour,
+    /// libp2p ping (`/ipfs/ping/1.0.0`). Bee's `pkg/p2p/libp2p/internal/reacher`
+    /// uses this to verify that a peer's advertised underlay is dial-able.
+    /// If we don't respond to pings, bee marks us
+    /// `ReachabilityStatusPrivate` and kademlia prunes us from
+    /// oversaturated bins every 5 minutes
+    /// (`defaultPruneWakeup` in `pkg/topology/kademlia/kademlia.go`).
+    /// Without ping support a long-running daemon's entire pool gets
+    /// disconnected every prune tick — observed empirically as
+    /// `pool maintenance: pruned 32 dead, 0 live` on every 5-min cycle.
+    pub ping: libp2p::ping::Behaviour,
 }
 
 fn behaviour(keypair: &Keypair, max_concurrent_substream_upgrades: usize) -> Behaviour {
@@ -576,6 +586,7 @@ fn behaviour(keypair: &Keypair, max_concurrent_substream_upgrades: usize) -> Beh
             libp2p::identify::Config::new("/swarm/0.1.0".to_string(), keypair.public())
                 .with_agent_version(format!("isheika/{}", crate::VERSION)),
         ),
+        ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::default()),
     }
 }
 
@@ -2520,17 +2531,13 @@ where
             }
         }
         handshake::Version::V15 => {
-            use std::time::{SystemTime, UNIX_EPOCH};
-            let timestamp = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs() as i64)
-                .unwrap_or(0);
-            let signature = signer.sign_handshake_v15(
-                &our_underlay,
-                signer.nonce(),
-                timestamp,
-                &our_chequebook,
-            )?;
+            // Use the cached `(timestamp, signature)` pair so inbound
+            // and outbound handshakes for the same `(underlay,
+            // chequebook)` present byte-identical records to bee. See
+            // `SwarmSigner::sign_handshake_v15_cached` for the
+            // gossip-update-interval rationale.
+            let (timestamp, signature) =
+                signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
             pb::BzzAddress {
                 underlay: our_underlay,
                 signature: signature.to_vec(),

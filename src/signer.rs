@@ -43,6 +43,30 @@ pub struct SwarmSigner {
     eth_address: [u8; 20],
     nonce: [u8; 32],
     network_id: u64,
+    /// Cache of `(underlay, chequebook) -> (timestamp, signature)` for
+    /// v15 handshakes. Bee 2.8.0 rejects gossip records whose
+    /// timestamp advances by less than `MinimumUpdateInterval = 300 s`
+    /// since the existing record (`ErrTimestampTooSoon` in
+    /// `pkg/bzz/timestamp.go`). When our daemon's pool churns and
+    /// re-handshakes the same peer with a fresh timestamp every time,
+    /// the peer's hive gossip about us produces a flood of
+    /// too-soon records that get silently dropped by other bees —
+    /// our overlay's kademlia membership ages out across the network
+    /// and bins re-saturate against us.
+    ///
+    /// Caching the `(timestamp, signature)` pair per (underlay,
+    /// chequebook) gives us byte-identical re-presentation on every
+    /// reconnect: bee's handshake check `newTimestamp < existing`
+    /// accepts equal timestamps, and gossip never sees a "newer"
+    /// record because we never produce one. Cache lives for the
+    /// daemon's lifetime; restart clears it, which is fine because
+    /// the next handshake produces `now_unix() > any past timestamp`.
+    handshake_cache_v15: std::sync::Arc<std::sync::Mutex<HandshakeCacheV15>>,
+}
+
+#[derive(Debug, Default)]
+struct HandshakeCacheV15 {
+    entries: std::collections::HashMap<(Vec<u8>, [u8; 20]), (i64, [u8; 65])>,
 }
 
 impl SwarmSigner {
@@ -51,7 +75,16 @@ impl SwarmSigner {
         let eth_address = inner.address().0.0;
         let nonce = random_nonce();
         let overlay = derive_overlay(&eth_address, network_id, &nonce);
-        Ok(Self { inner, overlay, eth_address, nonce, network_id })
+        Ok(Self {
+            inner,
+            overlay,
+            eth_address,
+            nonce,
+            network_id,
+            handshake_cache_v15: std::sync::Arc::new(std::sync::Mutex::new(
+                HandshakeCacheV15::default(),
+            )),
+        })
     }
 
     pub fn from_hex(hex_key: &str, network_id: u64) -> Result<Self, SignerError> {
@@ -95,6 +128,9 @@ impl SwarmSigner {
             eth_address,
             nonce: *nonce,
             network_id,
+            handshake_cache_v15: std::sync::Arc::new(std::sync::Mutex::new(
+                HandshakeCacheV15::default(),
+            )),
         })
     }
 
@@ -126,7 +162,16 @@ impl SwarmSigner {
         let eth_address = inner.address().0.0;
         let nonce = random_nonce();
         let overlay = derive_overlay(&eth_address, network_id, &nonce);
-        Self { inner, overlay, eth_address, nonce, network_id }
+        Self {
+            inner,
+            overlay,
+            eth_address,
+            nonce,
+            network_id,
+            handshake_cache_v15: std::sync::Arc::new(std::sync::Mutex::new(
+                HandshakeCacheV15::default(),
+            )),
+        }
     }
 
     pub const fn overlay(&self) -> &[u8; 32] { &self.overlay }
@@ -176,6 +221,70 @@ impl SwarmSigner {
             chequebook_address,
         );
         self.sign_eip191(&payload)
+    }
+
+    /// Like [`Self::sign_handshake_v15`] but returns a cached
+    /// `(timestamp, signature)` pair on repeat calls with the same
+    /// `(underlay, chequebook_address)`. Uses `self.nonce()` as the
+    /// signing nonce (the only correct value for our overlay).
+    ///
+    /// First call for a given `(underlay, chequebook_address)`:
+    /// generates `now_unix()` as timestamp, signs, caches, returns.
+    /// Subsequent calls: return the cached pair byte-for-byte.
+    ///
+    /// Why this matters for bee 2.8.0: when our session pool churns
+    /// and we re-handshake the same peer, bee's hive will gossip our
+    /// new record to other bees. Bee 2.8.0's
+    /// `bzz.CheckTimestamp(source=Gossip)` rejects gossip records
+    /// whose timestamp is less than `existing.Timestamp + 300 s` —
+    /// our reconnect every minute or two produces `ErrTimestampTooSoon`
+    /// errors at every gossip recipient, so other bees stop learning
+    /// about us and our kademlia membership across the network ages
+    /// out. By replaying the same `(timestamp, signature)` on every
+    /// reconnect, we present a single stable record per peer for the
+    /// lifetime of the daemon — gossip recipients see no update
+    /// after the first one and our presence stays cached.
+    ///
+    /// Daemon restarts clear the cache (it lives in memory). The next
+    /// run's timestamps will be strictly newer than the previous run's,
+    /// so handshake `newTimestamp < existing` passes; and the new
+    /// gossip records advance the existing-record timestamp by more
+    /// than 300 s (the daemon has been down for at least that long
+    /// in normal operation).
+    pub fn sign_handshake_v15_cached(
+        &self,
+        underlay: &[u8],
+        chequebook_address: &[u8; 20],
+    ) -> Result<(i64, [u8; 65]), SignerError> {
+        let key = (underlay.to_vec(), *chequebook_address);
+        {
+            let cache = self
+                .handshake_cache_v15
+                .lock()
+                .expect("handshake cache mutex poisoned");
+            if let Some(&(ts, sig)) = cache.entries.get(&key) {
+                return Ok((ts, sig));
+            }
+        }
+        // Cache miss: sign fresh. Generate `now_unix()` outside the
+        // mutex to keep lock hold time short; if a concurrent caller
+        // beats us into the cache, we accept their entry (they'll
+        // already have populated it with a different timestamp, but
+        // the signature is valid against that timestamp so functionally
+        // equivalent).
+        let timestamp = crate::peers::now_unix() as i64;
+        let signature = self.sign_handshake_v15(
+            underlay,
+            &self.nonce,
+            timestamp,
+            chequebook_address,
+        )?;
+        let mut cache = self
+            .handshake_cache_v15
+            .lock()
+            .expect("handshake cache mutex poisoned");
+        let entry = cache.entries.entry(key).or_insert((timestamp, signature));
+        Ok((entry.0, entry.1))
     }
 
     /// Sign a SWAP cheque (EIP-712). Returns the 65-byte (r || s || v)

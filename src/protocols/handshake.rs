@@ -191,13 +191,19 @@ where
             )
         }
         Version::V15 => {
-            let timestamp = now_unix_secs();
+            // Cached `(timestamp, signature)` per `(our_underlay,
+            // our_chequebook)`. First call signs fresh; subsequent calls
+            // replay the same record. See
+            // `SwarmSigner::sign_handshake_v15_cached` for why bee 2.8.0
+            // requires this — repeatedly bumping the timestamp on every
+            // reconnect ages our overlay out of other bees' addressbooks
+            // via the `MinimumUpdateInterval` gossip-reject path.
+            let (timestamp, sig_bytes) = signer
+                .sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
             if timestamp <= 0 {
                 return Err(HandshakeError::TimestampInvalid(timestamp));
             }
-            let sig = signer
-                .sign_handshake_v15(&our_underlay, signer.nonce(), timestamp, &our_chequebook)?
-                .to_vec();
+            let sig = sig_bytes.to_vec();
             (
                 sig.clone(),
                 timestamp,
@@ -298,10 +304,4 @@ fn client_loopback_underlay(peer_id: &PeerId) -> Vec<u8> {
     ma.to_vec()
 }
 
-fn now_unix_secs() -> i64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
-}
+
