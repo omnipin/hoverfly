@@ -1,11 +1,16 @@
-# Example: upload a directory to Swarm as a TAR collection on demand.
+# Example: upload a directory to Swarm as a TAR collection at max
+# throughput via the warm-pool daemon.
 #
 # Drop this into `.github/workflows/upload.yml` in your project. It
-# tars `./dist`, uploads via isheika, and prints the manifest root.
+# starts an isheika daemon, waits for its session pool to warm,
+# uploads `./dist` packed as a tar, and prints the manifest root.
 #
 # Required repo secrets:
 #   SWARM_KEY    Postage batch owner's signer (hex, 32 bytes, 0x optional)
 #   SWARM_BATCH  Postage batch ID (hex, 32 bytes)
+#   SWARM_NONCE  Overlay nonce (hex, 32 bytes). Generate once with
+#                `isheika vanity-overlay --key $SWARM_KEY` and treat
+#                like an identity secret — see isheika README.
 
 name: upload
 
@@ -27,6 +32,25 @@ jobs:
             -p 'peers.seed.json'
           tar -xzf isheika-*.tar.gz
           mv peers.seed.json peers.json
+          printf "%s" "${{ secrets.SWARM_NONCE }}" > overlay-nonce
+
+      - name: Start daemon
+        run: |
+          nohup ./isheika daemon \
+            --socket /tmp/isheika.sock \
+            --pool-size 256 \
+            --listen /ip4/0.0.0.0/tcp/1635 \
+            --identity "${{ secrets.SWARM_KEY }}" \
+            --discover-rounds 3 \
+            > /tmp/daemon.log 2>&1 &
+
+      - name: Wait for warm pool
+        run: |
+          for i in $(seq 1 96); do
+            grep -q "warm pool" /tmp/daemon.log && exit 0
+            sleep 5
+          done
+          echo "::warning::pool did not warm in 8 min; proceeding anyway"
 
       - name: Pack and upload
         env:
@@ -34,4 +58,8 @@ jobs:
           SWARM_BATCH: ${{ secrets.SWARM_BATCH }}
         run: |
           tar -cf dist.tar -C dist .
-          ./isheika upload --batch "$SWARM_BATCH" --key "$SWARM_KEY" dist.tar
+          ./isheika upload \
+            --daemon /tmp/isheika.sock \
+            --batch "$SWARM_BATCH" \
+            --key "$SWARM_KEY" \
+            dist.tar
