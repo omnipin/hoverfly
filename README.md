@@ -42,6 +42,40 @@ across keys (a vanity nonce for key A is just a random nonce for key B),
 and don't run two daemons with the same identity simultaneously (bee
 disconnects both for conflicting underlay).
 
+## Postage batches
+
+Uploads need a postage stamp batch. Create one on-chain via
+`isheika batch create` (Gnosis chain by default):
+
+```bash
+./target/release/isheika batch create \
+  --rpc-url https://rpc.gnosischain.com \
+  --key 0xYOUR_KEY \
+  --size 2GB \
+  --duration 30d
+```
+
+`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via
+the same formulas as the [official postage stamp
+calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators)
+(smallest depth whose effective volume covers the requested size,
+unencrypted + no erasure coding). If you'd rather set them directly,
+`--depth` + `--amount-per-chunk` still works.
+
+**Wait before using a new batch.** The on-chain `BatchCreated` event has
+to propagate to the bee nodes you'll push chunks to. Until they ingest
+it, pushsync rejects your stamps as `batch not on-chain or expired`.
+Typical propagation is 1-3 minutes. Poll
+[Swarmscan](https://swarmscan.io/) until it returns the batch:
+
+```bash
+curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
+# 404 = network hasn't indexed it yet
+# 200 with a JSON body = ready to use
+```
+
+Once that 200s, you can `isheika upload --batch <BATCH_ID> ...`.
+
 ## Quick start
 
 Build the native binary:
