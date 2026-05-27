@@ -68,34 +68,16 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
       - name: Install protoc
         # nectar-primitives / prost-build invoke `protoc` from build scripts.
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends protobuf-compiler
-          protoc --version
 
-      # Two-tier cache strategy:
-      #
-      # 1. `Swatinem/rust-cache` handles the standard Cargo paths
-      #    (.cargo/{bin,registry/index,registry/cache,git/db} + the
-      #    workspace target/{deps,build,...}). Prunes intermediates
-      #    so the cache stays small, keys on Cargo.lock so partial
-      #    dep updates still reuse most of the cache.
-      #
-      # 2. We additionally cache the final built binary keyed on a
-      #    hash of every input that affects the build output:
-      #    Cargo.{toml,lock}, the entire src/ tree, build.rs, and
-      #    proto/ files. If hit, we skip `cargo build` entirely.
-      #    This dodges the well-known mtime issue where actions/checkout
-      #    rewrites file timestamps, making cargo think source is
-      #    newer than cached artifacts and forcing a rebuild even
-      #    though nothing actually changed.
+      # Two-tier cache: Swatinem/rust-cache for Cargo paths + target/,
+      # plus a direct cache of the built binary keyed on every source
+      # input (works around actions/checkout rewriting mtimes and
+      # forcing cargo to rebuild).
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -119,37 +101,21 @@ jobs:
           USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
         run: |
           if [ "$USE_RANDOM_NONCE" = "true" ]; then
-            echo "use_random_nonce=true — daemon will generate a fresh random nonce"
             rm -f overlay-nonce
           else
-            NONCE_HEX="${BENCH_NONCE#0x}"
-            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
-            if [ "${#NONCE_HEX}" -ne 64 ]; then
-              echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
-              exit 1
-            fi
-            printf "%s" "$NONCE_HEX" > overlay-nonce
-            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+            printf "%s" "${BENCH_NONCE#0x}" | tr -d '[:space:]' > overlay-nonce
           fi
 
       - name: Seed peers.json from committed seed
         # Skip cold discover: peers.seed.json (committed, harvested
         # from a long-running v15 daemon) gives the daemon a usable
         # candidate set to dial immediately.
-        run: |
-          if [ ! -f peers.seed.json ]; then
-            echo "::error::peers.seed.json missing from checkout"
-            exit 1
-          fi
-          cp peers.seed.json peers.json
-          PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
-          echo "seeded peers.json with $PEER_COUNT peers"
+        run: cp peers.seed.json peers.json
 
       - name: Start daemon
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
-          rm -f /tmp/isheika.sock
           nohup ./target/release/isheika \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
             daemon \
@@ -160,9 +126,6 @@ jobs:
             --discover-rounds 3 \
             -d \
             > /tmp/daemon.log 2>&1 &
-          DAEMON_PID=$!
-          echo "DAEMON_PID=$DAEMON_PID" >> "$GITHUB_ENV"
-          echo "started daemon pid $DAEMON_PID"
 
       - name: Wait for warm pool
         # Pool fill on a cold GH runner is bandwidth-bound; cap at 8 min.
@@ -244,14 +207,9 @@ jobs:
 
           cat "$GITHUB_STEP_SUMMARY"
 
-      - name: Stop daemon and capture diagnostics
+      - name: Capture daemon diagnostics
         if: always()
         run: |
-          if [ -n "${DAEMON_PID:-}" ]; then
-            kill -INT "$DAEMON_PID" 2>/dev/null || true
-            sleep 1
-            kill -9 "$DAEMON_PID" 2>/dev/null || true
-          fi
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Last daemon log lines" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"

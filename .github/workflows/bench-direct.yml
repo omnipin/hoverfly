@@ -66,16 +66,11 @@ jobs:
     steps:
       - uses: actions/checkout@v6
 
-      - name: Install Rust toolchain
-        run: |
-          rustup toolchain install stable --profile minimal
-          rustup default stable
-
       - name: Install protoc
+        # nectar-primitives / prost-build invoke `protoc` from build scripts.
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends protobuf-compiler
-          protoc --version
 
       # Shares cache key with `bench.yml` so a single build is reused
       # across both workflows.
@@ -102,17 +97,9 @@ jobs:
           USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
         run: |
           if [ "$USE_RANDOM_NONCE" = "true" ]; then
-            echo "use_random_nonce=true — upload will generate a fresh random nonce"
             rm -f overlay-nonce
           else
-            NONCE_HEX="${BENCH_NONCE#0x}"
-            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
-            if [ "${#NONCE_HEX}" -ne 64 ]; then
-              echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
-              exit 1
-            fi
-            printf "%s" "$NONCE_HEX" > overlay-nonce
-            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+            printf "%s" "${BENCH_NONCE#0x}" | tr -d '[:space:]' > overlay-nonce
           fi
 
       - name: Populate peers.json
@@ -122,26 +109,14 @@ jobs:
           USE_SEED: ${{ inputs.use_seed_peers }}
         run: |
           if [ "$USE_SEED" = "true" ]; then
-            if [ ! -f peers.seed.json ]; then
-              echo "::error::peers.seed.json missing from checkout"
-              exit 1
-            fi
             cp peers.seed.json peers.json
-            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
-            echo "seeded peers.json with $PEER_COUNT peers (from committed seed)"
           else
-            echo "running cold discover against /dnsaddr/mainnet.ethswarm.org..."
             START_T=$(date +%s)
-            ./target/release/isheika \
-              discover \
-              --rounds 3 \
-              -v 2>&1 | tail -20
-            END_T=$(date +%s)
-            DISCOVER_SECS=$((END_T - START_T))
-            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))" 2>/dev/null || echo 0)
-            echo "discover took ${DISCOVER_SECS}s, peers.json now has $PEER_COUNT peers"
+            ./target/release/isheika discover --rounds 3 -v 2>&1 | tail -20
+            DISCOVER_SECS=$(( $(date +%s) - START_T ))
+            DISCOVER_PEERS=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))" 2>/dev/null || echo 0)
             echo "DISCOVER_SECS=$DISCOVER_SECS" >> "$GITHUB_ENV"
-            echo "DISCOVER_PEERS=$PEER_COUNT" >> "$GITHUB_ENV"
+            echo "DISCOVER_PEERS=$DISCOVER_PEERS" >> "$GITHUB_ENV"
           fi
 
       - name: Run benchmark uploads
