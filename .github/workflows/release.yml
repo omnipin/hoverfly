@@ -1,0 +1,194 @@
+name: release
+
+# Builds release tarballs for each supported (target, runner) and
+# attaches them to a draft GitHub release named after the pushed tag.
+# Maintainer reviews the draft and publishes manually.
+#
+# Trigger: push a `vX.Y.Z` tag whose semver matches Cargo.toml.
+#
+#   git tag -a v0.2.0 -m v0.2.0 && git push origin v0.2.0
+#
+# Each tarball ships:
+#   isheika-vX.Y.Z-<target>/
+#     ├── isheika              (stripped binary)
+#     ├── peers.seed.json      (curated cold-start peer list)
+#     ├── README.md
+#     └── LICENSE
+#
+# Each tarball is signed with a SLSA Build Provenance attestation
+# (sigstore-backed). Verify a downloaded asset with:
+#
+#   gh attestation verify isheika-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
+#     -R omnipin/isheika
+
+on:
+  push:
+    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+
+permissions:
+  contents: read
+
+jobs:
+  create-release:
+    name: Create draft release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.tag.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - id: tag
+        name: Resolve version
+        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify Cargo.toml version matches tag
+        # Catches "tagged v0.2.0 but forgot to bump Cargo.toml" before
+        # spending matrix-build time on stale artifacts.
+        run: |
+          tag="${{ steps.tag.outputs.version }}"
+          want="${tag#v}"
+          got="$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag $tag implies Cargo.toml version $want, but Cargo.toml says $got"
+            exit 1
+          fi
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        # `|| true` so reruns of a partially-failed pipeline don't
+        # abort on "release already exists" — the upload step on each
+        # build job uses `--clobber`.
+        run: |
+          gh release create "${{ steps.tag.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --draft \
+            --verify-tag \
+            --title "${{ steps.tag.outputs.version }}" \
+            --notes "Auto-generated draft. Review and publish manually." \
+          || gh release view "${{ steps.tag.outputs.version }}" --repo "${{ github.repository }}"
+
+  build:
+    name: ${{ matrix.target }}
+    needs: create-release
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: write
+      # SLSA Build Provenance attestations via `actions/attest`.
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: false
+          - target: aarch64-unknown-linux-gnu
+            runner: ubuntu-latest
+            use-cross: true
+          - target: x86_64-apple-darwin
+            # `macos-13` is the last GHA Intel runner. If/when it
+            # retires, switch to `macos-latest` and build with
+            # `--target x86_64-apple-darwin` cross from M-series.
+            runner: macos-13
+            use-cross: false
+          - target: aarch64-apple-darwin
+            runner: macos-latest
+            use-cross: false
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+
+      - name: Install cross
+        if: matrix.use-cross
+        # Pinned to v0.2.5 — newer releases have intermittently
+        # broken CI in other projects (per ripgrep's pinning note).
+        env:
+          CROSS_VERSION: v0.2.5
+        run: |
+          mkdir -p "$HOME/.local/bin"
+          curl -fL "https://github.com/cross-rs/cross/releases/download/${CROSS_VERSION}/cross-x86_64-unknown-linux-musl.tar.gz" \
+            | tar -xz -C "$HOME/.local/bin"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          # Per-target cache so an Apple Silicon rebuild doesn't
+          # invalidate the Linux x86_64 cache.
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        env:
+          # Smaller, more portable binaries. LTO is on by default in
+          # the `release` profile; this just makes binaries strip-friendly.
+          CARGO_PROFILE_RELEASE_STRIP: none
+        run: |
+          if [ "${{ matrix.use-cross }}" = "true" ]; then
+            cross build --release --locked --target ${{ matrix.target }}
+          else
+            cargo build --release --locked --target ${{ matrix.target }}
+          fi
+
+      - name: Strip binary
+        # `strip` ships on every GHA runner image. For aarch64-linux
+        # we have to use the cross-toolchain strip from inside the
+        # cross docker image because the host's `strip` doesn't know
+        # the ELF arch.
+        run: |
+          bin="target/${{ matrix.target }}/release/isheika"
+          case "${{ matrix.target }}" in
+            aarch64-unknown-linux-gnu)
+              docker run --rm -v "$PWD:/w" -w /w \
+                "ghcr.io/cross-rs/${{ matrix.target }}:main" \
+                aarch64-linux-gnu-strip "$bin"
+              ;;
+            *)
+              strip "$bin"
+              ;;
+          esac
+
+      - name: Package tarball
+        id: package
+        run: |
+          ver="${{ needs.create-release.outputs.version }}"
+          name="isheika-${ver}-${{ matrix.target }}"
+          stage="stage/${name}"
+          mkdir -p "$stage"
+
+          cp "target/${{ matrix.target }}/release/isheika" "$stage/"
+          cp peers.seed.json README.md LICENSE "$stage/"
+
+          tar -czf "${name}.tar.gz" -C stage "${name}"
+          shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"
+          ls -la "${name}.tar.gz"*
+
+          echo "tarball=${name}.tar.gz" >> "$GITHUB_OUTPUT"
+          echo "sha256=${name}.tar.gz.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        # SLSA Build Provenance: a sigstore-signed statement that this
+        # exact binary was produced by this workflow at this commit.
+        # Verifiable downstream with `gh attestation verify`.
+        uses: actions/attest@v4
+        with:
+          subject-path: ${{ steps.package.outputs.tarball }}
+
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload "${{ needs.create-release.outputs.version }}" \
+            --repo "${{ github.repository }}" \
+            --clobber \
+            "${{ steps.package.outputs.tarball }}" \
+            "${{ steps.package.outputs.sha256 }}"
