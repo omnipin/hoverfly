@@ -248,7 +248,6 @@ jobs:
             ./target/release/isheika \
               --nonce-file overlay-nonce \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
-              --dial-timeout 2 \
               daemon \
               --socket /tmp/isheika.sock \
               --peerlist peers.json \
