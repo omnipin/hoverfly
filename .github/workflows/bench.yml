@@ -138,6 +138,21 @@ jobs:
           printf "%s" "$NONCE_HEX" > overlay-nonce
           echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
 
+      - name: Seed peers.json from committed seed
+        # Bee 2.8.0 nodes drop the v14 substream id our older code
+        # used, so the official mainnet bootnodes return 0 peers on
+        # discover from a cold runner. peers.seed.json (706 peers
+        # across 706 unique /32 IPs, harvested from a v15 daemon)
+        # is the cold-start candidate set that bypasses discover.
+        run: |
+          if [ ! -f peers.seed.json ]; then
+            echo "::error::peers.seed.json missing from checkout"
+            exit 1
+          fi
+          cp peers.seed.json peers.json
+          PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
+          echo "seeded peers.json with $PEER_COUNT peers"
+
       - name: Install tcpdump
         # Capture outbound TCP traffic during daemon startup so we
         # can see whether bee bootnodes are silently disconnecting,
@@ -170,33 +185,24 @@ jobs:
           echo "tcpdump pid $TCPDUMP_PID"
 
       - name: Start daemon
-        # No standalone `discover` step: the explicit `isheika discover`
-        # uses an EPHEMERAL signer per process, which lands in bin 0
-        # of every bee bootnode and gets rejected via Pick saturation
-        # before any hive batch is sent (observed in prior run: 0 peers
-        # in 3 seconds vs 37 peers in the daemons internal discover).
+        # peers.seed.json (706 peers across 706 unique /32 IPs from a
+        # v15 hive harvest) is the primary cold-start source. Two
+        # known-good non-bootnode peers are listed as bootnodes for
+        # discover so we get some incremental fresh peers without
+        # depending on /dnsaddr/mainnet.ethswarm.org (which, from GH
+        # runners, mostly fails to reach the official bootnodes'
+        # TCP ports — at most 40 peers gossipped vs 130+ from
+        # direct peers).
         #
-        # Instead, run the daemon with `--discover-rounds 3`. The
-        # daemons own eager-pool-fill discover uses the STABLE vanity
-        # overlay from `--nonce-file` + `--identity`, which bees
-        # accept. 3 rounds typically yields 1500-3000 peers, enough
-        # to fill pool=256 to ~200+ live sessions.
+        # bee 2.8.0 (May 2026) raised the handshake protocol from
+        # 14.0.0 to 15.0.0 and the hive protocol from 1.1.0 to 2.0.0.
+        # isheika negotiates v15 first, falls back to v14 on
+        # UnsupportedProtocol, so it interoperates with the entire
+        # mainnet (both 2.7.x and 2.8.0 peers).
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
           rm -f /tmp/isheika.sock
-          # `-d` (debug) lets us see the actual handshake / discover
-          # error messages, not just "round done with 0 peers". Heavy
-          # log volume but bounded by the warm-pool wait (8 min cap).
-          #
-          # `--bootnode` overrides the default `/dnsaddr/mainnet.ethswarm.org`
-          # because (as of May 2026) the official Swarm bootnodes are
-          # silently rejecting our handshake substream from both GH
-          # runners and a known-good VPS — empirically verified in pcap.
-          # Regular bee peers still accept us, so we bootstrap from a
-          # specific stable mainnet peer instead. If THIS peer becomes
-          # unreachable, swap the multiaddr for another from a recent
-          # successful peers.json snapshot.
           nohup ./target/release/isheika \
             --nonce-file overlay-nonce \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
@@ -206,8 +212,9 @@ jobs:
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
-            --discover-rounds 3 \
-            --bootnode '/ip4/65.109.112.157/tcp/20474/p2p/QmSYwqAMAb9VfrTWzXxJ6APxWTjgtjyxxpMT8rXNKNjDXi' \
+            --discover-rounds 1 \
+            --bootnode '/ip4/142.132.214.211/tcp/3414/p2p/QmdWfNoHPGW7GebhH5V9S256nNNqY9HdDffjmaePVnk4ZT' \
+            --bootnode '/ip4/65.108.192.81/tcp/15024/p2p/QmUgivFBB9uHxajgA8fU9e7kge4t2RBYd6GBugpUTA67TB' \
             -d \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!
