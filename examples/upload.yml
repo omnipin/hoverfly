@@ -27,7 +27,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release download -R v1rtl/isheika \
+          gh release download -R omnipin/isheika \
             -p 'isheika-x86_64-unknown-linux-gnu.tar.gz' \
             -p 'peers.seed.json'
           tar -xzf isheika-*.tar.gz

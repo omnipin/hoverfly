@@ -7,7 +7,7 @@
 # CircleCI UI "Trigger Pipeline" button with `run_bench=true`, or via
 # the API:
 #
-#   curl -X POST https://circleci.com/api/v2/project/gh/v1rtl/isheika/pipeline \
+#   curl -X POST https://circleci.com/api/v2/project/gh/omnipin/isheika/pipeline \
 #     -H "Circle-Token: $CIRCLE_TOKEN" \
 #     -H "Content-Type: application/json" \
 #     -d '{"parameters": {"run_bench": true}}'

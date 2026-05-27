@@ -145,7 +145,7 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 
 ## Repo conventions
 
-- Multiple git remotes: `github` → GitHub (`v1rtl/isheika.git`),
+- Multiple git remotes: `github` → GitHub (`omnipin/isheika.git`),
   `rad` → Radicle (push), `iris` → Radicle (HTTPS mirror via
   `iris.radicle.xyz`), `vps` → SSH push to the VPS that runs the
   long-lived daemon. Push targets are explicit; there's no shared
