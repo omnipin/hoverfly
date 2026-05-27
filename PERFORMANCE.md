@@ -376,7 +376,30 @@ at a given configuration.
 | VPS, daemon + vanity overlay + **per-peer in-flight cap** (`IN_FLIGHT_CAP=4`), pool=64 | ~515 KiB/s median, 557 best |
 | VPS, all of the above + **`--pool-size 128 --buffer-multiplier 2`** | ~665 KiB/s median, 954 best |
 | VPS, all of the above + **latency-aware cap** + `--pool-size 256` | ~827 KiB/s median, 1106 best (1.08 MiB/s) |
-| VPS, all of the above + **3-bucket storage-radius sort** | **~1055 KiB/s median (1.03 MiB/s), 1075 best** |
+| VPS, all of the above + **3-bucket storage-radius sort** | **~1055 KiB/s median (1.03 MiB/s), 1075 best** — last pre-bee-2.8 measurement |
+
+**Bee 2.8.0 network rollout (May 2026)** — bee 2.8 raised handshake to
+`/swarm/handshake/15.0.0` and hive to `/swarm/hive/2.0.0` (network-wide
+upgrade required). Old `/14.0.0` and `/1.1.0` substreams stop being
+registered on upgraded nodes, so any v14-only client gets
+`UnsupportedProtocol` rejections that look exactly like kademlia
+bin-saturation. Once we shipped v15 + cached `(timestamp, signature)`
++ libp2p ping responder + the post-bee-2.8 IP-diverse `peers.seed.json`:
+
+| Configuration | Throughput (mainnet, novel random content) |
+|---|---|
+| VPS, v15 + cache + dnsaddr bootnode + 794-IP seed | ~324 KiB/s median, 525 best (high variance) |
+| **GitHub Actions** runner, same config | **~473 KiB/s median, 527 best** |
+| CircleCI runner, same config | ~376 KiB/s median, 462 best |
+
+The VPS regression vs the pre-bee-2.8 number is partly explained: bee
+2.8 nodes prune unreachable peers more aggressively (the reacher uses
+libp2p ping, which we now respond to, but the addressbook eviction
+that started before we added ping is still affecting us across the
+network). CI numbers, by contrast, jumped from ~50-200 KiB/s to
+~400-500 KiB/s because the v14 fallback path was effectively broken
+against the bee 2.8 majority of peers — v15 unlocked the full
+addressable peerset.
 
 For context, bee-light reports ~822 KiB/s on the same 5 MiB random
 upload — but that's its `deferred-upload` time which returns ~22×
@@ -1300,6 +1323,119 @@ become non-empty and bees pull-sync real content from us, building
 a sustained-traffic relationship that bee's connection manager
 wants to keep alive). That's the chunk-storage feature we
 deliberately scoped out — see "Further work" #4 below.
+
+## Bee 2.8.0 protocol migration (May 2026)
+
+Bee 2.8.0 shipped a network-wide upgrade with three changes that
+affect us directly. Bee's release notes label this a hard cutover —
+v2.7 and v2.8 nodes can't handshake or gossip with each other.
+
+1. **`/swarm/handshake/14.0.0` → `/swarm/handshake/15.0.0`**.
+   `BzzAddress` gains two signed fields: `timestamp` (int64
+   seconds since epoch) and `chequebook_address` (20 bytes, zero
+   for clients without an on-chain chequebook). The sign payload
+   becomes
+   `"bee-handshake-" || underlay || overlay || network_id_BE_8
+    || nonce || timestamp_BE_8 || chequebook_address`.
+   Bee's `pkg/bzz/timestamp.go::CheckTimestamp` rejects records
+   whose timestamp is more than `MaxClockSkew = 60 s` in the
+   future, and (for the gossip path) whose timestamp doesn't
+   advance by at least `MinimumUpdateInterval = 300 s` past the
+   existing record.
+
+2. **`/swarm/hive/1.1.0` → `/swarm/hive/2.0.0`**. Same
+   `BzzAddress` shape as the v15 handshake. Bee 2.8 receivers
+   validate the signature on each gossiped record and drop ones
+   that don't verify; this is how the timestamp/chequebook check
+   propagates beyond the immediate handshake.
+
+3. **`/ipfs/ping/1.0.0` is now load-bearing.** Bee's reacher
+   (`pkg/p2p/libp2p/internal/reacher`) calls `pinger.Ping(addr)`
+   to verify our advertised underlay is dial-able. A failed ping
+   marks us `ReachabilityStatusPrivate`, which makes us the top
+   target for kademlia's 5-minute `pruneOversaturatedBins`
+   sweep. Previously the reacher used a swarm-protocol-level
+   probe and we got away without registering ping. Bee 2.8's
+   reacher path is stricter.
+
+What we shipped to interoperate:
+
+* `proto/handshake.proto` and `proto/hive.proto` gained `nonce`,
+  `timestamp`, and `chequebook_address` fields on `BzzAddress`.
+  Proto3 zero-defaults keep v14 wire compat — we just emit zeros
+  for the new fields when we negotiate `/14.0.0`.
+
+* `signer.rs::generate_sign_data_v15` mirrors bee's v15 payload
+  byte-for-byte. `sign_handshake_v15` is the explicit-timestamp
+  signer.
+
+* `signer.rs::sign_handshake_v15_cached` is the per-`(underlay,
+  chequebook)` cached path. Returns the same `(timestamp,
+  signature)` on every call for a given key, so reconnects to a
+  peer replay an identical signed record. Without the cache,
+  bee 2.8's gossip path rejects every record we issue at every
+  receiver — `MinimumUpdateInterval` is 5 minutes but our session
+  rotation can re-handshake the same peer minute-scale, so the
+  network never updates its addressbook view of us and our
+  overlay's kademlia membership ages out. Cache lives in
+  `Arc<Mutex<HashMap<...>>>` on `SwarmSigner`; daemon restart
+  clears it, which is fine because the next run's `now_unix()`
+  is unconditionally newer than any cached value from the
+  previous run.
+
+* `protocols/handshake.rs` and `protocols/hive.rs` carry a
+  `Version` enum (`V14`/`V15` and `V1`/`V2`). Outbound: try v15
+  first via `transport.rs::do_handshake`, fall back to v14 on
+  `UnsupportedProtocol`. Inbound: `inbound.rs::run` accepts both
+  substream ids in parallel; `respond_to_handshake` is passed
+  the version that won negotiation. Hive uses the same family
+  the handshake just used — v14 handshake ⇒ v1 hive, v15 ⇒ v2.
+
+* `transport.rs::Behaviour` adds `ping: libp2p::ping::Behaviour`
+  with the default config (responds to inbound pings and pings
+  every connected peer periodically). Crate dep:
+  `libp2p = { features = ["ping", ...] }`.
+
+* `peers.seed.json` (committed) is regenerated from a v15 daemon
+  bootstrapping off `/dnsaddr/mainnet.ethswarm.org`: 794 peers
+  across 794 unique /32 IPs, IP-diverse so cold-start dials a
+  wide net of independent bee operators rather than concentrating
+  on a few /32s that bee's `connLimiter` (10 RPS / burst 40 per
+  /32) would throttle.
+
+* CI workflows (CircleCI + GitHub Actions) use
+  `--bootnode /dnsaddr/mainnet.ethswarm.org`. The hand-picked
+  direct-peer bootnodes we used during the v14-only transition
+  are no longer needed.
+
+Symptoms we saw BEFORE understanding the migration:
+
+* "Pool fill: 256 sessions, then `pruned 256 dead, 0 live` every
+  5 minutes." We attributed this to bee being meaner. Actual
+  cause: the reacher couldn't ping us, marked us Private, and
+  kademlia pruned us on the next sweep.
+
+* "Connection reset by peer 1ms after handshake completes." The
+  handshake substream succeeded but bee's `notifier.Connected`
+  immediately disconnected because gossip churn from re-issued
+  records made our addressbook entry stale, so we presented as
+  an unknown peer landing in a saturated bin.
+
+* "Discover from bootnode returns 0 peers." The bootnodes ran
+  bee 2.8 ahead of the network and stopped registering /14.0.0
+  for new dialers. They were never bin-saturating us — they were
+  protocol-rejecting us.
+
+The pre-bee-2.8 throughput numbers in the empirical-ceilings
+table above were measured against a network where most peers
+still ran 2.7. After the rollout, the comparable VPS number
+dropped from ~1055 KiB/s median to ~324 KiB/s median (high
+variance, peak 525). The gap is recoverable but requires
+addressing the addressbook eviction that happened during the
+v14-only window before we shipped ping/timestamp-cache. A
+fresh-identity daemon that comes up clean should land closer
+to the pre-2.8 number again; the existing identity is paying
+for its eviction history.
 
 ## Further work (unblocked, ordered by expected impact)
 

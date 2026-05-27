@@ -116,12 +116,15 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   cache.
 - `src/protocols/` — bee wire protocols: `handshake`, `pricing`,
   `retrieval`, `pushsync`, `pseudosettle`, `hive`, `framing`,
-  `swap`, `status`. The `status` responder is inbound-only;
-  bee's `pkg/salud` probes us via `/swarm/status/1.1.0/status` to
-  decide whether to mark us Healthy in its kademlia metrics
-  collector. Implementation is correct but currently inactive
-  because we don't get into bee's kademlia in the first place
-  (see PERFORMANCE.md "Status protocol responder").
+  `swap`, `status`. `handshake` and `hive` each support two on-wire
+  versions concurrently (bee 2.8.0 raised handshake `14.0.0`→`15.0.0`
+  and hive `1.1.0`→`2.0.0` as a network-wide upgrade in May 2026):
+  outbound tries v15 first and falls back to v14 on
+  `UnsupportedProtocol`; inbound accepts both ids in parallel. The
+  `Version` enum on each module disambiguates downstream. The
+  `status` responder is inbound-only; bee's `pkg/salud` probes us
+  via `/swarm/status/1.1.0/status` to decide whether to mark us
+  Healthy in its kademlia metrics collector.
 - `src/cheques.rs` — `#[cfg(not(target_arch = "wasm32"))]`. JSON-backed
   per-peer cumulative-payout sidecar (`cheques.json`). Required to
   persist across CLI runs because bee rejects non-strictly-increasing
@@ -142,9 +145,11 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 
 ## Repo conventions
 
-- Two git remotes: `origin` → GitHub (`v1rtl/isheika.git`), `rad` → Radicle.
-  `main` tracks `rad/main`; `git push` goes to Radicle, not GitHub. Push to
-  `origin` explicitly when you want GitHub.
+- Multiple git remotes: `github` → GitHub (`v1rtl/isheika.git`),
+  `rad` → Radicle (push), `iris` → Radicle (HTTPS mirror via
+  `iris.radicle.xyz`), `vps` → SSH push to the VPS that runs the
+  long-lived daemon. Push targets are explicit; there's no shared
+  default — pick the remote you mean.
 - `peers.json` is gitignored. The CLI writes reachability observations back
   into it on every operation; respect existing fields on read (see
   `apply_log` / `record_dial_{success,failure}`).
@@ -170,15 +175,21 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
     long to park a session entry, and how many rotation-dial failures
     trigger parking. Sized to outlast bee's ghost-overdraw blocklist
     and a rotation-dial cluster at high `--concurrency`.
-  - `client.rs:1340  MAX_CHUNK_RETRIES = 10` with linear backoff
-    `1000ms × (1+n)` capped at 10s (≈55 s total) — outer pusher-layer
-    retry budget per chunk, sized to outlast DEAD_SKIP_SECS.
-    Independent of `--max-retries`.
+  - `client.rs  MAX_CHUNK_RETRIES = 60` with 500ms flat backoff
+    (≈30 s total in the common case, longer if peers genuinely
+    take time) — outer pusher-layer retry budget per chunk. Was
+    `10` with linear backoff in older docs; bumped after observing
+    that bee mainnet bin-saturation and ghost-overdraw blocklist
+    windows occasionally need more retry runway. Independent of
+    `--max-retries`.
   - `transport.rs:118  is_connection_dead` deliberately excludes
     `Timeout` — a single slow op shouldn't retire the whole session
     on which dozens of other pushes might still be in flight.
-  - `client.rs:1920  SESSION_DIAL_PARALLELISM = 32` — in-flight window
-    while filling the session pool.
+  - `client.rs  SESSION_DIAL_PARALLELISM = 128` — in-flight window
+    while filling the session pool. Was `32`; bumped to absorb the
+    ~97% dial rejection rate against the post-bee-2.8 mainnet
+    where most peers either run 2.8 or have entries in our seed
+    that are now-stale.
 - Network IDs: `1` = mainnet (default), `10` = testnet/sepolia. Bootnode:
   `/dnsaddr/mainnet.ethswarm.org`. **EVM chain id** is separate from
   network id (it's the `chainID` in the cheque's EIP-712 domain): 100
@@ -202,6 +213,29 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   us back hours later, growing our kademlia presence beyond what
   any single session could. See PERFORMANCE.md
   "Pullsync inbound responder" and "Bee-citizenship".
+- **Bee 2.8.0 protocol support** (also May 2026, day-of-release).
+  Handshake v15 (`signer::sign_handshake_v15`) and hive v2 carry
+  signed `timestamp` + `chequebook_address` fields in the
+  `BzzAddress`. `SwarmSigner::sign_handshake_v15_cached` caches
+  the `(timestamp, signature)` pair per `(underlay, chequebook)`
+  so reconnects to the same peer replay an identical record —
+  bee 2.8's gossip path rejects updates within
+  `MinimumUpdateInterval = 300 s` of the existing record, so
+  re-issuing a fresh signature every minute-scale reconnect
+  ages our addressbook entry out across the network. Also added
+  `libp2p::ping::Behaviour` because bee 2.8's reacher uses
+  `/ipfs/ping/1.0.0` to verify peer reachability; failed pings
+  mark us `ReachabilityStatusPrivate` and the kademlia 5-min
+  prune loop kicks us. See PERFORMANCE.md "Bee 2.8.0 protocol
+  migration" for the full story.
+- **`peers.seed.json`** (committed, ~700 IPs as of mid-2026). An
+  IP-diverse cold-start seed harvested from a long-running daemon.
+  CI workflows copy it to `peers.json` before starting the daemon
+  so a fresh runner doesn't have to discover from scratch (which,
+  on AWS/Azure egress to a EU-Hetzner-heavy network, is slow).
+  Local installs that want fast cold-start can do the same.
+  Regenerate via the `isheika save-peers --socket <sock>` CLI
+  on a daemon that's been running a few hours.
 - **Postage stamp signature validator** (`src/stamp.rs`). Validates
   the 113-byte wire-format stamp shape and recovers the batch
   owner's Ethereum address from the signature. Does NOT verify
@@ -274,7 +308,11 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   dedupes by chunk address: identical bytes re-upload in O(stamp) and tell
   you nothing about real throughput).
 - The reference Bee implementation lives at
-  `~/Coding/bee-browser/bee/pkg/{pushsync,pusher,accounting,node}`. When in
-  doubt about protocol semantics — pushsync receipts, accounting,
-  pseudosettle wall-second rule, ghostBalance/blocklist windows — read Bee
-  directly; the upstream docs lag behind the code.
+  `~/Coding/forks/bee/pkg/{pushsync,pusher,accounting,node,p2p,bzz,hive,topology}`.
+  When in doubt about protocol semantics — pushsync receipts,
+  accounting, pseudosettle wall-second rule, ghostBalance/blocklist
+  windows, the v15 handshake / v2 hive wire format, kademlia
+  saturation/prune behavior — read Bee directly; the upstream
+  docs lag behind the code. Check out a specific tag
+  (`git -C ~/Coding/forks/bee checkout v2.8.0`) when you need
+  the actual code that's running on mainnet right now.
