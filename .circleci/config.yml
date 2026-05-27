@@ -227,14 +227,13 @@ jobs:
 
       - run:
           name: Start daemon
-          # peers.seed.json (706 peers across 706 unique /32 IPs from
+          # peers.seed.json (~794 peers across ~794 unique /32 IPs from
           # a v15 hive harvest) is the primary cold-start source.
-          # --bootnode is set to two known-good non-bootnode peers
-          # so discover adds some incremental fresh peers without
-          # depending on the dnsaddr resolution path (which, from
-          # CircleCI runners, mostly fails to reach the official
-          # bootnodes' TCP ports — at most 40 peers gossipped vs
-          # 130+ from these direct peers).
+          # `--bootnode /dnsaddr/mainnet.ethswarm.org` resolves to the
+          # current Swarm Foundation mainnet bootnodes. With v15
+          # handshake support landed, those bootnodes accept us again
+          # (they had been rejecting v14 handshakes when the network
+          # rolled to bee 2.8.0).
           background: true
           command: |
             rm -f /tmp/isheika.sock
@@ -247,9 +246,8 @@ jobs:
               --pool-size << pipeline.parameters.pool_size >> \
               --listen /ip4/0.0.0.0/tcp/1635 \
               --identity "$BENCH_KEY" \
-              --discover-rounds 1 \
-              --bootnode '/ip4/142.132.214.211/tcp/3414/p2p/QmdWfNoHPGW7GebhH5V9S256nNNqY9HdDffjmaePVnk4ZT' \
-              --bootnode '/ip4/65.108.192.81/tcp/15024/p2p/QmUgivFBB9uHxajgA8fU9e7kge4t2RBYd6GBugpUTA67TB' \
+              --discover-rounds 3 \
+              --bootnode '/dnsaddr/mainnet.ethswarm.org' \
               -d \
               > /tmp/daemon.log 2>&1
 

@@ -185,20 +185,16 @@ jobs:
           echo "tcpdump pid $TCPDUMP_PID"
 
       - name: Start daemon
-        # peers.seed.json (706 peers across 706 unique /32 IPs from a
-        # v15 hive harvest) is the primary cold-start source. Two
-        # known-good non-bootnode peers are listed as bootnodes for
-        # discover so we get some incremental fresh peers without
-        # depending on /dnsaddr/mainnet.ethswarm.org (which, from GH
-        # runners, mostly fails to reach the official bootnodes'
-        # TCP ports — at most 40 peers gossipped vs 130+ from
-        # direct peers).
+        # peers.seed.json (~794 peers across ~794 unique /32 IPs from
+        # a v15 hive harvest) is the primary cold-start source.
+        # /dnsaddr/mainnet.ethswarm.org resolves to the current
+        # Swarm Foundation bootnodes; with v15 handshake support
+        # those accept us again (they were rejecting v14 dialers).
         #
-        # bee 2.8.0 (May 2026) raised the handshake protocol from
-        # 14.0.0 to 15.0.0 and the hive protocol from 1.1.0 to 2.0.0.
-        # isheika negotiates v15 first, falls back to v14 on
-        # UnsupportedProtocol, so it interoperates with the entire
-        # mainnet (both 2.7.x and 2.8.0 peers).
+        # bee 2.8.0 (May 2026) raised handshake to 15.0.0 and hive
+        # to 2.0.0. isheika negotiates v15 first, falls back to v14
+        # on UnsupportedProtocol so it interoperates with both 2.7.x
+        # and 2.8.0 peers across the network.
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
@@ -212,9 +208,8 @@ jobs:
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
-            --discover-rounds 1 \
-            --bootnode '/ip4/142.132.214.211/tcp/3414/p2p/QmdWfNoHPGW7GebhH5V9S256nNNqY9HdDffjmaePVnk4ZT' \
-            --bootnode '/ip4/65.108.192.81/tcp/15024/p2p/QmUgivFBB9uHxajgA8fU9e7kge4t2RBYd6GBugpUTA67TB' \
+            --discover-rounds 3 \
+            --bootnode '/dnsaddr/mainnet.ethswarm.org' \
             -d \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!
