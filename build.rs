@@ -12,7 +12,6 @@ fn main() -> Result<()> {
             "proto/pseudosettle.proto",
             "proto/swap.proto",
             "proto/status.proto",
-            "proto/pullsync.proto",
         ],
         &["proto/"],
     )?;

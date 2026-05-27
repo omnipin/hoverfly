@@ -1221,108 +1221,47 @@ uploads, and is the prerequisite for any long-term kademlia-
 membership growth. If you want to validate it for real, leave a
 daemon running for ~6+ hours, then run a measurement batch.
 
-## Pullsync inbound responder (built, partially active)
+## Pullsync inbound responder (built, then dropped)
 
-The strategic question: bee's `pkg/salud` (status protocol) didn't
-probe us because we never made it into bee's `connectedPeers` slice.
-Pullsync is opened by bee on a DIFFERENT trigger — early in the
-connection lifecycle when bee considers us a new peer worth syncing
-from. If we accept pullsync, bee gives us its first signal that we
-exist in its kademlia.
+We briefly served bee's `/swarm/pullsync/1.4.0/cursors` and
+`/swarm/pullsync/1.4.0/pullsync` substreams to look more like a
+real bee citizen — bee's `pkg/salud` (status protocol) didn't
+probe us because we weren't in bee's `connectedPeers`, but pullsync
+gets opened earlier in the connection lifecycle, so accepting it
+was the first reciprocal signal we ever got from bee.
 
-Implementation (May 2026, see `protocols::pullsync`):
-
-- `proto/pullsync.proto` — wire-compatible with bee's
-  `pkg/pullsync/pb/pullsync.proto`.
-- Two stream protocols accepted:
-  `/swarm/pullsync/1.4.0/cursors` (one-shot per-peer
-  initial-handshake) and `/swarm/pullsync/1.4.0/pullsync`
-  (periodic chunk-sync probe).
-- Cursor responder: reply with `Ack{Cursors: [0; 32], Epoch: <session_start_unix_secs>}`.
-  Bee accepts all-zero as "no chunks synced yet" — a valid empty
-  reserve, not a malformed response.
-- Pullsync responder: reply with `Offer{Topmost: Get.Start, Chunks: []}`.
-  Bee's handler short-circuits on empty offers
-  (`pkg/pullsync/pullsync.go:183`); the dialer doesn't send a `Want`
-  and the exchange ends without delivering chunks.
-- Accepted on both the outbound session (`transport::PeerSession::connect`)
-  and the daemon inbound listener — bee may probe pullsync over either.
-- BMT chunk-address verification is already done in
-  `client.rs::NetworkedStore::fetch` (line 224, `chunk.address() != &address`).
-  Stamp signature validator (`src/stamp.rs`) recovers the batch
-  owner from the 113-byte stamp; ready for use when we add chunk
-  ingestion paths, but unused in the current upload-only code.
-
-### Measurement (May 2026)
-
-**This is the first bee-citizenship intervention that actually
-fires.** Status protocol probes never arrived; hive announces went
-out but no return dials. Pullsync DOES get probed:
+Idle-period measurement showed bee did probe pullsync:
 
 | Measurement window | Cursor probes received | Chunk probes |
 |---|---:|---:|
 | Daemon idle (~15 min) | 6 | 0 |
 
-Chunk probes stay at 0 because we always offer-empty. Cursor
-probes from bee mean **bee opened a substream specifically to ask
-us for our reserve cursors**, which it only does for peers it's
-treating as kademlia neighbors. This is direct evidence that the
-combination of stable overlay + hive announce + listen+advertise +
-pullsync accept gets us into bee's kademlia from at least some
-bees.
+Cursor probes mean bee opened a substream specifically to ask for
+our reserve cursors, which it only does for peers it treats as
+kademlia neighbors. Chunk probes stayed at 0 because we always
+returned empty `Offer{Topmost: Get.Start, Chunks: []}`.
 
-### Single-upload throughput unchanged
+**Why we dropped it (commit `00e85c1`):** every empty cursor
+response triggered another probe almost immediately. Bee's
+puller has no rate-limit backpressure when the offer is
+empty (`WaitN(ctx, 0)` is instant), so we ended up in a tight
+poll loop with no reciprocal benefit — we'd need to actually
+store chunks for the offers to be useful, and chunk storage
+is explicitly out of scope. Honest rejection
+(`UnsupportedProtocol`) is better for both sides than constantly
+saying "I have nothing."
 
-Three trials, daemon mode, c=64, 5 MiB end-to-end via bzz.limo:
+The protocol versions on bee mainnet also moved on: bee 2.8.0
+ships `/swarm/pullsync/1.4.0` still on the wire but the substream
+ids around it have evolved. Restoring pullsync would mean
+re-tracking that without the matching chunk-storage backend, so
+the responder code (`src/protocols/pullsync.rs`, `proto/pullsync.proto`,
+`PULLSYNC_*_PROTO` consts) was removed entirely.
 
-| Trial | Wire push | End-to-end (bzz.limo) |
-|---|---:|---:|
-| 1 | 110.27s (46.4 KiB/s) | 114.60s (44.7 KiB/s) |
-| 2 | 22.30s (229.6 KiB/s) | **TIMEOUT (>600s)** |
-| 3 | 23.19s (220.8 KiB/s) | 25.56s (200.3 KiB/s) |
-
-Median: ~120 KiB/s end-to-end of the two successful trials.
-
-**Trial 2 is concerning:** push reported completion in 22s
-(receipts received from ~64 peers) but bzz.limo never served the
-content after 10 minutes. This means we got receipts from peers
-that didn't propagate the chunks to the actual AOR storers — a
-real protocol gap. Bee's pushsync should retry on shallow
-receipts (`pushsync.ErrShallowReceipt`), and we do this
-(`client.rs:1463-1471`), but apparently not all "successful"
-receipts indicate durable storage.
-
-The 200 KiB/s third trial is the best single end-to-end number
-we've measured. But variance is still large and bee is still
-2-2.5× faster on median.
-
-### What we've learned about bee-citizenship as a strategy
-
-The full stack we now have running:
-- Stable overlay (--nonce-file)
-- Outbound hive announce per session (~160/upload)
-- Inbound status responder (still never probed)
-- Inbound pullsync responder (now actively probed — 6/15min)
-- --listen --advertise (Public reachability)
-- SWAP cheque emission (cheques accepted by bee, no measurable impact)
-
-This is enough to be **partially recognized** as a kademlia
-neighbor by some bees. But "partially" means a fraction of the
-sustained-neighbor benefits a real bee gets:
-- We don't hold long-lived connections — they still RST after
-  seconds due to `SO_LINGER=0` on bee's libp2p TCP transport.
-- We don't store chunks, so the pullsync probes that DO arrive
-  return empty offers and don't graduate into actual sync traffic.
-- Without sync traffic, bees don't have a reason to maintain a
-  long-lived connection to us beyond the initial handshake +
-  cursor exchange.
-
-To close the remaining gap to bee (2-2.5× as of this measurement),
-we'd need to actually start STORING chunks (so our pullsync offers
-become non-empty and bees pull-sync real content from us, building
-a sustained-traffic relationship that bee's connection manager
-wants to keep alive). That's the chunk-storage feature we
-deliberately scoped out — see "Further work" #4 below.
+If we ever do add chunk storage (the "Further work" item that
+would close the remaining throughput gap vs bee), pullsync would
+come back — but with non-empty offers and a real reserve to back
+them.
 
 ## Bee 2.8.0 protocol migration (May 2026)
 

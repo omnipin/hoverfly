@@ -48,15 +48,6 @@ pub(crate) const SWAP_PROTO: StreamProtocol = StreamProtocol::new("/swarm/swap/1
 /// See `protocols::status` docs for the rationale.
 pub(crate) const STATUS_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/status/1.1.3/status");
-/// Bee pull-sync protocol identifiers. We deliberately do NOT accept
-/// these substreams (see [`PeerSession::connect`] for the rationale).
-/// Kept here as documentation; the strings are referenced nowhere
-/// in the codebase after dropping the inbound responder.
-#[allow(dead_code)]
-pub(crate) const PULLSYNC_CURSORS_PROTO: &str = "/swarm/pullsync/1.4.0/cursors";
-#[allow(dead_code)]
-pub(crate) const PULLSYNC_PULLSYNC_PROTO: &str = "/swarm/pullsync/1.4.0/pullsync";
-
 /// Minimum interval between successive dials to the same peer-id.
 /// Bee's libp2p connection rate limiter
 /// (`pkg/p2p/libp2p/libp2p.go::connLimiter`) allows 10 RPS / burst 40

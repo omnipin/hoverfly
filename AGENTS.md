@@ -201,18 +201,18 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   `signer::from_bytes_with_nonce`), outbound hive self-announce on
   every session connect (`protocols::hive::announce_self`,
   invoked from `transport::do_hive_announce` after the bee
-  handshake), inbound status responder (`protocols::status`), and
-  inbound pullsync responder (`protocols::pullsync`,
-  cursors + sync sub-streams, replies with all-zero cursors +
-  empty offers). The pullsync responder is the only piece bee
-  actually probes — `pullsync-in: cursors=N pullsync=M` diag
-  counters in CLI output. Hive announces fire at ~160 per 5 MiB
-  upload at c=64. Single-upload throughput unchanged in
-  benchmarks; the design is a slow-burn lever — bees that learn
-  about us via gossip add us to their `knownPeers` and may dial
-  us back hours later, growing our kademlia presence beyond what
-  any single session could. See PERFORMANCE.md
-  "Pullsync inbound responder" and "Bee-citizenship".
+  handshake), inbound status responder (`protocols::status`).
+  Hive announces fire at ~160 per 5 MiB upload at c=64.
+  Single-upload throughput unchanged in benchmarks; the design is
+  a slow-burn lever — bees that learn about us via gossip add us
+  to their `knownPeers` and may dial us back hours later,
+  growing our kademlia presence beyond what any single session
+  could. We previously also exposed an inbound pullsync responder
+  (empty cursors / empty offers) but dropped it: it was the only
+  piece bee actually probed, but each empty response immediately
+  triggered another probe, creating constant noise with no
+  reciprocal benefit — we don't store chunks, so non-empty offers
+  aren't possible. See PERFORMANCE.md "Bee-citizenship".
 - **Bee 2.8.0 protocol support** (also May 2026, day-of-release).
   Handshake v15 (`signer::sign_handshake_v15`) and hive v2 carry
   signed `timestamp` + `chequebook_address` fields in the

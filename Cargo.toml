@@ -64,7 +64,6 @@ tracing = "0.1"
 
 # Async
 futures = "0.3"
-async-trait = "0.1"
 
 # Cross-platform Instant
 web-time = "1"
@@ -110,6 +109,7 @@ libp2p = { git = "https://github.com/libp2p/rust-libp2p", branch = "master", def
     "secp256k1",
     "ecdsa",
     "identify",
+    "ping",
 ] }
 libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 tokio = { package = "tokio_with_wasm", version = "0.8", features = ["sync", "macros", "time"] }

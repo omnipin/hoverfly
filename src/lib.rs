@@ -45,9 +45,6 @@ pub mod proto {
     pub mod status {
         include!(concat!(env!("OUT_DIR"), "/status.rs"));
     }
-    pub mod pullsync {
-        include!(concat!(env!("OUT_DIR"), "/pullsync.rs"));
-    }
 }
 
 pub mod protocols;
