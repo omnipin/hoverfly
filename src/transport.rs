@@ -382,17 +382,6 @@ pub mod diag {
     /// between handshake and the hive substream open — see
     /// `CONN_CLOSED_*` for the cause classification.
     pub static HIVE_ANNOUNCE_FAIL: AtomicU64 = AtomicU64::new(0);
-    /// Inbound pullsync `cursors` substreams accepted from bee. Each
-    /// indicates bee has decided we're a kademlia neighbor worth
-    /// probing — a strong signal of kademlia membership. Compare to
-    /// outbound `HIVE_ANNOUNCE_OK`: hive tells bee about us, cursors
-    /// is bee acting on what it learned.
-    pub static PULLSYNC_CURSORS_IN: AtomicU64 = AtomicU64::new(0);
-    /// Inbound pullsync `pullsync` substreams accepted from bee. Each
-    /// is bee attempting to sync chunks from us. Even though we reply
-    /// with empty offers, the request count tells us bee considers
-    /// us a sync-eligible neighbor.
-    pub static PULLSYNC_PULLSYNC_IN: AtomicU64 = AtomicU64::new(0);
 
     // ─── Per-push wall-clock histogram ──────────────────────────────────
     //

@@ -742,15 +742,6 @@ fn print_session_retire_diag() {
     if hive_ok > 0 || hive_fail > 0 {
         eprintln!("hive-announce: ok={} fail={}", hive_ok, hive_fail);
     }
-    let ps_cur = diag::PULLSYNC_CURSORS_IN.load(Ordering::Relaxed);
-    let ps_sync = diag::PULLSYNC_PULLSYNC_IN.load(Ordering::Relaxed);
-    if ps_cur > 0 || ps_sync > 0 {
-        // Per-session inbound pullsync activity. Non-zero values mean
-        // bee considers us a kademlia neighbor worth probing for
-        // sync — the strongest available signal that the
-        // bee-citizenship work has actually paid off.
-        eprintln!("pullsync-in: cursors={} pullsync={}", ps_cur, ps_sync);
-    }
     let push_a = diag::PUSH_LATENCY_LT_100MS.load(Ordering::Relaxed);
     let push_b = diag::PUSH_LATENCY_100_500MS.load(Ordering::Relaxed);
     let push_c = diag::PUSH_LATENCY_500MS_2S.load(Ordering::Relaxed);

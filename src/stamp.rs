@@ -32,9 +32,8 @@
 //!
 //! For an upload-only client this is acceptable: we don't ingest
 //! chunks into a long-term reserve where bad stamps would matter.
-//! When we do accept inbound chunks (via pullsync delivery — not
-//! currently implemented), the missing batch-owner check is a known
-//! gap, tracked in PERFORMANCE.md.
+//! isheika doesn't accept pullsync (we don't store chunks), so the
+//! missing batch-owner check has no operational consequence here.
 
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
