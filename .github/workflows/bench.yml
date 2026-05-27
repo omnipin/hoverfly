@@ -37,6 +37,11 @@ on:
         required: false
         default: "2"
         type: string
+      use_random_nonce:
+        description: "Use a freshly-generated random overlay nonce instead of BENCH_NONCE (A/B test the value of vanity-overlay optimization)"
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   bench:
@@ -109,11 +114,14 @@ jobs:
           BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
           BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+          USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
         run: |
           missing=()
           [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
           [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
-          [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
+          if [ "$USE_RANDOM_NONCE" != "true" ]; then
+            [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
+          fi
           if [ "${#missing[@]}" -gt 0 ]; then
             printf '::error::Missing required secret(s): %s\n' "${missing[*]}"
             exit 1
@@ -121,22 +129,33 @@ jobs:
           # Don't echo the secrets — just confirm they parse.
           [ "${#BENCH_BATCH}" -ge 64 ] || { echo "::error::BENCH_BATCH too short"; exit 1; }
           [ "${#BENCH_KEY}"   -ge 64 ] || { echo "::error::BENCH_KEY too short";   exit 1; }
-          [ "${#BENCH_NONCE}" -ge 64 ] || { echo "::error::BENCH_NONCE too short"; exit 1; }
+          if [ "$USE_RANDOM_NONCE" != "true" ]; then
+            [ "${#BENCH_NONCE}" -ge 64 ] || { echo "::error::BENCH_NONCE too short"; exit 1; }
+          fi
           echo "All secrets present and within expected length."
 
-      - name: Write vanity overlay nonce
+      - name: Write overlay nonce
         env:
           BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+          USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
         run: |
-          # Strip optional 0x prefix and any whitespace.
-          NONCE_HEX="${BENCH_NONCE#0x}"
-          NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
-          if [ "${#NONCE_HEX}" -ne 64 ]; then
-            echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
-            exit 1
+          if [ "$USE_RANDOM_NONCE" = "true" ]; then
+            # A/B test: skip vanity optimization, let the daemon generate
+            # a fresh random nonce on first run. We just don't create the
+            # overlay-nonce file; the daemon will create one itself.
+            echo "use_random_nonce=true — daemon will generate a fresh random nonce"
+            rm -f overlay-nonce
+          else
+            # Strip optional 0x prefix and any whitespace.
+            NONCE_HEX="${BENCH_NONCE#0x}"
+            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
+            if [ "${#NONCE_HEX}" -ne 64 ]; then
+              echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
+              exit 1
+            fi
+            printf "%s" "$NONCE_HEX" > overlay-nonce
+            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
           fi
-          printf "%s" "$NONCE_HEX" > overlay-nonce
-          echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
 
       - name: Seed peers.json from committed seed
         # Bee 2.8.0 nodes drop the v14 substream id our older code
@@ -283,6 +302,7 @@ jobs:
           echo "- n uploads: ${{ inputs.n_uploads }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- pool size: ${{ inputs.pool_size }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- buffer multiplier: ${{ inputs.buffer_multiplier }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- nonce mode: ${{ inputs.use_random_nonce == true && 'random (A/B baseline)' || 'vanity (BENCH_NONCE)' }}" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "| run | seconds | throughput |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----|---------|------------|" >> "$GITHUB_STEP_SUMMARY"
