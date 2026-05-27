@@ -69,6 +69,136 @@ pub const MAINNET_CHAIN_ID: u64 = 100;
 /// on mainnet at deploy time) and anything `>= depth`.
 pub const BUCKET_DEPTH: u8 = 16;
 
+/// Effective volume in binary gibibytes (1 GiB = 1024^3 bytes) for
+/// each batch depth 17..=41, in the bee-canonical default config:
+/// unencrypted, erasure-coding level NONE. Values copied verbatim
+/// from the `gb` field of the official postage stamp calculator at
+/// <https://github.com/ethersphere/bee-docs/blob/master/src/components/AmountAndDepthCalc.js>
+/// (Gyuri's simulations, 0.1% failure quantile, PAC overhead
+/// included). The calculator treats kB/MB/GB/TB/PB as binary units
+/// throughout — we follow the same convention so our depth choice
+/// matches the docs site's "Suggested Safe Depth" output.
+const EFFECTIVE_VOLUME_GIB: [(u8, f64); 25] = [
+    (17, 0.000043),
+    (18, 0.006504),
+    (19, 0.109434),
+    (20, 0.671504),
+    (21, 2.60),
+    (22, 7.73),
+    (23, 19.94),
+    (24, 47.06),
+    (25, 105.51),
+    (26, 227.98),
+    (27, 476.68),
+    (28, 993.65),
+    (29, 2088.96),
+    (30, 4270.08),
+    (31, 8652.80),
+    (32, 17479.68),
+    (33, 35184.64),
+    (34, 70696.96),
+    (35, 141864.96),
+    (36, 284385.28),
+    (37, 569702.40),
+    (38, 1163919.36),
+    (39, 2338324.48),
+    (40, 4676648.96),
+    (41, 9363783.68),
+];
+
+/// Gnosis chain block time in seconds. Stable since chain launch.
+pub const GNOSIS_BLOCK_TIME_SECS: u64 = 5;
+
+/// Pick the smallest batch depth whose effective volume covers
+/// `requested_bytes`. Matches the "Suggested Safe Depth" output of
+/// <https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators>.
+///
+/// Bytes are converted to binary GiB (`bytes / 1024^3`) before
+/// comparison, matching the calculator's unit semantics.
+pub fn depth_for_size(requested_bytes: u64) -> Option<u8> {
+    let requested_gib = requested_bytes as f64 / (1024.0_f64.powi(3));
+    EFFECTIVE_VOLUME_GIB
+        .iter()
+        .find(|(_, eff)| *eff >= requested_gib)
+        .map(|(d, _)| *d)
+}
+
+/// Compute the per-chunk `amount` (PLUR) needed for at least
+/// `duration_secs` of storage at the current on-chain price.
+///
+/// Formula (from the bee-docs calculator and PostageStamp.sol
+/// `minimumInitialBalancePerChunk = minimumValidityBlocks × lastPrice`):
+///
+///   amount = ceil(duration_secs / block_time) × last_price
+///
+/// The contract requires `amount > minimumInitialBalancePerChunk`
+/// strictly (`<=` reverts), so we add a small buffer (+10 PLUR,
+/// matching the docs calculator's "Suggested Minimum Amount").
+pub fn amount_for_duration(last_price: u64, duration_secs: u64) -> U256 {
+    let blocks = duration_secs.div_ceil(GNOSIS_BLOCK_TIME_SECS);
+    U256::from(blocks).saturating_mul(U256::from(last_price)) + U256::from(10u64)
+}
+
+/// Parse a human-readable size like `100MB`, `2GB`, `1.5TB` into bytes
+/// using binary multipliers (1 KB = 1024 B, 1 MB = 1024 KB, ...).
+/// Matches the unit semantics of the official bee-docs calculator.
+pub fn parse_size(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num_part, unit_part) = s
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| s.split_at(i))
+        .ok_or_else(|| format!("size '{s}' missing unit (kB / MB / GB / TB / PB)"))?;
+    let num: f64 = num_part
+        .trim()
+        .parse()
+        .map_err(|e| format!("size '{s}': bad number '{num_part}': {e}"))?;
+    let unit = unit_part.trim().to_ascii_lowercase();
+    let mult: u64 = match unit.as_str() {
+        "b" => 1,
+        "kb" | "k" => 1024,
+        "mb" | "m" => 1024 * 1024,
+        "gb" | "g" => 1024 * 1024 * 1024,
+        "tb" | "t" => 1024_u64.pow(4),
+        "pb" | "p" => 1024_u64.pow(5),
+        _ => return Err(format!("size '{s}': unknown unit '{unit_part}' (use kB/MB/GB/TB/PB)")),
+    };
+    let bytes = (num * mult as f64) as u64;
+    Ok(bytes)
+}
+
+/// Parse a human-readable duration like `24h`, `30d`, `2w`, `1y`
+/// into seconds. Single unit suffix only.
+pub fn parse_duration(s: &str) -> Result<u64, String> {
+    let s = s.trim();
+    let (num_part, unit) = s
+        .find(|c: char| c.is_alphabetic())
+        .map(|i| s.split_at(i))
+        .ok_or_else(|| format!("duration '{s}' missing unit (h / d / w / y)"))?;
+    let num: f64 = num_part
+        .trim()
+        .parse()
+        .map_err(|e| format!("duration '{s}': bad number '{num_part}': {e}"))?;
+    let mult: f64 = match unit.trim().to_ascii_lowercase().as_str() {
+        "s" | "sec" | "secs" | "second" | "seconds" => 1.0,
+        "m" | "min" | "mins" | "minute" | "minutes" => 60.0,
+        "h" | "hr" | "hrs" | "hour" | "hours" => 3600.0,
+        "d" | "day" | "days" => 86400.0,
+        "w" | "wk" | "wks" | "week" | "weeks" => 7.0 * 86400.0,
+        "y" | "yr" | "yrs" | "year" | "years" => 365.0 * 86400.0,
+        _ => return Err(format!("duration '{s}': unknown unit '{unit}' (use h/d/w/y)")),
+    };
+    Ok((num * mult) as u64)
+}
+
+/// Read the current `lastPrice` from the PostageStamp contract.
+/// Useful for previewing batch cost / amount before calling
+/// [`create_batch`]. Returns PLUR per chunk per block.
+pub async fn read_last_price(rpc_url: &str, postage_stamp: Address) -> Result<u64, BatchError> {
+    let rpc = EthRpc::new(rpc_url.to_string());
+    rpc.call_view::<lastPriceCall, _>(postage_stamp, lastPriceCall {})
+        .await
+}
+
 sol! {
     // PostageStamp.createBatch(address,uint256,uint8,uint8,bytes32,bool)
     function createBatch(
@@ -652,4 +782,57 @@ fn encode_legacy_signed(
     };
     header.encode(out);
     out.extend_from_slice(&payload);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_size_binary_units() {
+        assert_eq!(parse_size("100MB").unwrap(), 100 * 1024 * 1024);
+        assert_eq!(parse_size("2GB").unwrap(), 2 * 1024 * 1024 * 1024);
+        assert_eq!(
+            parse_size("1.5TB").unwrap(),
+            (1.5 * 1024.0 * 1024.0 * 1024.0 * 1024.0) as u64
+        );
+        assert_eq!(parse_size("44.70 kB").unwrap(), (44.70 * 1024.0) as u64);
+        assert_eq!(parse_size("1gb").unwrap(), 1024 * 1024 * 1024);
+        assert_eq!(parse_size("4K").unwrap(), 4 * 1024);
+    }
+
+    #[test]
+    fn parse_size_rejects_garbage() {
+        assert!(parse_size("100").is_err()); // no unit
+        assert!(parse_size("MB").is_err()); // no number
+        assert!(parse_size("100XB").is_err()); // bad unit
+    }
+
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("24h").unwrap(), 24 * 3600);
+        assert_eq!(parse_duration("30d").unwrap(), 30 * 86400);
+        assert_eq!(parse_duration("2w").unwrap(), 2 * 7 * 86400);
+        assert_eq!(parse_duration("1y").unwrap(), 365 * 86400);
+        assert_eq!(parse_duration("12 hours").unwrap(), 12 * 3600);
+        assert_eq!(parse_duration("7 days").unwrap(), 7 * 86400);
+    }
+
+    #[test]
+    fn depth_for_size_matches_calculator() {
+        // 1 GB ≈ 0.93 GiB ≤ 2.60 GiB ⇒ depth 21
+        assert_eq!(depth_for_size(1_000_000_000), Some(21));
+        // 50 GB ≈ 46.57 GiB ≤ 47.06 GiB ⇒ depth 24
+        assert_eq!(depth_for_size(50_000_000_000), Some(24));
+        // 1 TB = 10^12 B ≈ 931.32 GiB ≤ 993.65 GiB ⇒ depth 28
+        assert_eq!(depth_for_size(1_000_000_000_000), Some(28));
+        assert_eq!(depth_for_size(1), Some(17));
+    }
+
+    #[test]
+    fn amount_for_duration_24h() {
+        // 24h = 86400s; blocks = 86400 / 5 = 17280; with last_price=1
+        // amount = 17280 + 10 (buffer)
+        assert_eq!(amount_for_duration(1, 86400), U256::from(17290u64));
+    }
 }

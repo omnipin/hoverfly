@@ -567,18 +567,57 @@ enum BatchAction {
         #[arg(long, value_name = "HEX")]
         key: String,
 
+        /// Approximate storage volume the batch should cover. Combined
+        /// with `--duration`, derives `--depth` and `--amount-per-chunk`
+        /// via the same formulas as the official postage-stamp
+        /// calculator at <https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators>.
+        ///
+        /// Accepts a number with a unit suffix (binary): `kB`, `MB`,
+        /// `GB`, `TB`, `PB`. Examples: `100MB`, `2GB`, `1.5TB`.
+        /// Picks the smallest depth whose effective volume (unencrypted,
+        /// no erasure coding, 0.1% failure quantile) covers the value.
+        ///
+        /// Mutually exclusive with `--depth`.
+        #[arg(
+            long,
+            value_name = "SIZE",
+            conflicts_with_all = ["depth", "amount_per_chunk"],
+            requires = "duration"
+        )]
+        size: Option<String>,
+
+        /// How long the batch should stay valid. Combined with `--size`,
+        /// derives `--amount-per-chunk` as `ceil(duration/5s) × lastPrice`
+        /// + a small buffer, matching bee-docs.
+        ///
+        /// Accepts a number with a unit suffix: `h` (hours), `d`
+        /// (days), `w` (weeks), `y` (years). Examples: `24h`, `30d`,
+        /// `2w`, `1y`. Minimum is 24h (the on-chain
+        /// `minimumValidityBlocks` floor).
+        ///
+        /// Mutually exclusive with `--amount-per-chunk`.
+        #[arg(
+            long,
+            value_name = "DURATION",
+            conflicts_with_all = ["depth", "amount_per_chunk"],
+            requires = "size"
+        )]
+        duration: Option<String>,
+
         /// Per-chunk initial balance in BZZ-PLUR (1 BZZ = 10^16 PLUR).
-        /// Must exceed `lastPrice * minimumValidityBlocks` (~24h of
-        /// storage on Swarm mainnet); the contract reverts otherwise.
-        /// Total BZZ pulled from `--key` is this value × 2^depth.
-        #[arg(long, value_name = "PLUR")]
-        amount_per_chunk: String,
+        /// Low-level alternative to `--duration`. Must exceed
+        /// `lastPrice * minimumValidityBlocks` (~24h of storage on
+        /// Swarm mainnet); the contract reverts otherwise. Total BZZ
+        /// pulled from `--key` is this value × 2^depth.
+        #[arg(long, value_name = "PLUR", requires = "depth")]
+        amount_per_chunk: Option<String>,
 
         /// Batch depth. Stamp count = 2^depth. Must be > 16 (bucket
-        /// depth); typical values 20-24. Higher depth = more chunks =
-        /// proportionally more BZZ.
-        #[arg(long, default_value_t = 20)]
-        depth: u8,
+        /// depth); typical values 20-24. Low-level alternative to
+        /// `--size`. Higher depth = more chunks = proportionally
+        /// more BZZ.
+        #[arg(long, requires = "amount_per_chunk")]
+        depth: Option<u8>,
 
         /// Immutable batch flag. Mutable (default) can be topped up
         /// and diluted; immutable can't.
@@ -1654,6 +1693,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             BatchAction::Create {
                 rpc_url,
                 key,
+                size,
+                duration,
                 amount_per_chunk,
                 depth,
                 immutable,
@@ -1664,7 +1705,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 use alloy_signer_local::PrivateKeySigner;
                 use isheika::batch::{
-                    create_batch, CreateBatchParams, MAINNET_BZZ_TOKEN, MAINNET_POSTAGE_STAMP,
+                    amount_for_duration, create_batch, depth_for_size, parse_duration,
+                    parse_size, read_last_price, CreateBatchParams, MAINNET_BZZ_TOKEN,
+                    MAINNET_POSTAGE_STAMP,
                 };
 
                 let signer: PrivateKeySigner = key
@@ -1674,9 +1717,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map_err(|e| format!("--key parse: {e}"))?;
                 let signer_addr = signer.address();
 
-                let amount = amount_per_chunk
-                    .parse::<alloy_primitives::U256>()
-                    .map_err(|e| format!("--amount-per-chunk: {e}"))?;
+                let postage_stamp_addr: alloy_primitives::Address = postage_stamp
+                    .as_deref()
+                    .unwrap_or(MAINNET_POSTAGE_STAMP)
+                    .parse()
+                    .map_err(|e| format!("--postage-stamp: {e}"))?;
+
+                // Resolve depth + amount from either (--size, --duration)
+                // or (--depth, --amount-per-chunk). Clap's `requires` rules
+                // guarantee at least one of the pairs is fully present.
+                let (resolved_depth, resolved_amount) = match (size, duration) {
+                    (Some(sz), Some(dur)) => {
+                        let size_bytes = parse_size(&sz)?;
+                        let secs = parse_duration(&dur)?;
+                        let d = depth_for_size(size_bytes).ok_or_else(|| {
+                            format!(
+                                "size '{sz}' exceeds the maximum tabulated effective volume \
+                                 (depth=41 ≈ 8.93 PB). Pass --depth/--amount-per-chunk \
+                                 explicitly if you really need this."
+                            )
+                        })?;
+                        let last_price = read_last_price(&rpc_url, postage_stamp_addr).await?;
+                        let amount = amount_for_duration(last_price, secs);
+                        println!(
+                            "resolved size={sz} duration={dur} (last_price={last_price} PLUR/chunk/block) → depth={d} amount={amount}"
+                        );
+                        (d, amount)
+                    }
+                    (None, None) => {
+                        let d = depth
+                            .ok_or("must specify either (--size --duration) or (--depth --amount-per-chunk)")?;
+                        let amount = amount_per_chunk
+                            .as_ref()
+                            .ok_or("must specify --amount-per-chunk alongside --depth")?
+                            .parse::<alloy_primitives::U256>()
+                            .map_err(|e| format!("--amount-per-chunk: {e}"))?;
+                        (d, amount)
+                    }
+                    _ => unreachable!("clap `requires` ensures --size+--duration come as a pair"),
+                };
 
                 let params = CreateBatchParams {
                     rpc_url,
@@ -1685,18 +1764,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .map(|s| s.parse().map_err(|e| format!("--owner: {e}")))
                         .transpose()?
                         .unwrap_or(signer_addr),
-                    postage_stamp: postage_stamp
-                        .as_deref()
-                        .unwrap_or(MAINNET_POSTAGE_STAMP)
-                        .parse()
-                        .map_err(|e| format!("--postage-stamp: {e}"))?,
+                    postage_stamp: postage_stamp_addr,
                     bzz_token: bzz_token
                         .as_deref()
                         .unwrap_or(MAINNET_BZZ_TOKEN)
                         .parse()
                         .map_err(|e| format!("--bzz-token: {e}"))?,
-                    initial_balance_per_chunk: amount,
-                    depth,
+                    initial_balance_per_chunk: resolved_amount,
+                    depth: resolved_depth,
                     immutable,
                     chain_id,
                     receipt_timeout: std::time::Duration::from_secs(120),
