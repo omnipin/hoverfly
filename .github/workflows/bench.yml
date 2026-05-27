@@ -182,37 +182,6 @@ jobs:
           PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
           echo "seeded peers.json with $PEER_COUNT peers"
 
-      - name: Install tcpdump
-        # Capture outbound TCP traffic during daemon startup so we
-        # can see whether bee bootnodes are silently disconnecting,
-        # sending RST, or just timing out our handshake substream.
-        # The pcap is uploaded as an artifact.
-        run: |
-          sudo apt-get install -y --no-install-recommends tcpdump
-          tcpdump --version | head -1
-
-      - name: Start tcpdump capture
-        run: |
-          # Find the primary outbound interface.
-          IFACE=$(ip route get 8.8.8.8 | awk '{for(i=1;i<=NF;i++)if($i=="dev")print $(i+1)}' | head -1)
-          echo "capturing on interface $IFACE"
-          # tcpdump filter:
-          #   tcp: only TCP (no UDP, no ICMP)
-          #   not (dst port 443 or src port 443): exclude HTTPS to GitHub APIs
-          #   not (dst port 22 or src port 22): exclude SSH
-          #   not (dst port 80 or src port 80): exclude HTTP (apt mirrors)
-          # Snap length 256 bytes is enough to see TCP flags + first
-          # ~200 bytes of payload (libp2p Noise handshake, multistream
-          # protocol negotiation, beginning of any frame).
-          sudo nohup tcpdump -i "$IFACE" -s 256 -w /tmp/bench.pcap \
-            "tcp and not (port 443 or port 22 or port 80)" \
-            > /tmp/tcpdump.log 2>&1 &
-          TCPDUMP_PID=$!
-          echo "TCPDUMP_PID=$TCPDUMP_PID" >> "$GITHUB_ENV"
-          # Brief settle so capture is running before daemon starts dialing.
-          sleep 1
-          echo "tcpdump pid $TCPDUMP_PID"
-
       - name: Start daemon
         # peers.seed.json (~794 peers across ~794 unique /32 IPs from
         # a v15 hive harvest) is the primary cold-start source.
@@ -257,24 +226,6 @@ jobs:
           done
           echo "::warning::pool did not warm in 8 min; proceeding anyway"
           tail -50 /tmp/daemon.log
-
-      - name: Stop tcpdump capture
-        # Stop the capture before uploads kick off — we only care about
-        # the discover/handshake phase for the diagnosis, and the upload
-        # phase would generate gigabytes of payload traffic that we
-        # cant fit in a GitHub Actions artifact.
-        if: always()
-        run: |
-          if [ -n "${TCPDUMP_PID:-}" ]; then
-            sudo kill -INT "$TCPDUMP_PID" 2>/dev/null || true
-            # Give tcpdump a moment to flush its buffer.
-            sleep 2
-            sudo kill -9 "$TCPDUMP_PID" 2>/dev/null || true
-          fi
-          sudo chmod 644 /tmp/bench.pcap 2>/dev/null || true
-          ls -la /tmp/bench.pcap /tmp/tcpdump.log 2>/dev/null || true
-          echo '=== tcpdump.log ==='
-          sudo cat /tmp/tcpdump.log 2>/dev/null || true
 
       - name: Run benchmark uploads
         env:
@@ -368,7 +319,5 @@ jobs:
           path: |
             /tmp/daemon.log
             /tmp/bench.results
-            /tmp/bench.pcap
-            /tmp/tcpdump.log
             peers.json
           retention-days: 7

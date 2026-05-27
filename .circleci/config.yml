@@ -64,9 +64,8 @@ jobs:
           # scripts; the cimg/rust image doesnt ship it.
           command: |
             sudo apt-get update -y
-            sudo apt-get install -y --no-install-recommends protobuf-compiler tcpdump
+            sudo apt-get install -y --no-install-recommends protobuf-compiler
             protoc --version
-            tcpdump --version | head -1
 
       # Two-tier cache strategy:
       #
@@ -213,19 +212,6 @@ jobs:
             echo "seeded peers.json with $PEER_COUNT peers"
 
       - run:
-          name: Start tcpdump capture
-          # Capture outbound TCP (excluding HTTPS/SSH/HTTP) during daemon
-          # startup so we can confirm whether the alternate bootnode is
-          # accepting our handshake from a CircleCI IP. `-i any` avoids
-          # depending on iproute2 (the cimg/rust image ships without
-          # the `ip` command).
-          background: true
-          command: |
-            sudo tcpdump -i any -s 256 -w /tmp/bench.pcap \
-              'tcp and not (port 443 or port 22 or port 80)' \
-              > /tmp/tcpdump.log 2>&1
-
-      - run:
           name: Start daemon
           # peers.seed.json (~794 peers across ~794 unique /32 IPs from
           # a v15 hive harvest) is the primary cold-start source.
@@ -264,16 +250,6 @@ jobs:
             done
             echo "WARN pool did not warm in 8 min; proceeding anyway"
             tail -50 /tmp/daemon.log
-
-      - run:
-          name: Stop tcpdump capture
-          when: always
-          command: |
-            sudo pkill -INT tcpdump 2>/dev/null || true
-            sleep 2
-            sudo pkill -9 tcpdump 2>/dev/null || true
-            sudo chmod 644 /tmp/bench.pcap 2>/dev/null || true
-            ls -la /tmp/bench.pcap /tmp/tcpdump.log 2>/dev/null || true
 
       - run:
           name: Run benchmark uploads
@@ -346,12 +322,6 @@ jobs:
       - store_artifacts:
           path: /tmp/bench.results
           destination: bench.results
-      - store_artifacts:
-          path: /tmp/bench.pcap
-          destination: bench.pcap
-      - store_artifacts:
-          path: /tmp/tcpdump.log
-          destination: tcpdump.log
       - store_artifacts:
           path: peers.json
           destination: peers.json
