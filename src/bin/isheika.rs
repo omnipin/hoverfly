@@ -23,7 +23,7 @@ use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
-#[command(name = "isheika", version, about = "Swarm micro-client (WS-only, WASM-portable)")]
+#[command(name = "isheika", version, about = "Swarm micro-client (TCP + WebSocket on native, WebSocket on WASM)")]
 struct Cli {
     /// Verbose output (info-level logging)
     #[arg(short, long, global = true)]

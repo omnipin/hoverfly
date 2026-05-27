@@ -1,7 +1,10 @@
-//! isheika — minimal WS-only WASM-portable Swarm micro-client.
+//! isheika — minimal WASM-portable Swarm micro-client.
 //!
-//! Three operations: `discover`, `fetch`, `upload`. Networking is libp2p WebSocket
-//! only (websys on wasm32). DNS resolution is DoH-only.
+//! Three operations: `discover`, `fetch`, `upload`. Networking is libp2p
+//! over plain TCP **and** WebSocket on native builds, WebSocket-only on
+//! `wasm32` (browsers can't open raw TCP sockets). DNS resolution is
+//! DoH-only — no system resolver dependency, works the same in all
+//! deployment shapes (CLI, daemon, WASM bundle).
 
 pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]

@@ -1,6 +1,12 @@
 //! In-memory + (native) JSON-backed peer store.
 //!
-//! WS-only filtering: only peers with at least one ws/wss multiaddr are accepted.
+//! Underlay-dialability filter: peers are accepted only if they expose at
+//! least one underlay this build can dial. On native that's any `/ip4/.../tcp/`
+//! or `/ip4/.../ws[s]/` multiaddr; on `wasm32` (browser builds) it's
+//! `/ip4/.../ws[s]/` only — browsers can't open raw TCP sockets. Both
+//! variants exclude `/dns*/` and `/ip6/` because we don't ship a DNS resolver
+//! and v6 reachability on residential / CI networks is unreliable. See
+//! `dnsaddr.rs::is_dialable_multiaddr` for the canonical predicate.
 
 use libp2p::Multiaddr;
 use nectar_primitives::address::SwarmAddress;
