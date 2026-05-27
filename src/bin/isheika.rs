@@ -70,14 +70,17 @@ struct Cli {
 
     /// Multiplier applied to the dispatcher's in-flight chunk
     /// buffer. The buffer's base cap is `128 × mult`, floored at
-    /// pool size. At `mult=1` (default) the buffer matches the
-    /// original 128 cap. Increase together with `--concurrency`:
-    /// per-session in-flight stays ~constant while total grows.
-    /// Sweet spot empirically `--concurrency 512 --buffer-multiplier 4`
-    /// on a 3000+ peer pool (≈ 1 MB/s on a VPS); larger overshoots
-    /// into yamux contention and regresses. See PERFORMANCE.md
-    /// "Pool + buffer scaling" for the sweep.
-    #[arg(long, global = true, default_value_t = 1, value_name = "N")]
+    /// pool size. At `mult=1` the buffer matches the original 128
+    /// cap; default `2` (= 256 in-flight chunks) consistently
+    /// outperforms `1` in CI/VPS bench A/Bs with no measurable
+    /// memory or contention downside at the sizes we run. Increase
+    /// together with `--concurrency`: per-session in-flight stays
+    /// ~constant while total grows. Sweet spot empirically
+    /// `--concurrency 512 --buffer-multiplier 4` on a 3000+ peer
+    /// pool (≈ 1 MB/s on a VPS); larger overshoots into yamux
+    /// contention and regresses. See PERFORMANCE.md "Pool + buffer
+    /// scaling" for the sweep.
+    #[arg(long, global = true, default_value_t = 2, value_name = "N")]
     buffer_multiplier: usize,
 
     /// SWAP chequebook contract address (20 bytes hex, 0x-optional).
@@ -810,10 +813,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The library reads ISHEIKA_BUFFER_MULT from the environment at
     // upload dispatch time (`src/client.rs::push_chunks_inner`). The
     // `--buffer-multiplier` CLI flag plumbs the same knob without
-    // requiring the user to export an env var. CLI value > 1
-    // overrides the env var; CLI value 1 (default) defers to env so
-    // an explicit `ISHEIKA_BUFFER_MULT=N` from the shell still works.
-    if cli.buffer_multiplier > 1 {
+    // requiring the user to export an env var. An explicit env var
+    // takes precedence over the CLI default — set the env var from
+    // the CLI value only if the env var is unset, so an explicit
+    // `ISHEIKA_BUFFER_MULT=N` from the shell still wins.
+    if std::env::var_os("ISHEIKA_BUFFER_MULT").is_none() {
         // Safety: single-threaded at this point (main hasn't done
         // anything else yet); unsafe in nightly's edition-2024
         // because env::set_var is process-wide.

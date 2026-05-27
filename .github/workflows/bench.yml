@@ -229,16 +229,13 @@ jobs:
         run: |
           rm -f /tmp/isheika.sock
           nohup ./target/release/isheika \
-            --nonce-file overlay-nonce \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
             daemon \
             --socket /tmp/isheika.sock \
-            --peerlist peers.json \
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
             --discover-rounds 3 \
-            --bootnode '/dnsaddr/mainnet.ethswarm.org' \
             -d \
             > /tmp/daemon.log 2>&1 &
           DAEMON_PID=$!

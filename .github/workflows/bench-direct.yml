@@ -171,12 +171,8 @@ jobs:
             echo "running cold discover against /dnsaddr/mainnet.ethswarm.org..."
             START_T=$(date +%s)
             ./target/release/isheika \
-              --nonce-file overlay-nonce \
               discover \
-              /dnsaddr/mainnet.ethswarm.org \
-              --output peers.json \
               --rounds 3 \
-              --wait 5 \
               -v 2>&1 | tail -20
             END_T=$(date +%s)
             DISCOVER_SECS=$((END_T - START_T))
@@ -204,12 +200,10 @@ jobs:
 
             echo "=== Run $i ==="
             ./target/release/isheika \
-              --nonce-file overlay-nonce \
               --buffer-multiplier ${{ inputs.buffer_multiplier }} \
               upload \
               --batch "$BENCH_BATCH" \
               --key "$BENCH_KEY" \
-              --peerlist peers.json \
               --concurrency ${{ inputs.concurrency }} \
               --max-retries 60 \
               /tmp/bench-${{ inputs.file_size_mib }}mib.bin 2>&1 \
