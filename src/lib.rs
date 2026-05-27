@@ -6,6 +6,8 @@
 //! DoH-only — no system resolver dependency, works the same in all
 //! deployment shapes (CLI, daemon, WASM bundle).
 
+#[cfg(not(target_arch = "wasm32"))]
+pub mod batch;
 pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cheques;

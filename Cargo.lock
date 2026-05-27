@@ -2668,6 +2668,7 @@ name = "isheika"
 version = "0.1.0"
 dependencies = [
  "alloy-primitives",
+ "alloy-rlp",
  "alloy-signer",
  "alloy-signer-local",
  "alloy-sol-types",

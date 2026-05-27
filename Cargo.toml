@@ -98,6 +98,10 @@ getrandom = { version = "0.3", default-features = false }
 # Parallel postage stamp signing on native targets. Wasm-single-thread
 # doesn't benefit and rayon doesn't compile there anyway.
 rayon = "1"
+# RLP encoding for legacy EIP-155 transactions in `src/batch.rs`
+# (postage-batch creation on Gnosis chain). No transitive ETH-stack
+# deps — just `bytes` + a couple of small helpers.
+alloy-rlp = "0.3"
 
 # Wasm-only
 [target.'cfg(target_arch = "wasm32")'.dependencies]

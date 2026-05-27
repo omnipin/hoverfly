@@ -526,6 +526,83 @@ enum Commands {
         #[arg(long, default_value_t = 1)]
         network_id: u64,
     },
+
+    /// Manage on-chain postage stamp batches.
+    ///
+    /// Unlike every other subcommand, `batch` makes real on-chain RPC
+    /// calls (Gnosis chain by default). Requires an `--rpc-url` and a
+    /// `--key` whose Ethereum address holds enough BZZ to fund the
+    /// batch (depth=20 with the current price typically costs <1 BZZ
+    /// per day of validity).
+    #[cfg(unix)]
+    Batch {
+        #[command(subcommand)]
+        action: BatchAction,
+    },
+}
+
+#[cfg(unix)]
+#[derive(Subcommand)]
+enum BatchAction {
+    /// Create a new postage stamp batch on-chain.
+    ///
+    /// Flow (matches bee's `postagecontract.CreateBatch`):
+    /// 1. Read `lastPrice` and `minimumValidityBlocks` from the
+    ///    PostageStamp contract to compute the min initial balance.
+    /// 2. Verify the signer has enough BZZ to cover
+    ///    `initial_balance_per_chunk * 2^depth`.
+    /// 3. Approve the PostageStamp contract to spend the BZZ.
+    /// 4. Call `createBatch(owner, balancePerChunk, depth, 16,
+    ///    randomNonce, immutable)`.
+    /// 5. Parse the `BatchCreated` event from the receipt and emit
+    ///    the resulting batch ID.
+    Create {
+        /// JSON-RPC endpoint for the chain. For Swarm mainnet this is
+        /// any Gnosis chain RPC (e.g. `https://rpc.gnosischain.com`).
+        #[arg(long, value_name = "URL")]
+        rpc_url: String,
+
+        /// Signer private key (hex, 32 bytes). Pays gas, owns the
+        /// resulting batch unless `--owner` is set.
+        #[arg(long, value_name = "HEX")]
+        key: String,
+
+        /// Per-chunk initial balance in BZZ-PLUR (1 BZZ = 10^16 PLUR).
+        /// Must exceed `lastPrice * minimumValidityBlocks` (~24h of
+        /// storage on Swarm mainnet); the contract reverts otherwise.
+        /// Total BZZ pulled from `--key` is this value × 2^depth.
+        #[arg(long, value_name = "PLUR")]
+        amount_per_chunk: String,
+
+        /// Batch depth. Stamp count = 2^depth. Must be > 16 (bucket
+        /// depth); typical values 20-24. Higher depth = more chunks =
+        /// proportionally more BZZ.
+        #[arg(long, default_value_t = 20)]
+        depth: u8,
+
+        /// Immutable batch flag. Mutable (default) can be topped up
+        /// and diluted; immutable can't.
+        #[arg(long)]
+        immutable: bool,
+
+        /// Override the batch owner. Defaults to the signer's address.
+        /// The contract reverts on zero address.
+        #[arg(long, value_name = "ADDR")]
+        owner: Option<String>,
+
+        /// PostageStamp contract address. Defaults to the Swarm
+        /// mainnet deployment on Gnosis chain.
+        #[arg(long, value_name = "ADDR")]
+        postage_stamp: Option<String>,
+
+        /// BZZ ERC-20 token address. Defaults to Swarm mainnet BZZ.
+        #[arg(long, value_name = "ADDR")]
+        bzz_token: Option<String>,
+
+        /// EIP-155 chain id. Defaults to 100 (Gnosis).
+        #[arg(long, default_value_t = 100)]
+        chain_id: u64,
+    },
 }
 
 /// Parse a tar archive into a flat list of `UploadFile`s (regular files
@@ -1571,6 +1648,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 );
             }
         }
+
+        #[cfg(unix)]
+        Commands::Batch { action } => match action {
+            BatchAction::Create {
+                rpc_url,
+                key,
+                amount_per_chunk,
+                depth,
+                immutable,
+                owner,
+                postage_stamp,
+                bzz_token,
+                chain_id,
+            } => {
+                use alloy_signer_local::PrivateKeySigner;
+                use isheika::batch::{
+                    create_batch, CreateBatchParams, MAINNET_BZZ_TOKEN, MAINNET_POSTAGE_STAMP,
+                };
+
+                let signer: PrivateKeySigner = key
+                    .strip_prefix("0x")
+                    .unwrap_or(&key)
+                    .parse()
+                    .map_err(|e| format!("--key parse: {e}"))?;
+                let signer_addr = signer.address();
+
+                let amount = amount_per_chunk
+                    .parse::<alloy_primitives::U256>()
+                    .map_err(|e| format!("--amount-per-chunk: {e}"))?;
+
+                let params = CreateBatchParams {
+                    rpc_url,
+                    owner: owner
+                        .as_deref()
+                        .map(|s| s.parse().map_err(|e| format!("--owner: {e}")))
+                        .transpose()?
+                        .unwrap_or(signer_addr),
+                    postage_stamp: postage_stamp
+                        .as_deref()
+                        .unwrap_or(MAINNET_POSTAGE_STAMP)
+                        .parse()
+                        .map_err(|e| format!("--postage-stamp: {e}"))?,
+                    bzz_token: bzz_token
+                        .as_deref()
+                        .unwrap_or(MAINNET_BZZ_TOKEN)
+                        .parse()
+                        .map_err(|e| format!("--bzz-token: {e}"))?,
+                    initial_balance_per_chunk: amount,
+                    depth,
+                    immutable,
+                    chain_id,
+                    receipt_timeout: std::time::Duration::from_secs(120),
+                };
+
+                println!(
+                    "creating batch (owner={}, depth={}, amount/chunk={} PLUR, immutable={}) ...",
+                    params.owner, params.depth, params.initial_balance_per_chunk, params.immutable
+                );
+
+                let info = create_batch(&signer, params).await?;
+
+                println!("batch created:");
+                println!("  batch_id:    0x{}", hex::encode(info.batch_id));
+                println!("  owner:       {}", info.owner);
+                println!("  depth:       {}", info.depth);
+                println!("  bucket:      {}", info.bucket_depth);
+                println!("  immutable:   {}", info.immutable);
+                println!("  total_paid:  {} PLUR", info.total_amount);
+                println!("  normalised:  {} PLUR", info.normalised_balance);
+                if info.approve_tx != alloy_primitives::B256::ZERO {
+                    println!("  approve_tx:  0x{}", hex::encode(info.approve_tx));
+                }
+                println!("  create_tx:   0x{}", hex::encode(info.create_tx));
+            }
+        },
     }
 
     Ok(())
