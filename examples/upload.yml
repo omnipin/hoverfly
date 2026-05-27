@@ -1,0 +1,37 @@
+# Example: upload a directory to Swarm as a TAR collection on demand.
+#
+# Drop this into `.github/workflows/upload.yml` in your project. It
+# tars `./dist`, uploads via isheika, and prints the manifest root.
+#
+# Required repo secrets:
+#   SWARM_KEY    Postage batch owner's signer (hex, 32 bytes, 0x optional)
+#   SWARM_BATCH  Postage batch ID (hex, 32 bytes)
+
+name: upload
+
+on:
+  workflow_dispatch:
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Fetch isheika
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release download -R v1rtl/isheika \
+            -p 'isheika-x86_64-unknown-linux-gnu.tar.gz' \
+            -p 'peers.seed.json'
+          tar -xzf isheika-*.tar.gz
+          mv peers.seed.json peers.json
+
+      - name: Pack and upload
+        env:
+          SWARM_KEY: ${{ secrets.SWARM_KEY }}
+          SWARM_BATCH: ${{ secrets.SWARM_BATCH }}
+        run: |
+          tar -cf dist.tar -C dist .
+          ./isheika upload --batch "$SWARM_BATCH" --key "$SWARM_KEY" dist.tar
