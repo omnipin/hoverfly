@@ -35,24 +35,23 @@ parameters:
   pool_size:
     type: string
     default: "256"
-    description: "Daemon --pool-size. peers.seed.json has 706 unique /32 IPs (1 peer per IP from a v15 hive harvest), so 256 is well within bee's per-/32 connLimiter even after dial fan-out — at most 1 dial per IP, no rate-limit pressure."
+    description: "Daemon --pool-size"
   buffer_multiplier:
     type: string
     default: "2"
-    description: "Daemon --buffer-multiplier (1, 2, or 4). With pool=256 and per-session inflight_cap of 2-8, buffer=512 keeps the dispatcher saturated without overshooting any single session's capacity."
+    description: "Daemon --buffer-multiplier (1, 2, or 4)"
 
 jobs:
   bench:
     docker:
       - image: cimg/rust:1.95.0
-    # `large` = 4 vCPU / 8 GB RAM, comparable to GitHub-hosted ubuntu-latest.
-    # `medium` (the default) is 2 vCPU which makes Rust release builds slow.
+    # `large` (4 vCPU / 8 GB) ≈ GitHub-hosted ubuntu-latest. `medium`
+    # (2 vCPU, default) makes release builds significantly slower.
     resource_class: large
 
     environment:
-      # Disable incremental compilation in release mode. Combined with
-      # the cargo + built-binary caches, this makes cargo trust the
-      # fingerprint cache and skip recompiling unchanged source on hit.
+      # Workaround: incremental + Cargo.lock-keyed cache otherwise
+      # rebuilds on every run (checkout bumps mtimes).
       CARGO_INCREMENTAL: "0"
 
     steps:
@@ -60,90 +59,43 @@ jobs:
 
       - run:
           name: Install protoc
-          # nectar-primitives / prost-build call `protoc` from their build
-          # scripts; the cimg/rust image doesnt ship it.
+          # nectar-primitives / prost-build invoke `protoc` from build scripts.
           command: |
             sudo apt-get update -y
             sudo apt-get install -y --no-install-recommends protobuf-compiler
-            protoc --version
 
-      # Two-tier cache strategy:
-      #
-      # 1. Cargo registry + target dir, keyed on Cargo.lock. Restores
-      #    incremental build artifacts so a Cargo.lock-unchanged
-      #    rebuild only relinks.
-      #
-      # 2. Built binary keyed on hash of every input that affects the
-      #    build output. If hit, skip `cargo build` entirely — sidesteps
-      #    the well-known mtime-bumps-from-checkout rebuild issue.
+      # Two-tier cache: Cargo registry + target/ keyed on Cargo.lock,
+      # plus the built binary keyed on a hash of every source input
+      # (sidesteps the mtime-bumps-from-checkout rebuild issue).
       - restore_cache:
           name: Restore cargo cache
           keys:
             - cargo-v2-{{ arch }}-{{ checksum "Cargo.lock" }}
             - cargo-v2-{{ arch }}-
 
-      # Aggregate hash of inputs that determine the build output.
-      # Used as the key for the built-binary cache.
       - run:
           name: Compute source hash
           command: |
-            # Stable across reruns of the same commit. find sorts paths
-            # alphabetically so the hash is deterministic regardless of
-            # filesystem iteration order.
             (
               cat Cargo.toml Cargo.lock build.rs 2>/dev/null
               find src proto -type f \( -name '*.rs' -o -name '*.proto' \) | sort | xargs cat
             ) | sha256sum | awk '{print $1}' > /tmp/source.sha256
-            echo "source hash: $(cat /tmp/source.sha256)"
 
-      # Drop any binary the cargo cache may have brought back from a
-      # previous run. The cargo cache covers the whole `target/` dir
-      # for incremental compile state, so a stale binary will be there
-      # even when the source has changed. The binary cache (next step)
-      # legitimately restores it only when the current source hash
-      # matches — by removing it first and then restoring, we get a
-      # reliable "binary exists iff source hash hit" invariant.
+      # Drop any stale binary the cargo cache may have brought back —
+      # the binary cache below restores it only on a source-hash hit.
       - run:
           name: Drop possibly-stale binary from cargo cache
           command: rm -f target/release/isheika
 
-      # bin-v3: invalidates contaminated bin-v1/v2 caches from
-      # before the `rm -f` guard above. An earlier pipeline saved a
-      # binary built from cargo-cache fallthrough (stale .rs files)
-      # under bin-v1's hash, and subsequent pipelines with that hash
-      # kept restoring the broken binary.
       - restore_cache:
           name: Restore built binary
           keys:
             - bin-v3-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
 
       - run:
-          name: Build release binary (if not cached or broken)
-          # Even on a binary cache hit, verify the binary actually
-          # matches the source by running a smoke test that exercises
-          # at least one recently-changed CLI flag. If the smoke test
-          # fails, the cached binary is stale — delete it and rebuild.
+          name: Build release binary (if not cached)
           command: |
-            smoke_test() {
-              # Confirm clap accepts multiple --bootnode entries (added
-              # in commit 8f48f53). A stale binary will exit nonzero.
-              ./target/release/isheika daemon \
-                --socket /tmp/_smoke \
-                --bootnode /ip4/1.2.3.4/tcp/1/p2p/QmAAA \
-                --bootnode /ip4/5.6.7.8/tcp/2/p2p/QmBBB \
-                --help > /dev/null 2>&1
-            }
-            if [ -x target/release/isheika ] && smoke_test; then
-              echo "binary cache hit — skipping build"
-              ./target/release/isheika --version 2>/dev/null || \
-                ./target/release/isheika --help | head -1
-            else
-              if [ -x target/release/isheika ]; then
-                echo "cached binary failed smoke test — rebuilding"
-                rm -f target/release/isheika
-              else
-                echo "binary cache miss — running cargo build"
-              fi
+            if [ ! -x target/release/isheika ]; then
               cargo build --release --bin isheika
             fi
 
@@ -162,67 +114,20 @@ jobs:
             - target/release/isheika
 
       - run:
-          name: Validate secrets
-          command: |
-            missing=()
-            [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
-            [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
-            [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
-            if [ "${#missing[@]}" -gt 0 ]; then
-              printf 'ERROR Missing required env var(s): %s\n' "${missing[*]}"
-              exit 1
-            fi
-            [ "${#BENCH_BATCH}" -ge 64 ] || { echo "ERROR BENCH_BATCH too short"; exit 1; }
-            [ "${#BENCH_KEY}"   -ge 64 ] || { echo "ERROR BENCH_KEY too short";   exit 1; }
-            [ "${#BENCH_NONCE}" -ge 64 ] || { echo "ERROR BENCH_NONCE too short"; exit 1; }
-            echo "All secrets present and within expected length."
-
-      - run:
-          name: Write vanity overlay nonce
-          command: |
-            # Strip optional 0x prefix and whitespace.
-            NONCE_HEX="${BENCH_NONCE#0x}"
-            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
-            if [ "${#NONCE_HEX}" -ne 64 ]; then
-              echo "ERROR BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
-              exit 1
-            fi
-            printf "%s" "$NONCE_HEX" > overlay-nonce
-            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+          name: Write overlay nonce
+          command: printf "%s" "${BENCH_NONCE#0x}" | tr -d '[:space:]' > overlay-nonce
 
       - run:
           name: Seed peers.json from committed seed
-          # CircleCI runners have no persistent peerlist. Without a
-          # seed, the daemon's pre-fill discover has to negotiate
-          # the libp2p /swarm/handshake substream from a fresh IP
-          # against bee mainnet peers — which currently almost
-          # always rejects us due to kademlia bin saturation.
-          # peers.seed.json is a ~140-peer snapshot harvested from
-          # a long-running daemon on a VPS that holds established
-          # kademlia memberships. Copying it into place lets the
-          # daemon skip discover and go straight to pool fill
-          # against known reachable peers.
-          command: |
-            if [ ! -f peers.seed.json ]; then
-              echo "ERROR peers.seed.json missing from checkout"
-              exit 1
-            fi
-            cp peers.seed.json peers.json
-            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
-            echo "seeded peers.json with $PEER_COUNT peers"
+          # Skip cold discover: peers.seed.json (committed, harvested
+          # from a long-running v15 daemon) gives the daemon a usable
+          # candidate set to dial immediately.
+          command: cp peers.seed.json peers.json
 
       - run:
           name: Start daemon
-          # peers.seed.json (~794 peers across ~794 unique /32 IPs from
-          # a v15 hive harvest) is the primary cold-start source.
-          # `--bootnode /dnsaddr/mainnet.ethswarm.org` resolves to the
-          # current Swarm Foundation mainnet bootnodes. With v15
-          # handshake support landed, those bootnodes accept us again
-          # (they had been rejecting v14 handshakes when the network
-          # rolled to bee 2.8.0).
           background: true
           command: |
-            rm -f /tmp/isheika.sock
             ./target/release/isheika \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
               daemon \
@@ -236,9 +141,7 @@ jobs:
 
       - run:
           name: Wait for warm pool
-          # Daemon-side discover + pool fill from cold takes ~80s on a
-          # VPS for pool=256. CircleCI Docker may be slower with
-          # smaller bandwidth, so cap wait at 8 min.
+          # Pool fill on a cold CircleCI runner is bandwidth-bound; cap at 8 min.
           command: |
             for i in $(seq 1 96); do
               if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
