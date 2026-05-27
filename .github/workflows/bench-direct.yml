@@ -101,30 +101,6 @@ jobs:
           ./target/release/isheika --version || true
           ./target/release/isheika --help | head -3
 
-      - name: Validate secrets
-        env:
-          BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
-          BENCH_KEY: ${{ secrets.BENCH_KEY }}
-          BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
-          USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
-        run: |
-          missing=()
-          [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
-          [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
-          if [ "$USE_RANDOM_NONCE" != "true" ]; then
-            [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
-          fi
-          if [ "${#missing[@]}" -gt 0 ]; then
-            printf '::error::Missing required secret(s): %s\n' "${missing[*]}"
-            exit 1
-          fi
-          [ "${#BENCH_BATCH}" -ge 64 ] || { echo "::error::BENCH_BATCH too short"; exit 1; }
-          [ "${#BENCH_KEY}"   -ge 64 ] || { echo "::error::BENCH_KEY too short";   exit 1; }
-          if [ "$USE_RANDOM_NONCE" != "true" ]; then
-            [ "${#BENCH_NONCE}" -ge 64 ] || { echo "::error::BENCH_NONCE too short"; exit 1; }
-          fi
-          echo "All secrets present and within expected length."
-
       - name: Write overlay nonce
         env:
           BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
