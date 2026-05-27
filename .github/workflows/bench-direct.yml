@@ -1,0 +1,277 @@
+name: bench-direct
+
+# Benchmark isheika DAEMON-LESS upload throughput (cold `discover` +
+# `upload` per run, no warm session pool). Companion to `bench.yml`,
+# which measures the warm-pool daemon path. The two diverge mainly on
+# per-run pool-fill amortization: the daemon pays it once at startup;
+# direct mode pays it every upload.
+#
+# Manually triggered (workflow_dispatch) only — uploads cost real BZZ
+# via the postage batch.
+#
+# Required repository secrets (same set as bench.yml):
+#   BENCH_BATCH    Postage batch ID (32-byte hex, no 0x prefix)
+#   BENCH_KEY      Signer private key (32-byte hex, 0x prefix optional)
+#   BENCH_NONCE    Vanity overlay nonce (32-byte hex, no 0x prefix)
+
+# Shared with `bench` (daemon-mode) so the two never run concurrently —
+# overlapping discover from the same runner IP space would skew each
+# other's peer-table state. Queue rather than cancel — every run costs
+# real BZZ.
+concurrency:
+  group: bench-mainnet
+  cancel-in-progress: false
+
+on:
+  workflow_dispatch:
+    inputs:
+      file_size_mib:
+        description: "Random upload size in MiB"
+        required: false
+        default: "5"
+        type: string
+      n_uploads:
+        description: "Number of uploads to median (each costs real BZZ)"
+        required: false
+        default: "3"
+        type: string
+      concurrency:
+        description: "Upload --concurrency (in-process session pool size; daemon equivalent is --pool-size)"
+        required: false
+        default: "128"
+        type: string
+      buffer_multiplier:
+        description: "Upload --buffer-multiplier (1, 2, or 4)"
+        required: false
+        default: "2"
+        type: string
+      use_random_nonce:
+        description: "Use a freshly-generated random overlay nonce instead of BENCH_NONCE"
+        required: false
+        default: false
+        type: boolean
+      use_seed_peers:
+        description: "Seed peers.json from peers.seed.json instead of running fresh discover (faster cold start; less representative of a true cold path)"
+        required: false
+        default: false
+        type: boolean
+
+jobs:
+  bench-direct:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      CARGO_INCREMENTAL: "0"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - name: Install protoc
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+          protoc --version
+
+      # Share the Cargo + binary cache with `bench.yml` — same shared-key
+      # so we don't rebuild on every cross-workflow trigger. Source hash
+      # key for the prebuilt binary is identical too (same crate root).
+      - name: Cache Rust build artifacts
+        uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: bench-release
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Cache built binary
+        id: bin-cache
+        uses: actions/cache@v5
+        with:
+          path: target/release/isheika
+          key: bin-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'build.rs', 'proto/**') }}
+
+      - name: Build release binary
+        if: steps.bin-cache.outputs.cache-hit != 'true'
+        run: cargo build --release --bin isheika
+
+      - name: Verify binary
+        run: |
+          ./target/release/isheika --version || true
+          ./target/release/isheika --help | head -3
+
+      - name: Validate secrets
+        env:
+          BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
+          BENCH_KEY: ${{ secrets.BENCH_KEY }}
+          BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+          USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
+        run: |
+          missing=()
+          [ -z "$BENCH_BATCH" ] && missing+=("BENCH_BATCH")
+          [ -z "$BENCH_KEY" ]   && missing+=("BENCH_KEY")
+          if [ "$USE_RANDOM_NONCE" != "true" ]; then
+            [ -z "$BENCH_NONCE" ] && missing+=("BENCH_NONCE")
+          fi
+          if [ "${#missing[@]}" -gt 0 ]; then
+            printf '::error::Missing required secret(s): %s\n' "${missing[*]}"
+            exit 1
+          fi
+          [ "${#BENCH_BATCH}" -ge 64 ] || { echo "::error::BENCH_BATCH too short"; exit 1; }
+          [ "${#BENCH_KEY}"   -ge 64 ] || { echo "::error::BENCH_KEY too short";   exit 1; }
+          if [ "$USE_RANDOM_NONCE" != "true" ]; then
+            [ "${#BENCH_NONCE}" -ge 64 ] || { echo "::error::BENCH_NONCE too short"; exit 1; }
+          fi
+          echo "All secrets present and within expected length."
+
+      - name: Write overlay nonce
+        env:
+          BENCH_NONCE: ${{ secrets.BENCH_NONCE }}
+          USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
+        run: |
+          if [ "$USE_RANDOM_NONCE" = "true" ]; then
+            echo "use_random_nonce=true — upload will generate a fresh random nonce"
+            rm -f overlay-nonce
+          else
+            NONCE_HEX="${BENCH_NONCE#0x}"
+            NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
+            if [ "${#NONCE_HEX}" -ne 64 ]; then
+              echo "::error::BENCH_NONCE must be 32 bytes (64 hex chars), got ${#NONCE_HEX}"
+              exit 1
+            fi
+            printf "%s" "$NONCE_HEX" > overlay-nonce
+            echo "wrote overlay-nonce ($(wc -c < overlay-nonce) bytes)"
+          fi
+
+      - name: Populate peers.json
+        # Two modes for the cold-start peer set:
+        #
+        # 1. `use_seed_peers=true` — copy committed peers.seed.json. Same
+        #    fast cold-start path as bench.yml. Use this to compare like
+        #    against the daemon bench with the peerlist held constant.
+        #
+        # 2. `use_seed_peers=false` (default) — run `isheika discover`
+        #    against the official dnsaddr bootnode. Measures the full
+        #    cold path: dnsaddr resolution → bootnode dial → recursive
+        #    hive gossip walk → write peers.json. ~Tens of seconds.
+        env:
+          USE_SEED: ${{ inputs.use_seed_peers }}
+        run: |
+          if [ "$USE_SEED" = "true" ]; then
+            if [ ! -f peers.seed.json ]; then
+              echo "::error::peers.seed.json missing from checkout"
+              exit 1
+            fi
+            cp peers.seed.json peers.json
+            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))")
+            echo "seeded peers.json with $PEER_COUNT peers (from committed seed)"
+          else
+            echo "running cold discover against /dnsaddr/mainnet.ethswarm.org..."
+            START_T=$(date +%s)
+            ./target/release/isheika \
+              --nonce-file overlay-nonce \
+              discover \
+              /dnsaddr/mainnet.ethswarm.org \
+              --output peers.json \
+              --rounds 3 \
+              --wait 5 \
+              -v 2>&1 | tail -20
+            END_T=$(date +%s)
+            DISCOVER_SECS=$((END_T - START_T))
+            PEER_COUNT=$(python3 -c "import json; print(len(json.load(open('peers.json'))['peers']))" 2>/dev/null || echo 0)
+            echo "discover took ${DISCOVER_SECS}s, peers.json now has $PEER_COUNT peers"
+            echo "DISCOVER_SECS=$DISCOVER_SECS" >> "$GITHUB_ENV"
+            echo "DISCOVER_PEERS=$PEER_COUNT" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run benchmark uploads
+        # Each upload is a fresh in-process run — no socket, no warm
+        # pool, no `--daemon` flag. Per-upload cost includes session
+        # pool fill for the requested `--concurrency`. This is the
+        # apples-to-apples cost the daemon bench amortizes once.
+        env:
+          BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
+          BENCH_KEY: ${{ secrets.BENCH_KEY }}
+        run: |
+          : > /tmp/bench.results
+          for i in $(seq 1 ${{ inputs.n_uploads }}); do
+            rm -f /tmp/bench-${{ inputs.file_size_mib }}mib.bin
+            dd if=/dev/urandom \
+               of=/tmp/bench-${{ inputs.file_size_mib }}mib.bin \
+               bs=1M count=${{ inputs.file_size_mib }} status=none
+
+            echo "=== Run $i ==="
+            ./target/release/isheika \
+              --nonce-file overlay-nonce \
+              --buffer-multiplier ${{ inputs.buffer_multiplier }} \
+              upload \
+              --batch "$BENCH_BATCH" \
+              --key "$BENCH_KEY" \
+              --peerlist peers.json \
+              --concurrency ${{ inputs.concurrency }} \
+              --max-retries 60 \
+              /tmp/bench-${{ inputs.file_size_mib }}mib.bin 2>&1 \
+              | tee -a /tmp/bench.results \
+              | grep -E '^upload:|^uploaded' || true
+
+            # Brief pause between back-to-back uploads.
+            sleep 3
+          done
+
+      - name: Summarize throughput
+        run: |
+          echo "## Direct (daemon-less) benchmark summary" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- mode: in-process (no daemon, fresh pool per upload)" >> "$GITHUB_STEP_SUMMARY"
+          echo "- file size: ${{ inputs.file_size_mib }} MiB" >> "$GITHUB_STEP_SUMMARY"
+          echo "- n uploads: ${{ inputs.n_uploads }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- concurrency: ${{ inputs.concurrency }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- buffer multiplier: ${{ inputs.buffer_multiplier }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "- nonce mode: ${{ inputs.use_random_nonce == true && 'random (A/B baseline)' || 'vanity (BENCH_NONCE)' }}" >> "$GITHUB_STEP_SUMMARY"
+          if [ "${{ inputs.use_seed_peers }}" = "true" ]; then
+            echo "- peers source: committed peers.seed.json" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "- peers source: cold discover (${DISCOVER_SECS:-?}s, $DISCOVER_PEERS peers)" >> "$GITHUB_STEP_SUMMARY"
+          fi
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "| run | seconds | throughput |" >> "$GITHUB_STEP_SUMMARY"
+          echo "|----|---------|------------|" >> "$GITHUB_STEP_SUMMARY"
+
+          python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import re
+          rates = []
+          row_idx = 0
+          with open("/tmp/bench.results") as f:
+              for line in f:
+                  m = re.search(r'upload: \d+ bytes in ([\d.]+)s = ([\d.]+) (KiB|MiB)/s', line)
+                  if not m: continue
+                  row_idx += 1
+                  secs, val, unit = float(m.group(1)), float(m.group(2)), m.group(3)
+                  kibs = val if unit == "KiB" else val * 1024.0
+                  rates.append(kibs)
+                  print(f"| {row_idx} | {secs:.2f} | {val:.2f} {unit}/s |")
+          if rates:
+              rs = sorted(rates)
+              med = rs[len(rs)//2] if len(rs)%2==1 else (rs[len(rs)//2-1]+rs[len(rs)//2])/2
+              print()
+              print(f"**Median: {med:.2f} KiB/s**")
+              print(f"Best: {max(rates):.2f} KiB/s")
+              print(f"Worst: {min(rates):.2f} KiB/s")
+          else:
+              print()
+              print("**No successful uploads parsed from results.**")
+          PY
+
+          cat "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-direct-${{ github.run_id }}
+          path: |
+            /tmp/bench.results
+            peers.json
+          retention-days: 7

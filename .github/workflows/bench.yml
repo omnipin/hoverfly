@@ -14,6 +14,16 @@ name: bench
 #                  --target-po 10 --output overlay-nonce`, then
 #                  `cat overlay-nonce`.
 
+# Shared with `bench-direct` so the two never run concurrently —
+# both walk the same hive gossip graph from the same runner IP space
+# during their warm-up phase, and overlapping discover would skew
+# each other's peer-table state and pool fill timing. We queue
+# rather than cancel: every run costs real BZZ, no run should be
+# silently dropped.
+concurrency:
+  group: bench-mainnet
+  cancel-in-progress: false
+
 on:
   workflow_dispatch:
     inputs:
