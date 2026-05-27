@@ -1,0 +1,51 @@
+name: ci
+
+# Fast sanity checks on every push and PR. Builds the workspace,
+# runs the test suite, and verifies the committed `src/proto/`
+# bindings still match `proto/*.proto`.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt
+          rustup default stable
+
+      - name: Install protoc (for regen drift check)
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y --no-install-recommends protobuf-compiler
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          shared-key: ci
+
+      - name: cargo check
+        run: cargo check --all-targets
+
+      - name: cargo fmt
+        run: cargo fmt -- --check
+
+      - name: cargo test
+        run: cargo test --lib
+
+      - name: Proto regen drift
+        # If proto/*.proto and src/proto/*.rs are out of sync, fail.
+        run: |
+          ./scripts/regen-protos.sh
+          if ! git diff --exit-code src/proto/; then
+            echo "::error::src/proto/ is out of date — run scripts/regen-protos.sh and commit"
+            exit 1
+          fi

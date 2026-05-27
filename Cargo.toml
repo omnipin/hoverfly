@@ -133,8 +133,9 @@ tracing-wasm = "0.2"
 # accessed from a different thread, which can't happen in the browser.
 send_wrapper = { version = "0.6", features = ["futures"] }
 
-[build-dependencies]
-prost-build = "0.13"
-
 [dev-dependencies]
 tokio-test = "0.4"
+# Used by the `regen-protos` example to (re)generate `src/proto/*.rs`
+# from `proto/*.proto`. Not pulled into normal `cargo build` — invoke
+# explicitly via `scripts/regen-protos.sh`.
+prost-build = "0.13"

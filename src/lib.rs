@@ -12,47 +12,19 @@ pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cheques;
 pub mod cid;
-pub mod doh;
 pub mod dnsaddr;
+pub mod doh;
 pub mod mime;
 pub mod peers;
 pub mod signer;
 pub mod stamp;
 
-pub mod proto {
-    pub mod handshake {
-        include!(concat!(env!("OUT_DIR"), "/handshake.rs"));
-    }
-    pub mod headers {
-        include!(concat!(env!("OUT_DIR"), "/headers.rs"));
-    }
-    pub mod hive {
-        include!(concat!(env!("OUT_DIR"), "/hive.rs"));
-    }
-    pub mod pricing {
-        include!(concat!(env!("OUT_DIR"), "/pricing.rs"));
-    }
-    pub mod retrieval {
-        include!(concat!(env!("OUT_DIR"), "/retrieval.rs"));
-    }
-    pub mod pushsync {
-        include!(concat!(env!("OUT_DIR"), "/pushsync.rs"));
-    }
-    pub mod pseudosettle {
-        include!(concat!(env!("OUT_DIR"), "/pseudosettle.rs"));
-    }
-    pub mod swap {
-        include!(concat!(env!("OUT_DIR"), "/swap.rs"));
-    }
-    pub mod status {
-        include!(concat!(env!("OUT_DIR"), "/status.rs"));
-    }
-}
+pub mod proto;
 
-pub mod protocols;
-pub mod transport;
 pub mod client;
 pub mod manifest;
+pub mod protocols;
+pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
@@ -64,14 +36,14 @@ pub use nectar_primitives::{
     chunk::{ChunkAddress, ContentChunk},
 };
 
-pub use signer::SwarmSigner;
-pub use peers::{Peer, PeerStore};
-pub use transport::{Transport, TransportConfig, TransportError};
 pub use client::{
-    discover, fetch_bytes, fetch_manifest_path, list_manifest, prepare_upload_bytes,
-    push_chunks_with_pool, upload_bytes, upload_collection, ClientError, ManifestEntry,
-    SessionPool, StampedChunk, UploadFile,
+    ClientError, ManifestEntry, SessionPool, StampedChunk, UploadFile, discover, fetch_bytes,
+    fetch_manifest_path, list_manifest, prepare_upload_bytes, push_chunks_with_pool, upload_bytes,
+    upload_collection,
 };
+pub use peers::{Peer, PeerStore};
+pub use signer::SwarmSigner;
+pub use transport::{Transport, TransportConfig, TransportError};
 
 #[cfg(unix)]
 pub mod daemon;
@@ -79,7 +51,7 @@ pub mod daemon;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inbound;
 
-pub use cache::{ChunkCache, CachedChunk};
+pub use cache::{CachedChunk, ChunkCache};
 pub use doh::Doh;
 
 /// Default Swarm mainnet bootnode (resolved via DoH).
