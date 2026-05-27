@@ -77,9 +77,8 @@ jobs:
           sudo apt-get install -y --no-install-recommends protobuf-compiler
           protoc --version
 
-      # Share the Cargo + binary cache with `bench.yml` — same shared-key
-      # so we don't rebuild on every cross-workflow trigger. Source hash
-      # key for the prebuilt binary is identical too (same crate root).
+      # Shares cache key with `bench.yml` so a single build is reused
+      # across both workflows.
       - name: Cache Rust build artifacts
         uses: Swatinem/rust-cache@v2.9.1
         with:
@@ -146,16 +145,8 @@ jobs:
           fi
 
       - name: Populate peers.json
-        # Two modes for the cold-start peer set:
-        #
-        # 1. `use_seed_peers=true` — copy committed peers.seed.json. Same
-        #    fast cold-start path as bench.yml. Use this to compare like
-        #    against the daemon bench with the peerlist held constant.
-        #
-        # 2. `use_seed_peers=false` (default) — run `isheika discover`
-        #    against the official dnsaddr bootnode. Measures the full
-        #    cold path: dnsaddr resolution → bootnode dial → recursive
-        #    hive gossip walk → write peers.json. ~Tens of seconds.
+        # `use_seed_peers=true` mirrors bench.yml's fast path (committed
+        # seed). `false` measures the real cold path via `isheika discover`.
         env:
           USE_SEED: ${{ inputs.use_seed_peers }}
         run: |
@@ -183,10 +174,8 @@ jobs:
           fi
 
       - name: Run benchmark uploads
-        # Each upload is a fresh in-process run — no socket, no warm
-        # pool, no `--daemon` flag. Per-upload cost includes session
-        # pool fill for the requested `--concurrency`. This is the
-        # apples-to-apples cost the daemon bench amortizes once.
+        # Each upload pays its own session-pool fill — the cost the
+        # daemon bench amortizes across all uploads.
         env:
           BENCH_BATCH: ${{ secrets.BENCH_BATCH }}
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
@@ -210,7 +199,6 @@ jobs:
               | tee -a /tmp/bench.results \
               | grep -E '^upload:|^uploaded' || true
 
-            # Brief pause between back-to-back uploads.
             sleep 3
           done
 

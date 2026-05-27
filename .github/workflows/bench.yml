@@ -74,8 +74,7 @@ jobs:
           rustup default stable
 
       - name: Install protoc
-        # nectar-primitives / prost-build call `protoc` from their
-        # build scripts. ubuntu-latest doesn't ship it by default.
+        # nectar-primitives / prost-build invoke `protoc` from build scripts.
         run: |
           sudo apt-get update -y
           sudo apt-get install -y --no-install-recommends protobuf-compiler
@@ -136,7 +135,6 @@ jobs:
             printf '::error::Missing required secret(s): %s\n' "${missing[*]}"
             exit 1
           fi
-          # Don't echo the secrets — just confirm they parse.
           [ "${#BENCH_BATCH}" -ge 64 ] || { echo "::error::BENCH_BATCH too short"; exit 1; }
           [ "${#BENCH_KEY}"   -ge 64 ] || { echo "::error::BENCH_KEY too short";   exit 1; }
           if [ "$USE_RANDOM_NONCE" != "true" ]; then
@@ -150,13 +148,9 @@ jobs:
           USE_RANDOM_NONCE: ${{ inputs.use_random_nonce }}
         run: |
           if [ "$USE_RANDOM_NONCE" = "true" ]; then
-            # A/B test: skip vanity optimization, let the daemon generate
-            # a fresh random nonce on first run. We just don't create the
-            # overlay-nonce file; the daemon will create one itself.
             echo "use_random_nonce=true — daemon will generate a fresh random nonce"
             rm -f overlay-nonce
           else
-            # Strip optional 0x prefix and any whitespace.
             NONCE_HEX="${BENCH_NONCE#0x}"
             NONCE_HEX="$(echo -n "$NONCE_HEX" | tr -d '[:space:]')"
             if [ "${#NONCE_HEX}" -ne 64 ]; then
@@ -168,11 +162,9 @@ jobs:
           fi
 
       - name: Seed peers.json from committed seed
-        # Bee 2.8.0 nodes drop the v14 substream id our older code
-        # used, so the official mainnet bootnodes return 0 peers on
-        # discover from a cold runner. peers.seed.json (706 peers
-        # across 706 unique /32 IPs, harvested from a v15 daemon)
-        # is the cold-start candidate set that bypasses discover.
+        # Skip cold discover: peers.seed.json (committed, harvested
+        # from a long-running v15 daemon) gives the daemon a usable
+        # candidate set to dial immediately.
         run: |
           if [ ! -f peers.seed.json ]; then
             echo "::error::peers.seed.json missing from checkout"
@@ -183,16 +175,6 @@ jobs:
           echo "seeded peers.json with $PEER_COUNT peers"
 
       - name: Start daemon
-        # peers.seed.json (~794 peers across ~794 unique /32 IPs from
-        # a v15 hive harvest) is the primary cold-start source.
-        # /dnsaddr/mainnet.ethswarm.org resolves to the current
-        # Swarm Foundation bootnodes; with v15 handshake support
-        # those accept us again (they were rejecting v14 dialers).
-        #
-        # bee 2.8.0 (May 2026) raised handshake to 15.0.0 and hive
-        # to 2.0.0. isheika negotiates v15 first, falls back to v14
-        # on UnsupportedProtocol so it interoperates with both 2.7.x
-        # and 2.8.0 peers across the network.
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
@@ -212,9 +194,7 @@ jobs:
           echo "started daemon pid $DAEMON_PID"
 
       - name: Wait for warm pool
-        # Daemon-side discover + pool fill from cold takes
-        # ~80s on a VPS for pool=256; GH runners are slower with
-        # smaller bandwidth, so cap wait at 8 min.
+        # Pool fill on a cold GH runner is bandwidth-bound; cap at 8 min.
         run: |
           for i in $(seq 1 96); do
             if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
@@ -248,7 +228,6 @@ jobs:
               | tee -a /tmp/bench.results \
               | grep -E '^upload:|^uploaded' || true
 
-            # Brief pause so back-to-back uploads don't share warm caches.
             sleep 3
           done
 
@@ -265,10 +244,8 @@ jobs:
           echo "| run | seconds | throughput |" >> "$GITHUB_STEP_SUMMARY"
           echo "|----|---------|------------|" >> "$GITHUB_STEP_SUMMARY"
 
-          # Parse rows of the form:
-          #   upload: 5242880 bytes in 5.04s = 1016.60 KiB/s
-          # OR the MiB/s variant.
-          # Emit median, best, worst at the end.
+          # Parse `upload: N bytes in Ts = R KiB/s` (or MiB/s) lines,
+          # emit a row per upload + median/best/worst summary.
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import re
           rates = []
@@ -304,7 +281,6 @@ jobs:
             sleep 1
             kill -9 "$DAEMON_PID" 2>/dev/null || true
           fi
-          # Last few hundred lines of daemon log into the step summary
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "### Last daemon log lines" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
