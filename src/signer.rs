@@ -135,9 +135,46 @@ impl SwarmSigner {
     pub const fn network_id(&self) -> u64 { self.network_id }
     pub const fn alloy_signer(&self) -> &PrivateKeySigner { &self.inner }
 
-    /// Sign bee handshake payload. Returns 65-byte (r || s || v) signature with v ∈ {27, 28}.
+    /// Sign bee handshake payload (v14 / pre-bee-2.8.0 format).
+    /// Payload: `b"bee-handshake-" || underlay || overlay || network_id_BE_8`.
+    /// Returns 65-byte (r || s || v) signature with v ∈ {27, 28}.
     pub fn sign_handshake(&self, underlay: &[u8]) -> Result<[u8; 65], SignerError> {
         let payload = generate_sign_data(underlay, &self.overlay, self.network_id);
+        self.sign_eip191(&payload)
+    }
+
+    /// Sign bee handshake payload (v15 / bee 2.8.0+ format).
+    /// Payload:
+    ///   `b"bee-handshake-" || underlay || overlay || network_id_BE_8
+    ///     || nonce || timestamp_BE_8 || chequebook_address_20`
+    ///
+    /// `timestamp` is the seconds-since-epoch the peer will validate
+    /// against `time.Now() ± MaxClockSkew` (bee uses 60 s). Pass a
+    /// reasonably-fresh value (i.e. `now_unix()`) per handshake;
+    /// the same record can be re-presented later but each reconnect
+    /// should advance it.
+    ///
+    /// `chequebook_address` is the 20-byte address of our chequebook
+    /// contract. Zero address `[0; 20]` is acceptable when we're a
+    /// light-node (no chequebook); bee only enforces non-zero when
+    /// the peer has `--chequebook-verification` enabled and we
+    /// advertise `full_node = true`. With `full_node = false` bee
+    /// skips the chequebook gate regardless.
+    pub fn sign_handshake_v15(
+        &self,
+        underlay: &[u8],
+        nonce: &[u8; 32],
+        timestamp: i64,
+        chequebook_address: &[u8; 20],
+    ) -> Result<[u8; 65], SignerError> {
+        let payload = generate_sign_data_v15(
+            underlay,
+            &self.overlay,
+            self.network_id,
+            nonce,
+            timestamp,
+            chequebook_address,
+        );
         self.sign_eip191(&payload)
     }
 
@@ -213,6 +250,7 @@ pub fn derive_overlay(eth_address: &[u8; 20], network_id: u64, nonce: &[u8; 32])
     h.finalize().into()
 }
 
+/// v14 / pre-bee-2.8.0 handshake sign payload:
 /// `b"bee-handshake-" || underlay || overlay || network_id_BE_8`
 pub fn generate_sign_data(underlay: &[u8], overlay: &[u8; 32], network_id: u64) -> Vec<u8> {
     let mut data = Vec::with_capacity(14 + underlay.len() + 32 + 8);
@@ -223,7 +261,35 @@ pub fn generate_sign_data(underlay: &[u8], overlay: &[u8; 32], network_id: u64) 
     data
 }
 
-/// Recover the Ethereum address of the signer of a bee BzzAddress.
+/// v15 / bee-2.8.0+ handshake sign payload:
+/// `b"bee-handshake-" || underlay || overlay || network_id_BE_8
+///   || nonce_32 || timestamp_BE_8 || chequebook_address_20`
+///
+/// Mirrors bee's `pkg/bzz/address.go::generateSignData` byte-for-byte.
+/// `timestamp` is treated as `int64` and serialized as big-endian
+/// `uint64` (bee does `binary.BigEndian.PutUint64(buf, uint64(timestamp))`,
+/// so negative values would wrap; we reject them at the higher
+/// level via `ErrTimestampInvalid` semantics).
+pub fn generate_sign_data_v15(
+    underlay: &[u8],
+    overlay: &[u8; 32],
+    network_id: u64,
+    nonce: &[u8; 32],
+    timestamp: i64,
+    chequebook_address: &[u8; 20],
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(14 + underlay.len() + 32 + 8 + 32 + 8 + 20);
+    data.extend_from_slice(b"bee-handshake-");
+    data.extend_from_slice(underlay);
+    data.extend_from_slice(overlay);
+    data.extend_from_slice(&network_id.to_be_bytes());
+    data.extend_from_slice(nonce);
+    data.extend_from_slice(&(timestamp as u64).to_be_bytes());
+    data.extend_from_slice(chequebook_address);
+    data
+}
+
+/// Recover the Ethereum address of the signer of a bee v14 BzzAddress.
 ///
 /// Bee's `bzz/address.go::ParseAddress` does exactly this: it recovers
 /// the secp256k1 public key from the EIP-191-prefixed `generate_sign_data`
@@ -243,6 +309,38 @@ pub fn recover_eth_address_from_handshake(
     network_id: u64,
     signature: &[u8],
 ) -> Result<[u8; 20], SignerError> {
+    let payload = generate_sign_data(underlay, overlay, network_id);
+    recover_eth_from_eip191(&payload, signature)
+}
+
+/// Recover the Ethereum address of the signer of a bee v15 BzzAddress
+/// (bee 2.8.0+). Mirrors v14's [`recover_eth_address_from_handshake`]
+/// but uses the v15 sign payload that includes nonce, timestamp, and
+/// chequebook address.
+pub fn recover_eth_address_from_handshake_v15(
+    underlay: &[u8],
+    overlay: &[u8; 32],
+    network_id: u64,
+    nonce: &[u8; 32],
+    timestamp: i64,
+    chequebook_address: &[u8; 20],
+    signature: &[u8],
+) -> Result<[u8; 20], SignerError> {
+    let payload = generate_sign_data_v15(
+        underlay,
+        overlay,
+        network_id,
+        nonce,
+        timestamp,
+        chequebook_address,
+    );
+    recover_eth_from_eip191(&payload, signature)
+}
+
+/// Recover the 20-byte Ethereum address from a 65-byte (r || s || v)
+/// EIP-191 signature over `payload`. `v` is expected in Ethereum form
+/// (27 or 28); k256 normalises to 0/1 internally.
+fn recover_eth_from_eip191(payload: &[u8], signature: &[u8]) -> Result<[u8; 20], SignerError> {
     use alloy_primitives::Signature;
     use k256::ecdsa::{RecoveryId, Signature as K256Sig, VerifyingKey};
 
@@ -252,13 +350,12 @@ pub fn recover_eth_address_from_handshake(
             signature.len()
         )));
     }
-    let payload = generate_sign_data(underlay, overlay, network_id);
 
     // EIP-191 prefix hash: keccak256("\x19Ethereum Signed Message:\n{len}{payload}")
     let mut prefixed = Vec::with_capacity(46 + payload.len());
     prefixed.extend_from_slice(b"\x19Ethereum Signed Message:\n");
     prefixed.extend_from_slice(payload.len().to_string().as_bytes());
-    prefixed.extend_from_slice(&payload);
+    prefixed.extend_from_slice(payload);
     let digest: [u8; 32] = Keccak256::digest(&prefixed).into();
 
     // Normalize v: bee sends 27/28; k256 expects 0/1.

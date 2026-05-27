@@ -1,5 +1,16 @@
 // Swarm handshake protocol
 // Source: github.com/ethersphere/bee
+//
+// BzzAddress has two on-wire layouts depending on the negotiated
+// protocol version:
+//
+//   v14 (bee ≤ 2.7.x): underlay, signature, overlay
+//   v15 (bee  ≥ 2.8.0): underlay, signature, overlay, nonce, timestamp, chequebook_address
+//
+// In v15 the nonce, timestamp, and chequebook moved into BzzAddress
+// itself (and are covered by the signature). v14's separate Ack.nonce
+// field is unused on the wire in v15 but kept here for backward
+// compatibility — we still read it from v14 peers.
 
 syntax = "proto3";
 
@@ -13,6 +24,8 @@ message Ack {
     BzzAddress address = 1;
     uint64 network_id = 2;
     bool full_node = 3;
+    // v14-only: nonce sits at the Ack level. v15 places it inside
+    // BzzAddress where it's part of the signed payload.
     bytes nonce = 4;
     string welcome_message = 99;
 }
@@ -26,4 +39,10 @@ message BzzAddress {
     bytes underlay = 1;
     bytes signature = 2;
     bytes overlay = 3;
+    // v15 fields. Old peers don't send these (proto3 defaults to
+    // zero), so we discriminate by which handshake protocol version
+    // was negotiated, not by inspecting these field values.
+    bytes nonce = 4;
+    int64 timestamp = 5;
+    bytes chequebook_address = 6;
 }

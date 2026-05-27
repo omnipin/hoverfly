@@ -1,5 +1,15 @@
 // Swarm hive/Kademlia peer discovery protocol
 // Source: github.com/ethersphere/bee
+//
+// BzzAddress has two on-wire layouts depending on the negotiated
+// hive protocol version:
+//
+//   v1.1.0 (bee ≤ 2.7.x): underlay, signature, overlay, nonce
+//   v2.0.0 (bee  ≥ 2.8.0): underlay, signature, overlay, nonce, timestamp, chequebook_address
+//
+// We discriminate by negotiated protocol version, not by inspecting
+// field values (proto3 zeros are indistinguishable from omitted on
+// the wire).
 
 syntax = "proto3";
 
@@ -14,4 +24,9 @@ message BzzAddress {
     bytes signature = 2;
     bytes overlay = 3;
     bytes nonce = 4;
+    // v2.0.0 fields. Older peers don't send these (proto3 defaults
+    // to zero); their absence is fine on receive (we ignore them
+    // when negotiating v1.1.0).
+    int64 timestamp = 5;
+    bytes chequebook_address = 6;
 }

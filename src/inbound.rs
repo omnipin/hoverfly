@@ -32,7 +32,8 @@ use crate::protocols::status::StatusSnapshot;
 use crate::protocols::{hive, pricing, retrieval, status};
 use crate::signer::SwarmSigner;
 use crate::transport::{
-    build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO, HIVE_PROTO,
+    build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO_V14,
+    HANDSHAKE_PROTO_V15, HIVE_PROTO_V1, HIVE_PROTO_V2,
     PRICING_PROTO, RETRIEVAL_PROTO, STATUS_PROTO,
 };
 
@@ -106,20 +107,30 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
             "advertising external address {addr}");
     }
 
-    // Accept inbound streams for the three protocols we serve.
+    // Accept inbound streams for the protocols we serve. Handshake
+    // and hive each have two simultaneously-active versions during
+    // bee's network-wide rollout — v14/v1 for ≤2.7.x peers, v15/v2
+    // for 2.8.0+ peers — so we accept on both substream ids and tag
+    // the incoming event with which protocol negotiated.
     let mut control = swarm.behaviour().stream.new_control();
-    let mut hs_in = control
-        .accept(HANDSHAKE_PROTO)
-        .map_err(|e| InboundError::StreamControl(format!("accept handshake: {e:?}")))?;
+    let mut hs_in_v15 = control
+        .accept(HANDSHAKE_PROTO_V15)
+        .map_err(|e| InboundError::StreamControl(format!("accept handshake v15: {e:?}")))?;
+    let mut hs_in_v14 = control
+        .accept(HANDSHAKE_PROTO_V14)
+        .map_err(|e| InboundError::StreamControl(format!("accept handshake v14: {e:?}")))?;
     let mut pr_in = control
         .accept(PRICING_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept pricing: {e:?}")))?;
     let mut re_in = control
         .accept(RETRIEVAL_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept retrieval: {e:?}")))?;
-    let mut hive_in = control
-        .accept(HIVE_PROTO)
-        .map_err(|e| InboundError::StreamControl(format!("accept hive: {e:?}")))?;
+    let mut hive_in_v2 = control
+        .accept(HIVE_PROTO_V2)
+        .map_err(|e| InboundError::StreamControl(format!("accept hive v2: {e:?}")))?;
+    let mut hive_in_v1 = control
+        .accept(HIVE_PROTO_V1)
+        .map_err(|e| InboundError::StreamControl(format!("accept hive v1: {e:?}")))?;
     let mut status_in = control
         .accept(STATUS_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept status: {e:?}")))?;
@@ -176,23 +187,54 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 }
             }
 
-            Some((peer_id, mut stream)) = hs_in.next() => {
+            Some((peer_id, mut stream)) = hs_in_v15.next() => {
                 let signer = signer.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
                     info!(target: "isheika::inbound",
-                        "inbound handshake stream from {peer_id}");
+                        "inbound handshake (v15) stream from {peer_id}");
                     let res = tokio::time::timeout(
                         op_timeout,
-                        respond_to_handshake(&mut stream, &signer, None, advertised.as_ref().as_ref(), &our_peer_id, peer_id, true),
+                        respond_to_handshake(
+                            &mut stream, &signer, None,
+                            advertised.as_ref().as_ref(), &our_peer_id,
+                            peer_id, true,
+                            crate::protocols::handshake::Version::V15,
+                        ),
                     ).await;
                     match res {
                         Ok(Ok(())) => info!(target: "isheika::inbound",
-                            "handshake responded to {peer_id}"),
+                            "handshake v15 responded to {peer_id}"),
                         Ok(Err(e)) => warn!(target: "isheika::inbound",
-                            "handshake from {peer_id} failed: {e}"),
+                            "handshake v15 from {peer_id} failed: {e}"),
                         Err(_) => warn!(target: "isheika::inbound",
-                            "handshake from {peer_id} timed out"),
+                            "handshake v15 from {peer_id} timed out"),
+                    }
+                });
+            }
+
+            Some((peer_id, mut stream)) = hs_in_v14.next() => {
+                let signer = signer.clone();
+                let advertised = advertised.clone();
+                tokio::spawn(async move {
+                    info!(target: "isheika::inbound",
+                        "inbound handshake (v14) stream from {peer_id}");
+                    let res = tokio::time::timeout(
+                        op_timeout,
+                        respond_to_handshake(
+                            &mut stream, &signer, None,
+                            advertised.as_ref().as_ref(), &our_peer_id,
+                            peer_id, true,
+                            crate::protocols::handshake::Version::V14,
+                        ),
+                    ).await;
+                    match res {
+                        Ok(Ok(())) => info!(target: "isheika::inbound",
+                            "handshake v14 responded to {peer_id}"),
+                        Ok(Err(e)) => warn!(target: "isheika::inbound",
+                            "handshake v14 from {peer_id} failed: {e}"),
+                        Err(_) => warn!(target: "isheika::inbound",
+                            "handshake v14 from {peer_id} timed out"),
                     }
                 });
             }
@@ -244,7 +286,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 });
             }
 
-            Some((peer_id, mut stream)) = hive_in.next() => {
+            Some((peer_id, mut stream)) = hive_in_v2.next() => {
                 tokio::spawn(async move {
                     let res = tokio::time::timeout(
                         op_timeout,
@@ -252,11 +294,28 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                     ).await;
                     match res {
                         Ok(Ok(())) => debug!(target: "isheika::inbound",
-                            "hive responded (empty) to {peer_id}"),
+                            "hive v2 responded (empty) to {peer_id}"),
                         Ok(Err(e)) => debug!(target: "isheika::inbound",
-                            "hive from {peer_id} failed: {e}"),
+                            "hive v2 from {peer_id} failed: {e}"),
                         Err(_) => debug!(target: "isheika::inbound",
-                            "hive from {peer_id} timed out"),
+                            "hive v2 from {peer_id} timed out"),
+                    }
+                });
+            }
+
+            Some((peer_id, mut stream)) = hive_in_v1.next() => {
+                tokio::spawn(async move {
+                    let res = tokio::time::timeout(
+                        op_timeout,
+                        hive::respond_empty(&mut stream),
+                    ).await;
+                    match res {
+                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                            "hive v1 responded (empty) to {peer_id}"),
+                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                            "hive v1 from {peer_id} failed: {e}"),
+                        Err(_) => debug!(target: "isheika::inbound",
+                            "hive v1 from {peer_id} timed out"),
                     }
                 });
             }
