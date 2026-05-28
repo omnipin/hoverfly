@@ -4,10 +4,12 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
+use crate::protocols::stream_pool::{
+    AlreadyRegistered, IncomingStreams, OpenStreamError, handler::NewStream,
+};
 use futures::channel::mpsc;
 use libp2p::identity::PeerId;
 use libp2p::swarm::{ConnectionId, Stream, StreamProtocol};
-use crate::protocols::stream_pool::{handler::NewStream, AlreadyRegistered, IncomingStreams, OpenStreamError};
 
 pub(crate) struct Shared {
     /// Tracks the supported inbound protocols created via

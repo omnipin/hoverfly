@@ -9,21 +9,25 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
 use isheika::client::{
-    fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex, upload_collection,
-    upload_file_with_manifest_ex, ProgressFn, DEFAULT_DISCOVER_CONCURRENCY,
-    DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
+    DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
+    ProgressFn, fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex,
+    upload_collection, upload_file_with_manifest_ex,
 };
 
 use isheika::{
-    Doh, PeerStore, SwarmSigner, Transport, TransportConfig, UploadFile,
-    DEFAULT_DOH_URL, MAINNET_BOOTNODE,
+    DEFAULT_DOH_URL, Doh, MAINNET_BOOTNODE, PeerStore, SwarmSigner, Transport, TransportConfig,
+    UploadFile,
 };
 use libp2p::Multiaddr;
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
-#[command(name = "isheika", version, about = "Swarm micro-client (TCP + WebSocket on native, WebSocket on WASM)")]
+#[command(
+    name = "isheika",
+    version,
+    about = "Swarm micro-client (TCP + WebSocket on native, WebSocket on WASM)"
+)]
 struct Cli {
     /// Verbose output (info-level logging)
     #[arg(short, long, global = true)]
@@ -109,7 +113,12 @@ struct Cli {
     /// much is left in the chequebook. Defaults to 10^16 BZZ-wei
     /// (= 1 BZZ), which is generous for most workloads — bee will
     /// only ever ask us for a fraction of this in any single upload.
-    #[arg(long, global = true, default_value = "10000000000000000", value_name = "WEI")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "10000000000000000",
+        value_name = "WEI"
+    )]
     chequebook_per_peer_cap_bzz: String,
 
     /// Path to the cheque-issuance sidecar (`cheques.json`).
@@ -118,7 +127,12 @@ struct Cli {
     /// greater than the last one it accepted from us
     /// (`ErrChequeNotIncreasing`, chequestore.go:30), so this file
     /// **must** survive between runs that target the same peer set.
-    #[arg(long, global = true, default_value = "cheques.json", value_name = "FILE")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "cheques.json",
+        value_name = "FILE"
+    )]
     cheques_file: PathBuf,
 
     /// EVM chain id used in the EIP-712 domain of cheque signatures.
@@ -148,7 +162,12 @@ struct Cli {
     /// Daemon operators should treat this file like an identity
     /// secret — losing it means losing the overlay (and therefore
     /// any kademlia memberships built up over time).
-    #[arg(long, global = true, default_value = "overlay-nonce", value_name = "FILE")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "overlay-nonce",
+        value_name = "FILE"
+    )]
     nonce_file: PathBuf,
 
     #[command(subcommand)]
@@ -663,7 +682,11 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
         let content_type = guess_content_type(&path);
-        out.push(UploadFile { path, content_type, data });
+        out.push(UploadFile {
+            path,
+            content_type,
+            data,
+        });
     }
     Ok(out)
 }
@@ -785,8 +808,8 @@ fn load_or_create_nonce(path: &std::path::Path) -> Result<[u8; 32], Box<dyn std:
     let mut nonce = [0u8; 32];
     getrandom::fill(&mut nonce).map_err(|e| format!("os rng: {e}"))?;
     let tmp = path.with_extension("tmp");
-    let mut f = std::fs::File::create(&tmp)
-        .map_err(|e| format!("create {}: {e}", tmp.display()))?;
+    let mut f =
+        std::fs::File::create(&tmp).map_err(|e| format!("create {}: {e}", tmp.display()))?;
     f.write_all(format!("0x{}\n", hex::encode(nonce)).as_bytes())
         .map_err(|e| format!("write {}: {e}", tmp.display()))?;
     drop(f);
@@ -819,8 +842,8 @@ fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
 }
 
 fn print_session_retire_diag() {
-    use std::sync::atomic::Ordering;
     use isheika::transport::diag;
+    use std::sync::atomic::Ordering;
     let dead_low = diag::DEAD_RETIRE_LOW_GHOST.load(Ordering::Relaxed);
     let dead_prewarm = diag::DEAD_RETIRE_PREWARM_GHOST.load(Ordering::Relaxed);
     let dead_high = diag::DEAD_RETIRE_HIGH_GHOST.load(Ordering::Relaxed);
@@ -913,10 +936,7 @@ fn print_session_retire_diag() {
             // Sort descending by count so the dominant cause is first.
             let mut rows: Vec<(&String, &u64)> = map.iter().collect();
             rows.sort_by(|a, b| b.1.cmp(a.1));
-            let parts: Vec<String> = rows
-                .iter()
-                .map(|(k, v)| format!("{}={}", k, v))
-                .collect();
+            let parts: Vec<String> = rows.iter().map(|(k, v)| format!("{}={}", k, v)).collect();
             eprintln!("conn-closed-io-detail: {}", parts.join(" "));
         }
     }
@@ -972,11 +992,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // rather refuse to start than silently downgrade to
     // pseudosettle-only when the user expected to pay.
     let swap_cfg = if let Some(cb_hex) = cli.chequebook.as_ref() {
-        let cb = parse_address_hex(cb_hex)
-            .map_err(|e| format!("--chequebook: {e}"))?;
+        let cb = parse_address_hex(cb_hex).map_err(|e| format!("--chequebook: {e}"))?;
         let per_peer_cap = alloy_primitives::U256::from_str_radix(
             cli.chequebook_per_peer_cap_bzz.trim_start_matches("0x"),
-            if cli.chequebook_per_peer_cap_bzz.starts_with("0x") { 16 } else { 10 },
+            if cli.chequebook_per_peer_cap_bzz.starts_with("0x") {
+                16
+            } else {
+                10
+            },
         )
         .map_err(|e| format!("--chequebook-per-peer-cap-bzz: {e}"))?;
         let store = isheika::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
@@ -999,19 +1022,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     match cli.command {
-        Commands::Discover { peer, output, wait, append, rounds, discover_concurrency, healthcheck, healthcheck_concurrency } => {
+        Commands::Discover {
+            peer,
+            output,
+            wait,
+            append,
+            rounds,
+            discover_concurrency,
+            healthcheck,
+            healthcheck_concurrency,
+        } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
             let progress: isheika::client::DiscoverProgressFn = Arc::new(|ev| {
                 use isheika::client::DiscoverEvent::*;
                 match ev {
-                    RoundStarted { round, total_rounds, frontier_size, total_peers_so_far } => {
+                    RoundStarted {
+                        round,
+                        total_rounds,
+                        frontier_size,
+                        total_peers_so_far,
+                    } => {
                         println!(
                             "  round {round}/{total_rounds}: dialing {frontier_size} peer(s) (have {total_peers_so_far} so far)"
                         );
                     }
-                    RoundFinished { round, total_rounds, new_peers_this_round, total_peers } => {
+                    RoundFinished {
+                        round,
+                        total_rounds,
+                        new_peers_this_round,
+                        total_peers,
+                    } => {
                         println!(
                             "  round {round}/{total_rounds} done: +{new_peers_this_round} new (total {total_peers})"
                         );
@@ -1030,14 +1072,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
             println!("discovered {} peers ({} hop(s))", discovered.len(), rounds);
 
-            let mut store = if append { PeerStore::load_or_create(&output) } else { PeerStore::new() };
+            let mut store = if append {
+                PeerStore::load_or_create(&output)
+            } else {
+                PeerStore::new()
+            };
             for p in discovered {
                 store.upsert(p);
             }
 
             if healthcheck {
                 println!("probing {} peers for reachability...", store.len());
-                isheika::client::healthcheck_peers(&transport, &store, healthcheck_concurrency).await;
+                isheika::client::healthcheck_peers(&transport, &store, healthcheck_concurrency)
+                    .await;
                 isheika::peers::apply_log(&mut store, transport.reachability_log());
             }
 
@@ -1045,8 +1092,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             println!("wrote {} peers to {}", store.len(), output.display());
         }
 
-        Commands::Fetch { hash, output, path, list, peerlist, max_retries, concurrency,
-                          #[cfg(unix)] daemon } => {
+        Commands::Fetch {
+            hash,
+            output,
+            path,
+            list,
+            peerlist,
+            max_retries,
+            concurrency,
+            #[cfg(unix)]
+            daemon,
+        } => {
             #[cfg(unix)]
             if let Some(sock) = daemon {
                 let output = output.ok_or("--output is required when using --daemon")?;
@@ -1059,10 +1115,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 let resp = isheika::daemon::call(&sock, &req).await?;
                 match resp {
-                    isheika::daemon::Response::Fetched { bytes_written, content_type } => {
+                    isheika::daemon::Response::Fetched {
+                        bytes_written,
+                        content_type,
+                    } => {
                         let ct = content_type.as_deref().unwrap_or("-");
-                        println!("fetched {} bytes ({}) -> {} (via daemon)",
-                            bytes_written, ct, output.display());
+                        println!(
+                            "fetched {} bytes ({}) -> {} (via daemon)",
+                            bytes_written,
+                            ct,
+                            output.display()
+                        );
                         return Ok(());
                     }
                     isheika::daemon::Response::Err { message } => {
@@ -1075,12 +1138,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let transport = Transport::new(signer, cfg);
             let mut peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
-                return Err(format!("peerlist {} is empty — run `isheika discover` first", peerlist.display()).into());
+                return Err(format!(
+                    "peerlist {} is empty — run `isheika discover` first",
+                    peerlist.display()
+                )
+                .into());
             }
 
             let result: Result<(), Box<dyn std::error::Error>> = (async {
                 if list {
-                    let entries = list_manifest_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
+                    let entries =
+                        list_manifest_ex(&transport, &peers, &hash, max_retries, concurrency)
+                            .await?;
                     println!("{} entries:", entries.len());
                     for e in entries {
                         let ct = e.content_type.as_deref().unwrap_or("-");
@@ -1090,18 +1159,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 } else {
                     let output = output.ok_or("--output is required (omit only with --list)")?;
                     if let Some(p) = path {
-                        let (bytes, content_type) = fetch_manifest_path_ex(&transport, &peers, &hash, &p, max_retries, concurrency).await?;
+                        let (bytes, content_type) = fetch_manifest_path_ex(
+                            &transport,
+                            &peers,
+                            &hash,
+                            &p,
+                            max_retries,
+                            concurrency,
+                        )
+                        .await?;
                         std::fs::write(&output, &bytes)?;
                         let ct = content_type.as_deref().unwrap_or("-");
-                        println!("fetched {} bytes ({}) -> {}", bytes.len(), ct, output.display());
+                        println!(
+                            "fetched {} bytes ({}) -> {}",
+                            bytes.len(),
+                            ct,
+                            output.display()
+                        );
                     } else {
-                        let bytes = fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency).await?;
+                        let bytes =
+                            fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency)
+                                .await?;
                         std::fs::write(&output, &bytes)?;
                         println!("fetched {} bytes -> {}", bytes.len(), output.display());
                     }
                     Ok(())
                 }
-            }).await;
+            })
+            .await;
 
             // Persist reachability observations back to peers.json on
             // both success and error so the next run starts faster.
@@ -1124,7 +1209,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection,
             index_document,
             error_document,
-            #[cfg(unix)] daemon,
+            #[cfg(unix)]
+            daemon,
         } => {
             #[cfg(unix)]
             if let Some(sock) = daemon {
@@ -1154,7 +1240,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 match resp {
                     isheika::daemon::Response::Uploaded { root, bytes } => {
                         let cid = root_hex_to_cid(&root);
-                        println!("uploaded {} bytes — manifest root: {} (via daemon)", bytes, root);
+                        println!(
+                            "uploaded {} bytes — manifest root: {} (via daemon)",
+                            bytes, root
+                        );
                         if let Some(c) = cid.as_deref() {
                             println!("bzz.limo:   https://bzz.limo/bzz/{root}/");
                             println!("subdomain:  https://{c}.bzz.limo/");
@@ -1320,7 +1409,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let root_hex = hex::encode(root.as_bytes());
                 println!(
                     "uploaded {} bytes ({}) — manifest root: {}",
-                    data.len(), display_ct, root_hex,
+                    data.len(),
+                    display_ct,
+                    root_hex,
                 );
                 if let Some(c) = root_hex_to_cid(&root_hex) {
                     println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/{path}");
@@ -1344,26 +1435,33 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
-        Commands::Daemon { socket, peerlist, pool_size, listen, identity, advertise, discover_rounds, bootnode } => {
+        Commands::Daemon {
+            socket,
+            peerlist,
+            pool_size,
+            listen,
+            identity,
+            advertise,
+            discover_rounds,
+            bootnode,
+        } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
             let sock_path = socket.clone();
             tokio::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ = isheika::daemon::call(
-                        &sock_path,
-                        &isheika::daemon::Request::Shutdown,
-                    )
-                    .await;
+                    let _ = isheika::daemon::call(&sock_path, &isheika::daemon::Request::Shutdown)
+                        .await;
                 }
             });
 
             let listen_cfg = match listen {
                 Some(s) => {
-                    let ma: Multiaddr = s.parse()
+                    let ma: Multiaddr = s
+                        .parse()
                         .map_err(|e| format!("invalid --listen multiaddr: {e}"))?;
-                    let id_hex = identity
-                        .ok_or("--identity <HEX> is required when --listen is set")?;
+                    let id_hex =
+                        identity.ok_or("--identity <HEX> is required when --listen is set")?;
                     // Stable overlay nonce — same rationale as the
                     // upload command. The daemon especially benefits
                     // because it's the long-running configuration
@@ -1377,9 +1475,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     )?;
                     let advertised = advertise
                         .map(|s| -> Result<Multiaddr, Box<dyn std::error::Error>> {
-                            let base: Multiaddr = s.parse()
+                            let base: Multiaddr = s
+                                .parse()
                                 .map_err(|e| format!("invalid --advertise multiaddr: {e}"))?;
-                            let already_has_p2p = base.iter()
+                            let already_has_p2p = base
+                                .iter()
                                 .any(|p| matches!(p, libp2p::multiaddr::Protocol::P2p(_)));
                             if already_has_p2p {
                                 Ok(base)
@@ -1393,7 +1493,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "daemon identity: overlay={} eth={}{}",
                         hex::encode(signer.overlay()),
                         hex::encode(signer.eth_address()),
-                        advertised.as_ref().map(|a| format!(" advertise={a}")).unwrap_or_default(),
+                        advertised
+                            .as_ref()
+                            .map(|a| format!(" advertise={a}"))
+                            .unwrap_or_default(),
                     );
                     Some(isheika::daemon::ListenConfig {
                         listen: ma,
@@ -1404,8 +1507,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // for mainnet May 2026. Future: expose CLI
                         // flags for the percentile-critical fields if
                         // the defaults start failing.
-                        status_snapshot:
-                            isheika::protocols::status::StatusSnapshot::default(),
+                        status_snapshot: isheika::protocols::status::StatusSnapshot::default(),
                     })
                 }
                 None => None,
@@ -1414,8 +1516,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let doh = Doh::with_url(&cli.doh_url);
             let bootnodes: Vec<Multiaddr> = bootnode
                 .iter()
-                .map(|s| s.parse::<Multiaddr>()
-                    .map_err(|e| format!("invalid --bootnode multiaddr {s}: {e}")))
+                .map(|s| {
+                    s.parse::<Multiaddr>()
+                        .map_err(|e| format!("invalid --bootnode multiaddr {s}: {e}"))
+                })
                 .collect::<Result<_, _>>()?;
             if bootnodes.is_empty() {
                 return Err("at least one --bootnode is required".into());
@@ -1438,12 +1542,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(unix)]
         Commands::SavePeers { socket } => {
-            let resp = isheika::daemon::call(
-                &socket,
-                &isheika::daemon::Request::SavePeers,
-            )
-            .await
-            .map_err(|e| format!("daemon call failed: {e}"))?;
+            let resp = isheika::daemon::call(&socket, &isheika::daemon::Request::SavePeers)
+                .await
+                .map_err(|e| format!("daemon call failed: {e}"))?;
             match resp {
                 isheika::daemon::Response::Ok => {
                     println!("daemon saved peerlist");
@@ -1467,9 +1568,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             max_attempts,
             network_id,
         } => {
+            use alloy_signer_local::PrivateKeySigner;
             use isheika::signer::derive_overlay;
             use isheika::transport::proximity;
-            use alloy_signer_local::PrivateKeySigner;
 
             // Derive our eth_address from the key — this is the input
             // half of the overlay hash that's fixed by our identity.
@@ -1547,7 +1648,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 eprintln!(
                     "vanity-overlay: coverage mode against {} target peers (min-coverage={:.2})",
-                    peers.len(), min_coverage
+                    peers.len(),
+                    min_coverage
                 );
                 (peers, false)
             };
@@ -1610,8 +1712,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let elapsed = start.elapsed();
                     if anchored_mode {
                         // Print per-target PO for visibility.
-                        let pos: Vec<u8> =
-                            targets.iter().map(|p| proximity(&overlay, p)).collect();
+                        let pos: Vec<u8> = targets.iter().map(|p| proximity(&overlay, p)).collect();
                         eprintln!(
                             "vanity-overlay: attempt {} ({:.0} k/s): overlay={} → POs={:?} min={}",
                             attempt + 1,
@@ -1705,9 +1806,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 use alloy_signer_local::PrivateKeySigner;
                 use isheika::batch::{
-                    amount_for_duration, create_batch, depth_for_size, parse_duration,
-                    parse_size, read_last_price, CreateBatchParams, MAINNET_BZZ_TOKEN,
-                    MAINNET_POSTAGE_STAMP,
+                    CreateBatchParams, MAINNET_BZZ_TOKEN, MAINNET_POSTAGE_STAMP,
+                    amount_for_duration, create_batch, depth_for_size, parse_duration, parse_size,
+                    read_last_price,
                 };
 
                 let signer: PrivateKeySigner = key

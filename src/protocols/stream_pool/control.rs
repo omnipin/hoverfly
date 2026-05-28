@@ -13,7 +13,7 @@ use futures::{
 use libp2p::identity::PeerId;
 use libp2p::swarm::{Stream, StreamProtocol};
 
-use crate::protocols::stream_pool::{handler::NewStream, shared::Shared, AlreadyRegistered};
+use crate::protocols::stream_pool::{AlreadyRegistered, handler::NewStream, shared::Shared};
 
 /// A (remote) control for opening new streams and registration of inbound protocols.
 ///

@@ -6,7 +6,7 @@
 
 use crate::proto::headers as hdr;
 use crate::proto::retrieval as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use thiserror::Error;
 
 pub const PROTOCOL: &str = "/swarm/retrieval/1.4.0/retrieval";
@@ -40,7 +40,9 @@ where
     let _resp_headers: hdr::Headers = read_message(stream).await?;
 
     // 3. Send request.
-    let req = pb::Request { addr: addr.to_vec() };
+    let req = pb::Request {
+        addr: addr.to_vec(),
+    };
     write_message(stream, &req).await?;
 
     // 4. Read delivery.
@@ -97,7 +99,11 @@ where
     // 4. Look up and respond.
     match lookup(&addr) {
         Some((data, stamp)) => {
-            let delivery = pb::Delivery { data, stamp, err: String::new() };
+            let delivery = pb::Delivery {
+                data,
+                stamp,
+                err: String::new(),
+            };
             write_message(stream, &delivery).await?;
         }
         None => {

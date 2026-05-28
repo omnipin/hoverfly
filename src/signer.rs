@@ -8,7 +8,7 @@
 
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{sol, Eip712Domain};
+use alloy_sol_types::{Eip712Domain, sol};
 use sha3::{Digest, Keccak256};
 use thiserror::Error;
 
@@ -71,7 +71,8 @@ struct HandshakeCacheV15 {
 
 impl SwarmSigner {
     pub fn from_bytes(key: &[u8; 32], network_id: u64) -> Result<Self, SignerError> {
-        let inner = PrivateKeySigner::from_slice(key).map_err(|e| SignerError::Alloy(e.to_string()))?;
+        let inner =
+            PrivateKeySigner::from_slice(key).map_err(|e| SignerError::Alloy(e.to_string()))?;
         let eth_address = inner.address().0.0;
         let nonce = random_nonce();
         let overlay = derive_overlay(&eth_address, network_id, &nonce);
@@ -118,8 +119,8 @@ impl SwarmSigner {
         nonce: &[u8; 32],
         network_id: u64,
     ) -> Result<Self, SignerError> {
-        let inner = PrivateKeySigner::from_slice(key)
-            .map_err(|e| SignerError::Alloy(e.to_string()))?;
+        let inner =
+            PrivateKeySigner::from_slice(key).map_err(|e| SignerError::Alloy(e.to_string()))?;
         let eth_address = inner.address().0.0;
         let overlay = derive_overlay(&eth_address, network_id, nonce);
         Ok(Self {
@@ -174,11 +175,21 @@ impl SwarmSigner {
         }
     }
 
-    pub const fn overlay(&self) -> &[u8; 32] { &self.overlay }
-    pub const fn eth_address(&self) -> &[u8; 20] { &self.eth_address }
-    pub const fn nonce(&self) -> &[u8; 32] { &self.nonce }
-    pub const fn network_id(&self) -> u64 { self.network_id }
-    pub const fn alloy_signer(&self) -> &PrivateKeySigner { &self.inner }
+    pub const fn overlay(&self) -> &[u8; 32] {
+        &self.overlay
+    }
+    pub const fn eth_address(&self) -> &[u8; 20] {
+        &self.eth_address
+    }
+    pub const fn nonce(&self) -> &[u8; 32] {
+        &self.nonce
+    }
+    pub const fn network_id(&self) -> u64 {
+        self.network_id
+    }
+    pub const fn alloy_signer(&self) -> &PrivateKeySigner {
+        &self.inner
+    }
 
     /// Sign bee handshake payload (v14 / pre-bee-2.8.0 format).
     /// Payload: `b"bee-handshake-" || underlay || overlay || network_id_BE_8`.
@@ -273,12 +284,8 @@ impl SwarmSigner {
         // the signature is valid against that timestamp so functionally
         // equivalent).
         let timestamp = crate::peers::now_unix() as i64;
-        let signature = self.sign_handshake_v15(
-            underlay,
-            &self.nonce,
-            timestamp,
-            chequebook_address,
-        )?;
+        let signature =
+            self.sign_handshake_v15(underlay, &self.nonce, timestamp, chequebook_address)?;
         let mut cache = self
             .handshake_cache_v15
             .lock()

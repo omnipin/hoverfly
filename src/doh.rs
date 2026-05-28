@@ -95,7 +95,10 @@ impl Doh {
             return Err(DohError::Http(format!("status {}", resp.status())));
         }
 
-        let body: DohResponse = resp.json().await.map_err(|e| DohError::Decode(e.to_string()))?;
+        let body: DohResponse = resp
+            .json()
+            .await
+            .map_err(|e| DohError::Decode(e.to_string()))?;
         if body.status != 0 {
             return Err(DohError::NxDomain(format!("status code {}", body.status)));
         }

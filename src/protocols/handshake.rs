@@ -24,7 +24,7 @@
 //! `chequebook_address` in v15 to signal "no chequebook".
 
 use crate::proto::handshake as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use crate::signer::SwarmSigner;
 use libp2p::{Multiaddr, PeerId};
 use thiserror::Error;
@@ -198,8 +198,8 @@ where
             // requires this — repeatedly bumping the timestamp on every
             // reconnect ages our overlay out of other bees' addressbooks
             // via the `MinimumUpdateInterval` gossip-reject path.
-            let (timestamp, sig_bytes) = signer
-                .sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
+            let (timestamp, sig_bytes) =
+                signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
             if timestamp <= 0 {
                 return Err(HandshakeError::TimestampInvalid(timestamp));
             }
@@ -303,5 +303,3 @@ fn client_loopback_underlay(peer_id: &PeerId) -> Vec<u8> {
     let ma: Multiaddr = s.parse().expect("static loopback multiaddr is valid");
     ma.to_vec()
 }
-
-

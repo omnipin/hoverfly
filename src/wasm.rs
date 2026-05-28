@@ -11,12 +11,12 @@ use js_sys::Uint8Array;
 use libp2p::Multiaddr;
 use wasm_bindgen::prelude::*;
 
+use crate::DEFAULT_DOH_URL;
 use crate::client::{discover, fetch_bytes, upload_bytes};
 use crate::doh::Doh;
 use crate::peers::PeerStore;
 use crate::signer::SwarmSigner;
 use crate::transport::{Transport, TransportConfig};
-use crate::DEFAULT_DOH_URL;
 
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
@@ -95,7 +95,9 @@ impl IsheikaClient {
     /// Discovered peers are merged into the in-memory peer store and the
     /// new total count is returned.
     pub async fn discover(&mut self, bootstrap: String, wait_secs: u32) -> Result<usize, JsError> {
-        let bootstrap_ma: Multiaddr = bootstrap.parse().map_err(|e: libp2p::multiaddr::Error| into_js_err(e))?;
+        let bootstrap_ma: Multiaddr = bootstrap
+            .parse()
+            .map_err(|e: libp2p::multiaddr::Error| into_js_err(e))?;
         let discovered = discover(
             &self.transport,
             &self.doh,

@@ -11,7 +11,7 @@
 //! (`pkg/pricing/pricing.go:102-105`).
 
 use crate::proto::pricing as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use thiserror::Error;
 
 pub const PROTOCOL: &str = "/swarm/pricing/1.0.0/pricing";

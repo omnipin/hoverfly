@@ -108,7 +108,8 @@ fn dnsaddr_host(ma: &Multiaddr) -> Option<String> {
 /// True if multiaddr contains a /ws or /wss component.
 pub fn is_ws_multiaddr(ma: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
-    ma.iter().any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_)))
+    ma.iter()
+        .any(|p| matches!(p, Protocol::Ws(_) | Protocol::Wss(_)))
 }
 
 /// True if multiaddr is a plain `/tcp/...` (not wrapped in `/ws`/`/wss`).

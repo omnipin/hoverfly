@@ -8,10 +8,11 @@
 use core::time::Duration;
 use futures::StreamExt;
 use libp2p::{
+    Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
     identity::Keypair,
     noise,
-    swarm::{dial_opts::DialOpts, NetworkBehaviour, SwarmEvent},
-    yamux, Multiaddr, PeerId, StreamProtocol, Swarm, SwarmBuilder,
+    swarm::{NetworkBehaviour, SwarmEvent, dial_opts::DialOpts},
+    yamux,
 };
 use thiserror::Error;
 use tracing::{debug, info};
@@ -30,7 +31,8 @@ pub(crate) const HANDSHAKE_PROTO_V15: StreamProtocol =
     StreamProtocol::new("/swarm/handshake/15.0.0/handshake");
 pub(crate) const HANDSHAKE_PROTO_V14: StreamProtocol =
     StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
-pub(crate) const PRICING_PROTO: StreamProtocol = StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
+pub(crate) const PRICING_PROTO: StreamProtocol =
+    StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
 pub(crate) const HIVE_PROTO_V2: StreamProtocol = StreamProtocol::new("/swarm/hive/2.0.0/peers");
 pub(crate) const HIVE_PROTO_V1: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
 pub(crate) const RETRIEVAL_PROTO: StreamProtocol =
@@ -46,8 +48,7 @@ pub(crate) const SWAP_PROTO: StreamProtocol = StreamProtocol::new("/swarm/swap/1
 /// outbound connections we initiated for pushsync), so EVERY session
 /// — not just the daemon's inbound listener — has to accept it.
 /// See `protocols::status` docs for the rationale.
-pub(crate) const STATUS_PROTO: StreamProtocol =
-    StreamProtocol::new("/swarm/status/1.1.3/status");
+pub(crate) const STATUS_PROTO: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.3/status");
 /// Minimum interval between successive dials to the same peer-id.
 /// Bee's libp2p connection rate limiter
 /// (`pkg/p2p/libp2p/libp2p.go::connLimiter`) allows 10 RPS / burst 40
@@ -76,8 +77,6 @@ pub const REFRESH_RATE_PLUR: u64 = 4_500_000;
 /// Bee disconnects at `payment_threshold × 1.25` (≥ 16.875M default), so
 /// 9M PLUR leaves plenty of headroom for in-flight rounds.
 pub const SAFE_PEER_THRESHOLD_PLUR: u64 = REFRESH_RATE_PLUR * 2;
-
-
 
 /// Bee's per-PO chunk price (`pkg/pricer/pricer.go::PO_PRICE`).
 pub const PO_PRICE_PLUR: u64 = 10_000;
@@ -636,7 +635,8 @@ pub struct Transport {
     /// high-PO peers re-dialed every time their session retires)
     /// produces 100+ dials/peer per upload and bee starts silently
     /// dropping our connections mid-push.
-    dial_cooldown: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PeerId, web_time::Instant>>>,
+    dial_cooldown:
+        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PeerId, web_time::Instant>>>,
 }
 
 impl Transport {
@@ -689,7 +689,11 @@ impl Transport {
     /// the inbound listener under the same libp2p peer-id — without
     /// that, bee peers dial back to our advertised underlay, hit the
     /// listener under a different peer-id, and reject the connection.
-    pub fn new_with_keypair(signer: SwarmSigner, config: TransportConfig, keypair: Keypair) -> Self {
+    pub fn new_with_keypair(
+        signer: SwarmSigner,
+        config: TransportConfig,
+        keypair: Keypair,
+    ) -> Self {
         Self {
             keypair,
             signer,
@@ -770,10 +774,7 @@ impl Transport {
     /// Open a long-lived session to a peer. The handshake and pricing dance
     /// happen once; subsequent `pushsync_chunk` / `fetch_chunk` calls reuse
     /// the underlying libp2p connection (each opens a fresh yamux substream).
-    pub async fn open_session(
-        &self,
-        peer_addr: &Multiaddr,
-    ) -> Result<PeerSession, TransportError> {
+    pub async fn open_session(&self, peer_addr: &Multiaddr) -> Result<PeerSession, TransportError> {
         PeerSession::connect(self, peer_addr).await
     }
 
@@ -815,7 +816,14 @@ impl Transport {
             self.config.advertise.as_ref(),
         )
         .await?;
-        let _peer_threshold = do_pricing(&mut swarm, peer_id, &mut control, &mut pr_in, self.config.timeout).await?;
+        let _peer_threshold = do_pricing(
+            &mut swarm,
+            peer_id,
+            &mut control,
+            &mut pr_in,
+            self.config.timeout,
+        )
+        .await?;
 
         // Drain hive `peers` envelopes until either the hard deadline
         // (`wait`) elapses, the connection drops, or we hit `QUIET_FOR`
@@ -846,10 +854,14 @@ impl Transport {
         let mut last_batch_at: Option<web_time::Instant> = None;
         loop {
             let now = web_time::Instant::now();
-            if now >= deadline { break; }
+            if now >= deadline {
+                break;
+            }
             // Short-circuit once the gossip burst stops.
             if let Some(t) = last_batch_at {
-                if now.duration_since(t) >= QUIET_FOR { break; }
+                if now.duration_since(t) >= QUIET_FOR {
+                    break;
+                }
             }
             let hard_remaining = deadline - now;
             let soft_remaining = last_batch_at
@@ -1216,7 +1228,11 @@ impl PeerSession {
             status_in,
             status_snapshot: transport.status_snapshot.clone(),
         });
-        Ok(Self { cmd_tx, peer_id, state: session_state })
+        Ok(Self {
+            cmd_tx,
+            peer_id,
+            state: session_state,
+        })
     }
 
     pub const fn peer_id(&self) -> PeerId {
@@ -1463,7 +1479,8 @@ impl SessionState {
                 }
                 Err(_) => {
                     acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
-                    self.ghost_balance_plur.fetch_add(price, std::sync::atomic::Ordering::Relaxed);
+                    self.ghost_balance_plur
+                        .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
             }
@@ -1497,7 +1514,10 @@ impl SessionState {
         // open_stream round-trip on an entry whose connection died
         // between when the dispatcher picked it and when we got
         // scheduled.
-        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .connection_dead
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(TransportError::ConnectionClosed);
         }
         let mut control = self.control.clone();
@@ -1577,7 +1597,10 @@ impl SessionState {
     }
 
     async fn do_fetch(&self, addr: &[u8; 32]) -> Result<ChunkDelivery, TransportError> {
-        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .connection_dead
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(TransportError::ConnectionClosed);
         }
         let mut control = self.control.clone();
@@ -1611,7 +1634,10 @@ impl SessionState {
     /// elapsed time as a per-peer responsiveness signal; the response
     /// payload is discarded.
     async fn do_status_probe(&self) -> Result<Duration, TransportError> {
-        if self.connection_dead.load(std::sync::atomic::Ordering::Relaxed) {
+        if self
+            .connection_dead
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
             return Err(TransportError::ConnectionClosed);
         }
         let mut control = self.control.clone();
@@ -1728,13 +1754,11 @@ impl SessionState {
 
         // Open the swap stream and read the per-stream exchange rate.
         let mut control = self.control.clone();
-        let mut stream = tokio::time::timeout(
-            self.timeout,
-            control.open_stream(self.peer_id, SWAP_PROTO),
-        )
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
+        let mut stream =
+            tokio::time::timeout(self.timeout, control.open_stream(self.peer_id, SWAP_PROTO))
+                .await
+                .map_err(|_| TransportError::Timeout)?
+                .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
 
         let rates = tokio::time::timeout(self.timeout, swap::read_settlement_rates(&mut stream))
             .await
@@ -1770,9 +1794,9 @@ impl SessionState {
             if new > swap_state.config.max_cumulative_per_peer_bzz {
                 (U256::from(cur), true)
             } else {
-                let delta: u128 = amount_bzz.try_into().map_err(|_| {
-                    TransportError::Swap("cheque amount exceeds u128".into())
-                })?;
+                let delta: u128 = amount_bzz
+                    .try_into()
+                    .map_err(|_| TransportError::Swap("cheque amount exceeds u128".into()))?;
                 let next = store
                     .bump_and_get(&swap_state.peer_overlay_hex, delta)
                     .map_err(|e| TransportError::Swap(e.to_string()))?;
@@ -1834,8 +1858,6 @@ impl SessionState {
         );
         Ok(())
     }
-
-
 
     async fn do_pseudosettle(
         &self,
@@ -2126,7 +2148,10 @@ async fn poll_until<T, F: core::future::Future<Output = T>>(
     }
 }
 
-async fn close_stream_polled<S: futures::AsyncWrite + Unpin>(swarm: &mut Swarm<Behaviour>, stream: &mut S) {
+async fn close_stream_polled<S: futures::AsyncWrite + Unpin>(
+    swarm: &mut Swarm<Behaviour>,
+    stream: &mut S,
+) {
     use futures::AsyncWriteExt;
     let _ = poll_until(swarm, stream.close()).await;
 }
@@ -2148,7 +2173,11 @@ fn extract_peer_id(ma: &Multiaddr) -> Option<PeerId> {
     None
 }
 
-fn dial(swarm: &mut Swarm<Behaviour>, peer_id: PeerId, peer_addr: &Multiaddr) -> Result<(), TransportError> {
+fn dial(
+    swarm: &mut Swarm<Behaviour>,
+    peer_id: PeerId,
+    peer_addr: &Multiaddr,
+) -> Result<(), TransportError> {
     swarm
         .dial(
             DialOpts::peer_id(peer_id)
@@ -2189,25 +2218,37 @@ async fn prep_connection(
         match tokio::time::timeout(deadline - now, swarm.select_next_some()).await {
             Err(_) => return Err(TransportError::Timeout),
             Ok(ev) => match ev {
-                SwarmEvent::ConnectionEstablished { peer_id: pid, endpoint, .. } if pid == peer_id => {
+                SwarmEvent::ConnectionEstablished {
+                    peer_id: pid,
+                    endpoint,
+                    ..
+                } if pid == peer_id => {
                     info!(target: "isheika::transport", "connected to {}", pid);
                     peer_underlay = Some(endpoint.get_remote_address().clone());
                 }
-                SwarmEvent::OutgoingConnectionError { peer_id: Some(pid), error, .. } if pid == peer_id => {
+                SwarmEvent::OutgoingConnectionError {
+                    peer_id: Some(pid),
+                    error,
+                    ..
+                } if pid == peer_id => {
                     return Err(TransportError::DialFailed(error.to_string()));
                 }
                 SwarmEvent::ConnectionClosed { peer_id: pid, .. } if pid == peer_id => {
                     return Err(TransportError::ConnectionClosed);
                 }
                 SwarmEvent::Behaviour(BehaviourEvent::Identify(idev)) => match idev {
-                    libp2p::identify::Event::Received { peer_id: pid, info, .. } if pid == peer_id && !identify_received => {
+                    libp2p::identify::Event::Received {
+                        peer_id: pid, info, ..
+                    } if pid == peer_id && !identify_received => {
                         identify_received = true;
                         info!(target: "isheika::transport", "identify received; observed_addr={}", info.observed_addr);
                         swarm.add_external_address(info.observed_addr.clone());
                         swarm.behaviour_mut().identify.push([peer_id]);
                         push_in_flight = true;
                     }
-                    libp2p::identify::Event::Pushed { peer_id: pid, .. } if pid == peer_id && push_in_flight => {
+                    libp2p::identify::Event::Pushed { peer_id: pid, .. }
+                        if pid == peer_id && push_in_flight =>
+                    {
                         info!(target: "isheika::transport", "identify push acknowledged");
                         return Ok(peer_underlay.unwrap_or_else(Multiaddr::empty));
                     }
@@ -2351,7 +2392,9 @@ async fn do_pricing(
     let mut peer_threshold: u128 = u128::from(SAFE_PEER_THRESHOLD_PLUR);
     while !pr_in_done {
         let now = web_time::Instant::now();
-        if now >= deadline { return Err(TransportError::Timeout); }
+        if now >= deadline {
+            return Err(TransportError::Timeout);
+        }
         tokio::select! {
             _ = tokio::time::sleep(deadline - now) => return Err(TransportError::Timeout),
             ev = pr_in.next() => {
@@ -2405,10 +2448,13 @@ async fn do_swap_handshake(
     .await
     .map_err(|_| TransportError::Timeout)?
     .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-    tokio::time::timeout(timeout, poll_until(swarm, swap::send_handshake(&mut stream, beneficiary)))
-        .await
-        .map_err(|_| TransportError::Timeout)?
-        .map_err(|e| TransportError::Swap(e.to_string()))?;
+    tokio::time::timeout(
+        timeout,
+        poll_until(swarm, swap::send_handshake(&mut stream, beneficiary)),
+    )
+    .await
+    .map_err(|_| TransportError::Timeout)?
+    .map_err(|e| TransportError::Swap(e.to_string()))?;
     close_stream_polled(swarm, &mut stream).await;
     Ok(())
 }
@@ -2448,7 +2494,10 @@ async fn do_hive_announce(
     .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
     tokio::time::timeout(
         timeout,
-        poll_until(swarm, crate::protocols::hive::announce_self(&mut stream, me, version)),
+        poll_until(
+            swarm,
+            crate::protocols::hive::announce_self(&mut stream, me, version),
+        ),
     )
     .await
     .map_err(|_| TransportError::Timeout)?
@@ -2529,7 +2578,9 @@ where
         }
     };
     let synack = pb::SynAck {
-        syn: Some(pb::Syn { observed_underlay: peer_observed }),
+        syn: Some(pb::Syn {
+            observed_underlay: peer_observed,
+        }),
         ack: Some(pb::Ack {
             address: Some(our_addr),
             network_id: signer.network_id(),
@@ -2595,7 +2646,7 @@ pub(crate) async fn build_swarm_from(
     timeout: Duration,
     max_concurrent_substream_upgrades: usize,
 ) -> Result<Swarm<Behaviour>, TransportError> {
-    use libp2p_core::{upgrade, Transport as _};
+    use libp2p_core::{Transport as _, upgrade};
 
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
         .with_tokio()
@@ -2649,8 +2700,8 @@ pub(crate) async fn build_swarm_from(
 
 #[cfg(target_arch = "wasm32")]
 async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> {
-    use libp2p_core::{upgrade, Transport as _};
     use libp2p::websocket_websys as ws_websys;
+    use libp2p_core::{Transport as _, upgrade};
 
     let keypair = t.keypair.clone();
     let timeout = t.config.timeout;

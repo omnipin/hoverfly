@@ -44,11 +44,11 @@
 //! negligible there regardless. The single-shot nature of batch
 //! creation doesn't need fee optimization.
 
-use alloy_primitives::{keccak256, Address, B256, U256};
+use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rlp::Encodable;
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
-use alloy_sol_types::{sol, SolCall, SolEvent};
+use alloy_sol_types::{SolCall, SolEvent, sol};
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
 use thiserror::Error;
@@ -160,7 +160,11 @@ pub fn parse_size(s: &str) -> Result<u64, String> {
         "gb" | "g" => 1024 * 1024 * 1024,
         "tb" | "t" => 1024_u64.pow(4),
         "pb" | "p" => 1024_u64.pow(5),
-        _ => return Err(format!("size '{s}': unknown unit '{unit_part}' (use kB/MB/GB/TB/PB)")),
+        _ => {
+            return Err(format!(
+                "size '{s}': unknown unit '{unit_part}' (use kB/MB/GB/TB/PB)"
+            ));
+        }
     };
     let bytes = (num * mult as f64) as u64;
     Ok(bytes)
@@ -185,7 +189,11 @@ pub fn parse_duration(s: &str) -> Result<u64, String> {
         "d" | "day" | "days" => 86400.0,
         "w" | "wk" | "wks" | "week" | "weeks" => 7.0 * 86400.0,
         "y" | "yr" | "yrs" | "year" | "years" => 365.0 * 86400.0,
-        _ => return Err(format!("duration '{s}': unknown unit '{unit}' (use h/d/w/y)")),
+        _ => {
+            return Err(format!(
+                "duration '{s}': unknown unit '{unit}' (use h/d/w/y)"
+            ));
+        }
     };
     Ok((num * mult) as u64)
 }
@@ -370,10 +378,7 @@ pub async fn create_batch(
         .ok_or_else(|| BatchError::Rpc("total amount overflow".into()))?;
 
     let balance: U256 = rpc
-        .call_view::<balanceOfCall, _>(
-            params.bzz_token,
-            balanceOfCall { account: from },
-        )
+        .call_view::<balanceOfCall, _>(params.bzz_token, balanceOfCall { account: from })
         .await?;
     if balance < total {
         return Err(BatchError::InsufficientBalance {
@@ -442,11 +447,7 @@ pub async fn create_batch(
             continue;
         }
         // Decode the event using alloy-sol-types
-        let topics: Vec<B256> = log
-            .topics
-            .iter()
-            .filter_map(|s| s.parse().ok())
-            .collect();
+        let topics: Vec<B256> = log.topics.iter().filter_map(|s| s.parse().ok()).collect();
         let data = hex::decode(log.data.trim_start_matches("0x"))
             .map_err(|e| BatchError::AbiDecode(format!("log data hex: {e}")))?;
         let decoded = BatchCreated::decode_raw_log(topics.iter().copied(), &data)
@@ -556,9 +557,19 @@ impl EthRpc {
             method,
             params,
         };
-        let resp: RpcResp<R> = self.http.post(&self.url).json(&body).send().await?.json().await?;
+        let resp: RpcResp<R> = self
+            .http
+            .post(&self.url)
+            .json(&body)
+            .send()
+            .await?
+            .json()
+            .await?;
         if let Some(e) = resp.error {
-            return Err(BatchError::Rpc(format!("{}: {} (code {})", method, e.message, e.code)));
+            return Err(BatchError::Rpc(format!(
+                "{}: {} (code {})",
+                method, e.message, e.code
+            )));
         }
         Ok(resp.result)
     }
@@ -644,7 +655,9 @@ impl EthRpc {
                 [format!("0x{}", hex::encode(&raw))],
             )
             .await?;
-        Ok(hex_str.parse().map_err(|e| BatchError::Rpc(format!("tx hash parse: {e}")))?)
+        Ok(hex_str
+            .parse()
+            .map_err(|e| BatchError::Rpc(format!("tx hash parse: {e}")))?)
     }
 
     async fn wait_for_success(
@@ -661,9 +674,8 @@ impl EthRpc {
                 )
                 .await?;
             if let Some(rcpt) = r {
-                let ok = u64::from_str_radix(rcpt.status.trim_start_matches("0x"), 16)
-                    .unwrap_or(0)
-                    == 1;
+                let ok =
+                    u64::from_str_radix(rcpt.status.trim_start_matches("0x"), 16).unwrap_or(0) == 1;
                 if !ok {
                     return Err(BatchError::Reverted);
                 }

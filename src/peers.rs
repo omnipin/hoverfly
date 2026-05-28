@@ -53,7 +53,9 @@ pub struct Peer {
     pub consecutive_failures: u16,
 }
 
-fn is_zero_u16(x: &u16) -> bool { *x == 0 }
+fn is_zero_u16(x: &u16) -> bool {
+    *x == 0
+}
 
 /// Window (seconds) within which a recent dial failure causes a peer to
 /// be deprioritised. Tuned so that a peer down at the time of one upload
@@ -72,7 +74,8 @@ pub enum DialResult {
 
 /// Thread-safe map of `overlay_hex_lowercase → DialResult` populated by
 /// concurrent dial loops. Apply to a [`PeerStore`] with [`apply_log`].
-pub type ReachabilityLog = std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, DialResult>>>;
+pub type ReachabilityLog =
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, DialResult>>>;
 
 pub fn new_log() -> ReachabilityLog {
     std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
@@ -232,8 +235,9 @@ impl PeerStore {
                 }
                 if peer.last_dial_failure_unix > existing.last_dial_failure_unix {
                     existing.last_dial_failure_unix = peer.last_dial_failure_unix;
-                    existing.consecutive_failures =
-                        existing.consecutive_failures.saturating_add(peer.consecutive_failures.max(1));
+                    existing.consecutive_failures = existing
+                        .consecutive_failures
+                        .saturating_add(peer.consecutive_failures.max(1));
                 }
             }
             None => {

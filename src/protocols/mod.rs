@@ -7,9 +7,9 @@
 pub mod handshake;
 pub mod hive;
 pub mod pricing;
-pub mod retrieval;
-pub mod pushsync;
 pub mod pseudosettle;
+pub mod pushsync;
+pub mod retrieval;
 pub mod status;
 pub mod swap;
 

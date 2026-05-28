@@ -60,7 +60,10 @@ pub struct Fork {
 /// Decode a mantaray node from the chunk's payload bytes (no span prefix).
 pub fn decode_node(payload: &[u8]) -> Result<Node, ManifestError> {
     if payload.len() < NODE_HEADER_SIZE {
-        return Err(ManifestError::TooShort { expected: NODE_HEADER_SIZE, actual: payload.len() });
+        return Err(ManifestError::TooShort {
+            expected: NODE_HEADER_SIZE,
+            actual: payload.len(),
+        });
     }
 
     // XOR-decrypt everything past the obfuscation key in-place on a local copy.
@@ -70,8 +73,7 @@ pub fn decode_node(payload: &[u8]) -> Result<Node, ManifestError> {
         *byte ^= key[(i - OBFUSCATION_KEY_SIZE) % OBFUSCATION_KEY_SIZE];
     }
 
-    let version_hash =
-        &data[OBFUSCATION_KEY_SIZE..OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE];
+    let version_hash = &data[OBFUSCATION_KEY_SIZE..OBFUSCATION_KEY_SIZE + VERSION_HASH_SIZE];
     if version_hash != VERSION_HASH_V01 && version_hash != VERSION_HASH_V02 {
         return Err(ManifestError::InvalidVersion);
     }
@@ -172,7 +174,11 @@ pub fn decode_node(payload: &[u8]) -> Result<Node, ManifestError> {
 }
 
 fn trim_padding(b: &[u8]) -> &[u8] {
-    let end = b.iter().rposition(|&x| x != 0x0a).map(|i| i + 1).unwrap_or(0);
+    let end = b
+        .iter()
+        .rposition(|&x| x != 0x0a)
+        .map(|i| i + 1)
+        .unwrap_or(0);
     &b[..end]
 }
 
@@ -257,7 +263,10 @@ pub fn build_collection_manifest(
     if index_document.is_some() || error_document.is_some() {
         let mut root_meta: BTreeMap<String, String> = BTreeMap::new();
         if let Some(idx) = index_document {
-            root_meta.insert(WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY.to_string(), idx.to_string());
+            root_meta.insert(
+                WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY.to_string(),
+                idx.to_string(),
+            );
         }
         if let Some(err) = error_document {
             root_meta.insert(WEBSITE_ERROR_DOCUMENT_PATH_KEY.to_string(), err.to_string());
@@ -268,7 +277,9 @@ pub fn build_collection_manifest(
             .map_err(|e| ManifestError::Metadata(e.to_string()))?;
     }
 
-    let root = manifest.save().map_err(|e| ManifestError::Metadata(e.to_string()))?;
+    let root = manifest
+        .save()
+        .map_err(|e| ManifestError::Metadata(e.to_string()))?;
 
     let (_node, store) = manifest.into_parts();
     let chunks: Vec<(ChunkAddress, bytes::Bytes)> = store

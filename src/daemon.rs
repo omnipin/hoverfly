@@ -26,12 +26,11 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ChunkCache;
 use crate::client::{
-    discover_recursive_with_progress, fetch_bytes_ex, fetch_manifest_path_ex,
+    SessionPool, discover_recursive_with_progress, fetch_bytes_ex, fetch_manifest_path_ex,
     upload_bytes_with_pool, upload_collection, upload_file_with_manifest_with_pool,
-    SessionPool,
 };
 use crate::doh::Doh;
-use crate::peers::{apply_log, PeerStore};
+use crate::peers::{PeerStore, apply_log};
 use crate::signer::SwarmSigner;
 use crate::transport::Transport;
 use crate::{ClientError, UploadFile};
@@ -85,10 +84,18 @@ pub struct FetchRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Pong,
-    Uploaded { root: String, bytes: usize },
-    Fetched { bytes_written: usize, content_type: Option<String> },
+    Uploaded {
+        root: String,
+        bytes: usize,
+    },
+    Fetched {
+        bytes_written: usize,
+        content_type: Option<String>,
+    },
     Ok,
-    Err { message: String },
+    Err {
+        message: String,
+    },
 }
 
 /// Server state held across requests.
@@ -438,7 +445,9 @@ async fn handle_conn(
             apply_log(&mut *peers, state.transport.reachability_log());
             match peers.save(&state.peerlist_path) {
                 Ok(()) => Response::Ok,
-                Err(e) => Response::Err { message: format!("save: {e}") },
+                Err(e) => Response::Err {
+                    message: format!("save: {e}"),
+                },
             }
         }
         Request::Shutdown => {
@@ -462,7 +471,8 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
         // pre-stamp passes). Only the raw / single-file path benefits
         // from the persistent pool — that's where most repeat upload
         // throughput goes anyway.
-        let is_tar = r.file
+        let is_tar = r
+            .file
             .extension()
             .and_then(|s| s.to_str())
             .map(|s| s.eq_ignore_ascii_case("tar"))
@@ -472,10 +482,11 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
             // Collections still use the one-shot path: the dedup + multi-
             // stamp logic in upload_collection is complex enough that
             // refactoring it for an external pool is a follow-up.
-            let files = read_tar_files(&data)
-                .map_err(|e| ClientError::File(e.to_string()))?;
+            let files = read_tar_files(&data).map_err(|e| ClientError::File(e.to_string()))?;
             if files.is_empty() {
-                return Err(ClientError::File("tar archive contains no regular files".into()));
+                return Err(ClientError::File(
+                    "tar archive contains no regular files".into(),
+                ));
             }
             // Default the website index to `index.html` for tar
             // collections — that's what a static site build expects.
@@ -549,16 +560,16 @@ async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
     .await;
     match result {
         Ok((root, bytes)) => Response::Uploaded { root, bytes },
-        Err(e) => Response::Err { message: e.to_string() },
+        Err(e) => Response::Err {
+            message: e.to_string(),
+        },
     }
 }
 
 /// Ensure the daemon's persistent pool exists and has at least one
 /// reachable session. Subsequent uploads see a pre-filled pool with no
 /// dial-fill cost.
-async fn ensure_pool(
-    state: &Arc<State>,
-) -> Result<Arc<SessionPool>, ClientError> {
+async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError> {
     {
         let guard = state.pool.read().await;
         if let Some(p) = guard.as_ref() {
@@ -732,9 +743,9 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
         .map(|t| proximity(&current_overlay, t))
         .collect();
     let current_min_po = *current_pos.iter().min().unwrap_or(&0);
-    let current_avg_po =
-        (current_pos.iter().map(|p| *p as f64).sum::<f64>() / current_pos.len() as f64).floor()
-            as u8;
+    let current_avg_po = (current_pos.iter().map(|p| *p as f64).sum::<f64>()
+        / current_pos.len() as f64)
+        .floor() as u8;
 
     info!(target: "isheika::daemon",
         "auto-iterate: top {} peers by push success — current overlay POs={:?} (min={}, avg={})",
@@ -812,8 +823,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
             best_min_po, current_min_po);
         return Ok(());
     }
-    let winning_overlay =
-        derive_overlay(&eth_address, state.signer_network_id, &winning_nonce);
+    let winning_overlay = derive_overlay(&eth_address, state.signer_network_id, &winning_nonce);
     let pos: Vec<u8> = targets
         .iter()
         .map(|t| proximity(&winning_overlay, t))
@@ -903,13 +913,25 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
     let result: Result<(usize, Option<String>), ClientError> = (async {
         let peers = state.peers.read().await;
         let (bytes, ct) = if let Some(p) = r.path.as_deref() {
-            let (b, c) =
-                fetch_manifest_path_ex(&state.transport, &*peers, &r.hash, p, r.max_retries, r.concurrency)
-                    .await?;
+            let (b, c) = fetch_manifest_path_ex(
+                &state.transport,
+                &*peers,
+                &r.hash,
+                p,
+                r.max_retries,
+                r.concurrency,
+            )
+            .await?;
             (b, c)
         } else {
-            let b = fetch_bytes_ex(&state.transport, &*peers, &r.hash, r.max_retries, r.concurrency)
-                .await?;
+            let b = fetch_bytes_ex(
+                &state.transport,
+                &*peers,
+                &r.hash,
+                r.max_retries,
+                r.concurrency,
+            )
+            .await?;
             (b, None)
         };
         std::fs::write(&r.output, &bytes).map_err(|e| ClientError::File(e.to_string()))?;
@@ -917,8 +939,13 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
     })
     .await;
     match result {
-        Ok((bytes_written, content_type)) => Response::Fetched { bytes_written, content_type },
-        Err(e) => Response::Err { message: e.to_string() },
+        Ok((bytes_written, content_type)) => Response::Fetched {
+            bytes_written,
+            content_type,
+        },
+        Err(e) => Response::Err {
+            message: e.to_string(),
+        },
     }
 }
 
@@ -939,7 +966,11 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
         let content_type = crate::mime::guess_from_path(&path);
-        out.push(UploadFile { path, content_type, data });
+        out.push(UploadFile {
+            path,
+            content_type,
+            data,
+        });
     }
     Ok(out)
 }
@@ -949,10 +980,7 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
 /// Connect to a daemon listening on `socket_path` and exchange one
 /// `request → response` round-trip. Returns the deserialized response
 /// or an IO/protocol error.
-pub async fn call(
-    socket_path: &std::path::Path,
-    request: &Request,
-) -> std::io::Result<Response> {
+pub async fn call(socket_path: &std::path::Path, request: &Request) -> std::io::Result<Response> {
     let mut stream = UnixStream::connect(socket_path).await?;
     write_frame(&mut stream, request).await?;
     let resp = read_frame::<Response>(&mut stream)
@@ -984,10 +1012,7 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(
     Ok(Some(val))
 }
 
-async fn write_frame<T: Serialize>(
-    stream: &mut UnixStream,
-    value: &T,
-) -> std::io::Result<()> {
+async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
     let body = serde_json::to_vec(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME as usize {
@@ -1002,5 +1027,3 @@ async fn write_frame<T: Serialize>(
     stream.flush().await?;
     Ok(())
 }
-
-

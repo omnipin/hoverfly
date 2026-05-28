@@ -84,6 +84,9 @@ mod tests {
             r[i] = u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap();
         }
         let cid = reference_to_cid(&r);
-        assert_eq!(cid, "bah5acgza7uz732yevwl4jlqysqdx3j235zxwtpd4xlna5fodvswxjrw3542q");
+        assert_eq!(
+            cid,
+            "bah5acgza7uz732yevwl4jlqysqdx3j235zxwtpd4xlna5fodvswxjrw3542q"
+        );
     }
 }

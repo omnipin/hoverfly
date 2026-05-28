@@ -14,7 +14,8 @@ fn main() {
     println!();
 
     // Build sign payload exactly like bee handshake.
-    let underlay_str = format!("/ip4/127.0.0.1/tcp/1634/p2p/12D3KooWDQzJEjMQrA9XJWeKjtuQk1FzfaZbHpQzCQ8gNCwGfH7m");
+    let underlay_str =
+        format!("/ip4/127.0.0.1/tcp/1634/p2p/12D3KooWDQzJEjMQrA9XJWeKjtuQk1FzfaZbHpQzCQ8gNCwGfH7m");
     let underlay: libp2p::Multiaddr = underlay_str.parse().unwrap();
     let underlay_bytes = underlay.to_vec();
 

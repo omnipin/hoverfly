@@ -8,12 +8,12 @@
 use core::time::Duration;
 use libp2p::Multiaddr;
 use nectar_postage::{Batch, BatchId};
-use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
 #[cfg(target_arch = "wasm32")]
 use nectar_postage_issuer::Stamper;
+use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
-use nectar_primitives::file::{sync_split, GenericJoiner};
+use nectar_primitives::file::{GenericJoiner, sync_split};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
 use std::collections::HashMap;
 #[cfg(not(target_arch = "wasm32"))]
@@ -21,15 +21,14 @@ use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
-use crate::dnsaddr::{resolve, DnsAddrError};
+use crate::dnsaddr::{DnsAddrError, resolve};
 use crate::doh::Doh;
 use crate::peers::{DialResult, Peer, PeerStore};
-use crate::signer::SwarmSigner;
 use crate::protocols::pushsync::PushsyncReceipt;
+use crate::signer::SwarmSigner;
 use crate::transport::{
-    is_connection_dead, peer_price, PeerSession, PushOutcome, Transport, TransportError,
-    GHOST_BALANCE_LIMIT_PLUR, GHOST_BALANCE_PREWARM_DENOMINATOR,
-    GHOST_BALANCE_PREWARM_NUMERATOR,
+    GHOST_BALANCE_LIMIT_PLUR, GHOST_BALANCE_PREWARM_DENOMINATOR, GHOST_BALANCE_PREWARM_NUMERATOR,
+    PeerSession, PushOutcome, Transport, TransportError, is_connection_dead, peer_price,
 };
 use nectar_primitives::address::SwarmAddress;
 
@@ -245,7 +244,8 @@ impl<'a> NetworkedStore<'a> {
                             overlay.to_lowercase(),
                             crate::peers::DialResult::Success { rtt_ms },
                         );
-                        match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice()) {
+                        match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice())
+                        {
                             Ok(chunk) => {
                                 use nectar_primitives::Chunk as _;
                                 if chunk.address() != &address {
@@ -258,10 +258,9 @@ impl<'a> NetworkedStore<'a> {
                         }
                     }
                     Err(e) => {
-                        log.lock().unwrap().insert(
-                            overlay.to_lowercase(),
-                            crate::peers::DialResult::Failure,
-                        );
+                        log.lock()
+                            .unwrap()
+                            .insert(overlay.to_lowercase(), crate::peers::DialResult::Failure);
                         (overlay, Err(e.to_string()))
                     }
                 }
@@ -290,7 +289,9 @@ impl<'a> NetworkedStore<'a> {
                 }
             }
         }
-        Err(ChunkStoreError::Other(format!("all peers failed: {last_err}")))
+        Err(ChunkStoreError::Other(format!(
+            "all peers failed: {last_err}"
+        )))
     }
 }
 
@@ -298,7 +299,10 @@ impl<'a> NetworkedStore<'a> {
 impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
     type Error = ChunkStoreError;
 
-    async fn get(&self, address: &ChunkAddress) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+    async fn get(
+        &self,
+        address: &ChunkAddress,
+    ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
         self.fetch_chunk_inner(*address).await
     }
 }
@@ -367,7 +371,12 @@ impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
         }
         info!(target: "isheika::manifest", "blocking fetch for {}", address);
         let handle = tokio::runtime::Handle::current();
-        let store = NetworkedStore::with_concurrency(self.transport, self.peers, self.max_retries, self.concurrency);
+        let store = NetworkedStore::with_concurrency(
+            self.transport,
+            self.peers,
+            self.max_retries,
+            self.concurrency,
+        );
         let address_copy = *address;
         let chunk = handle.block_on(async move {
             ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &address_copy).await
@@ -446,8 +455,7 @@ pub async fn discover_recursive_with_concurrency(
 /// requiring `--verbose`. Stable enough across rounds to drive a
 /// simple `println!`; not stable enough that downstream tooling
 /// should pattern-match on its exact wording.
-pub type DiscoverProgressFn =
-    std::sync::Arc<dyn Fn(DiscoverEvent) + Send + Sync + 'static>;
+pub type DiscoverProgressFn = std::sync::Arc<dyn Fn(DiscoverEvent) + Send + Sync + 'static>;
 
 /// One progress event during a recursive discover.
 #[derive(Debug, Clone)]
@@ -596,12 +604,16 @@ pub async fn fetch_bytes_ex(
     concurrency: usize,
 ) -> Result<Vec<u8>, ClientError> {
     let root = parse_root(root_hex)?;
-    let store = NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+    let store =
+        NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     // Drive nectar's BMT joiner with the same per-chunk concurrency as
     // our network store so deep trees don't bottleneck on its default
     // (8). Each chunk fetch already races peers internally; this is the
     // outer "chunks in flight" knob.
-    let bytes = GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(store, root)
+    let bytes =
+        GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
+            store, root,
+        )
         .await?
         .with_concurrency(concurrency.max(1).max(8))
         .read_all()
@@ -639,7 +651,10 @@ pub async fn fetch_manifest_path_ex(
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
-    let bytes = GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(store, target)
+    let bytes =
+        GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
+            store, target,
+        )
         .await?
         .with_concurrency(concurrency.max(1).max(8))
         .read_all()
@@ -667,7 +682,8 @@ pub async fn list_manifest_ex(
     concurrency: usize,
 ) -> Result<Vec<ManifestEntry>, ClientError> {
     let root = parse_root(root_hex)?;
-    let store = NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+    let store =
+        NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     walk_manifest(&store, root, Vec::new()).await
 }
 
@@ -685,8 +701,7 @@ async fn lookup_manifest_path(
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &current)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {current}: {e}")))?;
-        let node = decode_node(chunk.data())
-            .map_err(|e| ClientError::Manifest(e.to_string()))?;
+        let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         if remaining.is_empty() {
             return node
@@ -721,8 +736,9 @@ fn walk_manifest<'a>(
     store: &'a NetworkedStore<'a>,
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + Send + 'a>>
-{
+) -> std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + Send + 'a>,
+> {
     Box::pin(async move {
         use crate::manifest::decode_node;
         use futures::stream::{FuturesUnordered, StreamExt};
@@ -730,8 +746,7 @@ fn walk_manifest<'a>(
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
-        let node =
-            decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+        let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         let mut out = Vec::new();
         if let Some(entry_addr) = node.entry {
@@ -901,7 +916,15 @@ pub async fn upload_collection(
 
     // 4. Stamp in parallel, then push everything concurrently.
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
+    push_chunks_concurrent(
+        transport,
+        peers,
+        work,
+        max_retries_per_chunk,
+        concurrency,
+        progress,
+    )
+    .await?;
     Ok(manifest_root)
 }
 
@@ -919,10 +942,17 @@ pub async fn upload_file_with_manifest_ex(
     concurrency: usize,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (manifest_root, work) = prepare_upload_file_with_manifest(
-        signer, batch_id_hex, depth, data, path, content_type,
-    )?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
+    let (manifest_root, work) =
+        prepare_upload_file_with_manifest(signer, batch_id_hex, depth, data, path, content_type)?;
+    push_chunks_concurrent(
+        transport,
+        peers,
+        work,
+        max_retries_per_chunk,
+        concurrency,
+        progress,
+    )
+    .await?;
     Ok(manifest_root)
 }
 
@@ -941,9 +971,8 @@ pub async fn upload_file_with_manifest_with_pool(
     max_retries_per_chunk: usize,
     cache: Option<&crate::cache::ChunkCache>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (manifest_root, work) = prepare_upload_file_with_manifest(
-        signer, batch_id_hex, depth, data, path, content_type,
-    )?;
+    let (manifest_root, work) =
+        prepare_upload_file_with_manifest(signer, batch_id_hex, depth, data, path, content_type)?;
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
@@ -1057,7 +1086,11 @@ fn stamp_chunk(
     let stamp_bytes = stamp.to_bytes().to_vec();
     let mut addr32 = [0u8; 32];
     addr32.copy_from_slice(addr.as_bytes());
-    Ok(StampedChunk { addr: addr32, wire, stamp: stamp_bytes })
+    Ok(StampedChunk {
+        addr: addr32,
+        wire,
+        stamp: stamp_bytes,
+    })
 }
 
 /// Stamp a batch of (address, wire) pairs, signing in parallel via rayon.
@@ -1161,7 +1194,15 @@ pub async fn upload_bytes_ex(
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
-    push_chunks_concurrent(transport, peers, work, max_retries_per_chunk, concurrency, progress).await?;
+    push_chunks_concurrent(
+        transport,
+        peers,
+        work,
+        max_retries_per_chunk,
+        concurrency,
+        progress,
+    )
+    .await?;
     Ok(root)
 }
 
@@ -1195,10 +1236,13 @@ pub async fn upload_bytes_with_pool(
 /// without waiting for pushsync propagation.
 fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
     use bytes::Bytes;
-    cache.put_many(
-        work.iter()
-            .map(|c| (c.addr, Bytes::copy_from_slice(&c.wire), Bytes::copy_from_slice(&c.stamp))),
-    );
+    cache.put_many(work.iter().map(|c| {
+        (
+            c.addr,
+            Bytes::copy_from_slice(&c.wire),
+            Bytes::copy_from_slice(&c.stamp),
+        )
+    }));
 }
 
 /// Split + stamp data, returning the root and the stamped chunks ready
@@ -1336,7 +1380,10 @@ impl SessionEntry {
     /// the pre-warm without paying a fresh dial (so DIAL_COOLDOWN
     /// doesn't apply).
     fn has_pending(&self) -> bool {
-        self.pending.lock().expect("pending mutex poisoned").is_some()
+        self.pending
+            .lock()
+            .expect("pending mutex poisoned")
+            .is_some()
     }
 
     /// Store a freshly-dialed session as the pre-warmed replacement.
@@ -1348,7 +1395,9 @@ impl SessionEntry {
     /// True if the dispatcher should skip this entry for chunks
     /// dispatched right now (peer has been seen to fail recently).
     fn is_dead(&self) -> bool {
-        let deadline = self.skip_until_unix.load(std::sync::atomic::Ordering::Relaxed);
+        let deadline = self
+            .skip_until_unix
+            .load(std::sync::atomic::Ordering::Relaxed);
         deadline > crate::peers::now_unix()
     }
 
@@ -1356,7 +1405,8 @@ impl SessionEntry {
     /// previously-flaky peer doesn't get marked dead by stale
     /// accumulated strikes after it recovers.
     fn clear_strikes(&self) {
-        self.failure_strikes.store(0, std::sync::atomic::Ordering::Relaxed);
+        self.failure_strikes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Record one rotation-dial failure. Returns `true` (and arms the
@@ -1378,7 +1428,9 @@ impl SessionEntry {
     /// is higher than what's currently stored. Called whenever we
     /// learn something new about this peer's depth.
     fn observe_storage_radius(&self, value: u8) {
-        let prev = self.storage_radius.load(std::sync::atomic::Ordering::Relaxed);
+        let prev = self
+            .storage_radius
+            .load(std::sync::atomic::Ordering::Relaxed);
         if value > prev {
             self.storage_radius
                 .store(value, std::sync::atomic::Ordering::Relaxed);
@@ -1497,12 +1549,10 @@ impl SessionEntry {
     /// treats unknown as "potentially yes" rather than excluding
     /// (a known-out-of-AOR peer is worse than an unknown one).
     fn in_aor(&self, chunk_po: u8) -> Option<bool> {
-        let sr = self.storage_radius.load(std::sync::atomic::Ordering::Relaxed);
-        if sr == 0 {
-            None
-        } else {
-            Some(chunk_po >= sr)
-        }
+        let sr = self
+            .storage_radius
+            .load(std::sync::atomic::Ordering::Relaxed);
+        if sr == 0 { None } else { Some(chunk_po >= sr) }
     }
 
     /// Mark this entry as dead for `secs` seconds. Subsequent chunks
@@ -1512,9 +1562,13 @@ impl SessionEntry {
     /// concurrently-failing chunk dispatch.
     fn mark_dead(&self, secs: u64) -> bool {
         let now = crate::peers::now_unix();
-        let was_alive = self.skip_until_unix.load(std::sync::atomic::Ordering::Relaxed) <= now;
+        let was_alive = self
+            .skip_until_unix
+            .load(std::sync::atomic::Ordering::Relaxed)
+            <= now;
         let until = now.saturating_add(secs);
-        self.skip_until_unix.store(until, std::sync::atomic::Ordering::Relaxed);
+        self.skip_until_unix
+            .store(until, std::sync::atomic::Ordering::Relaxed);
         was_alive
     }
 }
@@ -1593,15 +1647,23 @@ impl SessionPool {
         }
         let wrapped: Vec<std::sync::Arc<SessionEntry>> =
             sessions.into_iter().map(std::sync::Arc::new).collect();
-        Ok(Self { sessions: std::sync::Arc::new(std::sync::RwLock::new(wrapped)) })
+        Ok(Self {
+            sessions: std::sync::Arc::new(std::sync::RwLock::new(wrapped)),
+        })
     }
 
     pub fn len(&self) -> usize {
-        self.sessions.read().expect("session pool rwlock poisoned").len()
+        self.sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.sessions.read().expect("session pool rwlock poisoned").is_empty()
+        self.sessions
+            .read()
+            .expect("session pool rwlock poisoned")
+            .is_empty()
     }
 
     /// Take a cheap snapshot of the current entries. Each `Arc` is
@@ -1706,14 +1768,9 @@ impl SessionPool {
         }
         let additional = target_size - current;
         let existing = self.entry_overlays();
-        let new_entries = open_session_pool_filtered(
-            transport,
-            peers,
-            additional,
-            &existing,
-        )
-        .await
-        .unwrap_or_default();
+        let new_entries = open_session_pool_filtered(transport, peers, additional, &existing)
+            .await
+            .unwrap_or_default();
         if new_entries.is_empty() {
             return 0;
         }
@@ -1777,8 +1834,8 @@ pub async fn push_chunks_with_pool(
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     if work.is_empty() {
         return Ok(());
@@ -2438,20 +2495,15 @@ pub async fn push_chunks_with_pool(
             // comparable to bee's `bee_pusher_sync_time` histogram.
             let chunk_ms = t_chunk_start.elapsed().as_millis() as u64;
             if chunk_ms < 500 {
-                crate::transport::diag::CHUNK_LATENCY_LT_500MS
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::transport::diag::CHUNK_LATENCY_LT_500MS.fetch_add(1, Ordering::Relaxed);
             } else if chunk_ms < 2000 {
-                crate::transport::diag::CHUNK_LATENCY_500MS_2S
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::transport::diag::CHUNK_LATENCY_500MS_2S.fetch_add(1, Ordering::Relaxed);
             } else if chunk_ms < 5000 {
-                crate::transport::diag::CHUNK_LATENCY_2_5S
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::transport::diag::CHUNK_LATENCY_2_5S.fetch_add(1, Ordering::Relaxed);
             } else if chunk_ms < 15000 {
-                crate::transport::diag::CHUNK_LATENCY_5_15S
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::transport::diag::CHUNK_LATENCY_5_15S.fetch_add(1, Ordering::Relaxed);
             } else {
-                crate::transport::diag::CHUNK_LATENCY_GT_15S
-                    .fetch_add(1, Ordering::Relaxed);
+                crate::transport::diag::CHUNK_LATENCY_GT_15S.fetch_add(1, Ordering::Relaxed);
             }
             (chunk_for_result, attempts, result)
         }
@@ -2461,15 +2513,11 @@ pub async fn push_chunks_with_pool(
     // inner sleep before delegating) and the initial path (no sleep)
     // unify on a single Future type that FuturesUnordered can hold.
     #[cfg(not(target_arch = "wasm32"))]
-    type DispatchFut<'a> = futures::future::BoxFuture<
-        'a,
-        (Arc<StampedChunk>, u8, Result<(), ClientError>),
-    >;
+    type DispatchFut<'a> =
+        futures::future::BoxFuture<'a, (Arc<StampedChunk>, u8, Result<(), ClientError>)>;
     #[cfg(target_arch = "wasm32")]
-    type DispatchFut<'a> = futures::future::LocalBoxFuture<
-        'a,
-        (Arc<StampedChunk>, u8, Result<(), ClientError>),
-    >;
+    type DispatchFut<'a> =
+        futures::future::LocalBoxFuture<'a, (Arc<StampedChunk>, u8, Result<(), ClientError>)>;
     let mut inflight: FuturesUnordered<DispatchFut<'_>> = FuturesUnordered::new();
     let mut iter = work.into_iter().map(|c| Arc::new(c));
 
@@ -2495,10 +2543,7 @@ pub async fn push_chunks_with_pool(
     // snapshot index changes between dispatch and resolution.
     #[cfg(not(target_arch = "wasm32"))]
     let mut prewarm_dials: FuturesUnordered<
-        futures::future::BoxFuture<
-            '_,
-            (Arc<SessionEntry>, Result<PeerSession, TransportError>),
-        >,
+        futures::future::BoxFuture<'_, (Arc<SessionEntry>, Result<PeerSession, TransportError>)>,
     > = FuturesUnordered::new();
     #[cfg(target_arch = "wasm32")]
     let mut prewarm_dials: FuturesUnordered<
@@ -2512,86 +2557,80 @@ pub async fn push_chunks_with_pool(
     // candidates or heartbeat. The snapshot is cheap (Vec of Arc
     // clones); all entries are treated identically for ghost-balance
     // pre-warm purposes.
-    let maybe_prewarm = |entries: &[Arc<SessionEntry>],
-                         idx: usize,
-                         prewarm_dials: &mut FuturesUnordered<_>| {
-        let entry = &entries[idx];
-        // Don't prewarm a parked entry — that's the path that gets us
-        // rate-limited by bee in the first place (`record_failure` parks
-        // the entry after 3 consecutive dial failures, almost always
-        // because of bee's per-IP libp2p connection rate limit). Let
-        // the dead window run out before we try again.
-        if entry.is_dead() {
-            return;
-        }
-        // Two triggers for a prewarm:
-        // 1. Ghost balance has crossed the prewarm watermark — the
-        //    session is on track to retire from accounting pressure.
-        //    Get a replacement ready before the rotation point so the
-        //    swap is instant.
-        // 2. The session's driver has already exited (`is_alive` is
-        //    false) for any reason. On mainnet the dominant retirement
-        //    cause is `dead_low_ghost` — the libp2p connection dies for
-        //    non-accounting reasons (NAT keepalive expiry, bee restart,
-        //    yamux idle timeout, transient network blip) well before
-        //    ghost balance approaches the prewarm watermark. Without
-        //    this trigger the next push to this entry has to do a
-        //    synchronous re-dial inside `try_push_with_rotation`,
-        //    blocking the dispatcher for one full dial RTT
-        //    (~500-1500 ms on mainnet). With the trigger, the prewarm
-        //    happens in the background and the swap is instant.
-        let session = entry.snapshot();
-        let ghost = session.ghost_balance_plur();
-        let dead = !session.is_alive();
-        // The dead-trigger is speculative: we don't know yet whether
-        // bee is willing to talk to us again. If a prior prewarm /
-        // rotation dial already failed (strikes > 0), back off the
-        // dead-trigger and let the dead-skip window run — repeatedly
-        // re-dialing a peer that already refused us once burns bee's
-        // per-IP libp2p rate limit (10 RPS / burst 40 per /32 — see
-        // `pkg/p2p/libp2p/libp2p.go::connLimiter`) and contributes
-        // nothing. The ghost-trigger still fires: that means the
-        // existing connection is being retired due to local
-        // accounting, which is independent of dial health.
-        let strikes = entry
-            .failure_strikes
-            .load(std::sync::atomic::Ordering::Relaxed);
-        let dead_trigger_ok = dead && strikes == 0;
-        let trigger = ghost >= PREWARM_GHOST_BALANCE_PLUR || dead_trigger_ok;
-        if trigger
-            && entry
-                .prewarm_inflight
-                .compare_exchange(
-                    false,
-                    true,
-                    Ordering::AcqRel,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            // Attribute the trigger to the most-specific reason.
-            // `dead_trigger_ok` (dead + strikes == 0) takes precedence
-            // because that's the new path; ghost-only firings are the
-            // pre-existing pre-warm cause.
-            if dead_trigger_ok {
-                crate::transport::diag::PREWARM_ON_DEAD.fetch_add(1, Ordering::Relaxed);
-            } else {
-                crate::transport::diag::PREWARM_ON_GHOST.fetch_add(1, Ordering::Relaxed);
+    let maybe_prewarm =
+        |entries: &[Arc<SessionEntry>], idx: usize, prewarm_dials: &mut FuturesUnordered<_>| {
+            let entry = &entries[idx];
+            // Don't prewarm a parked entry — that's the path that gets us
+            // rate-limited by bee in the first place (`record_failure` parks
+            // the entry after 3 consecutive dial failures, almost always
+            // because of bee's per-IP libp2p connection rate limit). Let
+            // the dead window run out before we try again.
+            if entry.is_dead() {
+                return;
             }
-            let underlay = entry.underlay.clone();
-            let entry = entry.clone();
-            #[cfg(not(target_arch = "wasm32"))]
-            prewarm_dials.push(Box::pin(async move {
-                let res = transport.open_session(&underlay).await;
-                (entry, res)
-            }) as futures::future::BoxFuture<'_, _>);
-            #[cfg(target_arch = "wasm32")]
-            prewarm_dials.push(Box::pin(async move {
-                let res = transport.open_session(&underlay).await;
-                (entry, res)
-            }) as futures::future::LocalBoxFuture<'_, _>);
-        }
-    };
+            // Two triggers for a prewarm:
+            // 1. Ghost balance has crossed the prewarm watermark — the
+            //    session is on track to retire from accounting pressure.
+            //    Get a replacement ready before the rotation point so the
+            //    swap is instant.
+            // 2. The session's driver has already exited (`is_alive` is
+            //    false) for any reason. On mainnet the dominant retirement
+            //    cause is `dead_low_ghost` — the libp2p connection dies for
+            //    non-accounting reasons (NAT keepalive expiry, bee restart,
+            //    yamux idle timeout, transient network blip) well before
+            //    ghost balance approaches the prewarm watermark. Without
+            //    this trigger the next push to this entry has to do a
+            //    synchronous re-dial inside `try_push_with_rotation`,
+            //    blocking the dispatcher for one full dial RTT
+            //    (~500-1500 ms on mainnet). With the trigger, the prewarm
+            //    happens in the background and the swap is instant.
+            let session = entry.snapshot();
+            let ghost = session.ghost_balance_plur();
+            let dead = !session.is_alive();
+            // The dead-trigger is speculative: we don't know yet whether
+            // bee is willing to talk to us again. If a prior prewarm /
+            // rotation dial already failed (strikes > 0), back off the
+            // dead-trigger and let the dead-skip window run — repeatedly
+            // re-dialing a peer that already refused us once burns bee's
+            // per-IP libp2p rate limit (10 RPS / burst 40 per /32 — see
+            // `pkg/p2p/libp2p/libp2p.go::connLimiter`) and contributes
+            // nothing. The ghost-trigger still fires: that means the
+            // existing connection is being retired due to local
+            // accounting, which is independent of dial health.
+            let strikes = entry
+                .failure_strikes
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let dead_trigger_ok = dead && strikes == 0;
+            let trigger = ghost >= PREWARM_GHOST_BALANCE_PLUR || dead_trigger_ok;
+            if trigger
+                && entry
+                    .prewarm_inflight
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Relaxed)
+                    .is_ok()
+            {
+                // Attribute the trigger to the most-specific reason.
+                // `dead_trigger_ok` (dead + strikes == 0) takes precedence
+                // because that's the new path; ghost-only firings are the
+                // pre-existing pre-warm cause.
+                if dead_trigger_ok {
+                    crate::transport::diag::PREWARM_ON_DEAD.fetch_add(1, Ordering::Relaxed);
+                } else {
+                    crate::transport::diag::PREWARM_ON_GHOST.fetch_add(1, Ordering::Relaxed);
+                }
+                let underlay = entry.underlay.clone();
+                let entry = entry.clone();
+                #[cfg(not(target_arch = "wasm32"))]
+                prewarm_dials.push(Box::pin(async move {
+                    let res = transport.open_session(&underlay).await;
+                    (entry, res)
+                }) as futures::future::BoxFuture<'_, _>);
+                #[cfg(target_arch = "wasm32")]
+                prewarm_dials.push(Box::pin(async move {
+                    let res = transport.open_session(&underlay).await;
+                    (entry, res)
+                }) as futures::future::LocalBoxFuture<'_, _>);
+            }
+        };
 
     let mut first_err: Option<ClientError> = None;
     let mut more_chunks = true;
@@ -3118,9 +3157,7 @@ const SESSION_DIAL_PARALLELISM: usize = 128;
 /// prefix. Uses an "anti-prefix" bucket walk: for every PO bin (8-bit
 /// high-byte group, 256 in total) we round-robin one peer at a time.
 /// Cheap (O(N)) and deterministic; no RNG dep.
-fn spread_across_address_space(
-    peers: &mut Vec<(SwarmAddress, String, Multiaddr, bool)>,
-) {
+fn spread_across_address_space(peers: &mut Vec<(SwarmAddress, String, Multiaddr, bool)>) {
     // 256 buckets by overlay's leading byte; cheap to compute, gives
     // even distribution across the first 8 PO bins for random overlays.
     let mut buckets: Vec<Vec<(SwarmAddress, String, Multiaddr, bool)>> =
@@ -3200,12 +3237,16 @@ async fn open_session_pool_filtered(
         .filter_map(|p| {
             let underlay = p.first_dialable_underlay()?;
             let overlay = p.overlay_address()?;
-            Some((overlay, p.overlay.clone(), underlay, p.is_recently_unreachable(now)))
+            Some((
+                overlay,
+                p.overlay.clone(),
+                underlay,
+                p.is_recently_unreachable(now),
+            ))
         })
         .collect();
     spread_across_address_space(&mut all);
-    let (fresh, stale): (Vec<_>, Vec<_>) =
-        all.into_iter().partition(|(_, _, _, stale)| !stale);
+    let (fresh, stale): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, _, _, stale)| !stale);
     let candidates: Vec<(SwarmAddress, String, Multiaddr)> = fresh
         .into_iter()
         .chain(stale.into_iter())
@@ -3281,10 +3322,9 @@ async fn open_session_pool_filtered(
                 debug!(target: "isheika::upload",
                     "session opened to {} ({}) in {} ms",
                     overlay_hex, underlay, rtt_ms);
-                log.lock().unwrap().insert(
-                    overlay_hex.to_lowercase(),
-                    DialResult::Success { rtt_ms },
-                );
+                log.lock()
+                    .unwrap()
+                    .insert(overlay_hex.to_lowercase(), DialResult::Success { rtt_ms });
                 sessions.push(SessionEntry {
                     overlay,
                     overlay_hex,
@@ -3314,7 +3354,8 @@ async fn open_session_pool_filtered(
                 // log shows only the successful pool size.
                 debug!(target: "isheika::upload",
                     "session to {} failed: {}", overlay_hex, e);
-                log.lock().unwrap()
+                log.lock()
+                    .unwrap()
                     .insert(overlay_hex.to_lowercase(), DialResult::Failure);
             }
         }
@@ -3334,11 +3375,7 @@ async fn open_session_pool_filtered(
 /// failure (with rtt) into the reachability log without keeping the
 /// resulting sessions open. Called optionally by `discover` after a hive
 /// round to pre-prune dead peers from `peers.json`.
-pub async fn healthcheck_peers(
-    transport: &Transport,
-    peers: &PeerStore,
-    concurrency: usize,
-) {
+pub async fn healthcheck_peers(transport: &Transport, peers: &PeerStore, concurrency: usize) {
     let log = transport.reachability_log();
     use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -3372,7 +3409,11 @@ pub async fn healthcheck_peers(
         }
         log.lock().unwrap().insert(
             overlay_hex.to_lowercase(),
-            if ok { DialResult::Success { rtt_ms } } else { DialResult::Failure },
+            if ok {
+                DialResult::Success { rtt_ms }
+            } else {
+                DialResult::Failure
+            },
         );
         if let Some((overlay_hex, underlay)) = iter.next() {
             inflight.push(probe(overlay_hex, underlay));
@@ -3405,4 +3446,7 @@ fn parse_batch_id(hex_str: &str) -> Result<BatchId, ClientError> {
 // Unused trait imports kept here to ensure the bridge between sync/async
 // store traits is available (nectar wires them via blanket impls).
 #[allow(dead_code)]
-fn _store_traits_in_scope<S: SyncChunkGet<DEFAULT_BODY_SIZE> + SyncChunkPut<DEFAULT_BODY_SIZE>>(_: S) {}
+fn _store_traits_in_scope<S: SyncChunkGet<DEFAULT_BODY_SIZE> + SyncChunkPut<DEFAULT_BODY_SIZE>>(
+    _: S,
+) {
+}

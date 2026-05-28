@@ -28,7 +28,9 @@ pub async fn write_message<W: AsyncWrite + Unpin, M: Message>(
     let mut buf = Vec::with_capacity(msg.encoded_len() + 4);
     msg.encode_length_delimited(&mut buf)
         .map_err(|e| FrameError::Decode(e.to_string()))?;
-    w.write_all(&buf).await.map_err(|e| FrameError::Io(e.to_string()))?;
+    w.write_all(&buf)
+        .await
+        .map_err(|e| FrameError::Io(e.to_string()))?;
     w.flush().await.map_err(|e| FrameError::Io(e.to_string()))?;
     Ok(())
 }
@@ -41,7 +43,9 @@ pub async fn read_message<R: AsyncRead + Unpin, M: Message + Default>(
         return Err(FrameError::TooLarge(len));
     }
     let mut buf = vec![0u8; len];
-    r.read_exact(&mut buf).await.map_err(|e| FrameError::Io(e.to_string()))?;
+    r.read_exact(&mut buf)
+        .await
+        .map_err(|e| FrameError::Io(e.to_string()))?;
     M::decode(&buf[..]).map_err(|e| FrameError::Decode(e.to_string()))
 }
 
@@ -50,7 +54,9 @@ async fn read_uvarint<R: AsyncRead + Unpin>(r: &mut R) -> Result<usize, FrameErr
     let mut value: u64 = 0;
     let mut shift: u32 = 0;
     for _ in 0..10 {
-        r.read_exact(&mut byte).await.map_err(|e| FrameError::Io(e.to_string()))?;
+        r.read_exact(&mut byte)
+            .await
+            .map_err(|e| FrameError::Io(e.to_string()))?;
         let b = byte[0] as u64;
         value |= (b & 0x7f) << shift;
         if (b & 0x80) == 0 {
@@ -62,9 +68,7 @@ async fn read_uvarint<R: AsyncRead + Unpin>(r: &mut R) -> Result<usize, FrameErr
 }
 
 /// Strip a single length-delimited message from a `BytesMut` if available.
-pub fn try_take_message<M: Message + Default>(
-    buf: &mut BytesMut,
-) -> Result<Option<M>, FrameError> {
+pub fn try_take_message<M: Message + Default>(buf: &mut BytesMut) -> Result<Option<M>, FrameError> {
     let mut shift = 0u32;
     let mut len: u64 = 0;
     let bytes = &buf[..];

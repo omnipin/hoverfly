@@ -115,9 +115,9 @@ impl ChequeStore {
             });
         }
         for (k, v) in on_disk.peers {
-            let n: u128 = v.parse().map_err(|e: std::num::ParseIntError| {
-                ChequeStoreError::Parse(e.to_string())
-            })?;
+            let n: u128 = v
+                .parse()
+                .map_err(|e: std::num::ParseIntError| ChequeStoreError::Parse(e.to_string()))?;
             store.payouts.insert(k.to_lowercase(), n);
         }
         Ok(store)
@@ -156,7 +156,9 @@ impl ChequeStore {
     /// (~50 bytes per peer we've ever paid). Called from the same
     /// `apply_log`-style flush path peers.json uses.
     pub fn save(&self) -> Result<(), ChequeStoreError> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         let on_disk = OnDisk {
             version: 1,
             chequebook: format!("0x{}", hex::encode(self.chequebook)),

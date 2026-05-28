@@ -18,7 +18,7 @@
 //! already exchanged headers (see `transport.rs::write_then_read_empty_headers`).
 
 use crate::proto::pseudosettle as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use thiserror::Error;
 
 pub const PROTOCOL: &str = "/swarm/pseudosettle/1.0.0/pseudosettle";

@@ -5,7 +5,7 @@
 
 use crate::proto::headers as hdr;
 use crate::proto::pushsync as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use thiserror::Error;
 
 pub const PROTOCOL: &str = "/swarm/pushsync/1.3.1/pushsync";

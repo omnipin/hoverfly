@@ -31,7 +31,7 @@
 
 use crate::proto::headers as hdr;
 use crate::proto::swap as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use alloy_primitives::U256;
 use thiserror::Error;
 

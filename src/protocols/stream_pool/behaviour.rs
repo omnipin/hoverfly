@@ -17,9 +17,9 @@ use swarm::{
 };
 
 use crate::protocols::stream_pool::{
-    handler::{Handler, DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES},
-    shared::Shared,
     Control,
+    handler::{DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES, Handler},
+    shared::Shared,
 };
 
 /// A generic behaviour for stream-oriented protocols.

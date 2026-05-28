@@ -21,7 +21,7 @@
 use crate::peers::Peer;
 use crate::proto::headers as hdr;
 use crate::proto::hive as pb;
-use crate::protocols::framing::{read_message, write_message, FrameError};
+use crate::protocols::framing::{FrameError, read_message, write_message};
 use libp2p::Multiaddr;
 use thiserror::Error;
 
@@ -210,7 +210,9 @@ fn deserialize_underlays(data: &[u8]) -> Result<Vec<Multiaddr>, ()> {
     if data[0] == UNDERLAY_LIST_PREFIX {
         return deserialize_list(&data[1..]);
     }
-    Multiaddr::try_from(data.to_vec()).map(|m| vec![m]).map_err(|_| ())
+    Multiaddr::try_from(data.to_vec())
+        .map(|m| vec![m])
+        .map_err(|_| ())
 }
 
 fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, ()> {

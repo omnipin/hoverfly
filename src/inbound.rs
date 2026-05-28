@@ -32,9 +32,8 @@ use crate::protocols::status::StatusSnapshot;
 use crate::protocols::{hive, pricing, retrieval, status};
 use crate::signer::SwarmSigner;
 use crate::transport::{
-    build_swarm_from, respond_to_handshake, BehaviourEvent, HANDSHAKE_PROTO_V14,
-    HANDSHAKE_PROTO_V15, HIVE_PROTO_V1, HIVE_PROTO_V2,
-    PRICING_PROTO, RETRIEVAL_PROTO, STATUS_PROTO,
+    BehaviourEvent, HANDSHAKE_PROTO_V14, HANDSHAKE_PROTO_V15, HIVE_PROTO_V1, HIVE_PROTO_V2,
+    PRICING_PROTO, RETRIEVAL_PROTO, STATUS_PROTO, build_swarm_from, respond_to_handshake,
 };
 
 #[derive(Debug, Error)]
@@ -91,8 +90,8 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
         cfg.idle_timeout,
         crate::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
     )
-        .await
-        .map_err(|e| InboundError::Build(e.to_string()))?;
+    .await
+    .map_err(|e| InboundError::Build(e.to_string()))?;
     swarm
         .listen_on(cfg.listen.clone())
         .map_err(|e| InboundError::Listen(format!("listen on {}: {e}", cfg.listen)))?;

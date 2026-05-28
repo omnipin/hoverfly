@@ -16,7 +16,7 @@ use libp2p::swarm::{
     handler::{ConnectionEvent, DialUpgradeError, FullyNegotiatedInbound, FullyNegotiatedOutbound},
 };
 
-use crate::protocols::stream_pool::{shared::Shared, upgrade::Upgrade, OpenStreamError};
+use crate::protocols::stream_pool::{OpenStreamError, shared::Shared, upgrade::Upgrade};
 
 /// Default cap on concurrent outbound substream upgrades per
 /// connection when the caller (e.g. [`Behaviour::new`]) doesn't
@@ -108,8 +108,13 @@ impl ConnectionHandler for Handler {
     fn poll(
         &mut self,
         cx: &mut Context<'_>,
-    ) -> Poll<swarm::ConnectionHandlerEvent<Self::OutboundProtocol, Self::OutboundOpenInfo, Self::ToBehaviour>>
-    {
+    ) -> Poll<
+        swarm::ConnectionHandlerEvent<
+            Self::OutboundProtocol,
+            Self::OutboundOpenInfo,
+            Self::ToBehaviour,
+        >,
+    > {
         // First: emit any queued substream requests (we can only yield
         // one event per `poll` call, so we buffer extras here).
         if let Some((id, upgrade)) = self.pending_emit.pop_front() {
@@ -123,16 +128,12 @@ impl ConnectionHandler for Handler {
         // emitted) or the channel returns Pending. Each pulled
         // request becomes either an immediate emit (this poll) or a
         // queued emit (next polls).
-        while self.pending_upgrades.len() + self.pending_emit.len()
-            < self.max_concurrent_upgrades
-        {
+        while self.pending_upgrades.len() + self.pending_emit.len() < self.max_concurrent_upgrades {
             match self.receiver.poll_next_unpin(cx) {
                 Poll::Ready(Some(new_stream)) => {
                     let id = self.alloc_id();
-                    self.pending_upgrades.insert(
-                        id,
-                        (new_stream.protocol.clone(), new_stream.sender),
-                    );
+                    self.pending_upgrades
+                        .insert(id, (new_stream.protocol.clone(), new_stream.sender));
                     let upgrade = Upgrade {
                         supported_protocols: vec![new_stream.protocol],
                     };

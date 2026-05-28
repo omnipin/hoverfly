@@ -108,10 +108,7 @@ pub fn validate<'a>(chunk_addr: &[u8; 32], stamp: &'a [u8]) -> Result<ValidStamp
 /// but operates on a raw 32-byte digest rather than an EIP-191
 /// prefixed payload (since bee's stamp signer does NOT use the
 /// EIP-191 prefix — see `postage/stamp.go::ToSignDigest`).
-fn recover_secp256k1_address(
-    digest: &[u8; 32],
-    signature: &[u8],
-) -> Result<[u8; 20], StampError> {
+fn recover_secp256k1_address(digest: &[u8; 32], signature: &[u8]) -> Result<[u8; 20], StampError> {
     use k256::ecdsa::{RecoveryId, Signature as K256Sig, VerifyingKey};
 
     if signature.len() != 65 {
@@ -125,7 +122,10 @@ fn recover_secp256k1_address(
         v -= 27;
     }
     if v > 1 {
-        return Err(StampError::BadSignature(format!("bad v byte: {}", signature[64])));
+        return Err(StampError::BadSignature(format!(
+            "bad v byte: {}",
+            signature[64]
+        )));
     }
     let k_sig = K256Sig::from_slice(&signature[..64])
         .map_err(|e| StampError::BadSignature(format!("k256 sig parse: {e}")))?;
@@ -148,7 +148,10 @@ mod tests {
     #[test]
     fn bad_length_rejected() {
         let chunk = [0u8; 32];
-        assert!(matches!(validate(&chunk, &[]), Err(StampError::BadLength(0))));
+        assert!(matches!(
+            validate(&chunk, &[]),
+            Err(StampError::BadLength(0))
+        ));
         assert!(matches!(
             validate(&chunk, &[0u8; 100]),
             Err(StampError::BadLength(100))
