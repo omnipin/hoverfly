@@ -10,13 +10,22 @@ Three operations: `discover`, `fetch`, `upload`.
 
 ## Setup
 
-Build the binary:
+### 1. Install isheika
 
 ```bash
-cargo build --release --bin isheika
+curl -fsSL https://raw.githubusercontent.com/omnipin/isheika/main/install.sh | sh
 ```
 
-### 1. Generate a key
+Drops the latest prebuilt `isheika` into `~/.local/bin` (override with
+`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.0`). Prebuilts
+cover Linux x86_64 / aarch64 and macOS x86_64 / aarch64; on anything
+else, build from source:
+
+```bash
+cargo install --git https://github.com/omnipin/isheika
+```
+
+### 2. Generate a key
 
 Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is
 your long-lived signer. Bee uses the derived Ethereum address to
@@ -38,9 +47,7 @@ that lands your overlay in less-saturated kademlia bins — empirically
 **~25% higher upload throughput** vs random.
 
 ```bash
-./target/release/isheika vanity-overlay \
-  --key 0xYOUR_KEY \
-  --output overlay-nonce
+isheika vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
 ```
 
 CPU-bound and one-time (seconds to minutes depending on target PO and
@@ -60,11 +67,7 @@ step 1 with a little xDAI (for gas) and some BZZ (for the batch
 itself), then:
 
 ```bash
-./target/release/isheika batch create \
-  --rpc-url https://rpc.gnosischain.com \
-  --key 0xYOUR_KEY \
-  --size 2GB \
-  --duration 30d
+isheika batch create --rpc-url https://rpc.gnosischain.com --key 0xYOUR_KEY --size 2GB --duration 30d
 ```
 
 `--size` and `--duration` map to `--depth` and `--amount-per-chunk`
@@ -93,13 +96,7 @@ upload). For one-shot uploads you can skip this step and pass
 `--peerlist` directly to `isheika upload`.
 
 ```bash
-./target/release/isheika daemon \
-  --socket /tmp/isheika.sock \
-  --pool-size 256 \
-  --listen /ip4/0.0.0.0/tcp/1635 \
-  --identity 0xYOUR_KEY \
-  --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 \
-  --discover-rounds 3
+isheika daemon --socket /tmp/isheika.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
 ```
 
 The repo ships a curated `peers.seed.json` (committed); the daemon
@@ -113,11 +110,7 @@ cp peers.seed.json peers.json
 ### 5. Upload
 
 ```bash
-./target/release/isheika upload \
-  --daemon /tmp/isheika.sock \
-  --batch YOUR_BATCH_ID_HEX \
-  --key 0xYOUR_KEY \
-  path/to/file.bin
+isheika upload --daemon /tmp/isheika.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
 ```
 
 A `.tar` input is auto-treated as a collection (multi-file mantaray);
