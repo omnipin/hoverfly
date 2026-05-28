@@ -10,42 +10,54 @@ Three operations: `discover`, `fetch`, `upload`.
 
 ## Setup
 
-isheika identifies itself on the network with **two persistent pieces of
-state** — generate them once, reuse forever:
+Build the binary:
 
-1. **A secp256k1 private key** (`--key` / `--identity`, 32 bytes hex).
-   This is your long-lived signer; bee uses the derived Ethereum address
-   to recognize you across reconnects, route cheques, and verify your
-   postage stamps. Generate however you'd usually generate one
-   (`openssl rand -hex 32`, hardware wallet, etc.).
+```bash
+cargo build --release --bin isheika
+```
 
-2. **An overlay nonce** (`--nonce-file`, 32 bytes hex). Your Swarm
-   overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A random nonce
-   works, but `isheika vanity-overlay` can search for a nonce that lands
-   your overlay in less-saturated kademlia bins — empirically **~25%
-   higher upload throughput** versus random (see
-   `.github/workflows/bench.yml` A/B in commit history).
+### 1. Generate a key
 
-   ```bash
-   ./target/release/isheika vanity-overlay \
-     --key 0xYOUR_KEY \
-     --output overlay-nonce
-   ```
+Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is
+your long-lived signer. Bee uses the derived Ethereum address to
+recognize you across reconnects, route cheques, and verify your
+postage stamps.
 
-   This is **CPU-bound and one-time** (seconds to minutes depending on
-   target PO and seed size). The written `overlay-nonce` is then reused
-   by the daemon/upload commands forever. Treat it like a secret — losing
-   it means losing your accumulated kademlia presence on the network.
+```bash
+cast wallet new
+```
 
-A `(key, overlay-nonce)` pair is your Swarm identity. Don't share nonces
-across keys (a vanity nonce for key A is just a random nonce for key B),
-and don't run two daemons with the same identity simultaneously (bee
-disconnects both for conflicting underlay).
+Save the printed `Private key` and `Address` — both are useful (the
+key for `--key`/`--identity`, the address for funding xDAI + BZZ).
 
-## Postage batches
+### 2. Generate a vanity overlay nonce
 
-Uploads need a postage stamp batch. Create one on-chain via
-`isheika batch create` (Gnosis chain by default):
+Your Swarm overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A
+random nonce works, but `isheika vanity-overlay` searches for one
+that lands your overlay in less-saturated kademlia bins — empirically
+**~25% higher upload throughput** vs random.
+
+```bash
+./target/release/isheika vanity-overlay \
+  --key 0xYOUR_KEY \
+  --output overlay-nonce
+```
+
+CPU-bound and one-time (seconds to minutes depending on target PO and
+seed size). The written `overlay-nonce` file is reused by every
+subsequent daemon / upload command. Treat it like a secret — losing
+it means losing your accumulated kademlia presence on the network.
+
+A `(key, overlay-nonce)` pair is your Swarm identity. Don't share
+nonces across keys (a vanity nonce for key A is just a random nonce
+for key B), and don't run two daemons with the same identity
+simultaneously (bee disconnects both for conflicting underlay).
+
+### 3. Create a postage batch
+
+Uploads need a postage stamp batch on-chain. Fund the address from
+step 1 with a little xDAI (for gas) and some BZZ (for the batch
+itself), then:
 
 ```bash
 ./target/release/isheika batch create \
@@ -55,18 +67,16 @@ Uploads need a postage stamp batch. Create one on-chain via
   --duration 30d
 ```
 
-`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via
-the same formulas as the [official postage stamp
+`--size` and `--duration` map to `--depth` and `--amount-per-chunk`
+via the same formulas as the [official postage stamp
 calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators)
 (smallest depth whose effective volume covers the requested size,
-unencrypted + no erasure coding). If you'd rather set them directly,
-`--depth` + `--amount-per-chunk` still works.
+unencrypted + no erasure coding). `--depth` + `--amount-per-chunk`
+still works if you want to set them explicitly.
 
-**Wait before using a new batch.** The on-chain `BatchCreated` event has
-to propagate to the bee nodes you'll push chunks to. Until they ingest
-it, pushsync rejects your stamps as `batch not on-chain or expired`.
-Typical propagation is 1-3 minutes. Poll
-[Swarmscan](https://swarmscan.io/) until it returns the batch:
+The on-chain `BatchCreated` event takes 1-3 minutes to propagate to
+the bee nodes that'll accept your stamps. Poll
+[Swarmscan](https://swarmscan.io/) until it 200s the batch:
 
 ```bash
 curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
@@ -74,33 +84,35 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 # 200 with a JSON body = ready to use
 ```
 
-Once that 200s, you can `isheika upload --batch <BATCH_ID> ...`.
+### 4. Run the daemon
 
-## Quick start
-
-Build the native binary:
-
-```bash
-cargo build --release --bin isheika
-```
-
-Bench daemon-mode upload throughput (default `--pool-size 256`):
+A long-lived daemon holds a warm session pool across uploads — ~5x
+throughput vs running a fresh upload each time (the per-upload cost
+of filling 256 peer sessions is paid once at daemon startup, not per
+upload). For one-shot uploads you can skip this step and pass
+`--peerlist` directly to `isheika upload`.
 
 ```bash
-# In one terminal — start a long-lived daemon.
-./target/release/isheika \
-  --nonce-file overlay-nonce \
-  --buffer-multiplier 2 \
-  daemon \
+./target/release/isheika daemon \
   --socket /tmp/isheika.sock \
-  --peerlist peers.json \
   --pool-size 256 \
   --listen /ip4/0.0.0.0/tcp/1635 \
   --identity 0xYOUR_KEY \
   --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 \
   --discover-rounds 3
+```
 
-# In another — upload through the daemon.
+The repo ships a curated `peers.seed.json` (committed); the daemon
+loads it via `--peerlist` (default: `peers.json`) for fast cold-start
+without running `discover` first. Copy it before first start:
+
+```bash
+cp peers.seed.json peers.json
+```
+
+### 5. Upload
+
+```bash
 ./target/release/isheika upload \
   --daemon /tmp/isheika.sock \
   --batch YOUR_BATCH_ID_HEX \
@@ -108,9 +120,9 @@ Bench daemon-mode upload throughput (default `--pool-size 256`):
   path/to/file.bin
 ```
 
-The daemon ships with a curated `peers.seed.json` (committed); copy it
-to your daemon's `--peerlist peers.json` for fast cold-start without
-running `discover` first.
+A `.tar` input is auto-treated as a collection (multi-file mantaray);
+pass `--collection` to force collection mode on any other extension.
+See `isheika upload --help` for the rest.
 
 ## Bench targets
 
@@ -151,7 +163,3 @@ Not stable. The Cargo description is `0.1.0` and the API will change.
 Useful as an audit reference for the bee protocols and as a
 deployment client when you need uploads from somewhere bee won't run
 (WASM, CI, light constrained environments).
-
-## License
-
-MIT.
