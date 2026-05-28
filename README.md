@@ -12,7 +12,6 @@ Three operations: `discover`, `fetch`, `upload`.
 
 - **Small.** ~6 MB compressed; 10 MB stripped binary.
 - **Runs in a browser.** First-class `wasm32` target (WebSocket transport).
-- **No bee dependency.** Talks bee's libp2p protocols directly.
 - **Daemon + one-shot modes.** Warm session pool for sustained uploads, ~5× the cold-start throughput.
 - **TAR collections.** Multi-file uploads as mantaray manifests, addressable by path.
 - **On-chain batch creation.** `isheika batch create --size 2GB --duration 30d` issues a postage batch on Gnosis chain.
