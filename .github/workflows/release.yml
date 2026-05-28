@@ -1,12 +1,16 @@
 name: release
 
-# Builds release tarballs for each supported (target, runner) and
-# attaches them to a draft GitHub release named after the pushed tag.
-# Maintainer reviews the draft and publishes manually.
+# Triggered when you publish a GitHub release (or pre-release) via the
+# UI / API. The release itself — with auto-generated changelog notes —
+# is created manually so GitHub's "Generate release notes" button can
+# do its thing. This workflow only attaches platform binaries.
 #
-# Trigger: push a `vX.Y.Z` tag whose semver matches Cargo.toml.
-#
-#   git tag -a v0.2.0 -m v0.2.0 && git push origin v0.2.0
+# Workflow:
+#   1. Tag locally and push it:  git push origin v0.2.0
+#   2. On GitHub, "Draft a new release" against the tag, click
+#      "Generate release notes", review, then "Publish release".
+#   3. This workflow fires, builds for each target, and uploads
+#      `isheika-vX.Y.Z-<target>.tar.gz` + .sha256 to the release.
 #
 # Each tarball ships:
 #   isheika-vX.Y.Z-<target>/
@@ -22,57 +26,15 @@ name: release
 #     -R omnipin/isheika
 
 on:
-  push:
-    tags: ['v[0-9]+.[0-9]+.[0-9]+']
+  release:
+    types: [published, prereleased]
 
 permissions:
   contents: read
 
 jobs:
-  create-release:
-    name: Create draft release
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    outputs:
-      version: ${{ steps.tag.outputs.version }}
-    steps:
-      - uses: actions/checkout@v6
-
-      - id: tag
-        name: Resolve version
-        run: echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
-
-      - name: Verify Cargo.toml version matches tag
-        # Catches "tagged v0.2.0 but forgot to bump Cargo.toml" before
-        # spending matrix-build time on stale artifacts.
-        run: |
-          tag="${{ steps.tag.outputs.version }}"
-          want="${tag#v}"
-          got="$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)"
-          if [ "$want" != "$got" ]; then
-            echo "::error::tag $tag implies Cargo.toml version $want, but Cargo.toml says $got"
-            exit 1
-          fi
-
-      - name: Create draft release
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        # `|| true` so reruns of a partially-failed pipeline don't
-        # abort on "release already exists" — the upload step on each
-        # build job uses `--clobber`.
-        run: |
-          gh release create "${{ steps.tag.outputs.version }}" \
-            --repo "${{ github.repository }}" \
-            --draft \
-            --verify-tag \
-            --title "${{ steps.tag.outputs.version }}" \
-            --notes "Auto-generated draft. Review and publish manually." \
-          || gh release view "${{ steps.tag.outputs.version }}" --repo "${{ github.repository }}"
-
   build:
     name: ${{ matrix.target }}
-    needs: create-release
     runs-on: ${{ matrix.runner }}
     permissions:
       contents: write
@@ -102,6 +64,23 @@ jobs:
 
     steps:
       - uses: actions/checkout@v6
+        with:
+          # Check out the exact commit the release tag points at —
+          # the default would be whatever default branch HEAD is at,
+          # which can drift past the tagged commit.
+          ref: ${{ github.event.release.tag_name }}
+
+      - name: Verify Cargo.toml version matches release tag
+        # Catches "tagged v0.2.0 but forgot to bump Cargo.toml" before
+        # spending matrix-build time on stale artifacts.
+        run: |
+          tag="${{ github.event.release.tag_name }}"
+          want="${tag#v}"
+          got="$(awk -F'"' '/^version =/{print $2; exit}' Cargo.toml)"
+          if [ "$want" != "$got" ]; then
+            echo "::error::tag $tag implies Cargo.toml version $want, but Cargo.toml says $got"
+            exit 1
+          fi
 
       - name: Install Rust toolchain
         run: |
@@ -160,7 +139,7 @@ jobs:
       - name: Package tarball
         id: package
         run: |
-          ver="${{ needs.create-release.outputs.version }}"
+          ver="${{ github.event.release.tag_name }}"
           name="isheika-${ver}-${{ matrix.target }}"
           stage="stage/${name}"
           mkdir -p "$stage"
@@ -187,7 +166,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          gh release upload "${{ needs.create-release.outputs.version }}" \
+          gh release upload "${{ github.event.release.tag_name }}" \
             --repo "${{ github.repository }}" \
             --clobber \
             "${{ steps.package.outputs.tarball }}" \
