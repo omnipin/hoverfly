@@ -10,34 +10,14 @@ Three operations: `discover`, `fetch`, `upload`.
 
 ## Features
 
-- **Small binaries.** ~6-8 MB compressed per platform. The full
-  end-to-end client — libp2p stack, bee wire protocols, mantaray
-  manifests, postage stamps, on-chain batch creation — fits in
-  10 MB of stripped native binary.
-- **Runs in a browser.** First-class `wasm32` target builds against
-  WebSocket transport (browsers can't open raw TCP). The same crate
-  uploads to Swarm from a Node script, a Cloudflare Worker, or a
-  browser page.
-- **No bee dependency.** isheika talks bee's wire protocols directly.
-  No reverse-proxying to a bee HTTP gateway; uploads push chunks
-  straight to mainnet over libp2p.
-- **Daemon + one-shot modes.** Long-running `daemon` for sustained
-  uploads (warm session pool, ~5x throughput); or invoke `upload`
-  directly for a single file with no setup.
-- **TAR collections.** Multi-file uploads as bee-compatible mantaray
-  manifests, addressable by path. `*.tar` inputs auto-trigger
-  collection mode.
-- **On-chain batch creation.** `isheika batch create` issues postage
-  stamp batches on Gnosis chain directly (no bee node needed).
-  `--size 2GB --duration 30d` resolves to the right depth+amount via
-  the official postage-stamp calculator's formulas.
-- **CI-friendly.** A drop-in GitHub Actions example uploads a
-  `./dist` directory to Swarm at ~500 KiB/s on a fresh runner. See
-  [`examples/upload.yml`](examples/upload.yml).
-- **Reproducible releases.** Multi-platform release tarballs (Linux
-  x86_64/aarch64, macOS x86_64/aarch64) shipped with SHA-256 sidecars
-  and SLSA Build Provenance attestations. Verify with
-  `gh attestation verify`.
+- **Small.** ~6 MB compressed; 10 MB stripped binary.
+- **Runs in a browser.** First-class `wasm32` target (WebSocket transport).
+- **No bee dependency.** Talks bee's libp2p protocols directly.
+- **Daemon + one-shot modes.** Warm session pool for sustained uploads, ~5× the cold-start throughput.
+- **TAR collections.** Multi-file uploads as mantaray manifests, addressable by path.
+- **On-chain batch creation.** `isheika batch create --size 2GB --duration 30d` issues a postage batch on Gnosis chain.
+- **CI-friendly.** Drop-in GitHub Actions example: [`examples/upload.yml`](examples/upload.yml).
+- **Attested releases.** SLSA Build Provenance per tarball; verify with `gh attestation verify`.
 
 ## Setup
 
