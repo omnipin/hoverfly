@@ -139,17 +139,16 @@ throughput on a fresh runner currently lands ~400–500 KiB/s — see
 
 Tracks the upstream [bee][bee] mainnet protocols:
 
-| Protocol      | Versions accepted          | Notes                                                |
-| ------------- | -------------------------- | ---------------------------------------------------- |
-| handshake     | `15.0.0` (preferred), `14.0.0` (fallback) | v15 added timestamp + chequebook in the signed payload (bee 2.8.0, May 2026) |
-| hive          | `2.0.0` (preferred), `1.1.0` (fallback)   | Same field-set bump as v15 handshake                 |
-| retrieval     | `1.4.0`                                   |                                                      |
-| pushsync      | `1.3.1`                                   |                                                      |
-| pricing       | `1.0.0`                                   |                                                      |
-| pseudosettle  | `1.0.0`                                   |                                                      |
-| status        | `1.1.3`                                   | Inbound-only (responds to bee's salud probes)        |
-| swap          | `1.0.0`                                   | Cheque issuance only, no cashout                     |
-| libp2p ping   | `1.0.0`                                   | Responds — bee 2.8's reacher uses this for reachability checks |
+| Protocol     | Versions accepted                         | Notes                            |
+| ------------ | ----------------------------------------- | -------------------------------- |
+| handshake    | `15.0.0` (preferred), `14.0.0` (fallback) |                                  |
+| hive         | `2.0.0` (preferred), `1.1.0` (fallback)   |                                  |
+| retrieval    | `1.4.0`                                   |                                  |
+| pushsync     | `1.3.1`                                   |                                  |
+| pricing      | `1.0.0`                                   |                                  |
+| pseudosettle | `1.0.0`                                   |                                  |
+| status       | `1.1.3`                                   | inbound-only                     |
+| swap         | `1.0.0`                                   | cheque issuance only, no cashout |
 
 [bee]: https://github.com/ethersphere/bee
 
