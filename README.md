@@ -8,6 +8,37 @@ libp2p over plain TCP **and** WebSocket; WASM build speaks WebSocket only
 
 Three operations: `discover`, `fetch`, `upload`.
 
+## Features
+
+- **Small binaries.** ~6-8 MB compressed per platform. The full
+  end-to-end client — libp2p stack, bee wire protocols, mantaray
+  manifests, postage stamps, on-chain batch creation — fits in
+  10 MB of stripped native binary.
+- **Runs in a browser.** First-class `wasm32` target builds against
+  WebSocket transport (browsers can't open raw TCP). The same crate
+  uploads to Swarm from a Node script, a Cloudflare Worker, or a
+  browser page.
+- **No bee dependency.** isheika talks bee's wire protocols directly.
+  No reverse-proxying to a bee HTTP gateway; uploads push chunks
+  straight to mainnet over libp2p.
+- **Daemon + one-shot modes.** Long-running `daemon` for sustained
+  uploads (warm session pool, ~5x throughput); or invoke `upload`
+  directly for a single file with no setup.
+- **TAR collections.** Multi-file uploads as bee-compatible mantaray
+  manifests, addressable by path. `*.tar` inputs auto-trigger
+  collection mode.
+- **On-chain batch creation.** `isheika batch create` issues postage
+  stamp batches on Gnosis chain directly (no bee node needed).
+  `--size 2GB --duration 30d` resolves to the right depth+amount via
+  the official postage-stamp calculator's formulas.
+- **CI-friendly.** A drop-in GitHub Actions example uploads a
+  `./dist` directory to Swarm at ~500 KiB/s on a fresh runner. See
+  [`examples/upload.yml`](examples/upload.yml).
+- **Reproducible releases.** Multi-platform release tarballs (Linux
+  x86_64/aarch64, macOS x86_64/aarch64) shipped with SHA-256 sidecars
+  and SLSA Build Provenance attestations. Verify with
+  `gh attestation verify`.
+
 ## Setup
 
 ### 1. Install isheika
@@ -142,13 +173,6 @@ Tracks the upstream [bee][bee] mainnet protocols:
 | libp2p ping   | `1.0.0`                                   | Responds — bee 2.8's reacher uses this for reachability checks |
 
 [bee]: https://github.com/ethersphere/bee
-
-## Documentation
-
-* `AGENTS.md` — architecture map, build/test workflow, file:line for
-  the constants that matter when tuning.
-* `PERFORMANCE.md` — every optimisation in the project's history with
-  empirical numbers and the bee-vs-isheika end-to-end comparison.
 
 ## Status
 
