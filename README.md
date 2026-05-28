@@ -60,15 +60,10 @@ that lands your overlay in less-saturated kademlia bins — empirically
 isheika vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
 ```
 
-CPU-bound and one-time (seconds to minutes depending on target PO and
-seed size). The written `overlay-nonce` file is reused by every
-subsequent daemon / upload command. Treat it like a secret — losing
-it means losing your accumulated kademlia presence on the network.
-
-A `(key, overlay-nonce)` pair is your Swarm identity. Don't share
-nonces across keys (a vanity nonce for key A is just a random nonce
-for key B), and don't run two daemons with the same identity
-simultaneously (bee disconnects both for conflicting underlay).
+One-time, CPU-bound (seconds to minutes). The resulting
+`overlay-nonce` is your Swarm identity together with `--key` — keep
+it, don't reuse across keys, and don't run two daemons with the
+same `(key, nonce)` pair at once (bee disconnects both).
 
 ### 3. Create a postage batch
 
