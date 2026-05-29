@@ -139,7 +139,75 @@ pub struct NetworkedStore<'a> {
     /// `Clone` shares the cache: pass a clone of the store to nectar's
     /// `join` and our manifest walkers and they'll reuse fetched chunks.
     cache: std::sync::Arc<std::sync::Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>>,
+    /// Per-peer `PeerSession` cache shared across all of the joiner's
+    /// concurrent chunk fetches for a single `fetch_bytes_ex` call.
+    /// Without this, every chunk-level call to `Transport::fetch_chunk`
+    /// would open a fresh libp2p connection to the same peer — for a
+    /// 1407-chunk file fanned out by the joiner that's ~1407 concurrent
+    /// dials to one Bee, which trips its connection / handshake limits
+    /// and produces cascading timeouts. The comment at `transport.rs:780`
+    /// explicitly says: "For multi-chunk workloads use `PeerSession`."
+    /// Keyed by underlay multiaddr (stringified) so peers reachable via
+    /// multiple underlays still get one session per actual connection.
+    ///
+    /// Each entry pairs the session with a `Semaphore` that caps concurrent
+    /// in-flight fetches against that session at [`MAX_INFLIGHT_PER_SESSION`].
+    /// Bee's `pkg/retrieval` enforces the same cap (their constant
+    /// `IN_FLIGHT_CAP = 4`). Without this cap the joiner's parallel chunk
+    /// fetches stack 16+ concurrent yamux substreams on one connection; bee
+    /// tears them down mid-frame, producing
+    /// `retrieval: frame: io: unexpected end of file`.
+    sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, CachedSession>>>,
+    /// Cross-chunk peer scoreboard, shared (via `Clone`) across every
+    /// `fetch_chunk_inner` call in a single fetch. Multi-MB objects are fanned
+    /// out by the joiner into hundreds/thousands of per-chunk fetches; each one
+    /// independently ranks candidates by proximity (closest-first). On a real
+    /// hive-crawl pool the proximity-closest peers are *usually dead* (~86% of a
+    /// 932-peer mainnet crawl never answer), so without shared memory every
+    /// chunk re-pays a full sweep of 20 s timeouts re-discovering the handful of
+    /// live forwarders. This scoreboard lets the *first* chunk's discovery
+    /// benefit all the rest.
+    ///
+    /// Maps lowercased-hex overlay → reachability score:
+    ///   score  > 0  → proven reachable forwarder → FRONT of the candidate queue
+    ///   score == 0  → not yet tried / recovered   → middle (unknown)
+    ///   score  < 0  → recently timed out / undialable → BACK of the queue
+    /// A protocol-level response (delivery, or even "no peer found" — proof the
+    /// peer is reachable and forwarding) bumps the score up; a timeout / dial
+    /// failure decrements it. Crucially the score is NOT sticky in either
+    /// direction: a known-good forwarder that we overload with 64-way fan-out
+    /// until it starts timing out is gradually demoted (load rebalances onto
+    /// other live peers), and a peer demoted by a transient blip climbs back as
+    /// soon as it answers again. The score is clamped to a small band so
+    /// recovery only takes a couple of responses. Empirically this is the
+    /// difference between "1340 chunks time out at 0 bytes in 10 min" and
+    /// "1340 chunks in ~90 s" on the same raw pool, and (with demotion) the
+    /// difference between a 10k-chunk fetch stalling on a decaying peer set and
+    /// completing.
+    peer_scores: std::sync::Arc<std::sync::Mutex<HashMap<String, i32>>>,
 }
+
+/// A cached per-peer session for the retrieval path: a shared
+/// [`PeerSession`] reused across the joiner's concurrent chunk fetches,
+/// paired with the semaphore that caps its in-flight fetches at
+/// [`MAX_INFLIGHT_PER_SESSION`].
+type CachedSession = (
+    std::sync::Arc<PeerSession>,
+    std::sync::Arc<tokio::sync::Semaphore>,
+);
+
+/// Maximum concurrent fetches against a single `PeerSession`. Mirrors Bee's
+/// `IN_FLIGHT_CAP = 4`.
+const MAX_INFLIGHT_PER_SESSION: usize = 4;
+
+/// Score a peer reaches (and is clamped to) on a protocol-level response.
+/// Small so that a couple of consecutive timeouts demote a peer that has gone
+/// bad, but positive enough to keep a healthy forwarder ahead of the unknowns.
+const PEER_SCORE_MAX: i32 = 4;
+/// Floor a peer is clamped to on repeated timeouts. Bounded so a peer that
+/// timed out thousands of times early can still climb back to the front after
+/// a couple of fresh responses, rather than being permanently buried.
+const PEER_SCORE_MIN: i32 = -3;
 
 impl<'a> NetworkedStore<'a> {
     /// Construct a store with sequential fetch (concurrency = 1).
@@ -150,6 +218,8 @@ impl<'a> NetworkedStore<'a> {
             max_retries,
             concurrency: 1,
             cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_scores: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 
@@ -167,11 +237,70 @@ impl<'a> NetworkedStore<'a> {
             max_retries,
             concurrency,
             cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            peer_scores: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
         }
     }
 }
 
 impl<'a> NetworkedStore<'a> {
+    /// Return a cached `PeerSession` for this underlay, opening (and
+    /// caching) one if none exists yet. Multi-chunk workloads MUST share
+    /// sessions across chunks to a peer — see the `sessions` field
+    /// rationale on [`NetworkedStore`]. Concurrent first-time callers
+    /// for the same peer may both connect (the second's session is
+    /// dropped on insert via `or_insert_with`); one wasted dial is
+    /// preferable to holding the cache lock across a multi-second
+    /// `PeerSession::connect`.
+    async fn get_or_open_session(
+        &self,
+        underlay: &Multiaddr,
+    ) -> Result<CachedSession, TransportError> {
+        let key = underlay.to_string();
+        {
+            let guard = self.sessions.lock().await;
+            if let Some((s, sem)) = guard.get(&key) {
+                return Ok((s.clone(), sem.clone()));
+            }
+        }
+        // Not cached — connect without holding the lock.
+        let session = PeerSession::connect(self.transport, underlay).await?;
+        let session_arc = std::sync::Arc::new(session);
+        let sem_arc = std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_SESSION));
+        let mut guard = self.sessions.lock().await;
+        let entry = guard
+            .entry(key)
+            .or_insert_with(|| (session_arc.clone(), sem_arc.clone()));
+        Ok((entry.0.clone(), entry.1.clone()))
+    }
+}
+
+impl<'a> NetworkedStore<'a> {
+    /// Record that a peer answered at the protocol level this fetch (delivery
+    /// or "no peer found"). Bumps its score toward [`PEER_SCORE_MAX`] so it
+    /// sorts ahead of unknown/dead peers for every later chunk. A peer
+    /// previously demoted by timeouts recovers to the front after a couple of
+    /// responses (the `+2` step crosses zero from the `PEER_SCORE_MIN` floor in
+    /// two hits).
+    fn note_response(&self, overlay: &str) {
+        let o = overlay.to_lowercase();
+        let mut m = self.peer_scores.lock().unwrap();
+        let e = m.entry(o).or_insert(0);
+        *e = (*e + 2).clamp(1, PEER_SCORE_MAX);
+    }
+
+    /// Record that a peer timed out / failed to dial this fetch. Decrements its
+    /// score toward [`PEER_SCORE_MIN`]; once it goes negative the peer sorts to
+    /// the back so no further chunk leads with it. Not sticky: a healthy
+    /// forwarder we overload until it times out is demoted gradually (load
+    /// shifts to other live peers) and climbs back when it answers again.
+    fn note_timeout(&self, overlay: &str) {
+        let o = overlay.to_lowercase();
+        let mut m = self.peer_scores.lock().unwrap();
+        let e = m.entry(o).or_insert(0);
+        *e = (*e - 1).max(PEER_SCORE_MIN);
+    }
+
     /// Body of [`ChunkGet::get`]. Pulled into a private helper so the
     /// `ChunkGet` impl can be split per-target: native uses `async fn`,
     /// wasm wraps in `SendWrapper` to satisfy the trait's `+ Send` bound.
@@ -210,9 +339,34 @@ impl<'a> NetworkedStore<'a> {
             .closest(&address, usize::MAX)
             .into_iter()
             .partition(|p| !p.is_recently_unreachable(now));
-        let candidates: Vec<&Peer> = fresh.into_iter().chain(stale.into_iter()).collect();
+        let mut candidates: Vec<&Peer> = fresh.into_iter().chain(stale.into_iter()).collect();
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
+        }
+
+        // Cross-chunk reordering using the shared scoreboard (see the
+        // `peer_scores` field on `NetworkedStore`). The base order above is
+        // proximity-first (closest peers most likely to hold the chunk
+        // locally). But on a real hive-crawl pool most proximity-close peers
+        // are dead, and re-sweeping them per chunk is what makes a 1340-chunk
+        // fetch hang. We do a STABLE 3-way partition that preserves proximity
+        // order *within* each tier:
+        //   tier 0 — score > 0: proven reachable forwarders → front
+        //   tier 1 — score == 0: not yet tried / recovered  → middle
+        //   tier 2 — score < 0: recently timed out / dead   → back
+        // After the first chunk discovers the live forwarders, every later
+        // chunk hits them immediately instead of paying the timeout sweep.
+        {
+            let scores = self.peer_scores.lock().unwrap();
+            if !scores.is_empty() {
+                candidates.sort_by_key(|p| {
+                    match scores.get(&p.overlay.to_lowercase()).copied().unwrap_or(0) {
+                        s if s > 0 => 0u8,
+                        0 => 1,
+                        _ => 2,
+                    }
+                });
+            }
         }
         let attempt_cap = if self.max_retries == 0 {
             candidates.len()
@@ -221,7 +375,39 @@ impl<'a> NetworkedStore<'a> {
         };
 
         let concurrency = self.concurrency.max(1);
-        let mut candidates_iter = candidates.into_iter().take(attempt_cap);
+
+        // Per-attempt outcome — `Deferred` is distinct from `Failed` so the
+        // dispatcher can re-queue the peer for retry rather than marking it as
+        // having failed for *this chunk*. Without this distinction the loop
+        // treats a per-peer dial-cooldown rejection as if the peer couldn't
+        // serve the chunk at all, which is wrong: it's just a "try me later"
+        // signal from another concurrent dispatch claiming the dial window.
+        enum AttemptOutcome<C> {
+            Got(C),
+            Deferred,
+            Failed(String),
+        }
+
+        // VecDeque so DialTooSoon-deferred peers can be re-queued at the back
+        // instead of being treated as a peer failure. Tier 1 of the retrieval-
+        // loop port (mirroring Bee's `pkg/retrieval` semantics): the keystone
+        // fix for the cooldown-as-failure thrash isheika hits against post-2.8
+        // mainnet (~37 `dial too soon` rejections/sec, 0 chunks retrieved).
+        use std::collections::{HashMap, HashSet, VecDeque};
+        let all_candidates: Vec<&Peer> = candidates.into_iter().take(attempt_cap).collect();
+        let mut deque: VecDeque<&Peer> = all_candidates.iter().copied().collect();
+        let initial_deque_len = deque.len();
+
+        // Per-chunk skiplist of recently-failed peers — Tier 2 of the
+        // retrieval-loop port. Mirrors Bee's `errSkip` from
+        // `pkg/retrieval/retrieval.go:80,277-280` with the same 60-second
+        // expiry. A peer that returned `storage: not found` (or any non-Deferred
+        // failure) for *this chunk* is parked here for `skiplist_dur`; after
+        // that the deque is refilled with re-eligible candidates so they get a
+        // second chance (the peer's local state may have changed in the
+        // meantime — fresh pushsync, neighborhood replay, etc.).
+        let skiplist_dur = Duration::from_secs(60);
+        let mut skiplist: HashMap<String, web_time::Instant> = HashMap::new();
 
         // Build a future that performs a single peer fetch and returns a
         // structured result. Captures peer metadata for logging and feeds
@@ -233,10 +419,47 @@ impl<'a> NetworkedStore<'a> {
             let log = log.clone();
             async move {
                 let Some(underlay) = underlay else {
-                    return (overlay, Err("no dialable underlay".to_string()));
+                    return (
+                        peer,
+                        overlay,
+                        AttemptOutcome::Failed("no dialable underlay".to_string()),
+                    );
                 };
                 let started = web_time::Instant::now();
-                let res = self.transport.fetch_chunk(&underlay, &bytes32).await;
+                // Reuse a cached PeerSession for this peer across all of the
+                // joiner's chunk requests (transport.rs:780 — "For multi-chunk
+                // workloads use `PeerSession`"). Falls back to `Deferred` /
+                // `Failed` for the connect-time errors the original
+                // `Transport::fetch_chunk` would have surfaced.
+                let res = match self.get_or_open_session(&underlay).await {
+                    Ok((session, sem)) => {
+                        // Cap concurrent fetches against this session to
+                        // [`MAX_INFLIGHT_PER_SESSION`] (Bee's `IN_FLIGHT_CAP`).
+                        // The permit is dropped at end of this block, releasing
+                        // capacity for the next chunk waiting on the same peer.
+                        let _permit = match sem.acquire_owned().await {
+                            Ok(p) => p,
+                            Err(_) => {
+                                // Semaphore closed (shouldn't happen unless
+                                // cache was wiped mid-flight). Treat as
+                                // transient and let the loop retry.
+                                return (peer, overlay, AttemptOutcome::Deferred);
+                            }
+                        };
+                        session.fetch_chunk(&bytes32).await
+                    }
+                    Err(e) => Err(e),
+                };
+                // If the session died (peer closed the connection, driver
+                // task exited), evict it from the cache so the next fetch on
+                // this peer reconnects. The caller treats `ConnectionClosed`
+                // as `Deferred` (below) so the peer is requeued, not
+                // skiplisted — by the time we re-dial, the new session will
+                // be live.
+                if matches!(res, Err(TransportError::ConnectionClosed)) {
+                    let mut g = self.sessions.lock().await;
+                    g.remove(&underlay.to_string());
+                }
                 let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 match res {
                     Ok(delivery) => {
@@ -244,24 +467,67 @@ impl<'a> NetworkedStore<'a> {
                             overlay.to_lowercase(),
                             crate::peers::DialResult::Success { rtt_ms },
                         );
+                        // Proven reachable forwarder — promote for every later
+                        // chunk this fetch (see `peer_scores` field rationale).
+                        self.note_response(&overlay);
                         match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice())
                         {
                             Ok(chunk) => {
                                 use nectar_primitives::Chunk as _;
                                 if chunk.address() != &address {
-                                    (overlay, Err("address mismatch".to_string()))
+                                    (
+                                        peer,
+                                        overlay,
+                                        AttemptOutcome::Failed("address mismatch".to_string()),
+                                    )
                                 } else {
-                                    (overlay, Ok(AnyChunk::from(chunk)))
+                                    (peer, overlay, AttemptOutcome::Got(AnyChunk::from(chunk)))
                                 }
                             }
-                            Err(e) => (overlay, Err(format!("decode chunk: {e}"))),
+                            Err(e) => (
+                                peer,
+                                overlay,
+                                AttemptOutcome::Failed(format!("decode chunk: {e}")),
+                            ),
                         }
+                    }
+                    // DialTooSoon = another concurrent fetch claimed this peer's
+                    // dial window. Transient deferral — re-queue the peer; do
+                    // NOT record `DialResult::Failure` (it'd poison the peer's
+                    // long-term reachability score) and do NOT log a warn (it
+                    // produces a firehose of noise at ~37/sec under
+                    // multi-chunk concurrency).
+                    Err(TransportError::DialTooSoon { .. }) => {
+                        (peer, overlay, AttemptOutcome::Deferred)
+                    }
+                    // Connection closed mid-fetch (e.g. bee closed our session
+                    // after some quota / yamux state hit a limit). The session
+                    // has already been evicted above; treating as `Deferred`
+                    // requeues the peer for an immediate retry, which will
+                    // open a fresh session. Skiplisting would penalise a peer
+                    // that is otherwise serving us fine.
+                    Err(TransportError::ConnectionClosed) => {
+                        (peer, overlay, AttemptOutcome::Deferred)
                     }
                     Err(e) => {
                         log.lock()
                             .unwrap()
                             .insert(overlay.to_lowercase(), crate::peers::DialResult::Failure);
-                        (overlay, Err(e.to_string()))
+                        // Classify for the cross-chunk scoreboard. A `Retrieval`
+                        // error means the peer answered at the protocol level
+                        // (e.g. "no peer found") — it's a reachable forwarder
+                        // that just lacked *this* chunk, so promote it (it may
+                        // serve a different chunk). `Timeout` / `DialFailed`
+                        // mean the peer is unreachable — demote so no other
+                        // chunk wastes a timeout on it.
+                        match &e {
+                            TransportError::Retrieval(_) => self.note_response(&overlay),
+                            TransportError::Timeout | TransportError::DialFailed(_) => {
+                                self.note_timeout(&overlay)
+                            }
+                            _ => {}
+                        }
+                        (peer, overlay, AttemptOutcome::Failed(e.to_string()))
                     }
                 }
             }
@@ -269,24 +535,98 @@ impl<'a> NetworkedStore<'a> {
 
         let mut inflight = FuturesUnordered::new();
         // Seed the initial window.
-        for peer in candidates_iter.by_ref().take(concurrency) {
-            inflight.push(try_peer(peer));
+        for _ in 0..concurrency {
+            if let Some(peer) = deque.pop_front() {
+                inflight.push(try_peer(peer));
+            } else {
+                break;
+            }
         }
 
         let mut last_err = String::from("no peers tried");
-        while let Some((overlay, outcome)) = inflight.next().await {
+        // If the entire candidate set has cycled as `Deferred` without any
+        // making real progress (no `Got`/`Failed`), every peer is in cooldown.
+        // Sleep briefly so cooldowns can elapse rather than spinning. Mirrors
+        // Bee's `overDraftRefresh = 600 ms` sleep when all peers are blocked.
+        let cycle_threshold = initial_deque_len
+            .saturating_add(concurrency)
+            .saturating_add(1);
+        let mut consecutive_deferrals: usize = 0;
+
+        loop {
+            // No work left in flight. Try to refill the deque with skiplisted
+            // peers whose 60-second cooldown has elapsed (Tier 2). If the
+            // skiplist is empty we've truly exhausted the pool with no live
+            // entries to wait on; return the last error.
+            if inflight.is_empty() && deque.is_empty() {
+                let now = web_time::Instant::now();
+                skiplist.retain(|_, expiry| *expiry > now);
+                if skiplist.is_empty() {
+                    break;
+                }
+                // Sleep to the earliest live skiplist expiry, then refill from
+                // all_candidates whose entries have aged out. This is the
+                // partner mechanism to Tier 1's cycle-sleep: instead of giving
+                // up after one pass through the pool, we wait for failed peers
+                // to become eligible again (their local state — pushsync,
+                // neighborhood replay, network recovery — may have changed).
+                let earliest = skiplist.values().min().copied().unwrap_or(now);
+                if earliest > now {
+                    tokio::time::sleep(earliest.saturating_duration_since(now)).await;
+                }
+                let now = web_time::Instant::now();
+                skiplist.retain(|_, expiry| *expiry > now);
+                let still_skipped: HashSet<String> = skiplist.keys().cloned().collect();
+                for peer in all_candidates.iter() {
+                    if !still_skipped.contains(&peer.overlay.to_lowercase()) {
+                        deque.push_back(*peer);
+                    }
+                }
+                // Re-seed inflight from the refilled deque.
+                for _ in 0..concurrency {
+                    if let Some(p) = deque.pop_front() {
+                        inflight.push(try_peer(p));
+                    } else {
+                        break;
+                    }
+                }
+                if inflight.is_empty() {
+                    // Couldn't refill (skiplist entries kept all candidates out).
+                    break;
+                }
+            }
+            let Some((peer, overlay, outcome)) = inflight.next().await else {
+                // inflight became empty between checks — re-enter the refill
+                // branch on the next iteration.
+                continue;
+            };
             match outcome {
-                Ok(chunk) => {
+                AttemptOutcome::Got(chunk) => {
                     self.cache.lock().unwrap().insert(address, chunk.clone());
                     return Ok(chunk);
                 }
-                Err(e) => {
-                    warn!(target: "isheika::fetch", "peer {} failed: {}", overlay, e);
-                    last_err = e;
-                    if let Some(next) = candidates_iter.next() {
-                        inflight.push(try_peer(next));
+                AttemptOutcome::Deferred => {
+                    // Transient: do not log, do not record failure, requeue.
+                    deque.push_back(peer);
+                    consecutive_deferrals = consecutive_deferrals.saturating_add(1);
+                    if consecutive_deferrals >= cycle_threshold {
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        consecutive_deferrals = 0;
                     }
                 }
+                AttemptOutcome::Failed(e) => {
+                    warn!(target: "isheika::fetch", "peer {} failed: {}", overlay, e);
+                    last_err = e;
+                    consecutive_deferrals = 0;
+                    // Tier 2: park failed peer in per-chunk skiplist.
+                    skiplist.insert(
+                        overlay.to_lowercase(),
+                        web_time::Instant::now() + skiplist_dur,
+                    );
+                }
+            }
+            if let Some(next) = deque.pop_front() {
+                inflight.push(try_peer(next));
             }
         }
         Err(ChunkStoreError::Other(format!(
