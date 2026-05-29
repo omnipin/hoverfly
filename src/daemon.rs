@@ -26,8 +26,9 @@ use tracing::{debug, info, warn};
 
 use crate::cache::ChunkCache;
 use crate::client::{
-    SessionPool, discover_recursive_with_progress, fetch_bytes_ex, fetch_manifest_path_ex,
-    upload_bytes_with_pool, upload_collection, upload_file_with_manifest_with_pool,
+    RetrievalCache, SessionPool, discover_recursive_with_progress, fetch_bytes_cached_ex,
+    fetch_manifest_path_cached_ex, upload_bytes_with_pool, upload_collection,
+    upload_file_with_manifest_with_pool,
 };
 use crate::doh::Doh;
 use crate::peers::{PeerStore, apply_log};
@@ -138,6 +139,11 @@ struct State {
     /// suggested next-nonce here (with `.next` suffix) so an operator
     /// can opt into it by renaming and restarting the daemon.
     nonce_file_path: Option<PathBuf>,
+    /// Persistent retrieval state (per-peer session cache + cross-chunk
+    /// peer scoreboard) reused across every fetch request, so warm
+    /// sessions and learned forwarder scores carry over between
+    /// downloads instead of being rebuilt cold each time.
+    retrieval_cache: RetrievalCache,
 }
 
 /// Optional inbound listener configuration for [`run`].
@@ -276,6 +282,7 @@ pub async fn run(
         discover_rounds: discover_rounds.max(1),
         identity_eth_address,
         nonce_file_path: nonce_file_path.clone(),
+        retrieval_cache: RetrievalCache::new(),
     });
 
     // Spawn the inbound bee-protocol listener if configured. Failure
@@ -913,23 +920,25 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
     let result: Result<(usize, Option<String>), ClientError> = (async {
         let peers = state.peers.read().await;
         let (bytes, ct) = if let Some(p) = r.path.as_deref() {
-            let (b, c) = fetch_manifest_path_ex(
+            let (b, c) = fetch_manifest_path_cached_ex(
                 &state.transport,
                 &*peers,
                 &r.hash,
                 p,
                 r.max_retries,
                 r.concurrency,
+                &state.retrieval_cache,
             )
             .await?;
             (b, c)
         } else {
-            let b = fetch_bytes_ex(
+            let b = fetch_bytes_cached_ex(
                 &state.transport,
                 &*peers,
                 &r.hash,
                 r.max_retries,
                 r.concurrency,
+                &state.retrieval_cache,
             )
             .await?;
             (b, None)

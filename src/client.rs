@@ -209,6 +209,29 @@ const PEER_SCORE_MAX: i32 = 4;
 /// a couple of fresh responses, rather than being permanently buried.
 const PEER_SCORE_MIN: i32 = -3;
 
+/// Retrieval state that can persist *across* multiple fetches. A one-shot
+/// CLI fetch builds the per-peer session cache and the cross-chunk peer
+/// scoreboard from cold and throws them away on exit; a long-lived daemon
+/// instead holds a single [`RetrievalCache`] and feeds it to every request
+/// (via [`NetworkedStore::with_cache`]) so warm sessions and learned peer
+/// scores carry over between downloads — the first request pays discovery,
+/// every later one reuses the live forwarders. Cheap to clone (Arc bumps).
+///
+/// Note: only the session cache and the scoreboard are shared. The chunk
+/// *content* cache is deliberately left per-fetch so a daemon's memory
+/// doesn't grow without bound across unrelated downloads.
+#[derive(Clone, Default)]
+pub struct RetrievalCache {
+    sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, CachedSession>>>,
+    peer_scores: std::sync::Arc<std::sync::Mutex<HashMap<String, i32>>>,
+}
+
+impl RetrievalCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+}
+
 impl<'a> NetworkedStore<'a> {
     /// Construct a store with sequential fetch (concurrency = 1).
     pub fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
@@ -239,6 +262,29 @@ impl<'a> NetworkedStore<'a> {
             cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
             sessions: std::sync::Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             peer_scores: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// Like [`Self::with_concurrency`] but reuses the session cache and
+    /// peer scoreboard from a shared [`RetrievalCache`] instead of
+    /// starting cold. Used by the daemon so warm sessions and learned
+    /// peer scores persist across fetch requests. The chunk content
+    /// cache is still per-store (see [`RetrievalCache`] docs).
+    pub fn with_cache(
+        transport: &'a Transport,
+        peers: &'a PeerStore,
+        max_retries: usize,
+        concurrency: usize,
+        cache: &RetrievalCache,
+    ) -> Self {
+        Self {
+            transport,
+            peers,
+            max_retries,
+            concurrency,
+            cache: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
+            sessions: cache.sessions.clone(),
+            peer_scores: cache.peer_scores.clone(),
         }
     }
 }
@@ -943,9 +989,31 @@ pub async fn fetch_bytes_ex(
     max_retries_per_chunk: usize,
     concurrency: usize,
 ) -> Result<Vec<u8>, ClientError> {
+    fetch_bytes_cached_ex(
+        transport,
+        peers,
+        root_hex,
+        max_retries_per_chunk,
+        concurrency,
+        &RetrievalCache::new(),
+    )
+    .await
+}
+
+/// Like [`fetch_bytes_ex`], but reuses the session cache and peer
+/// scoreboard from a shared [`RetrievalCache`] so a daemon keeps them
+/// warm across requests.
+pub async fn fetch_bytes_cached_ex(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    cache: &RetrievalCache,
+) -> Result<Vec<u8>, ClientError> {
     let root = parse_root(root_hex)?;
     let store =
-        NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+        NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
     // Drive nectar's BMT joiner with the same per-chunk concurrency as
     // our network store so deep trees don't bottleneck on its default
     // (8). Each chunk fetch already races peers internally; this is the
@@ -985,11 +1053,34 @@ pub async fn fetch_manifest_path_ex(
     max_retries_per_chunk: usize,
     concurrency: usize,
 ) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    fetch_manifest_path_cached_ex(
+        transport,
+        peers,
+        root_hex,
+        path,
+        max_retries_per_chunk,
+        concurrency,
+        &RetrievalCache::new(),
+    )
+    .await
+}
+
+/// Like [`fetch_manifest_path_ex`], but reuses the session cache and
+/// peer scoreboard from a shared [`RetrievalCache`] (daemon warm path).
+pub async fn fetch_manifest_path_cached_ex(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    cache: &RetrievalCache,
+) -> Result<(Vec<u8>, Option<String>), ClientError> {
     let root = parse_root(root_hex)?;
     // Single store shared between path lookup and content fetch; the
     // root chunk is hit by both phases so the cache saves a round-trip.
     let store =
-        NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+        NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
@@ -3497,14 +3588,24 @@ const SESSION_DIAL_PARALLELISM: usize = 128;
 /// prefix. Uses an "anti-prefix" bucket walk: for every PO bin (8-bit
 /// high-byte group, 256 in total) we round-robin one peer at a time.
 /// Cheap (O(N)) and deterministic; no RNG dep.
-fn spread_across_address_space(peers: &mut Vec<(SwarmAddress, String, Multiaddr, bool)>) {
+fn spread_across_address_space(peers: &mut Vec<(SwarmAddress, String, Multiaddr, u8, u32)>) {
     // 256 buckets by overlay's leading byte; cheap to compute, gives
     // even distribution across the first 8 PO bins for random overlays.
-    let mut buckets: Vec<Vec<(SwarmAddress, String, Multiaddr, bool)>> =
+    let mut buckets: Vec<Vec<(SwarmAddress, String, Multiaddr, u8, u32)>> =
         (0..256).map(|_| Vec::new()).collect();
     for p in peers.drain(..) {
         let key = p.0.as_bytes()[0] as usize;
         buckets[key].push(p);
+    }
+    // Within each PO bin, order by dial quality so the round-robin hands
+    // out each bin's best-known peer first. Field 3 is the reachability
+    // rank (lower = better, see `Peer::dial_rank`); field 4 is last-seen
+    // dial RTT in ms (lower = faster). Sort *descending* (worst first,
+    // best last) because the round-robin `pop()`s from the back — so the
+    // first peer taken from each bin is its lowest-rank, lowest-latency
+    // candidate.
+    for b in buckets.iter_mut() {
+        b.sort_by(|a, c| c.3.cmp(&a.3).then(c.4.cmp(&a.4)));
     }
     // Round-robin pop. As long as any bucket has entries, take one
     // from each in sequence and append to `peers`.
@@ -3570,7 +3671,7 @@ async fn open_session_pool_filtered(
     // Reachability still matters: recently-failed peers move to the
     // back so we don't burn dial timeouts on known-dead hosts first.
     let now = crate::peers::now_unix();
-    let mut all: Vec<(SwarmAddress, String, Multiaddr, bool)> = peers
+    let mut all: Vec<(SwarmAddress, String, Multiaddr, u8, u32)> = peers
         .closest(&ChunkAddress::new([0u8; 32]), usize::MAX)
         .into_iter()
         .filter(|p| !exclude.contains(&p.overlay.to_lowercase()))
@@ -3581,16 +3682,22 @@ async fn open_session_pool_filtered(
                 overlay,
                 p.overlay.clone(),
                 underlay,
-                p.is_recently_unreachable(now),
+                p.dial_rank(now),
+                p.last_dial_rtt_ms.unwrap_or(u32::MAX),
             ))
         })
         .collect();
     spread_across_address_space(&mut all);
-    let (fresh, stale): (Vec<_>, Vec<_>) = all.into_iter().partition(|(_, _, _, stale)| !stale);
+    // Peers that failed hard within their backoff window (rank 3) sink to
+    // the very back of the dial parade so the initial dial window isn't
+    // spent waiting on known-dead hosts' timeouts; rank 0-2 keep their
+    // quality-aware, address-spread order from `spread_across_address_space`.
+    let (fresh, stale): (Vec<_>, Vec<_>) =
+        all.into_iter().partition(|&(_, _, _, rank, _)| rank < 3);
     let candidates: Vec<(SwarmAddress, String, Multiaddr)> = fresh
         .into_iter()
         .chain(stale.into_iter())
-        .map(|(o, hex, u, _)| (o, hex, u))
+        .map(|(o, hex, u, _, _)| (o, hex, u))
         .collect();
     if candidates.is_empty() {
         return Err(ClientError::NoPeers("peerlist empty".into()));

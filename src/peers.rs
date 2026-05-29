@@ -144,8 +144,17 @@ impl Peer {
         Some(SwarmAddress::new(self.overlay_bytes()?))
     }
 
-    /// `true` if this peer's last dial attempt failed within the recent
-    /// failure window AND we haven't had a successful dial since.
+    /// `true` if this peer's last dial attempt failed within its
+    /// backoff window AND we haven't had a successful dial since.
+    ///
+    /// The window grows with `consecutive_failures` (see
+    /// [`Self::failure_backoff_secs`]) rather than being a flat
+    /// [`RECENT_FAILURE_SECS`]: a peer that failed once (likely a
+    /// transient dial timeout / momentary overload) is given another
+    /// chance within ~1 min, while a peer that has failed repeatedly
+    /// is parked for the full window. This keeps a single bad dial
+    /// from exiling an otherwise-good peer from the candidate set for
+    /// 5 minutes.
     pub fn is_recently_unreachable(&self, now_unix: u64) -> bool {
         let Some(fail) = self.last_dial_failure_unix else {
             return false;
@@ -155,7 +164,54 @@ impl Peer {
                 return false;
             }
         }
-        now_unix.saturating_sub(fail) < RECENT_FAILURE_SECS
+        now_unix.saturating_sub(fail) < self.failure_backoff_secs()
+    }
+
+    /// Backoff window (seconds) before a recently-failed peer is
+    /// reconsidered, scaled by `consecutive_failures`:
+    /// `60 × 2^(min(failures,3))` capped at [`RECENT_FAILURE_SECS`].
+    /// So 1 failure → 120 s, 2 → 240 s, 3+ → 300 s. A first failure
+    /// recovers far faster than the old flat 300 s.
+    fn failure_backoff_secs(&self) -> u64 {
+        let shift = u32::from(self.consecutive_failures).min(3);
+        (60u64.saturating_mul(1u64 << shift)).min(RECENT_FAILURE_SECS)
+    }
+
+    /// Coarse reachability rank for candidate ordering — **lower is
+    /// better**. Used to front-load the dial parade (and the session
+    /// pool) with peers most likely to answer, mirroring bee's
+    /// `topology.Select{Reachable, Healthy}` filter in
+    /// `pkg/retrieval` / `pkg/topology/kademlia`. There bee excludes
+    /// unreachable/unhealthy peers outright; we don't have continuous
+    /// health probes, so we grade by dial history instead and keep
+    /// even the worst peers as last-resort candidates.
+    ///
+    /// - `0` — a successful dial is on record with no more-recent
+    ///   failure (known-good).
+    /// - `1` — never attempted, or a stale failure outside the
+    ///   backoff window (unknown; worth a fresh try).
+    /// - `2` — failed within the backoff window, few strikes
+    ///   (probably transient).
+    /// - `3` — failed within the backoff window with ≥
+    ///   [`DEAD_STRIKES`]-many consecutive failures (likely dead).
+    pub fn dial_rank(&self, now_unix: u64) -> u8 {
+        match (self.last_dial_success_unix, self.last_dial_failure_unix) {
+            // Last attempt (or only attempts) succeeded.
+            (Some(s), Some(f)) if s >= f => 0,
+            (Some(_), None) => 0,
+            // Never dialed.
+            (None, None) => 1,
+            // Last attempt failed (success older than failure, or only failures).
+            (_, Some(f)) => {
+                if now_unix.saturating_sub(f) >= self.failure_backoff_secs() {
+                    1
+                } else if self.consecutive_failures >= 3 {
+                    3
+                } else {
+                    2
+                }
+            }
+        }
     }
 }
 
@@ -318,5 +374,82 @@ fn is_dialable_str(ma: &str) -> bool {
     #[cfg(target_arch = "wasm32")]
     {
         is_ws(ma)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: u64 = 1_000_000;
+
+    fn peer() -> Peer {
+        Peer::default()
+    }
+
+    #[test]
+    fn never_dialed_is_unknown_rank_not_unreachable() {
+        let p = peer();
+        assert_eq!(p.dial_rank(NOW), 1, "never-dialed peer ranks as unknown");
+        assert!(!p.is_recently_unreachable(NOW));
+    }
+
+    #[test]
+    fn recent_success_is_best_rank() {
+        let mut p = peer();
+        p.last_dial_success_unix = Some(NOW - 10);
+        assert_eq!(p.dial_rank(NOW), 0);
+        assert!(!p.is_recently_unreachable(NOW));
+    }
+
+    #[test]
+    fn success_after_failure_clears_unreachable() {
+        let mut p = peer();
+        p.last_dial_failure_unix = Some(NOW - 100);
+        p.last_dial_success_unix = Some(NOW - 10);
+        // A later success outranks the earlier failure.
+        assert_eq!(p.dial_rank(NOW), 0);
+        assert!(!p.is_recently_unreachable(NOW));
+    }
+
+    #[test]
+    fn single_failure_recovers_in_two_minutes_not_five() {
+        let mut p = peer();
+        p.last_dial_failure_unix = Some(NOW);
+        p.consecutive_failures = 1;
+        // Backoff for 1 failure is 60 * 2^1 = 120s.
+        assert!(p.is_recently_unreachable(NOW + 60));
+        assert!(!p.is_recently_unreachable(NOW + 121));
+        assert_eq!(p.dial_rank(NOW + 60), 2, "soft failure inside window");
+        assert_eq!(
+            p.dial_rank(NOW + 121),
+            1,
+            "stale failure outside window is retryable"
+        );
+    }
+
+    #[test]
+    fn many_failures_rank_hard_and_park_longer() {
+        let mut p = peer();
+        p.last_dial_failure_unix = Some(NOW);
+        p.consecutive_failures = 5;
+        // Backoff caps at RECENT_FAILURE_SECS (300s) regardless of shift.
+        assert!(p.is_recently_unreachable(NOW + 250));
+        assert!(!p.is_recently_unreachable(NOW + RECENT_FAILURE_SECS + 1));
+        assert_eq!(p.dial_rank(NOW + 10), 3, "hard failure ranks last");
+    }
+
+    #[test]
+    fn backoff_grows_with_failures() {
+        let mut p = peer();
+        p.last_dial_failure_unix = Some(NOW);
+        p.consecutive_failures = 1;
+        assert_eq!(p.failure_backoff_secs(), 120);
+        p.consecutive_failures = 2;
+        assert_eq!(p.failure_backoff_secs(), 240);
+        p.consecutive_failures = 3;
+        assert_eq!(p.failure_backoff_secs(), RECENT_FAILURE_SECS); // 480 capped to 300
+        p.consecutive_failures = 9;
+        assert_eq!(p.failure_backoff_secs(), RECENT_FAILURE_SECS);
     }
 }
