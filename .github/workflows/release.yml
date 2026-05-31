@@ -24,6 +24,18 @@ name: release
 #
 #   gh attestation verify isheika-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
 #     -R omnipin/isheika
+#
+# The wasm32 target goes to npm instead (job `publish-npm`): it's a
+# browser cdylib, not a CLI binary. Built with nightly + build-std
+# (forced by the +atomics rustflags in .cargo/config.toml), bound with
+# wasm-bindgen, and published via npm OIDC trusted publishing — no
+# NPM_TOKEN, provenance is automatic.
+#
+# First release only: publish by hand once to create the package, then
+# add the trusted publisher (GitHub Actions, repo omnipin/isheika,
+# workflow release.yml) under the npm package's settings.
+#
+# Every release after that publishes tokenlessly from this workflow.
 
 on:
   release:
@@ -183,3 +195,64 @@ jobs:
             --clobber \
             "${{ steps.package.outputs.tarball }}" \
             "${{ steps.package.outputs.sha256 }}"
+
+  publish-npm:
+    name: npm (@omnipin/isheika)
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write          # OIDC for npm trusted publishing (no token)
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # Browser wasm is a cdylib built with nightly + build-std: the
+      # +atomics rustflags in .cargo/config.toml force a std rebuild.
+      - name: Install toolchain
+        run: |
+          rustup toolchain install nightly --profile minimal --component rust-src
+          rustup target add wasm32-unknown-unknown --toolchain nightly
+
+      - uses: Swatinem/rust-cache@v2.9.1
+        with:
+          key: wasm32-unknown-unknown
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      # wasm-bindgen CLI must match the crate version in Cargo.lock.
+      - name: Install wasm-bindgen
+        run: |
+          curl -fL https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.108/wasm-bindgen-0.2.108-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 wasm-bindgen-0.2.108-x86_64-unknown-linux-musl/wasm-bindgen
+
+      # --no-default-features drops the native-only CLI bins; --lib builds
+      # the cdylib, then wasm-bindgen emits the ESM package into pkg/.
+      - name: Build wasm package
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        run: |
+          cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --lib
+          wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/isheika.wasm
+          cp README.npm.md pkg/README.md
+
+      - name: Publish to npm
+        working-directory: pkg
+        run: |
+          ver="${{ github.event.release.tag_name }}"
+          cat > package.json <<EOF
+          {
+            "name": "@omnipin/isheika",
+            "version": "${ver#v}",
+            "license": "MIT",
+            "repository": { "type": "git", "url": "git+https://github.com/omnipin/isheika.git" },
+            "type": "module",
+            "main": "isheika.js",
+            "types": "isheika.d.ts",
+            "files": ["isheika_bg.wasm", "isheika.js", "isheika.d.ts", "snippets"]
+          }
+          EOF
+          npm publish --access public
