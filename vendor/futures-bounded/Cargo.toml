@@ -1,0 +1,29 @@
+# Vendored copy of futures-bounded 0.3.0, patched so `Delay::tokio` falls back
+# to `futures-timer` on wasm32 (real tokio's timer calls std::time::Instant::now
+# which panics on wasm32-unknown-unknown). libp2p-identify hardcodes
+# `Delay::tokio`, so patching here fixes every libp2p user via [patch.crates-io].
+[package]
+name = "futures-bounded"
+version = "0.3.0"
+edition = "2021"
+license = "MIT"
+description = "Utilities for bounding futures in size and time (vendored + wasm-patched for isheika)."
+repository = "https://github.com/thomaseizinger/rust-futures-bounded"
+
+[lib]
+name = "futures_bounded"
+path = "src/lib.rs"
+
+[dependencies]
+futures-util = "0.3.30"
+futures-timer = { version = "3.0.2", optional = true }
+tokio = { version = "1.35.1", features = ["time"], optional = true }
+
+[features]
+# The `tokio` variant also needs futures-timer available for its wasm fallback.
+tokio = ["dep:tokio", "dep:futures-timer"]
+futures-timer = ["dep:futures-timer"]
+
+[dev-dependencies]
+futures = "0.3.30"
+tokio = { version = "1.35.1", features = ["macros", "rt", "sync"] }

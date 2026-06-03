@@ -805,7 +805,7 @@ impl Transport {
         dial(&mut swarm, peer_id, peer_addr)?;
 
         let underlay = prep_connection(&mut swarm, peer_id, self.config.timeout).await?;
-        do_handshake(
+        let hs = do_handshake(
             &mut swarm,
             peer_id,
             &mut control,
@@ -848,7 +848,19 @@ impl Transport {
         // tuning unattractively expensive (per-round wall clock =
         // `ceil(peers / concurrency) × wait`).
         const QUIET_FOR: Duration = Duration::from_millis(750);
-        let mut peers: Vec<Peer> = Vec::new();
+        // Seed the result with the dialed peer itself: it just completed a full
+        // bee handshake, so it's a known-reachable forwarder. Bootnodes in
+        // particular are highly-connected and (being /ws-dialable via AutoTLS)
+        // are among the very few peers a browser build can reach — keeping them
+        // in the retrieval set markedly improves browser fetch reliability,
+        // which would otherwise depend only on the sparse /ws peers that hive
+        // happens to gossip. `peer_addr` carries the `/p2p/<id>` tail so the
+        // retrieval dialer can extract the peer-id.
+        let mut peers: Vec<Peer> = vec![Peer {
+            overlay: hex::encode(hs.peer_overlay),
+            underlays: vec![peer_addr.to_string()],
+            ..Default::default()
+        }];
         let mut batches_read = 0usize;
         let deadline = web_time::Instant::now() + wait;
         let mut last_batch_at: Option<web_time::Instant> = None;
@@ -2178,6 +2190,13 @@ fn dial(
     peer_id: PeerId,
     peer_addr: &Multiaddr,
 ) -> Result<(), TransportError> {
+    // On wasm, rewrite bee AutoTLS underlays into a /dns4/<sni>/tcp/<port>/tls/ws
+    // form so `websocket_websys` dials `wss://<sni-host>` and the *browser*
+    // terminates TLS (it can't open raw TCP or do userspace TLS).
+    #[cfg(target_arch = "wasm32")]
+    let rewritten = crate::dnsaddr::browser_ws_addr(peer_addr);
+    #[cfg(target_arch = "wasm32")]
+    let peer_addr = &rewritten;
     swarm
         .dial(
             DialOpts::peer_id(peer_id)
@@ -2700,7 +2719,9 @@ pub(crate) async fn build_swarm_from(
 
 #[cfg(target_arch = "wasm32")]
 async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> {
-    use libp2p::websocket_websys as ws_websys;
+    // Vendored + patched websocket-websys (see src/wsws): sends non-shared
+    // buffers so `WebSocket.send()` works under the shared-memory wasm build.
+    use crate::wsws as ws_websys;
     use libp2p_core::{Transport as _, upgrade};
 
     let keypair = t.keypair.clone();

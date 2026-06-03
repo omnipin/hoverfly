@@ -7,16 +7,28 @@
 #![cfg(target_arch = "wasm32")]
 
 use core::time::Duration;
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use futures_timer::Delay;
 use js_sys::Uint8Array;
 use libp2p::Multiaddr;
 use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
-use crate::client::{discover, fetch_bytes, upload_bytes};
+use crate::client::{
+    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_ex,
+    list_manifest_ex, upload_bytes,
+};
 use crate::doh::Doh;
 use crate::peers::PeerStore;
 use crate::signer::SwarmSigner;
 use crate::transport::{Transport, TransportConfig};
+
+/// Per-chunk peer racing for browser fetches. Mirrors the CLI default
+/// (`client::DEFAULT_FETCH_CONCURRENCY`).
+const FETCH_CONCURRENCY: usize = 5;
 
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
@@ -26,11 +38,27 @@ pub fn _wasm_init() {
 
 #[wasm_bindgen]
 pub struct IsheikaClient {
-    transport: Transport,
-    peers: PeerStore,
-    doh: Doh,
+    /// libp2p transport, shared (`Arc`) with the background daemon loop so
+    /// foreground fetches and background discovery dial through the same
+    /// identity + per-peer dial cooldown.
+    transport: Arc<Transport>,
+    /// Candidate peer list behind shared interior mutability. The background
+    /// daemon loop (see [`IsheikaClient::start`]) merges freshly-discovered
+    /// peers in; every fetch snapshots it under a short borrow — never held
+    /// across an `.await` — and retrieves against that snapshot. `Rc<RefCell>`
+    /// is sound because wasm is single-threaded.
+    peers: Rc<RefCell<PeerStore>>,
+    doh: Arc<Doh>,
     signer_key: Option<String>,
     network_id: u64,
+    /// Shared session cache + peer scoreboard. A long-lived (daemon-style)
+    /// client reuses this across every fetch so warm sessions and learned
+    /// peer scores carry over — the first request pays discovery, later ones
+    /// reuse live forwarders.
+    cache: RetrievalCache,
+    /// `true` once the background daemon loop has been spawned. Guards
+    /// against spawning more than one loop on repeated `start()` calls.
+    running: Rc<RefCell<bool>>,
 }
 
 #[wasm_bindgen]
@@ -62,62 +90,200 @@ impl IsheikaClient {
         };
 
         Ok(Self {
-            transport: Transport::new(signer, cfg),
-            peers: PeerStore::new(),
-            doh: Doh::with_url(doh_url),
+            transport: Arc::new(Transport::new(signer, cfg)),
+            peers: Rc::new(RefCell::new(PeerStore::new())),
+            doh: Arc::new(Doh::with_url(doh_url)),
             signer_key: private_key_hex,
             network_id,
+            cache: RetrievalCache::new(),
+            running: Rc::new(RefCell::new(false)),
         })
     }
 
     /// Replace the in-memory peer store from a peers.json string.
     #[wasm_bindgen(js_name = "loadPeers")]
-    pub fn load_peers(&mut self, peers_json: &str) -> Result<(), JsError> {
+    pub fn load_peers(&self, peers_json: &str) -> Result<(), JsError> {
         let store: PeerStore = serde_json::from_str(peers_json).map_err(into_js_err)?;
-        self.peers = store;
+        *self.peers.borrow_mut() = store;
         Ok(())
     }
 
     /// Export the current peer store as a JSON string.
     #[wasm_bindgen(js_name = "exportPeers")]
     pub fn export_peers(&self) -> Result<String, JsError> {
-        serde_json::to_string_pretty(&self.peers).map_err(into_js_err)
+        serde_json::to_string_pretty(&*self.peers.borrow()).map_err(into_js_err)
     }
 
     /// Number of peers currently held in memory.
     #[wasm_bindgen(js_name = "peerCount")]
     pub fn peer_count(&self) -> usize {
-        self.peers.len()
+        self.peers.borrow().len()
     }
 
-    /// Discover peers from a bootstrap multiaddr (or `/dnsaddr/...`).
-    /// Wait `wait_secs` for hive announcements per dialed underlay.
-    /// Discovered peers are merged into the in-memory peer store and the
-    /// new total count is returned.
-    pub async fn discover(&mut self, bootstrap: String, wait_secs: u32) -> Result<usize, JsError> {
+    /// Start the in-browser daemon: a long-lived background task that keeps
+    /// the peer set warm. It runs one discovery round immediately — so the
+    /// first fetch already has fresh, browser-dialable peers to race — then
+    /// re-discovers every `interval_secs` for as long as the client lives.
+    ///
+    /// This is the in-browser analogue of the native unix-socket daemon's
+    /// eager pool-fill + maintenance loop (`src/daemon.rs`): rather than the
+    /// caller orchestrating discrete `discover()` then `fetch()` steps, the
+    /// node maintains its own connectivity and `fetchManifestPath` / `fetch`
+    /// simply talk to the running daemon. Because every method takes `&self`,
+    /// fetches run concurrently with the background loop with no locking.
+    ///
+    /// Idempotent: a second call refreshes peers but does not spawn a second
+    /// loop. Returns the peer count after the initial round.
+    pub async fn start(
+        &self,
+        bootstrap: String,
+        interval_secs: u32,
+        wait_secs: u32,
+    ) -> Result<usize, JsError> {
         let bootstrap_ma: Multiaddr = bootstrap
             .parse()
             .map_err(|e: libp2p::multiaddr::Error| into_js_err(e))?;
-        let discovered = discover(
+
+        // Eager initial fill — the first fetch should not start cold.
+        merge_discovered(
             &self.transport,
             &self.doh,
+            &self.peers,
             &bootstrap_ma,
             Duration::from_secs(wait_secs as u64),
         )
-        .await
-        .map_err(into_js_err)?;
-        for p in discovered {
-            self.peers.upsert(p);
+        .await;
+
+        // Spawn the maintenance loop exactly once.
+        let already_running = *self.running.borrow();
+        if !already_running {
+            *self.running.borrow_mut() = true;
+            let transport = self.transport.clone();
+            let doh = self.doh.clone();
+            let peers = self.peers.clone();
+            let running = self.running.clone();
+            let bootstrap_ma = bootstrap_ma.clone();
+            let interval = Duration::from_secs(interval_secs.max(1) as u64);
+            let wait = Duration::from_secs(wait_secs as u64);
+            wasm_bindgen_futures::spawn_local(async move {
+                loop {
+                    // Sleep first: `start` already did the eager round above,
+                    // so there's no need to discover again immediately.
+                    Delay::new(interval).await;
+                    let keep_running = *running.borrow();
+                    if !keep_running {
+                        break;
+                    }
+                    merge_discovered(&transport, &doh, &peers, &bootstrap_ma, wait).await;
+                }
+            });
         }
-        Ok(self.peers.len())
+
+        Ok(self.peers.borrow().len())
+    }
+
+    /// Stop the background daemon loop. It exits after its current sleep.
+    pub fn stop(&self) {
+        *self.running.borrow_mut() = false;
+    }
+
+    /// Run a single discovery round now and merge the results into the
+    /// in-memory peer store. The daemon's background loop does this
+    /// automatically once [`IsheikaClient::start`] has been called; this is
+    /// exposed for an explicit "refresh peers" affordance. Returns the new
+    /// peer count.
+    pub async fn discover(&self, bootstrap: String, wait_secs: u32) -> Result<usize, JsError> {
+        let bootstrap_ma: Multiaddr = bootstrap
+            .parse()
+            .map_err(|e: libp2p::multiaddr::Error| into_js_err(e))?;
+        merge_discovered(
+            &self.transport,
+            &self.doh,
+            &self.peers,
+            &bootstrap_ma,
+            Duration::from_secs(wait_secs as u64),
+        )
+        .await;
+        Ok(self.peers.borrow().len())
     }
 
     /// Fetch content. `root_hex` is a 32-byte content address in hex.
+    /// Reassembles the BMT tree into the full byte stream.
     pub async fn fetch(&self, root_hex: String, max_retries: usize) -> Result<Uint8Array, JsError> {
-        let bytes = fetch_bytes(&self.transport, &self.peers, &root_hex, max_retries)
-            .await
-            .map_err(into_js_err)?;
+        let peers = self.peers.borrow().clone();
+        let bytes = fetch_bytes_cached_ex(
+            &self.transport,
+            &peers,
+            &root_hex,
+            max_retries,
+            FETCH_CONCURRENCY,
+            &self.cache,
+        )
+        .await
+        .map_err(into_js_err)?;
         Ok(Uint8Array::from(bytes.as_slice()))
+    }
+
+    /// Resolve `path` through the mantaray manifest rooted at `root_hex` and
+    /// fetch the resulting file's bytes + `Content-Type`. This is the gateway
+    /// entry point: `fetchManifestPath("<root>", "index.html", 3)`. An empty
+    /// `path` returns the manifest's root entry. Uses the shared retrieval
+    /// cache so warm sessions/peer scores persist across requests.
+    #[wasm_bindgen(js_name = "fetchManifestPath")]
+    pub async fn fetch_manifest_path(
+        &self,
+        root_hex: String,
+        path: String,
+        max_retries: usize,
+    ) -> Result<ManifestFetch, JsError> {
+        let peers = self.peers.borrow().clone();
+        let (bytes, content_type) = fetch_manifest_path_cached_ex(
+            &self.transport,
+            &peers,
+            &root_hex,
+            &path,
+            max_retries,
+            FETCH_CONCURRENCY,
+            &self.cache,
+        )
+        .await
+        .map_err(into_js_err)?;
+        Ok(ManifestFetch {
+            bytes,
+            content_type,
+        })
+    }
+
+    /// List every entry in the mantaray manifest at `root_hex` as a JSON
+    /// string: `[{"path","reference","contentType"}]`. Useful for directory
+    /// index pages.
+    #[wasm_bindgen(js_name = "listManifest")]
+    pub async fn list_manifest(
+        &self,
+        root_hex: String,
+        max_retries: usize,
+    ) -> Result<String, JsError> {
+        let peers = self.peers.borrow().clone();
+        let entries = list_manifest_ex(
+            &self.transport,
+            &peers,
+            &root_hex,
+            max_retries,
+            FETCH_CONCURRENCY,
+        )
+        .await
+        .map_err(into_js_err)?;
+        let json: Vec<serde_json::Value> = entries
+            .iter()
+            .map(|e| {
+                serde_json::json!({
+                    "path": e.path,
+                    "reference": e.reference,
+                    "contentType": e.content_type,
+                })
+            })
+            .collect();
+        serde_json::to_string(&json).map_err(into_js_err)
     }
 
     /// Upload bytes with an existing postage batch. Returns the root hash hex.
@@ -134,9 +300,10 @@ impl IsheikaClient {
             .ok_or_else(|| JsError::new("client constructed without a private key"))?;
         let signer = SwarmSigner::from_hex(key, self.network_id).map_err(into_js_err)?;
         let buf = data.to_vec();
+        let peers = self.peers.borrow().clone();
         let root = upload_bytes(
             &self.transport,
-            &self.peers,
+            &peers,
             &signer,
             &batch_id_hex,
             depth,
@@ -149,6 +316,60 @@ impl IsheikaClient {
     }
 }
 
+/// Result of a manifest path fetch: file bytes plus the optional
+/// `Content-Type` recorded in the manifest entry's metadata.
+#[wasm_bindgen]
+pub struct ManifestFetch {
+    bytes: Vec<u8>,
+    content_type: Option<String>,
+}
+
+#[wasm_bindgen]
+impl ManifestFetch {
+    /// The resolved file's content bytes.
+    #[wasm_bindgen(getter)]
+    pub fn bytes(&self) -> Uint8Array {
+        Uint8Array::from(self.bytes.as_slice())
+    }
+
+    /// The `Content-Type` from the manifest entry's metadata, if present.
+    #[wasm_bindgen(getter, js_name = "contentType")]
+    pub fn content_type(&self) -> Option<String> {
+        self.content_type.clone()
+    }
+}
+
 fn into_js_err<E: core::fmt::Display>(e: E) -> JsError {
     JsError::new(&e.to_string())
+}
+
+/// Run one discovery round against `bootstrap` and merge the freshly-found
+/// peers into `peers`. Shared by the eager initial fill, the background
+/// maintenance loop, and the manual `discover()` affordance.
+///
+/// Errors are swallowed (logged) — a failed round just means the next one
+/// retries; the daemon must stay alive. The peer-store borrow is taken only
+/// after the `discover` await resolves and is never held across an `.await`,
+/// so it can never clash with a concurrent fetch's snapshot borrow.
+async fn merge_discovered(
+    transport: &Transport,
+    doh: &Doh,
+    peers: &Rc<RefCell<PeerStore>>,
+    bootstrap: &Multiaddr,
+    wait: Duration,
+) {
+    match discover(transport, doh, bootstrap, wait).await {
+        Ok(found) => {
+            let n = found.len();
+            let mut store = peers.borrow_mut();
+            for p in found {
+                store.upsert(p);
+            }
+            tracing::info!(target: "isheika::wasm",
+                "[daemon] discover round ok: found {} peer(s), store now {}", n, store.len());
+        }
+        Err(e) => {
+            tracing::warn!(target: "isheika::wasm", "[daemon] discover round failed: {e}");
+        }
+    }
 }

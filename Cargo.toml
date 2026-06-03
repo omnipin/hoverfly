@@ -24,6 +24,12 @@ required-features = ["cli"]
 default = ["cli"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:tar", "dep:indicatif"]
 
+# Redirect futures-bounded to a vendored copy whose `Delay::tokio` falls back to
+# futures-timer on wasm32 (real tokio's timer panics in the browser). Fixes the
+# libp2p-identify (and any other) `futures_bounded::Delay::tokio` usage on wasm.
+[patch.crates-io]
+futures-bounded = { path = "vendor/futures-bounded" }
+
 [dependencies]
 # Nectar primitives (BMT, chunks, file split/join, mantaray, postage)
 nectar-primitives = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386" }
@@ -124,6 +130,13 @@ getrandom_04 = { package = "getrandom", version = "0.4", default-features = fals
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
+# Used by the vendored websocket-websys module (src/wsws).
+web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket", "Window", "WorkerGlobalScope"] }
+# libp2p-swarm/ping pull `futures-timer` transitively; its default `Delay` on
+# wasm uses a std::time::Instant-backed timer thread that panics ("time not
+# implemented on this platform"). Enable the wasm-bindgen feature (gloo-timers)
+# via feature-unification so the swarm's idle-connection timeout works in-browser.
+futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"

@@ -1,0 +1,19 @@
+{
+  "name": "@isheika/gateway",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-browser Swarm subdomain gateway powered by a shared isheika (wasm) daemon",
+  "scripts": {
+    "build": "node build.js",
+    "watch": "node build.js --watch",
+    "serve": "node serve.js",
+    "start": "node build.js && node serve.js",
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.worker.json",
+    "selftest": "node --experimental-strip-types scripts/selftest.ts"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  }
+}

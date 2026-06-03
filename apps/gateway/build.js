@@ -1,0 +1,62 @@
+// Build the gateway: bundle the TS entry points with esbuild, copy static
+// files from public/, and vendor the isheika wasm package from the repo's
+// pkg/ (built via `cargo build --target wasm32-... && wasm-bindgen`).
+
+import * as esbuild from 'esbuild'
+import { cpSync, existsSync, mkdirSync, rmSync } from 'node:fs'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+
+const here = dirname(fileURLToPath(import.meta.url))
+const dist = resolve(here, 'dist')
+const assets = resolve(dist, '__gw__')
+const pkg = resolve(here, '../../pkg')
+const watch = process.argv.includes('--watch')
+
+const entryPoints = {
+  landing: resolve(here, 'src/app/landing.ts'),
+  boot: resolve(here, 'src/boot/boot.ts'),
+  sw: resolve(here, 'src/sw/sw.ts'),
+  frame: resolve(here, 'src/frame/frame.ts'),
+  daemon: resolve(here, 'src/daemon/daemon.ts')
+}
+
+function copyStatic () {
+  cpSync(resolve(here, 'public'), dist, { recursive: true })
+  if (existsSync(pkg)) {
+    cpSync(pkg, resolve(assets, 'isheika'), { recursive: true })
+  } else {
+    console.warn(`\n  ⚠  ${pkg} not found — build the wasm first:\n` +
+      '     RUSTUP_TOOLCHAIN=nightly cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --lib\n' +
+      '     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/isheika.wasm\n')
+  }
+}
+
+/** @type {import('esbuild').BuildOptions} */
+const options = {
+  entryPoints,
+  outdir: assets,
+  entryNames: '[name]',
+  bundle: true,
+  format: 'esm',
+  splitting: false,
+  sourcemap: true,
+  target: ['chrome120'],
+  logLevel: 'info',
+  define: { 'process.env.NODE_ENV': '"production"' }
+}
+
+rmSync(dist, { recursive: true, force: true })
+mkdirSync(assets, { recursive: true })
+copyStatic()
+
+if (watch) {
+  const ctx = await esbuild.context(options)
+  await ctx.watch()
+  // re-copy static on a simple interval is overkill; copy once and rely on
+  // editing public/ rarely. Re-run `npm run build` for static changes.
+  console.log('esbuild watching for changes…')
+} else {
+  await esbuild.build(options)
+  console.log('built →', dist)
+}

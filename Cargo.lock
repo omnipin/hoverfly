@@ -1882,9 +1882,8 @@ dependencies = [
 [[package]]
 name = "futures-bounded"
 version = "0.3.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b604752cefc5aa3ab98992a107a8bd99465d2825c1584e0b60cb6957b21e19d7"
 dependencies = [
+ "futures-timer",
  "futures-util",
  "tokio",
 ]
@@ -2677,6 +2676,7 @@ dependencies = [
  "clap",
  "console_error_panic_hook",
  "futures",
+ "futures-timer",
  "getrandom 0.2.17",
  "getrandom 0.3.4",
  "getrandom 0.4.2",
@@ -2711,6 +2711,7 @@ dependencies = [
  "tracing-wasm",
  "wasm-bindgen",
  "wasm-bindgen-futures",
+ "web-sys",
  "web-time",
 ]
 

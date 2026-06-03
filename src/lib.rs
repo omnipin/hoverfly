@@ -28,6 +28,11 @@ pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
 pub mod wasm;
+// Vendored copy of libp2p-websocket-websys, patched so `WebSocket.send()` is
+// handed a non-shared buffer (the wasm memory is a SharedArrayBuffer because of
+// the atomics/wasm-bindgen-rayon build, and Chrome rejects sending shared views).
+#[cfg(target_arch = "wasm32")]
+mod wsws;
 
 // Re-export nectar primitives so consumers don't have to depend on nectar separately.
 pub use nectar_primitives::{

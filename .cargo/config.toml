@@ -5,9 +5,29 @@
 #   rustup target add wasm32-unknown-unknown --toolchain nightly
 #   RUSTUP_TOOLCHAIN=nightly cargo build --target wasm32-unknown-unknown --no-default-features
 #
+# `wasm-bindgen-rayon` requires the wasm memory to be a SharedArrayBuffer, so we
+# build a shared memory: `--shared-memory --import-memory` plus a `--max-memory`
+# (shared memory MUST declare a maximum). Without these, atomic ops run over an
+# unshared memory and `Atomics.waitAsync` throws "not a shared typed array" in
+# the browser, hanging every async op. wasm-bindgen's threads transform then
+# reads the TLS init symbols (`__wasm_init_tls` etc.); lld doesn't export them by
+# default, so we export them explicitly or wasm-bindgen fails with "failed to
+# find __wasm_init_tls".
 
 [target.wasm32-unknown-unknown]
-rustflags = ["-C", "target-feature=+atomics,+bulk-memory,+mutable-globals"]
+rustflags = [
+    "-C", "target-feature=+atomics,+bulk-memory,+mutable-globals",
+    "-C", "link-arg=--shared-memory",
+    "-C", "link-arg=--import-memory",
+    "-C", "link-arg=--max-memory=4294967296",
+    # wasm-bindgen's threads transform reads these TLS symbols; lld doesn't
+    # export them by default, so do it explicitly (otherwise wasm-bindgen
+    # fails with "failed to find __wasm_init_tls").
+    "-C", "link-arg=--export=__wasm_init_tls",
+    "-C", "link-arg=--export=__tls_size",
+    "-C", "link-arg=--export=__tls_align",
+    "-C", "link-arg=--export=__tls_base",
+]
 
 [unstable]
 build-std = ["panic_abort", "std"]

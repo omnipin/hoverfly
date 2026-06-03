@@ -158,3 +158,37 @@ fn has_ip4_host(ma: &Multiaddr) -> bool {
     use libp2p::multiaddr::Protocol;
     ma.iter().any(|p| matches!(p, Protocol::Ip4(_)))
 }
+
+/// Rewrite a bee AutoTLS browser underlay
+/// `/ip4|ip6/<ip>/tcp/<port>/tls/sni/<host>/ws[/p2p/<id>]` into
+/// `/dns4/<host>/tcp/<port>/tls/ws`, which `libp2p::websocket_websys` dials as
+/// `wss://<host>:<port>`.
+///
+/// In the browser there is no raw TCP and no userspace TLS: the browser's
+/// `WebSocket` performs the TLS handshake itself. So we must hand it the SNI
+/// *hostname* (whose `libp2p.direct` AutoTLS certificate matches and which DNS
+/// resolves to the peer's IP), not the raw IP — connecting `wss://<ip>` would
+/// fail certificate validation. Non-AutoTLS multiaddrs are returned unchanged.
+#[cfg(target_arch = "wasm32")]
+pub fn browser_ws_addr(ma: &Multiaddr) -> Multiaddr {
+    use libp2p::multiaddr::Protocol;
+    let mut port: Option<u16> = None;
+    let mut sni: Option<String> = None;
+    let mut has_tls = false;
+    let mut has_ws = false;
+    for p in ma.iter() {
+        match p {
+            Protocol::Tcp(n) => port = Some(n),
+            Protocol::Sni(h) => sni = Some(h.into_owned()),
+            Protocol::Tls => has_tls = true,
+            Protocol::Ws(_) => has_ws = true,
+            _ => {}
+        }
+    }
+    match (port, sni) {
+        (Some(port), Some(host)) if has_tls && has_ws => format!("/dns4/{host}/tcp/{port}/tls/ws")
+            .parse()
+            .unwrap_or_else(|_| ma.clone()),
+        _ => ma.clone(),
+    }
+}
