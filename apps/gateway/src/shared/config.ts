@@ -41,6 +41,22 @@ export const DOH_URL: string | undefined = undefined
 export const IDB_NAME = 'isheika-gateway'
 export const IDB_STORE = 'kv'
 export const IDB_PEERS_KEY = 'peerstore-json'
+/**
+ * Persisted browser-daemon identity. The node's Swarm overlay is
+ * `keccak256(eth_addr || network_id || nonce)`, so a stable identity across
+ * page loads/sessions requires persisting BOTH the secp256k1 node key and the
+ * overlay nonce — replaying only the key still rotates the overlay every
+ * launch. Stored as 32-byte hex strings in the kv store on the root origin.
+ */
+export const IDB_NODEKEY_KEY = 'node-key-hex'
+export const IDB_NONCE_KEY = 'node-nonce-hex'
+/**
+ * IndexedDB database name for the persistent, content-addressed chunk cache
+ * (L2). Managed inside the isheika wasm via `enableChunkStore`. Immutable
+ * Swarm chunks persist here across fetches and sessions, on top of the SW's
+ * file-level Cache API.
+ */
+export const IDB_CHUNKS_DB = 'isheika-gw-chunks'
 export const LS_USER_PEERS = 'isheika-gw:user-wss-peers'
 
 // ---- caching ----

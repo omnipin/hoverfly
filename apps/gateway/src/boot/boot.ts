@@ -26,6 +26,7 @@ async function main (): Promise<void> {
   try {
     controller = await ensureControllingSW()
     console.log('[boot] SW controlling')
+    ui.phase('Connecting to the Swarm daemon…', 'Bridging to the shared node…')
   } catch (e) {
     console.error('[boot] SW failed', e)
     ui.fail('Service worker failed to take control: ' + (e as Error).message)
@@ -109,6 +110,7 @@ function connectDaemon (): Promise<MessagePort> {
 interface ShellUi {
   loadContent: (path: string) => void
   status: (s: DaemonStatus) => void
+  phase: (primary: string, sub?: string) => void
   fail: (msg: string) => void
 }
 
@@ -125,38 +127,101 @@ function renderShell (): ShellUi {
   pill.title = 'isheika gateway status — click to hide'
   pill.addEventListener('click', () => pill.classList.toggle('gw-hidden'))
 
+  // Full-viewport loading overlay shown over the (initially blank, white)
+  // content iframe until the real site finishes loading — or boot fails.
+  const loading = document.createElement('div')
+  loading.className = 'gw-loading'
+  loading.innerHTML =
+    '<div class="gw-spinner"></div>' +
+    '<div class="gw-loading-text">Starting gateway…</div>' +
+    '<div class="gw-loading-sub">Registering service worker…</div>'
+
   root.appendChild(frame)
   root.appendChild(pill)
+  root.appendChild(loading)
 
   const text = pill.querySelector('.gw-pill-text') as HTMLElement
   const dot = pill.querySelector('.gw-dot') as HTMLElement
+  const loadingText = loading.querySelector('.gw-loading-text') as HTMLElement
+  const loadingSub = loading.querySelector('.gw-loading-sub') as HTMLElement
 
   let loaded = false
-  frame.addEventListener('load', () => {
+  let contentRequested = false
+
+  // Reveal the loaded site by fading the overlay out (idempotent).
+  const reveal = (): void => {
+    if (loaded) return
     loaded = true
+    loading.classList.add('gw-hide')
+    setTimeout(() => loading.remove(), 500)
     setTimeout(() => pill.classList.add('gw-min'), 1500)
-  })
+  }
+
+  // Dismiss the overlay as soon as the site's document has parsed and its entry
+  // scripts have run (DOMContentLoaded ⇒ readyState 'interactive'), NOT on the
+  // full `load` event. Images and other late subresources are retrieved from
+  // Swarm chunk-by-chunk and can lag badly or never arrive; `load` waits for
+  // all of them, so gating on it leaves the overlay stuck over an already
+  // interactive page. `load` still acts as a happy-path accelerator, and a hard
+  // cap guards against a wholly stalled navigation.
+  const watchContentReady = (): void => {
+    const started = Date.now()
+    const poll = setInterval(() => {
+      let ready = false
+      try {
+        const doc = frame.contentDocument
+        const rs = doc?.readyState
+        // Ignore the initial about:blank document still present mid-navigation.
+        ready = !(doc?.URL ?? '').startsWith('about:') && (rs === 'interactive' || rs === 'complete')
+      } catch { ready = false } // transiently inaccessible while navigating
+      if (ready) {
+        clearInterval(poll)
+        setTimeout(reveal, 400) // brief grace for first paint / hydration
+      } else if (Date.now() - started > 20_000) {
+        clearInterval(poll)
+        reveal()
+      }
+    }, 150)
+  }
+
+  frame.addEventListener('load', () => { if (contentRequested) reveal() })
 
   return {
-    loadContent (path) { frame.src = path },
+    loadContent (path) {
+      contentRequested = true
+      loadingText.textContent = 'Loading Swarm site…'
+      frame.src = path
+      watchContentReady()
+    },
+    phase (primary, sub) {
+      loadingText.textContent = primary
+      if (sub != null) loadingSub.textContent = sub
+    },
     status (s) {
+      let msg: string
       if (s.lastError != null) {
         dot.style.background = '#f85149'
-        text.textContent = `daemon error · ${s.peerCount} peers (${s.dialable} dialable)`
+        msg = `daemon error · ${s.dialable} peers`
       } else if (s.warming || !s.ready) {
         dot.style.background = '#d29922'
-        text.textContent = s.ready ? `discovering · ${s.dialable} dialable` : 'starting daemon…'
+        msg = s.ready ? `discovering · ${s.dialable} peers` : 'starting daemon…'
       } else {
         dot.style.background = s.dialable > 0 ? '#3fb950' : '#d29922'
-        text.textContent = `${s.peerCount} peers · ${s.dialable} dialable`
+        msg = `${s.dialable} peers`
       }
+      text.textContent = msg
+      // Mirror live daemon status into the overlay while the site is loading.
+      if (!loaded) loadingSub.textContent = msg
       if (loaded) setTimeout(() => pill.classList.add('gw-min'), 1500)
     },
     fail (msg) {
       pill.classList.remove('gw-min', 'gw-hidden')
       dot.style.background = '#f85149'
       text.textContent = msg
-      frame.srcdoc = `<body style="font:15px system-ui;color:#e6edf3;background:#0e1116;display:grid;place-items:center;height:100vh;margin:0"><div style="max-width:32rem;padding:2rem;text-align:center">${msg}</div></body>`
+      loading.classList.remove('gw-hide')
+      loading.classList.add('gw-error')
+      loadingText.textContent = 'Failed to load site'
+      loadingSub.textContent = msg
     }
   }
 }

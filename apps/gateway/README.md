@@ -61,16 +61,16 @@ wasm-bindgen --target web --out-dir pkg \
 
 # 2. Build + serve the gateway:
 cd apps/gateway
-npm install
-npm start            # builds, then serves on http://bzz.localhost:3000
+pnpm install
+pnpm start            # builds, then serves on http://bzz.localhost:3000
 ```
 
 Open **http://bzz.localhost:3000** in Chrome. (`*.localhost` resolves to
 127.0.0.1 automatically — no `/etc/hosts` needed.) Enter a Swarm reference
 (64-char hex) or a swarm CID (`b…`) and it opens at `<cid>.bzz.localhost:3000`.
 
-`npm run watch` rebuilds on source changes (re-run `npm run build` after editing
-`public/`).
+`pnpm run watch` rebuilds on source changes (re-run `pnpm run build` after
+editing `public/`).
 
 ## Connectivity: browser-dialable peers
 

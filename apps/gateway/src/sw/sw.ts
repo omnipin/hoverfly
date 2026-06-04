@@ -55,6 +55,19 @@ self.addEventListener('fetch', (event: FetchEvent) => {
 
 async function serveContent (req: Request): Promise<Response> {
   const url = new URL(req.url)
+
+  // The browser auto-probes /favicon.ico for the top-level document. The
+  // gateway shell ships its own icon (see boot.html), and a content site's
+  // favicon would never be shown anyway — it renders inside an iframe, so the
+  // tab icon is always the shell's. Answer the probe with an empty 204 instead
+  // of doing a daemon round-trip and emitting a (harmless but noisy) manifest
+  // 404 for a file the site simply doesn't ship.
+  if (url.pathname === '/favicon.ico') {
+    const headers = new Headers({ 'cache-control': 'no-cache', server: 'isheika-gateway' })
+    isolation(headers)
+    return new Response(null, { status: 204, headers })
+  }
+
   const host = parseHost(url.host)
   if (host.kind !== 'subdomain' || host.id == null) {
     return errorPage(404, 'Not a Swarm content subdomain', url.host)
@@ -98,7 +111,13 @@ async function serveContent (req: Request): Promise<Response> {
 
   const headers = new Headers()
   headers.set('content-type', res.contentType ?? 'application/octet-stream')
-  headers.set('cache-control', 'public, max-age=300')
+  // A CID origin is content-addressed and immutable: every path under it is
+  // fixed forever (a new site = a new CID = a new origin). So mark responses
+  // immutable with a long max-age — the SW already replays them from the
+  // persistent Cache API, and this lets the browser's own HTTP cache treat
+  // them as permanent too. (isheika's in-wasm chunk cache is per-fetch only,
+  // so this Cache API layer is what gives cross-load / offline persistence.)
+  headers.set('cache-control', 'public, max-age=31536000, immutable')
   headers.set('x-swarm-reference', refHex)
   headers.set('server', 'isheika-gateway')
   // The boot shell is crossOriginIsolated (COEP: require-corp) so the nested

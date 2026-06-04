@@ -32,8 +32,7 @@ app.innerHTML = `
         <span id="state" class="muted">connecting…</span>
       </div>
       <dl class="stats">
-        <div><dt>Peers known</dt><dd id="peers">–</dd></div>
-        <div><dt>Browser-dialable (/wss)</dt><dd id="dialable">–</dd></div>
+        <div><dt>Dialable peers</dt><dd id="peers">–</dd></div>
         <div><dt>Network</dt><dd id="net">–</dd></div>
       </dl>
       <details class="adv">
@@ -72,8 +71,10 @@ const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'i
 const rpc = new DaemonRpc(worker.port)
 
 function render (s: DaemonStatus): void {
-  $('peers').textContent = String(s.peerCount)
-  $('dialable').textContent = String(s.dialable)
+  // Only browser-dialable (/ws, /wss) peers can actually be used from the
+  // browser, so that's the single count worth surfacing — the raw PeerStore
+  // total mostly counts TCP-only peers we can never connect to.
+  $('peers').textContent = String(s.dialable)
   $('net').textContent = s.network === 1 ? 'mainnet' : s.network === 10 ? 'testnet' : String(s.network)
   const dot = $('dot')
   const state = $('state')

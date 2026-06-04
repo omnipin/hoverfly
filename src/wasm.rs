@@ -65,20 +65,35 @@ pub struct IsheikaClient {
 impl IsheikaClient {
     /// Construct a client. `private_key_hex` is optional — provide it only for upload.
     /// `network_id` defaults to `1` (mainnet). `doh_url` defaults to Cloudflare.
+    ///
+    /// `nonce_hex` is the optional 32-byte overlay nonce. The Swarm overlay is
+    /// `keccak256(eth_addr || network_id || nonce)`, so to keep a *stable*
+    /// overlay across restarts a caller must persist and replay BOTH the key and
+    /// the nonce — persisting the key alone still yields a fresh random overlay
+    /// each launch (see `SwarmSigner::from_hex`), which defeats peers' kademlia
+    /// memory of this node. A long-lived browser daemon passes both to reuse one
+    /// identity across page loads.
     #[wasm_bindgen(constructor)]
     pub fn new(
         private_key_hex: Option<String>,
         network_id: Option<u64>,
         doh_url: Option<String>,
         timeout_secs: Option<u32>,
+        nonce_hex: Option<String>,
     ) -> Result<IsheikaClient, JsError> {
         let network_id = network_id.unwrap_or(1);
         let doh_url = doh_url.unwrap_or_else(|| DEFAULT_DOH_URL.to_string());
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30) as u64);
 
-        let signer = match &private_key_hex {
-            Some(hex) => SwarmSigner::from_hex(hex, network_id).map_err(into_js_err)?,
-            None => SwarmSigner::random(network_id),
+        // key + nonce -> stable overlay (persisted, reusable daemon identity)
+        // key only    -> stable eth identity, fresh random overlay nonce
+        // neither      -> fully ephemeral (random key + nonce)
+        let signer = match (&private_key_hex, &nonce_hex) {
+            (Some(key), Some(nonce)) => {
+                SwarmSigner::from_hex_with_nonce(key, nonce, network_id).map_err(into_js_err)?
+            }
+            (Some(key), None) => SwarmSigner::from_hex(key, network_id).map_err(into_js_err)?,
+            (None, _) => SwarmSigner::random(network_id),
         };
         let cfg = TransportConfig {
             timeout,

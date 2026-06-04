@@ -16,7 +16,8 @@
 
 import {
   DAEMON_REFRESH_SECS, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, DOH_URL,
-  FETCH_RETRIES, IDB_NAME, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID
+  FETCH_RETRIES, IDB_CHUNKS_DB, IDB_NAME, IDB_NODEKEY_KEY, IDB_NONCE_KEY,
+  IDB_PEERS_KEY, IDB_STORE, NETWORK_ID
 } from '../shared/config.ts'
 import { ATTACH, type DaemonStatus } from '../shared/protocol.ts'
 
@@ -32,6 +33,11 @@ interface IsheikaClient {
   start: (bootstrap: string, intervalSecs: number, waitSecs: number) => Promise<number>
   /** Stop the background maintenance loop. */
   stop: () => void
+  /** Enable the persistent IndexedDB chunk cache (L2). Retrieved chunks are
+   *  written back and reused across fetches/sessions. */
+  enableChunkStore: (dbName: string) => Promise<void>
+  /** Chunks served from the L2 (IndexedDB) cache since load. */
+  chunkStoreHits: () => number
   /** Manual one-shot discovery round (the daemon loop does this automatically). */
   discover: (bootstrap: string, waitSecs: number) => Promise<number>
   fetchManifestPath: (rootHex: string, path: string, maxRetries: number) => Promise<ManifestFetch>
@@ -43,7 +49,7 @@ interface IsheikaClient {
 interface IsheikaModule {
   default: (input?: any) => Promise<unknown>
   initThreadPool?: (n: number) => Promise<unknown>
-  IsheikaClient: new (key?: string | null, networkId?: bigint | null, doh?: string | null, timeout?: number | null) => IsheikaClient
+  IsheikaClient: new (key?: string | null, networkId?: bigint | null, doh?: string | null, timeout?: number | null, nonceHex?: string | null) => IsheikaClient
 }
 // Resolved at runtime (relative to this worker script) so esbuild leaves the
 // dynamic import alone — the wasm-bindgen module must load itself + its wasm
@@ -101,6 +107,36 @@ async function idbSet (key: string, value: string): Promise<void> {
   } catch { /* best effort */ }
 }
 
+// ---------------- node identity (persisted) ----------------
+function randomHex32 (): string {
+  const b = new Uint8Array(32)
+  crypto.getRandomValues(b)
+  return Array.from(b, (x) => x.toString(16).padStart(2, '0')).join('')
+}
+
+/**
+ * Load the persisted browser-daemon identity (secp256k1 node key + overlay
+ * nonce) from IndexedDB, generating and storing one on first run. Persisting
+ * BOTH values keeps the node's libp2p peer id AND its Swarm overlay stable
+ * across reloads/sessions, so peers' kademlia memory of us survives instead of
+ * us rejoining as a brand-new node on every page load. The pair lives in the
+ * shared daemon's (root-origin) kv store, so all tabs/subdomains reuse it.
+ */
+async function loadOrCreateIdentity (): Promise<{ key: string, nonce: string }> {
+  let key = await idbGet(IDB_NODEKEY_KEY)
+  let nonce = await idbGet(IDB_NONCE_KEY)
+  if (key == null || nonce == null) {
+    key = randomHex32()
+    nonce = randomHex32()
+    await idbSet(IDB_NODEKEY_KEY, key)
+    await idbSet(IDB_NONCE_KEY, nonce)
+    console.log('[daemon] minted new persistent node identity')
+  } else {
+    console.log('[daemon] reusing persisted node identity')
+  }
+  return { key, nonce }
+}
+
 // ---------------- helpers ----------------
 function broadcastStatus (): void {
   const msg = { kind: 'event', event: 'status', status: { ...status } }
@@ -151,8 +187,21 @@ async function warm (): Promise<void> {
         console.warn('[daemon] initThreadPool unavailable, continuing single-threaded:', e)
       }
     }
-    const c = new mod.IsheikaClient(undefined, BigInt(NETWORK_ID), DOH_URL ?? undefined, 30)
+    // Reuse a persisted node identity (key + overlay nonce) so this browser
+    // daemon keeps one stable Swarm overlay across reloads — see config.ts.
+    const identity = await loadOrCreateIdentity()
+    const c = new mod.IsheikaClient(identity.key, BigInt(NETWORK_ID), DOH_URL ?? undefined, 30, identity.nonce)
     client = c
+
+    // Enable the persistent L2 chunk cache (IndexedDB) before any fetch. Best
+    // effort: if storage is unavailable the daemon still works, just without
+    // cross-session chunk persistence (the SW file cache still applies).
+    try {
+      await c.enableChunkStore(IDB_CHUNKS_DB)
+      console.log('[daemon] chunk store enabled:', IDB_CHUNKS_DB)
+    } catch (e) {
+      console.warn('[daemon] chunk store unavailable:', e)
+    }
 
     const saved = await idbGet(IDB_PEERS_KEY)
     if (saved != null) {
@@ -263,7 +312,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       console.log('[daemon] fetchPath: calling client.fetchManifestPath', candidate)
       const r = await c.fetchManifestPath(refHex, candidate, FETCH_RETRIES)
       const bytes = r.bytes.slice()
-      console.log('[daemon] fetchPath: got', candidate, bytes.length, 'bytes')
+      console.log('[daemon] fetchPath: got', candidate, bytes.length, 'bytes (L2 chunk hits so far:', c.chunkStoreHits() + ')')
       return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer }
     } catch (e) {
       console.log('[daemon] fetchPath:', candidate, 'failed:', errMsg(e))
