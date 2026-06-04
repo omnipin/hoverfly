@@ -89,7 +89,9 @@ impl IdbChunkStore {
                 // clone quirks with shared views (same reasoning as src/wsws).
                 let arr = js_sys::Uint8Array::new_with_length(bytes.len() as u32);
                 arr.copy_from(&bytes);
-                store.put_kv(&JsValue::from_str(&key_hex), arr.as_ref()).await
+                store
+                    .put_kv(&JsValue::from_str(&key_hex), arr.as_ref())
+                    .await
             })
             .await;
     }

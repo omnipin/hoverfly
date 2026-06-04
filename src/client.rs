@@ -675,7 +675,9 @@ impl<'a> NetworkedStore<'a> {
                     if let Some(store) = crate::idb_chunk_store::get_store() {
                         let key = hex::encode(address.as_bytes());
                         let wire = wire_form(&chunk);
-                        wasm_bindgen_futures::spawn_local(async move { store.put(key, wire).await; });
+                        wasm_bindgen_futures::spawn_local(async move {
+                            store.put(key, wire).await;
+                        });
                     }
                     return Ok(chunk);
                 }
