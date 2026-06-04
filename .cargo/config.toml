@@ -10,9 +10,13 @@
 # (shared memory MUST declare a maximum). Without these, atomic ops run over an
 # unshared memory and `Atomics.waitAsync` throws "not a shared typed array" in
 # the browser, hanging every async op. wasm-bindgen's threads transform then
-# reads the TLS init symbols (`__wasm_init_tls` etc.); lld doesn't export them by
-# default, so we export them explicitly or wasm-bindgen fails with "failed to
-# find __wasm_init_tls".
+# reads the TLS init symbols (`__wasm_init_tls` etc.); lld doesn't export them
+# by default, so we export them explicitly or wasm-bindgen fails with "failed to
+# find __wasm_init_tls". lld ≥ ~21 dropped the default export of `__heap_base`
+# under `--import-memory`, which the same threads transform also needs to find
+# the static-data / heap boundary when injecting the per-thread id, so we
+# export that explicitly too (otherwise it errors with "failed to find
+# __heap_base for injecting thread id").
 
 [target.wasm32-unknown-unknown]
 rustflags = [
@@ -27,6 +31,7 @@ rustflags = [
     "-C", "link-arg=--export=__tls_size",
     "-C", "link-arg=--export=__tls_align",
     "-C", "link-arg=--export=__tls_base",
+    "-C", "link-arg=--export=__heap_base",
 ]
 
 [unstable]
