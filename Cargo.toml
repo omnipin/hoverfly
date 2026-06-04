@@ -132,6 +132,11 @@ wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
 # Used by the vendored websocket-websys module (src/wsws).
 web-sys = { version = "0.3", features = ["BinaryType", "CloseEvent", "Event", "MessageEvent", "WebSocket", "Window", "WorkerGlobalScope"] }
+# Persistent content-addressed chunk cache (src/idb_chunk_store). This crate is
+# the only IndexedDB binding that works under wasm-bindgen's multi-threaded
+# futures executor — which our `+atomics` / wasm-bindgen-rayon build uses — so
+# `idb`/`rexie` (which break on transaction auto-commit there) aren't options.
+indexed-db = "0.4"
 # libp2p-swarm/ping pull `futures-timer` transitively; its default `Delay` on
 # wasm uses a std::time::Instant-backed timer thread that panics ("time not
 # implemented on this platform"). Enable the wasm-bindgen feature (gloo-timers)

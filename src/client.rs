@@ -363,6 +363,25 @@ impl<'a> NetworkedStore<'a> {
             return Ok(c);
         }
 
+        // L2 hit: persistent IndexedDB chunk cache (browser only). Chunks are
+        // immutable + content-addressed, so a stored copy is reusable across
+        // fetches and sessions. Re-verify the BMT address on read-back so a
+        // corrupted/tampered store can never inject a bad chunk.
+        #[cfg(target_arch = "wasm32")]
+        if let Some(store) = crate::idb_chunk_store::get_store() {
+            use nectar_primitives::Chunk;
+            if let Some(wire) = store.get(hex::encode(address.as_bytes())).await {
+                if let Ok(cc) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()) {
+                    if cc.address() == &address {
+                        let chunk = AnyChunk::from(cc);
+                        self.cache.lock().unwrap().insert(address, chunk.clone());
+                        crate::idb_chunk_store::note_hit();
+                        return Ok(chunk);
+                    }
+                }
+            }
+        }
+
         let mut bytes32 = [0u8; 32];
         bytes32.copy_from_slice(address.as_bytes());
 
@@ -649,6 +668,15 @@ impl<'a> NetworkedStore<'a> {
             match outcome {
                 AttemptOutcome::Got(chunk) => {
                     self.cache.lock().unwrap().insert(address, chunk.clone());
+                    // Write-back to the persistent L2 (browser). Fire-and-forget
+                    // so the IndexedDB write never blocks retrieval — the chunk
+                    // is already in L1 for this session.
+                    #[cfg(target_arch = "wasm32")]
+                    if let Some(store) = crate::idb_chunk_store::get_store() {
+                        let key = hex::encode(address.as_bytes());
+                        let wire = wire_form(&chunk);
+                        wasm_bindgen_futures::spawn_local(async move { store.put(key, wire).await; });
+                    }
                     return Ok(chunk);
                 }
                 AttemptOutcome::Deferred => {

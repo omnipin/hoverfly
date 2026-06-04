@@ -33,6 +33,11 @@ pub mod wasm;
 // the atomics/wasm-bindgen-rayon build, and Chrome rejects sending shared views).
 #[cfg(target_arch = "wasm32")]
 mod wsws;
+// Persistent IndexedDB-backed L2 chunk cache (browser only). Immutable,
+// content-addressed chunks survive reloads/sessions on top of the per-fetch
+// in-memory cache in `client::NetworkedStore`.
+#[cfg(target_arch = "wasm32")]
+pub mod idb_chunk_store;
 
 // Re-export nectar primitives so consumers don't have to depend on nectar separately.
 pub use nectar_primitives::{

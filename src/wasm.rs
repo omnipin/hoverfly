@@ -202,6 +202,29 @@ impl IsheikaClient {
         *self.running.borrow_mut() = false;
     }
 
+    /// Enable the persistent IndexedDB chunk cache (L2). Once enabled, every
+    /// retrieved chunk is written back to IndexedDB and future fetches (this
+    /// session or later) reuse stored chunks instead of hitting the network —
+    /// immutable + content-addressed, so it's safe to keep indefinitely. This
+    /// sits on top of the per-fetch in-memory cache. `db_name` is the
+    /// IndexedDB database name to use.
+    #[wasm_bindgen(js_name = "enableChunkStore")]
+    pub async fn enable_chunk_store(&self, db_name: String) -> Result<(), JsError> {
+        let store = crate::idb_chunk_store::IdbChunkStore::open(&db_name)
+            .await
+            .map_err(into_js_err)?;
+        crate::idb_chunk_store::set_store(store);
+        Ok(())
+    }
+
+    /// Number of chunks served from the persistent L2 (IndexedDB) cache since
+    /// load. Non-zero with a cold in-memory cache means fetches are being
+    /// served from IndexedDB rather than the network.
+    #[wasm_bindgen(js_name = "chunkStoreHits")]
+    pub fn chunk_store_hits(&self) -> u32 {
+        crate::idb_chunk_store::hits()
+    }
+
     /// Run a single discovery round now and merge the results into the
     /// in-memory peer store. The daemon's background loop does this
     /// automatically once [`IsheikaClient::start`] has been called; this is
