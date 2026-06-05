@@ -127,6 +127,11 @@ jobs:
           # Per-target cache so an Apple Silicon rebuild doesn't
           # invalidate the Linux x86_64 cache.
           key: ${{ matrix.target }}
+          # Persist cache even on job failure: a 1m 30s wasm cold
+          # compile that fails at the post-build `wasm-bindgen` step
+          # would otherwise drop the cache and force the next attempt
+          # to recompile from scratch.
+          cache-on-failure: true
 
       - name: Build release binary
         env:
@@ -217,6 +222,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2.9.1
         with:
           key: wasm32-unknown-unknown
+          # See note on the matrix cache step: a wasm compile that
+          # fails at `wasm-bindgen` should still leave a warm cache
+          # for the retry.
+          cache-on-failure: true
 
       - uses: actions/setup-node@v6
         with:
