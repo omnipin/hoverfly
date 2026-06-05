@@ -9,26 +9,18 @@ WebSocket-only, because browsers can't open raw TCP sockets.
 
 [swarm]: https://www.ethswarm.org/
 
-## What it does
+## Features
 
-- Fetches and uploads Swarm content by speaking bee's libp2p protocols
-  directly (see the compatibility table below).
-- Discovers peers by walking bee's hive gossip out from a bootnode, and
-  caches the result in a reusable `peers.json`.
-- Wraps a file in a mantaray manifest, or packs a directory into a TAR
-  collection — one manifest, every file still addressable by path.
-- Creates postage batches on-chain: `isheika batch create --size 2GB
-  --duration 30d` issues a stamp batch on Gnosis chain.
-- Runs one-shot, or as a daemon that keeps a warm session pool so the
-  pool-fill cost is paid once at startup, not on every upload.
-- Cross-compiles to `wasm32` and runs the same client in the browser. The
-  WASM bindings are on npm as
-  [`@omnipin/isheika`](https://www.npmjs.com/package/@omnipin/isheika).
-
-The native binary is a single static file — about 5 MB gzipped, 14 MB
-unpacked (x86_64-linux). Release tarballs carry a SLSA build-provenance
-attestation; verify a download with `gh attestation verify`. A ready-made
-GitHub Actions upload workflow lives in [`examples/upload.yml`](examples/upload.yml).
+- **Light node functionality.** End-to-end content and upload and download.
+- **Static peerlist bootstrap.** Faster peer discovery with cached peer info.
+- **Collection support.** Upload, download and list content-addressable tarballs.
+- **Onchain postage batch creation.** Single command postage batch issuance, no `bee` needed.
+- **One-shot and daemon modes.** Static commands for ease of use, daemon mode for max performance and warm connection pool.
+- **Cross-platform.** Supports WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
+- **JavaScript bindings.** Use [`@omnipin/isheika`](https://www.npmjs.com/package/@omnipin/isheika) in a browser.
+- **Small size.** 5MB gzipped, 14MB unpacked x86 Linux binary.
+- **Build-provenance attestation.** Each release is signed via SLSA. Verify via `gh attestation verify`.
+- **CI-friendly.** ~400-500KB/s uploads in GitHub Actions.
 
 ## Install
 
@@ -37,9 +29,7 @@ curl -fsSL https://raw.githubusercontent.com/omnipin/isheika/main/install.sh | s
 ```
 
 Drops the latest prebuilt `isheika` into `~/.local/bin` (override with
-`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.2`). The installer
-covers Linux x86_64 / aarch64 and macOS x86_64 / aarch64; releases also
-ship FreeBSD and NetBSD x86_64 tarballs.
+`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.2`).
 
 ### Build from source
 
@@ -79,31 +69,20 @@ see `PERFORMANCE.md` for the method and numbers.
 isheika vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
 ```
 
-One-time, CPU-bound (seconds to minutes). The resulting
-`overlay-nonce` is your Swarm identity together with `--key` — keep
-it, don't reuse across keys, and don't run two daemons with the
-same `(key, nonce)` pair at once (bee disconnects both).
+One-time, CPU-bound (seconds to minutes). The resulting `overlay-nonce` is your Swarm identity together with `--key` — keep it.
 
 ### 3. Create a postage batch
 
-Uploads need a postage stamp batch on-chain. Fund the address from
-step 1 with a little xDAI (for gas) and some BZZ (for the batch
-itself), then:
+Uploads need a postage stamp batch on-chain. Fund the address from step 1 with a little xDAI (for gas) and some BZZ (for the batch itself), then:
 
 ```bash
 isheika batch create --rpc-url https://rpc.gnosischain.com --key 0xYOUR_KEY --size 2GB --duration 30d
 ```
 
-`--size` and `--duration` map to `--depth` and `--amount-per-chunk`
-via the same formulas as the [official postage stamp
-calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators)
-(smallest depth whose effective volume covers the requested size,
-unencrypted + no erasure coding). `--depth` + `--amount-per-chunk`
-still works if you want to set them explicitly.
+`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via the same formulas as the [official postage stamp
+calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators).
 
-The on-chain `BatchCreated` event takes 1-3 minutes to propagate to
-the bee nodes that'll accept your stamps. Poll
-[Swarmscan](https://swarmscan.io/) until it 200s the batch:
+The on-chain `BatchCreated` event takes 1-3 minutes to propagate to the bee nodes that'll accept your stamps. Poll [Swarmscan](https://swarmscan.io/) until it 200s:
 
 ```bash
 curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
@@ -113,19 +92,14 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 
 ### 4. Run the daemon
 
-A long-lived daemon holds a warm session pool across uploads. Filling a
-256-session pool takes ~80 s; the daemon pays that once at startup
-instead of on every upload, which is a big win for repeated or
-one-shot-heavy workloads. For a single upload you can skip this step and
-pass `--peerlist` directly to `isheika upload`.
+A long-lived daemon holds a warm session pool across uploads. Filling a 256-session pool takes ~80 s; the daemon pays that once at startup
+instead of on every upload, which is a big win for repeated or one-shot-heavy workloads. For a single upload you can skip this step and pass `--peerlist` directly to `isheika upload`.
 
 ```bash
 isheika daemon --socket /tmp/isheika.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
 ```
 
-The repo ships a curated `peers.seed.json` (committed); the daemon
-loads it via `--peerlist` (default: `peers.json`) for fast cold-start
-without running `discover` first. Copy it before first start:
+The repo ships a curated `peers.seed.json`; the daemon loads it via `--peerlist` (default: `peers.json`) for fast cold-start without running `discover` first.
 
 ```bash
 cp peers.seed.json peers.json
@@ -136,10 +110,6 @@ cp peers.seed.json peers.json
 ```bash
 isheika upload --daemon /tmp/isheika.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
 ```
-
-A `.tar` input is auto-treated as a collection (multi-file mantaray);
-pass `--collection` to force collection mode on any other extension.
-See `isheika upload --help` for the rest.
 
 ## Benchmarks
 
@@ -167,10 +137,3 @@ Tracks the upstream [bee][bee] mainnet protocols:
 | swap         | `1.0.0`                                   | cheque issuance only, no cashout |
 
 [bee]: https://github.com/ethersphere/bee
-
-## Status
-
-Not stable. The crate is at `0.1.2` and the API will change. Useful as
-an audit reference for the bee protocols, and as a deployment client when
-you need uploads from somewhere bee won't run — WASM, CI, light or
-otherwise constrained environments.
