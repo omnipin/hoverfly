@@ -1,41 +1,57 @@
 # isheika
 
-Minimal [Swarm][swarm] (Ethereum Swarm) micro-client. Native build speaks
-libp2p over plain TCP **and** WebSocket; WASM build speaks WebSocket only
-(browsers can't open raw TCP sockets).
+Minimal [Swarm][swarm] (Ethereum Swarm) micro-client — `discover`, `fetch`,
+`upload`. It talks bee's mainnet libp2p protocols directly; there's no bee
+node or HTTP gateway in between.
+
+Native builds use plain TCP and WebSocket. The `wasm32` build is
+WebSocket-only, because browsers can't open raw TCP sockets.
 
 [swarm]: https://www.ethswarm.org/
 
-Three operations: `discover`, `fetch`, `upload`.
+## What it does
 
-## Features
+- Fetches and uploads Swarm content by speaking bee's libp2p protocols
+  directly (see the compatibility table below).
+- Discovers peers by walking bee's hive gossip out from a bootnode, and
+  caches the result in a reusable `peers.json`.
+- Wraps a file in a mantaray manifest, or packs a directory into a TAR
+  collection — one manifest, every file still addressable by path.
+- Creates postage batches on-chain: `isheika batch create --size 2GB
+  --duration 30d` issues a stamp batch on Gnosis chain.
+- Runs one-shot, or as a daemon that keeps a warm session pool so the
+  pool-fill cost is paid once at startup, not on every upload.
+- Cross-compiles to `wasm32` and runs the same client in the browser. The
+  WASM bindings are on npm as
+  [`@omnipin/isheika`](https://www.npmjs.com/package/@omnipin/isheika).
 
-- **Small.** ~6 MB compressed; 10 MB stripped binary.
-- **Runs in a browser.** First-class `wasm32` target (WebSocket transport).
-- **Daemon + one-shot modes.** Warm session pool for sustained uploads, ~5× the cold-start throughput.
-- **TAR collections.** Multi-file uploads as mantaray manifests, addressable by path.
-- **On-chain batch creation.** `isheika batch create --size 2GB --duration 30d` issues a postage batch on Gnosis chain.
-- **CI-friendly.** Drop-in GitHub Actions example: [`examples/upload.yml`](examples/upload.yml).
-- **Attested releases.** SLSA Build Provenance per tarball; verify with `gh attestation verify`.
+The native binary is a single static file — about 5 MB gzipped, 14 MB
+unpacked (x86_64-linux). Release tarballs carry a SLSA build-provenance
+attestation; verify a download with `gh attestation verify`. A ready-made
+GitHub Actions upload workflow lives in [`examples/upload.yml`](examples/upload.yml).
 
-## Setup
-
-### 1. Install isheika
+## Install
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/omnipin/isheika/main/install.sh | sh
 ```
 
 Drops the latest prebuilt `isheika` into `~/.local/bin` (override with
-`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.0`). Prebuilts
-cover Linux x86_64 / aarch64 and macOS x86_64 / aarch64; on anything
-else, build from source:
+`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.2`). The installer
+covers Linux x86_64 / aarch64 and macOS x86_64 / aarch64; releases also
+ship FreeBSD and NetBSD x86_64 tarballs.
+
+### Build from source
+
+On any other platform, or to track `main`:
 
 ```bash
 cargo install --git https://github.com/omnipin/isheika
 ```
 
-### 2. Generate a key
+## Setup
+
+### 1. Generate a key
 
 Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is
 your long-lived signer. Bee uses the derived Ethereum address to
@@ -52,9 +68,12 @@ key for `--key`/`--identity`, the address for funding xDAI + BZZ).
 ### 2. Generate a vanity overlay nonce
 
 Your Swarm overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A
-random nonce works, but `isheika vanity-overlay` searches for one
-that lands your overlay in less-saturated kademlia bins — empirically
-**~25% higher upload throughput** vs random.
+random nonce works, but most random overlays land in bee's already-full
+low kademlia bins and get dropped right after the handshake. `isheika
+vanity-overlay` searches for a nonce that puts you in deeper,
+undersaturated bins instead. Anchoring against a few stable peers
+(`--target-overlay`) roughly **doubled** upload throughput in testing —
+see `PERFORMANCE.md` for the method and numbers.
 
 ```bash
 isheika vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
@@ -94,11 +113,11 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 
 ### 4. Run the daemon
 
-A long-lived daemon holds a warm session pool across uploads — ~5x
-throughput vs running a fresh upload each time (the per-upload cost
-of filling 256 peer sessions is paid once at daemon startup, not per
-upload). For one-shot uploads you can skip this step and pass
-`--peerlist` directly to `isheika upload`.
+A long-lived daemon holds a warm session pool across uploads. Filling a
+256-session pool takes ~80 s; the daemon pays that once at startup
+instead of on every upload, which is a big win for repeated or
+one-shot-heavy workloads. For a single upload you can skip this step and
+pass `--peerlist` directly to `isheika upload`.
 
 ```bash
 isheika daemon --socket /tmp/isheika.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
@@ -122,13 +141,15 @@ A `.tar` input is auto-treated as a collection (multi-file mantaray);
 pass `--collection` to force collection mode on any other extension.
 See `isheika upload --help` for the rest.
 
-## Bench targets
+## Benchmarks
 
-Both CircleCI and GitHub Actions ship a workflow under `.circleci/` and
-`.github/workflows/` that runs a 3-upload manual benchmark on demand
-(`workflow_dispatch` on GH, `run_bench` parameter on CircleCI). Median
-throughput on a fresh runner currently lands ~400–500 KiB/s — see
-`PERFORMANCE.md` for the full empirical-ceilings table.
+`.github/workflows/bench.yml` and `.circleci/config.yml` run a manual
+mainnet upload benchmark on demand (`workflow_dispatch` on GitHub, the
+`run_bench` pipeline parameter on CircleCI). They're never automatic —
+each upload spends real BZZ. Throughput is bandwidth- and
+peer-coverage-bound and moves a lot with the pool / buffer / overlay
+knobs; `PERFORMANCE.md` has the empirical-ceilings table and the full
+sweep behind each one.
 
 ## Compatibility
 
@@ -149,7 +170,7 @@ Tracks the upstream [bee][bee] mainnet protocols:
 
 ## Status
 
-Not stable. The Cargo description is `0.1.0` and the API will change.
-Useful as an audit reference for the bee protocols and as a
-deployment client when you need uploads from somewhere bee won't run
-(WASM, CI, light constrained environments).
+Not stable. The crate is at `0.1.2` and the API will change. Useful as
+an audit reference for the bee protocols, and as a deployment client when
+you need uploads from somewhere bee won't run — WASM, CI, light or
+otherwise constrained environments.
