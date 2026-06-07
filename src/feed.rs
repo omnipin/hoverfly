@@ -25,7 +25,11 @@
 //! `swarm-feed-topic`, `swarm-feed-type` (see [`crate::manifest`]). ENS Swarm
 //! contenthashes for mutable sites resolve to such a manifest.
 
+use core::time::Duration;
+
 use alloy_primitives::{Address, Keccak256};
+use nectar_primitives::store::{ChunkGet, ChunkStoreError};
+use nectar_primitives::{AnyChunk, Chunk, ChunkAddress, DEFAULT_BODY_SIZE};
 
 /// Metadata keys bee writes into a feed manifest's root entry
 /// (`pkg/api/feed.go`).
@@ -36,9 +40,14 @@ pub const FEED_TYPE_KEY: &str = "swarm-feed-type";
 /// Sequence-feed index width (`uint64` big-endian), per bee `sequence.index`.
 const INDEX_BYTES: usize = 8;
 
-/// Legacy/v1 feed payload prefix: `span(8) || timestamp(8)` precede the
-/// wrapped content reference. See bee `feeds.legacyPayload` (`cacData[16:]`).
-const PAYLOAD_PREFIX: usize = 16;
+/// Legacy/v1 feed payload prefix preceding the wrapped content reference.
+///
+/// Bee's `feeds.legacyPayload` skips 16 bytes (`span(8) || timestamp(8)`) of
+/// the raw CAC data. We operate on nectar's `BmtBody::data()`, which already
+/// strips the 8-byte span (it's stored as a separate field), so the payload we
+/// see is `timestamp(8) || reference(32)` and we skip only the 8-byte
+/// timestamp.
+const PAYLOAD_PREFIX: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FeedError {
@@ -150,6 +159,205 @@ pub fn reference_from_payload(cac_data: &[u8]) -> Result<[u8; 32], FeedError> {
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).map_err(|e| e.to_string())
+}
+
+/// Errors from resolving a feed over the network.
+#[derive(Debug)]
+pub enum ResolveError {
+    Feed(FeedError),
+    /// A chunk fetch failed for a reason other than "not found".
+    Fetch(String),
+    /// The update chunk wasn't a valid single-owner chunk.
+    BadUpdate(String),
+}
+
+impl core::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ResolveError::Feed(e) => write!(f, "{e}"),
+            ResolveError::Fetch(s) => write!(f, "feed update fetch failed: {s}"),
+            ResolveError::BadUpdate(s) => write!(f, "invalid feed update chunk: {s}"),
+        }
+    }
+}
+impl std::error::Error for ResolveError {}
+impl From<FeedError> for ResolveError {
+    fn from(e: FeedError) -> Self {
+        ResolveError::Feed(e)
+    }
+}
+
+/// Maximum sequence index we'll probe when searching for the feed head. Guards
+/// against an unbounded scan on a malformed feed; 2^20 updates is far beyond
+/// any real feed-backed site.
+const MAX_PROBE_INDEX: u64 = 1 << 20;
+
+/// How many doubling levels to probe concurrently per exponential-search round.
+/// Each level is one SOC network round-trip; fanning out a band of them hides
+/// the per-chunk latency. 12 levels covers indices up to 2^12 = 4096 in a
+/// single concurrent round.
+const PROBE_BAND: u32 = 12;
+
+/// Per-probe deadline for head-finding. The retrieval layer is built to
+/// *exhaustively* locate a chunk that exists (racing every peer, full dial
+/// budget, skiplist retries) — but feed head-finding deliberately probes
+/// indices that DON'T exist, and without a deadline every such "miss" pays the
+/// full give-up cost, making resolution glacial. Mirroring bee's asyncFinder
+/// (which bounds each probe to 1s), we cap each probe so a missing index fails
+/// fast and the search advances. Slightly more generous than bee's 1s to
+/// absorb browser ws round-trip latency.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Resolve the **latest** update of a sequence feed and return the content
+/// reference it points at.
+///
+/// Finds the head with an exponential probe (find the first missing index by
+/// doubling) followed by a binary search in `[last_present, first_missing)`,
+/// which costs ~`2·log2(n)` chunk fetches instead of `n`. Then parses the head
+/// update as a single-owner chunk (via nectar) and extracts the wrapped
+/// content reference from its CAC body.
+pub async fn resolve_latest<S>(store: &S, feed: &Feed) -> Result<ChunkAddress, ResolveError>
+where
+    S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    tracing::info!(
+        target: "hoverfly::feed",
+        "resolving sequence feed: owner={} topic={}",
+        feed.owner,
+        hex::encode(feed.topic)
+    );
+    // Index 0 must exist for the feed to have any update at all.
+    let chunk0 = match get_update(store, feed, 0).await? {
+        Some(c) => c,
+        None => return Err(ResolveError::Feed(FeedError::NoUpdate)),
+    };
+
+    // --- Phase 1: concurrent exponential boundary search. ---
+    // Each SOC lookup is a slow network round-trip, so probe a whole band of
+    // doubling indices (1,2,4,8,…) AT ONCE rather than one-at-a-time (mirrors
+    // bee's asyncFinder doubling fan-out). From the batch results, `lo` = the
+    // highest index found present, `hi` = the lowest index found absent. The
+    // true head is somewhere in [lo, hi).
+    let mut lo = 0u64; // highest present
+    let mut last_chunk = chunk0;
+    let mut hi = u64::MAX; // lowest absent (MAX = "not yet found")
+
+    // Probe levels 0..PROBE_BAND (indices 2^1..2^BAND) concurrently per round;
+    // if all present, advance the base and probe the next band.
+    let mut base = 1u64;
+    'outer: loop {
+        let mut futs = FuturesUnordered::new();
+        for k in 0..PROBE_BAND {
+            let idx = base.saturating_mul(1u64 << k);
+            if idx > MAX_PROBE_INDEX {
+                break;
+            }
+            futs.push(async move { (idx, get_update(store, feed, idx).await) });
+        }
+        if futs.is_empty() {
+            break;
+        }
+        let mut any_present = false;
+        let mut top = base; // highest index probed this round
+        while let Some((idx, res)) = futs.next().await {
+            top = top.max(idx);
+            match res? {
+                Some(c) => {
+                    any_present = true;
+                    if idx > lo {
+                        lo = idx;
+                        last_chunk = c;
+                    }
+                }
+                None => {
+                    if idx < hi {
+                        hi = idx;
+                    }
+                }
+            }
+        }
+        // If we found an absent index, the boundary is bracketed; stop probing.
+        if hi != u64::MAX {
+            break 'outer;
+        }
+        // All present in this band — jump the base past the top we probed.
+        if !any_present || top >= MAX_PROBE_INDEX {
+            break;
+        }
+        base = top.saturating_mul(2);
+    }
+
+    // --- Phase 2: binary search the bracket (lo present, hi absent). ---
+    // Sequential, but only ~log2(band) steps now that the band is small.
+    if hi != u64::MAX {
+        let mut low = lo;
+        let mut high = hi;
+        while high - low > 1 {
+            let mid = low + (high - low) / 2;
+            match get_update(store, feed, mid).await? {
+                Some(c) => {
+                    low = mid;
+                    last_chunk = c;
+                }
+                None => high = mid,
+            }
+        }
+    }
+
+    // `last_chunk` is the head update SOC, parsed+validated by the retrieval
+    // layer. `AnyChunk::data()` on a single-owner chunk returns its *wrapped*
+    // CAC body — exactly the feed payload (`span+timestamp+reference`) — so we
+    // extract the content reference from it directly.
+    let reference = reference_from_payload(last_chunk.data().as_ref())?;
+    tracing::info!(
+        target: "hoverfly::feed",
+        "resolved feed head: index={} -> content ref {}",
+        lo,
+        hex::encode(reference)
+    );
+    Ok(ChunkAddress::new(reference))
+}
+
+/// Fetch the feed update at index `i`. Returns `Ok(None)` if the update chunk
+/// doesn't exist (a network "not found"), `Ok(Some(chunk))` if it does, and
+/// `Err` only on a genuine fetch failure (so a missing index ends the search
+/// rather than aborting it).
+async fn get_update<S>(
+    store: &S,
+    feed: &Feed,
+    i: u64,
+) -> Result<Option<AnyChunk<DEFAULT_BODY_SIZE>>, ResolveError>
+where
+    S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
+{
+    let addr = ChunkAddress::new(feed.update_address(i));
+
+    // Bound the probe: race the retrieval against a deadline. A probe that
+    // doesn't resolve within PROBE_TIMEOUT is treated as "absent" for the
+    // search (bee's asyncFinder does the same with a 1s per-probe ctx). This is
+    // what makes head-finding fast — missing indices no longer pay the full
+    // exhaustive-retrieval give-up cost. `tokio::time::timeout` is portable
+    // here: native uses real tokio, wasm uses tokio_with_wasm (both have the
+    // `time` feature, gloo-timer backed on wasm).
+    match tokio::time::timeout(PROBE_TIMEOUT, store.get(&addr)).await {
+        Ok(Ok(c)) => Ok(Some(c)),
+        Ok(Err(ChunkStoreError::NotFound { .. })) => Ok(None),
+        // "no peer found" / "all peers failed" => nobody is serving this SOC
+        // address right now; treat as absent for head-finding.
+        Ok(Err(ChunkStoreError::Other(msg))) if is_absent_retrieval(&msg) => Ok(None),
+        Ok(Err(e)) => Err(ResolveError::Fetch(e.to_string())),
+        // Timed out — treat as absent.
+        Err(_) => Ok(None),
+    }
+}
+
+/// Heuristic: a retrieval error string that indicates the chunk simply isn't
+/// being served (vs. a transport/protocol failure we should surface).
+fn is_absent_retrieval(msg: &str) -> bool {
+    let m = msg.to_lowercase();
+    m.contains("no peer found") || m.contains("not found") || m.contains("all peers failed")
 }
 
 #[cfg(test)]
