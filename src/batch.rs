@@ -207,6 +207,68 @@ pub async fn read_last_price(rpc_url: &str, postage_stamp: Address) -> Result<u6
         .await
 }
 
+/// On-chain metadata for a postage batch, read from the PostageStamp
+/// contract's `batches(bytes32)` getter.
+#[derive(Debug, Clone)]
+pub struct BatchOnChain {
+    /// Batch owner — the address whose signer must sign every stamp for
+    /// bee to accept it. An upload key whose address differs from this
+    /// will produce stamps bee rejects.
+    pub owner: Address,
+    /// Batch depth (`2^depth` total stamps). The stamper must be built
+    /// with this exact depth or the per-bucket index math diverges from
+    /// what bee expects for the batch.
+    pub depth: u8,
+    /// Bucket depth (bee hard-codes 16).
+    pub bucket_depth: u8,
+    /// Immutable batches reject any bucket over-fill outright.
+    pub immutable: bool,
+    /// `true` when the batch does not exist on-chain (getter returned the
+    /// zero owner / zero depth). Callers should treat this as "unknown
+    /// batch" rather than a depth-0 batch.
+    pub not_found: bool,
+}
+
+/// Read a batch's on-chain metadata (owner, depth, …) from the
+/// PostageStamp contract via a single `eth_call`. No transaction, no gas.
+///
+/// `batch_id_hex` is the 32-byte batch ID as hex (`0x`-optional). Returns
+/// `not_found = true` when the batch ID isn't registered on-chain (the
+/// getter returns an all-zero struct).
+pub async fn read_batch(
+    rpc_url: &str,
+    postage_stamp: Address,
+    batch_id_hex: &str,
+) -> Result<BatchOnChain, BatchError> {
+    let trimmed = batch_id_hex
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let raw = hex::decode(trimmed).map_err(|e| BatchError::Rpc(format!("batch id hex: {e}")))?;
+    if raw.len() != 32 {
+        return Err(BatchError::Rpc(format!(
+            "batch id must be 32 bytes, got {}",
+            raw.len()
+        )));
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&raw);
+
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let ret = rpc
+        .call_view::<batchesCall, _>(postage_stamp, batchesCall { id: id.into() })
+        .await?;
+
+    let owner = ret.owner;
+    let not_found = owner == Address::ZERO && ret.depth == 0;
+    Ok(BatchOnChain {
+        owner,
+        depth: ret.depth,
+        bucket_depth: ret.bucketDepth,
+        immutable: ret.immutableFlag,
+        not_found,
+    })
+}
+
 sol! {
     // PostageStamp.createBatch(address,uint256,uint8,uint8,bytes32,bool)
     function createBatch(
@@ -217,6 +279,18 @@ sol! {
         bytes32 nonce,
         bool immutable_
     ) external returns (bytes32);
+
+    // PostageStamp.batches(bytes32) public mapping getter. Returns the
+    // on-chain Batch struct fields in storage order. Used to infer a
+    // batch's depth and verify its owner before an upload.
+    function batches(bytes32 id) external view returns (
+        address owner,
+        uint8 depth,
+        uint8 bucketDepth,
+        bool immutableFlag,
+        uint256 normalisedBalance,
+        uint256 lastUpdatedBlockNumber
+    );
 
     // PostageStamp.lastPrice() returns (uint64)
     function lastPrice() external view returns (uint64);
