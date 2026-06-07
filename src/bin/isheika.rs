@@ -374,6 +374,58 @@ enum Commands {
         daemon: Option<PathBuf>,
     },
 
+    /// Compute the Swarm BMT (content) root of a file without uploading.
+    ///
+    /// No network, no postage batch, no key — pure local hashing. The
+    /// output mirrors exactly what `upload` would produce for the same
+    /// input and flags:
+    ///
+    /// - Single file (default): prints the bare file BMT root (what
+    ///   `upload --raw` produces) and the single-entry mantaray manifest
+    ///   root (what the default `upload` produces, addressable via
+    ///   `fetch <root> --path <name>`).
+    /// - Collection (`*.tar`, or `--collection`): prints the multi-entry
+    ///   manifest root (what `upload <file>.tar` produces), matching
+    ///   bee's `application/x-tar` collection semantics.
+    Bmt {
+        /// Input file
+        #[arg(value_name = "FILE")]
+        file: PathBuf,
+
+        /// Override the manifest path used to derive the single-entry
+        /// manifest root (default: file basename). Must match the
+        /// `--manifest-path` you intend to pass to `upload` for the
+        /// manifest roots to agree. Ignored in collection mode.
+        #[arg(long, value_name = "PATH")]
+        manifest_path: Option<String>,
+
+        /// Override the Content-Type baked into the manifest entry
+        /// (default: auto-detected from extension). Must match what
+        /// `upload` will use for the manifest roots to agree. Ignored in
+        /// collection mode (per-entry types are auto-detected there).
+        #[arg(long, value_name = "MIME")]
+        content_type: Option<String>,
+
+        /// Treat the input as a tar archive (bee's collection upload):
+        /// compute the multi-entry manifest root instead of a single
+        /// file root. Auto-enabled for `*.tar`. Pass to force collection
+        /// mode on inputs without a `.tar` extension.
+        #[arg(long)]
+        collection: bool,
+
+        /// (Collection mode) Filename served when the root manifest is
+        /// fetched without a sub-path. Defaults to `index.html`, matching
+        /// `upload`'s collection default; pass `--index-document ""` to
+        /// disable. Must match what `upload` will use for the roots to agree.
+        #[arg(long, value_name = "FILE")]
+        index_document: Option<String>,
+
+        /// (Collection mode) Filename served on lookups that miss. Must
+        /// match what `upload` will use for the roots to agree.
+        #[arg(long, value_name = "FILE")]
+        error_document: Option<String>,
+    },
+
     /// Run a long-lived daemon that holds a warm session pool across
     /// upload/fetch requests. Listens on a unix socket; the same CLI
     /// (`upload --daemon <socket>` / `fetch --daemon <socket>`)
@@ -1521,6 +1573,82 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
             print_session_retire_diag();
+        }
+
+        Commands::Bmt {
+            file,
+            manifest_path,
+            content_type,
+            collection,
+            index_document,
+            error_document,
+        } => {
+            let data = std::fs::read(&file)?;
+
+            // Auto-detect tar by extension, mirroring `upload`'s logic so
+            // `bmt <f>.tar` reports the same root `upload <f>.tar` produces.
+            let is_tar = file
+                .extension()
+                .and_then(|s| s.to_str())
+                .map(|s| s.eq_ignore_ascii_case("tar"))
+                .unwrap_or(false);
+
+            if collection || is_tar {
+                let files = read_tar_files(&data)?;
+                if files.is_empty() {
+                    return Err("tar archive contains no regular files".into());
+                }
+                let n_files = files.len();
+                let total: usize = files.iter().map(|f| f.data.len()).sum();
+                // Same index-document defaulting as the upload collection
+                // path: default to `index.html`, empty string opts out.
+                let index_doc = index_document
+                    .as_deref()
+                    .map(|s| if s.is_empty() { None } else { Some(s) })
+                    .unwrap_or(Some("index.html"));
+                let (manifest_root, n_chunks) =
+                    isheika::client::collection_root(&files, index_doc, error_document.as_deref())?;
+                let root_hex = hex::encode(manifest_root.as_bytes());
+                println!(
+                    "collection: {} files, {} bytes, {} unique chunks",
+                    n_files, total, n_chunks
+                );
+                println!("manifest root (upload <tar>): {root_hex}");
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("  cid: {c}");
+                }
+                return Ok(());
+            }
+
+            // Bare content root — identical to `upload --raw`.
+            let (file_root, n_chunks) = isheika::client::bmt_root(&data)?;
+            let file_root_hex = hex::encode(file_root.as_bytes());
+
+            // Manifest root — what the default (non-raw) `upload` yields.
+            // Mirror the upload path's path/content-type defaulting so the
+            // two agree when the same flags are passed to `upload`.
+            let path = manifest_path.unwrap_or_else(|| {
+                file.file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "file".to_string())
+            });
+            let ct = content_type.or_else(|| guess_content_type(&path));
+            let (manifest_root, _manifest_chunks) =
+                isheika::manifest::build_single_entry_manifest(&path, file_root, ct.as_deref())
+                    .map_err(|e| format!("building manifest: {e}"))?;
+            let manifest_root_hex = hex::encode(manifest_root.as_bytes());
+
+            println!("file: {} bytes, {} chunks", data.len(), n_chunks);
+            println!("file BMT root (upload --raw):  {file_root_hex}");
+            if let Some(c) = root_hex_to_cid(&file_root_hex) {
+                println!("  cid: {c}");
+            }
+            let display_ct = ct.as_deref().unwrap_or("-");
+            println!("manifest root (upload, path={path} [{display_ct}]): {manifest_root_hex}");
+            if let Some(c) = root_hex_to_cid(&manifest_root_hex) {
+                println!("  cid: {c}");
+            }
         }
 
         #[cfg(unix)]
