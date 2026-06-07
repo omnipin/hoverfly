@@ -190,6 +190,33 @@ pub const WEBSITE_ERROR_DOCUMENT_PATH_KEY: &str = "website-error-document";
 /// Bee's manifest root-path marker for website metadata.
 pub const ROOT_PATH: &str = "/";
 
+/// Feed-manifest metadata keys (bee `pkg/api/feed.go`). A feed manifest is a
+/// normal mantaray manifest whose root (`/`) entry carries these, encoding the
+/// feed to resolve instead of pointing directly at content.
+pub const FEED_OWNER_KEY: &str = "swarm-feed-owner";
+pub const FEED_TOPIC_KEY: &str = "swarm-feed-topic";
+pub const FEED_TYPE_KEY: &str = "swarm-feed-type";
+
+/// If `node` is a feed manifest, return its `(owner_hex, topic_hex, type)`
+/// metadata. Bee writes these on the root-path (`/`) fork's metadata; some
+/// encoders place them on the node's own metadata — check both. Returns `None`
+/// for an ordinary content manifest.
+pub fn extract_feed_meta(node: &Node) -> Option<(String, String, String)> {
+    // Bee stores feed metadata on the root-path (`/`) fork's metadata map.
+    for fork in node.forks.values() {
+        let m = &fork.metadata;
+        if let (Some(owner), Some(topic)) = (m.get(FEED_OWNER_KEY), m.get(FEED_TOPIC_KEY)) {
+            // type defaults to "sequence" if omitted (bee only writes sequence).
+            let ty = m
+                .get(FEED_TYPE_KEY)
+                .cloned()
+                .unwrap_or_else(|| "sequence".to_string());
+            return Some((owner.clone(), topic.clone(), ty));
+        }
+    }
+    None
+}
+
 /// One file entry to include in a collection manifest.
 pub struct CollectionEntry {
     /// In-manifest path (e.g. `"index.html"`, `"static/app.css"`). Used as
@@ -305,5 +332,29 @@ mod tests {
         let node = decode_node(&data).unwrap();
         assert!(node.entry.is_none());
         assert!(node.forks.is_empty());
+    }
+
+    /// Real `swarm.eth` feed-manifest root chunk (ref
+    /// 03b80b08…, fetched from mainnet). Its `/` fork metadata carries the
+    /// feed params; `extract_feed_meta` must find them. Guards both the
+    /// mantaray decoder (fork metadata) and the feed-key extraction against
+    /// real-world data, not just synthetic fixtures.
+    #[test]
+    fn extract_feed_meta_from_swarm_eth_manifest() {
+        use base64::Engine;
+        // Base64 of the 384-byte mantaray node (CAC data, span already stripped).
+        const B64: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAABXaLO2p9tW0h0av/QNQc6/yDRI/tjX6bBuwNOwc/KPIAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAASAS8AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAIUE8qEHypQL6vxM4vbJqfCWjGKltYk/8OTh4pgwSNJ2AL57InN3YXJtLWZlZWQtb3duZXIiOiJmNzdhMTNkYzJmNzg2YjQ1MjNmNWUwYmY2ZGI2NzU3ZjRjZjYwZWJiIiwic3dhcm0tZmVlZC10b3BpYyI6ImUwZDdkZWY1MDc0ZGI5ZDk4YzBhNWVkNmYzOTFhMjIwNTY4NDM2NzdlZWFkZTkwNzE4MDAyZjY5NmQ2MzZhZjEiLCJzd2FybS1mZWVkLXR5cGUiOiJTZXF1ZW5jZSJ9CgoKCgoKCgoKCgoK";
+        let data = base64::engine::general_purpose::STANDARD
+            .decode(B64)
+            .unwrap();
+        let node = decode_node(&data).expect("decode swarm.eth feed manifest node");
+        let (owner, topic, ty) =
+            extract_feed_meta(&node).expect("swarm.eth root must be detected as a feed manifest");
+        assert_eq!(owner, "f77a13dc2f786b4523f5e0bf6db6757f4cf60ebb");
+        assert_eq!(
+            topic,
+            "e0d7def5074db9d98c0a5ed6f391a22056843677eeade90718002f696d636af1"
+        );
+        assert_eq!(ty, "Sequence");
     }
 }

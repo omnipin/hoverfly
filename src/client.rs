@@ -12,7 +12,7 @@ use nectar_postage::{Batch, BatchId};
 use nectar_postage_issuer::Stamper;
 use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
-use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk};
+use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk, SingleOwnerChunk};
 use nectar_primitives::file::{GenericJoiner, sync_split};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
 use std::collections::HashMap;
@@ -69,6 +69,8 @@ pub enum ClientError {
     Stamp(String),
     #[error("manifest: {0}")]
     Manifest(String),
+    #[error("feed: {0}")]
+    Feed(String),
 }
 
 impl From<nectar_primitives::error::PrimitivesError> for ClientError {
@@ -224,11 +226,31 @@ const PEER_SCORE_MIN: i32 = -3;
 pub struct RetrievalCache {
     sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, CachedSession>>>,
     peer_scores: std::sync::Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Last resolved sequence index per feed (key = owner||topic hex). A feed's
+    /// head only ever moves forward, so the previous resolution is a strong
+    /// hint: the next lookup starts a short forward gallop from here instead of
+    /// a full cold search. Steady-state (a daemon re-serving the same feed-
+    /// backed site) this turns resolution into ~1 fast round.
+    feed_index: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl RetrievalCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Last known head index for a feed, if previously resolved.
+    pub fn feed_hint(&self, key: &str) -> Option<u64> {
+        self.feed_index.lock().unwrap().get(key).copied()
+    }
+
+    /// Record the resolved head index for a feed (monotonic: never moves back).
+    pub fn set_feed_hint(&self, key: &str, index: u64) {
+        let mut m = self.feed_index.lock().unwrap();
+        let e = m.entry(key.to_string()).or_insert(0);
+        if index > *e {
+            *e = index;
+        }
     }
 }
 
@@ -346,6 +368,8 @@ impl<'a> NetworkedStore<'a> {
         let e = m.entry(o).or_insert(0);
         *e = (*e - 1).max(PEER_SCORE_MIN);
     }
+
+    // (validate_delivery is a free fn defined below the impl)
 
     /// Body of [`ChunkGet::get`]. Pulled into a private helper so the
     /// `ChunkGet` impl can be split per-target: native uses `async fn`,
@@ -563,24 +587,20 @@ impl<'a> NetworkedStore<'a> {
                         // Proven reachable forwarder — promote for every later
                         // chunk this fetch (see `peer_scores` field rationale).
                         self.note_response(&overlay);
-                        match ContentChunk::<DEFAULT_BODY_SIZE>::try_from(delivery.data.as_slice())
-                        {
-                            Ok(chunk) => {
-                                use nectar_primitives::Chunk as _;
-                                if chunk.address() != &address {
-                                    (
-                                        peer,
-                                        overlay,
-                                        AttemptOutcome::Failed("address mismatch".to_string()),
-                                    )
-                                } else {
-                                    (peer, overlay, AttemptOutcome::Got(AnyChunk::from(chunk)))
-                                }
-                            }
-                            Err(e) => (
+                        // The delivered bytes are either a content-addressed
+                        // chunk (CAC, address = BMT hash of data) or a single-
+                        // owner chunk (SOC, address = keccak256(id||owner)).
+                        // Feed updates are SOCs, whose address is NOT the BMT
+                        // hash — so validating every delivery as a CAC rejects
+                        // them ("address mismatch"). Try CAC first (the common
+                        // case), then fall back to SOC, accepting whichever
+                        // validates against the requested address.
+                        match validate_delivery(&delivery.data, &address) {
+                            Some(chunk) => (peer, overlay, AttemptOutcome::Got(chunk)),
+                            None => (
                                 peer,
                                 overlay,
-                                AttemptOutcome::Failed(format!("decode chunk: {e}")),
+                                AttemptOutcome::Failed("address mismatch".to_string()),
                             ),
                         }
                     }
@@ -1168,6 +1188,7 @@ pub async fn fetch_manifest_path_cached_ex(
     // root chunk is hit by both phases so the cache saves a round-trip.
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
+    let root = resolve_feed_root(&store, root, Some(cache)).await?;
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
@@ -1202,7 +1223,75 @@ pub async fn list_manifest_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
+    let root = resolve_feed_root(&store, root, None).await?;
     walk_manifest(&store, root, Vec::new()).await
+}
+
+/// Validate a delivered chunk against the address that was requested, trying
+/// both chunk kinds. Returns the parsed chunk if it validates, else `None`.
+///
+/// - Content-addressed chunk (CAC): address is the BMT hash of the data.
+/// - Single-owner chunk (SOC): address is `keccak256(id || owner)`; the data
+///   is `id(32) || signature(65) || wrapped-cac`. Feed updates are SOCs, so a
+///   retrieval that requested a SOC address must be validated this way — the
+///   CAC BMT check would (correctly) reject it.
+fn validate_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEFAULT_BODY_SIZE>> {
+    use nectar_primitives::Chunk as _;
+    // CAC first — the overwhelmingly common case.
+    if let Ok(cac) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(data) {
+        if cac.address() == address {
+            return Some(AnyChunk::from(cac));
+        }
+    }
+    // Fall back to SOC: nectar computes its address as keccak256(id||owner)
+    // and verifies the owner by recovering it from the signature over
+    // keccak256(id || wrapped.bmt_hash), so a matching address means the
+    // single-owner chunk is authentic.
+    if let Ok(soc) = SingleOwnerChunk::<DEFAULT_BODY_SIZE>::try_from(data) {
+        if soc.address() == address {
+            return Some(AnyChunk::from(soc));
+        }
+    }
+    None
+}
+
+/// If `root` is a *feed manifest* (its root node carries `swarm-feed-*`
+/// metadata), resolve the feed to its current content root and return that;
+/// otherwise return `root` unchanged. This lets feed-backed references (e.g.
+/// mutable ENS sites like `swarm.eth`) be fetched transparently: callers walk
+/// the returned root as an ordinary content manifest.
+async fn resolve_feed_root(
+    store: &NetworkedStore<'_>,
+    root: ChunkAddress,
+    cache: Option<&RetrievalCache>,
+) -> Result<ChunkAddress, ClientError> {
+    use crate::feed::{Feed, resolve_latest};
+    use crate::manifest::{decode_node, extract_feed_meta};
+
+    let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &root)
+        .await
+        .map_err(|e| ClientError::Manifest(format!("fetch root {root}: {e}")))?;
+    let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+
+    let Some((owner_hex, topic_hex, ty)) = extract_feed_meta(&node) else {
+        return Ok(root); // ordinary content manifest
+    };
+    let feed = Feed::from_manifest_meta(&owner_hex, &topic_hex, &ty)
+        .map_err(|e| ClientError::Feed(e.to_string()))?;
+
+    // Use the last resolved index for this feed as a forward-search hint, so a
+    // daemon re-serving the same feed-backed site resolves the head in ~1 round
+    // instead of a full cold search. Key the cache on owner||topic.
+    let feed_key = format!("{}{}", owner_hex.to_lowercase(), topic_hex.to_lowercase());
+    let after = cache.and_then(|c| c.feed_hint(&feed_key)).unwrap_or(0);
+
+    let (resolved, index) = resolve_latest(store, &feed, after)
+        .await
+        .map_err(|e| ClientError::Feed(e.to_string()))?;
+    if let Some(c) = cache {
+        c.set_feed_hint(&feed_key, index);
+    }
+    Ok(resolved)
 }
 
 async fn lookup_manifest_path(
