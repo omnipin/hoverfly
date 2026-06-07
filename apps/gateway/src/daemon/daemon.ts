@@ -346,14 +346,20 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   if (c == null) return { httpStatus: 503, error: status.lastError ?? 'daemon not ready' }
 
   const p = rawPath.replace(/^\/+/, '')
-  // Build the manifest lookup candidates:
-  //   - ""        / "dir/"   -> directory index:  "<p>index.html"
-  //   - "dir"               -> the path itself, then a directory-index fallback
-  //                            "dir/index.html" (extensionless => looks like a dir)
-  //   - "dir/file.png"      -> the path itself ONLY. A path whose last segment
-  //                            has a file extension is a file, never a directory;
-  //                            appending "/index.html" to it (e.g.
-  //                            "uploads/0626.png/index.html") is always wrong.
+  // Build the manifest lookup candidates for the requested path:
+  //   - ""  /  "dir/"        -> directory index:  "<p>index.html"
+  //   - "dir/file.png"       -> the path itself ONLY. A last segment with a file
+  //                             extension is a file, never a directory; appending
+  //                             "/index.html" (e.g. "uploads/0626.png/index.html")
+  //                             is always wrong.
+  //   - "page" (extensionless, no slash) -> a "clean URL". Try, in order:
+  //       1. "page"            exact (a genuine extensionless file)
+  //       2. "page.html"       static-site-generator page (VitePress/Docusaurus/
+  //                            Next export with cleanUrls=false emit "<path>.html")
+  //       3. "page/index.html" directory index
+  //     This mirrors how eth.limo's dweb proxy resolves clean URLs against an
+  //     SSG export. (ethlimo/dweb-proxy-api). Trailing-slash handling is left
+  //     as-is for now.
   const lastSeg = p.split('/').pop() ?? ''
   const hasExtension = /\.[^./]+$/.test(lastSeg)
   let candidates: string[]
@@ -362,7 +368,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   } else if (hasExtension) {
     candidates = [p]
   } else {
-    candidates = [p, p + '/index.html']
+    candidates = [p, p + '.html', p + '/index.html']
   }
 
   let lastErr: string | undefined
