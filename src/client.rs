@@ -1718,6 +1718,78 @@ fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
 /// what enables the multi-worker upload model: a coordinator with
 /// the batch owner key stamps chunks, then ships them to N workers
 /// with ephemeral overlay keys for pushing.
+/// Compute the BMT/content root of `data` without stamping, pushing, or
+/// any network or key access. This is the bare content-addressed root
+/// produced by nectar's chunked-file split — identical to what
+/// [`prepare_upload_bytes`] derives as its `root`, and to the
+/// `file_root` that an `upload --raw` would yield.
+///
+/// Returns `(root, chunk_count)`. The chunk count is the total number of
+/// content + intermediate chunks the file splits into (the same value
+/// the upload path logs), which the caller can use to size a pool or
+/// to compute the chunk-address set for proximity-targeted discovery.
+///
+/// Note: this is **not** the same hash `isheika upload` prints by
+/// default — the default (non-`--raw`) upload wraps the file in a
+/// single-entry mantaray manifest, whose root differs. Use
+/// [`prepare_upload_file_with_manifest`] (or just split + manifest) to
+/// derive that manifest root.
+pub fn bmt_root(data: &[u8]) -> Result<(ChunkAddress, usize), ClientError> {
+    let (root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    Ok((root, store.len()))
+}
+
+/// Compute the multi-entry mantaray manifest root of a collection
+/// (e.g. the contents of a tar) without stamping, pushing, or any
+/// network or key access. This is the exact root [`upload_collection`]
+/// produces for the same `files` / `index_document` / `error_document`
+/// inputs — split each file, build the collection manifest, return its
+/// root. Use it to pre-compute the reference for a `*.tar` upload.
+///
+/// Returns `(manifest_root, unique_chunk_count)`. The chunk count is the
+/// number of *unique* chunk addresses across all files plus the manifest
+/// chunks (deduplicated exactly as `upload_collection` does before
+/// stamping), so it reflects the real push workload rather than the raw
+/// pre-dedup total.
+pub fn collection_root(
+    files: &[UploadFile],
+    index_document: Option<&str>,
+    error_document: Option<&str>,
+) -> Result<(ChunkAddress, usize), ClientError> {
+    use crate::manifest::CollectionEntry;
+
+    if files.is_empty() {
+        return Err(ClientError::Manifest("collection is empty".into()));
+    }
+
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
+    for f in files {
+        let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        for (addr, _chunk) in file_store.into_chunks() {
+            let mut addr_bytes = [0u8; 32];
+            addr_bytes.copy_from_slice(addr.as_bytes());
+            seen.insert(addr_bytes);
+        }
+        entries.push(CollectionEntry {
+            path: f.path.clone(),
+            reference: file_root,
+            content_type: f.content_type.clone(),
+        });
+    }
+
+    let (manifest_root, manifest_chunks) =
+        crate::manifest::build_collection_manifest(&entries, index_document, error_document)
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
+    for (addr, _wire) in manifest_chunks.iter() {
+        let mut addr_bytes = [0u8; 32];
+        addr_bytes.copy_from_slice(addr.as_bytes());
+        seen.insert(addr_bytes);
+    }
+
+    Ok((manifest_root, seen.len()))
+}
+
 pub fn prepare_upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,

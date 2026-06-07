@@ -47,9 +47,9 @@ pub use nectar_primitives::{
 };
 
 pub use client::{
-    ClientError, ManifestEntry, SessionPool, StampedChunk, UploadFile, discover, fetch_bytes,
-    fetch_manifest_path, list_manifest, prepare_upload_bytes, push_chunks_with_pool, upload_bytes,
-    upload_collection,
+    ClientError, ManifestEntry, SessionPool, StampedChunk, UploadFile, bmt_root, collection_root,
+    discover, fetch_bytes, fetch_manifest_path, list_manifest, prepare_upload_bytes,
+    push_chunks_with_pool, upload_bytes, upload_collection,
 };
 pub use peers::{Peer, PeerStore};
 pub use signer::SwarmSigner;
