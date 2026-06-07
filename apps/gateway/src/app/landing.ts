@@ -1,13 +1,15 @@
 // Landing page — served at the gateway ROOT origin (bzz.<host>).
 //
-// Lets you enter a Swarm reference (hex) or swarm CID and opens it on its own
-// content subdomain. Connects to the shared daemon SharedWorker directly
-// (same origin) to show live peer status and trigger discovery.
+// Lets you enter a Swarm reference (hex), a swarm CID, or an ENS name and opens
+// it on its own content subdomain. Connects to the shared daemon SharedWorker
+// directly (same origin) to show live peer status and trigger discovery.
 
 import { DAEMON_WORKER_SCRIPT, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS } from '../shared/config.ts'
 import { DaemonRpc, type DaemonStatus } from '../shared/protocol.ts'
 import { subdomainUrl } from '../shared/parse-request.ts'
 import { normalizeRef } from '../shared/swarm-ref.ts'
+import { referenceToCid } from '../shared/swarm-cid.ts'
+import { looksLikeEnsName, resolveEnsToSwarm } from '../shared/ens.ts'
 
 const app = document.getElementById('app') as HTMLElement
 
@@ -20,8 +22,8 @@ app.innerHTML = `
 
     <form id="open" class="open">
       <input id="ref" type="text" spellcheck="false" autocomplete="off"
-        placeholder="Swarm reference (64-hex) or CID (b…)" />
-      <button type="submit">Open</button>
+        placeholder="Swarm reference (64-hex), CID (b…), or ENS name (name.eth)" />
+      <button id="open-btn" type="submit">Open</button>
     </form>
     <p id="err" class="err" hidden></p>
 
@@ -55,16 +57,41 @@ const errEl = $<HTMLParagraphElement>('err')
 
 $('open').addEventListener('submit', (e) => {
   e.preventDefault()
+  void handleOpen()
+})
+
+async function handleOpen (): Promise<void> {
   errEl.hidden = true
-  const raw = $<HTMLInputElement>('ref').value
+  const raw = $<HTMLInputElement>('ref').value.trim()
+  const btn = $<HTMLButtonElement>('open-btn')
+
+  // Fast path: a 64-hex reference or a swarm CID needs no network round-trip.
   try {
     const { cid } = normalizeRef(raw)
     location.href = subdomainUrl(cid, location, '/')
-  } catch (err) {
-    errEl.textContent = (err as Error).message
-    errEl.hidden = false
+    return
+  } catch { /* not a raw ref/CID — try ENS below */ }
+
+  // ENS path: <name>.eth (or other ENS name) -> resolve contenthash -> Swarm ref.
+  if (looksLikeEnsName(raw)) {
+    const prev = btn?.textContent
+    if (btn != null) { btn.disabled = true; btn.textContent = 'Resolving ENS…' }
+    try {
+      const { refHex } = await resolveEnsToSwarm(raw)
+      location.href = subdomainUrl(referenceToCid(refHex), location, '/')
+      return
+    } catch (err) {
+      errEl.textContent = (err as Error).message
+      errEl.hidden = false
+    } finally {
+      if (btn != null) { btn.disabled = false; btn.textContent = prev ?? 'Open' }
+    }
+    return
   }
-})
+
+  errEl.textContent = 'Enter a Swarm reference (64-hex), a swarm CID (b…), or an ENS name (name.eth).'
+  errEl.hidden = false
+}
 
 // ---- daemon status ----
 const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'hoverfly-daemon' })
