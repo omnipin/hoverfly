@@ -1,11 +1,6 @@
 # isheika
 
-Minimal [Swarm][swarm] (Ethereum Swarm) micro-client — `discover`, `fetch`,
-`upload`. It talks bee's mainnet libp2p protocols directly; there's no bee
-node or HTTP gateway in between.
-
-Native builds use plain TCP and WebSocket. The `wasm32` build is
-WebSocket-only, because browsers can't open raw TCP sockets.
+Experimental [Swarm][swarm] light client. Works natively and in a browser.
 
 [swarm]: https://www.ethswarm.org/
 
@@ -28,12 +23,13 @@ WebSocket-only, because browsers can't open raw TCP sockets.
 curl -fsSL https://raw.githubusercontent.com/omnipin/isheika/main/install.sh | sh
 ```
 
-Drops the latest prebuilt `isheika` into `~/.local/bin` (override with
-`ISHEIKA_BIN_DIR=…`, pin with `ISHEIKA_VERSION=v0.1.2`).
+### Specific version
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/omnipin/isheika/main/install.sh | ISHEIKA_VERSION=v0.1.2 sh
+```
 
 ### Build from source
-
-On any other platform, or to track `main`:
 
 ```bash
 cargo install --git https://github.com/omnipin/isheika
@@ -110,16 +106,6 @@ cp peers.seed.json peers.json
 ```bash
 isheika upload --daemon /tmp/isheika.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
 ```
-
-## Benchmarks
-
-`.github/workflows/bench.yml` and `.circleci/config.yml` run a manual
-mainnet upload benchmark on demand (`workflow_dispatch` on GitHub, the
-`run_bench` pipeline parameter on CircleCI). They're never automatic —
-each upload spends real BZZ. Throughput is bandwidth- and
-peer-coverage-bound and moves a lot with the pool / buffer / overlay
-knobs; `PERFORMANCE.md` has the empirical-ceilings table and the full
-sweep behind each one.
 
 ## Compatibility
 
