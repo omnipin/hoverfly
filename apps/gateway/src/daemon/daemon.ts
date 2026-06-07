@@ -346,9 +346,24 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   if (c == null) return { httpStatus: 503, error: status.lastError ?? 'daemon not ready' }
 
   const p = rawPath.replace(/^\/+/, '')
-  const candidates = (p === '' || p.endsWith('/'))
-    ? [p + 'index.html']
-    : [p, p + '/index.html']
+  // Build the manifest lookup candidates:
+  //   - ""        / "dir/"   -> directory index:  "<p>index.html"
+  //   - "dir"               -> the path itself, then a directory-index fallback
+  //                            "dir/index.html" (extensionless => looks like a dir)
+  //   - "dir/file.png"      -> the path itself ONLY. A path whose last segment
+  //                            has a file extension is a file, never a directory;
+  //                            appending "/index.html" to it (e.g.
+  //                            "uploads/0626.png/index.html") is always wrong.
+  const lastSeg = p.split('/').pop() ?? ''
+  const hasExtension = /\.[^./]+$/.test(lastSeg)
+  let candidates: string[]
+  if (p === '' || p.endsWith('/')) {
+    candidates = [p + 'index.html']
+  } else if (hasExtension) {
+    candidates = [p]
+  } else {
+    candidates = [p, p + '/index.html']
+  }
 
   let lastErr: string | undefined
   for (const candidate of candidates) {
