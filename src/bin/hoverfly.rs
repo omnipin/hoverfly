@@ -7,12 +7,12 @@ use std::time::Duration;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
-use indicatif::{ProgressBar, ProgressStyle};
 use hoverfly::client::{
     DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
     ProgressFn, fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex,
     upload_collection, upload_file_with_manifest_ex,
 };
+use indicatif::{ProgressBar, ProgressStyle};
 
 use hoverfly::{
     DEFAULT_DOH_URL, Doh, MAINNET_BOOTNODE, PeerStore, SwarmSigner, Transport, TransportConfig,
@@ -1170,8 +1170,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     // Keep only browser-dialable (/ws, /wss) underlays; drop the
                     // peer entirely if it has none. (`discover` already stripped
                     // unroutable/private IPs, so what's left is publicly dialable.)
-                    p.underlays
-                        .retain(|u| hoverfly::peers::is_ws_underlay(u));
+                    p.underlays.retain(|u| hoverfly::peers::is_ws_underlay(u));
                     if p.underlays.is_empty() {
                         dropped_non_ws += 1;
                         continue;
@@ -1634,8 +1633,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .as_deref()
                     .map(|s| if s.is_empty() { None } else { Some(s) })
                     .unwrap_or(Some("index.html"));
-                let (manifest_root, n_chunks) =
-                    hoverfly::client::collection_root(&files, index_doc, error_document.as_deref())?;
+                let (manifest_root, n_chunks) = hoverfly::client::collection_root(
+                    &files,
+                    index_doc,
+                    error_document.as_deref(),
+                )?;
                 let root_hex = hex::encode(manifest_root.as_bytes());
                 println!(
                     "collection: {} files, {} bytes, {} unique chunks",
@@ -1695,8 +1697,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sock_path = socket.clone();
             tokio::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ = hoverfly::daemon::call(&sock_path, &hoverfly::daemon::Request::Shutdown)
-                        .await;
+                    let _ =
+                        hoverfly::daemon::call(&sock_path, &hoverfly::daemon::Request::Shutdown)
+                            .await;
                 }
             });
 

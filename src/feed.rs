@@ -9,13 +9,13 @@
 //! Algorithm (mirrors bee `pkg/feeds`):
 //!
 //! 1. A feed is `{ owner: 20-byte eth address, topic: 32 bytes }`.
-//! 2. The update at sequence index `i` lives at a SOC address derived as:
-//!      `id   = keccak256(topic || u64_be(i))`
-//!      `addr = keccak256(id || owner)`              (== SOC `CreateAddress`)
-//! 3. To find the latest update we probe indices upward from 0 until a fetch
-//!    misses; the last index that resolved is the current head. (Bee uses a
-//!    concurrent doubling search; we use a bounded binary/exponential search
-//!    that keeps the per-chunk fetch count low.)
+//! 2. The update at sequence index `i` lives at a SOC address derived as
+//!    `id = keccak256(topic || u64_be(i))` then
+//!    `addr = keccak256(id || owner)` (== SOC `CreateAddress`).
+//! 3. To find the latest update we bracket the head with a concurrent
+//!    exponential probe (fan out doubling indices at once), then narrow it with
+//!    a concurrent k-ary search of the bracket — both fully parallel so a
+//!    high-index head resolves in a few round-trips, not one-per-index.
 //! 4. The found chunk is a SOC. Its wrapped CAC body is the feed *payload*,
 //!    laid out (legacy/v1) as `span(8) || timestamp(8) || reference(32[|64])`.
 //!    The `reference` after the 16-byte prefix is the content manifest root.
@@ -29,7 +29,7 @@ use core::time::Duration;
 
 use alloy_primitives::{Address, Keccak256};
 use nectar_primitives::store::{ChunkGet, ChunkStoreError};
-use nectar_primitives::{AnyChunk, Chunk, ChunkAddress, DEFAULT_BODY_SIZE};
+use nectar_primitives::{AnyChunk, ChunkAddress, DEFAULT_BODY_SIZE};
 
 /// Metadata keys bee writes into a feed manifest's root entry
 /// (`pkg/api/feed.go`).
@@ -66,7 +66,10 @@ impl core::fmt::Display for FeedError {
             FeedError::BadOwner(s) => write!(f, "invalid feed owner: {s}"),
             FeedError::BadTopic(s) => write!(f, "invalid feed topic: {s}"),
             FeedError::UnsupportedType(s) => {
-                write!(f, "unsupported feed type '{s}' (only Sequence is supported)")
+                write!(
+                    f,
+                    "unsupported feed type '{s}' (only Sequence is supported)"
+                )
             }
             FeedError::ShortPayload(n) => write!(f, "feed update payload too short: {n} bytes"),
             FeedError::NoUpdate => write!(f, "feed has no updates"),
@@ -159,6 +162,27 @@ pub fn reference_from_payload(cac_data: &[u8]) -> Result<[u8; 32], FeedError> {
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let s = s.strip_prefix("0x").unwrap_or(s);
     hex::decode(s).map_err(|e| e.to_string())
+}
+
+/// Pick up to `k` distinct, evenly-spaced candidate indices strictly inside the
+/// open interval `(low, high)` for one concurrent k-ary search round. Returns
+/// indices in ascending order with none equal to `low`/`high` and no
+/// duplicates. Empty if the interval has no interior point.
+fn bracket_candidates(low: u64, high: u64, k: u32) -> Vec<u64> {
+    if high <= low + 1 {
+        return Vec::new(); // no interior indices
+    }
+    let span = high - low - 1; // count of interior indices
+    let probes = (k as u64).min(span);
+    let mut out = Vec::with_capacity(probes as usize);
+    for j in 1..=probes {
+        // Evenly distribute j across the interior: positions span/(probes+1).
+        let idx = low + (span * j) / (probes + 1) + 1;
+        if idx > low && idx < high && out.last() != Some(&idx) {
+            out.push(idx);
+        }
+    }
+    out
 }
 
 /// Errors from resolving a feed over the network.
@@ -289,20 +313,55 @@ where
         base = top.saturating_mul(2);
     }
 
-    // --- Phase 2: binary search the bracket (lo present, hi absent). ---
-    // Sequential, but only ~log2(band) steps now that the band is small.
+    // --- Phase 2: concurrent k-ary search of the bracket (lo present, hi absent).
+    // A plain binary search here is SEQUENTIAL — each step waits a full round-
+    // trip (and a miss waits the whole PROBE_TIMEOUT), which dominated total
+    // resolution time. Instead, split the open interval (low, high) into
+    // PROBE_BAND equally-spaced candidate indices and probe them ALL at once;
+    // the results narrow the bracket to (highest-present, lowest-absent) in a
+    // single round. This collapses ~log2(gap) sequential probes into
+    // ~log_PROBE_BAND(gap) concurrent rounds (a 64-wide gap: 1 round vs ~6).
     if hi != u64::MAX {
         let mut low = lo;
         let mut high = hi;
         while high - low > 1 {
-            let mid = low + (high - low) / 2;
-            match get_update(store, feed, mid).await? {
-                Some(c) => {
-                    low = mid;
-                    last_chunk = c;
-                }
-                None => high = mid,
+            let candidates = bracket_candidates(low, high, PROBE_BAND);
+            let mut futs = FuturesUnordered::new();
+            for idx in candidates {
+                futs.push(async move { (idx, get_update(store, feed, idx).await) });
             }
+            if futs.is_empty() {
+                break;
+            }
+            let mut round_low = low;
+            let mut round_high = high;
+            let mut round_chunk: Option<AnyChunk<DEFAULT_BODY_SIZE>> = None;
+            while let Some((idx, res)) = futs.next().await {
+                match res? {
+                    Some(c) => {
+                        if idx > round_low {
+                            round_low = idx;
+                            round_chunk = Some(c);
+                        }
+                    }
+                    None => {
+                        if idx < round_high {
+                            round_high = idx;
+                        }
+                    }
+                }
+            }
+            // Make progress guard: if the round somehow didn't tighten the
+            // bracket (shouldn't happen), stop to avoid an infinite loop.
+            if round_low == low && round_high == high {
+                break;
+            }
+            if let Some(c) = round_chunk {
+                last_chunk = c;
+                lo = round_low;
+            }
+            low = round_low;
+            high = round_high;
         }
     }
 
@@ -423,6 +482,61 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn bracket_candidates_are_interior_sorted_unique() {
+        // Wide gap, k=12: up to 12 distinct interior, all strictly inside.
+        let c = bracket_candidates(64, 128, 12);
+        assert!(!c.is_empty());
+        assert!(c.len() <= 12);
+        assert!(c.iter().all(|&i| i > 64 && i < 128), "all interior: {c:?}");
+        assert!(c.windows(2).all(|w| w[0] < w[1]), "sorted+unique: {c:?}");
+    }
+
+    #[test]
+    fn bracket_candidates_edges() {
+        assert!(bracket_candidates(10, 11, 12).is_empty()); // adjacent: no interior
+        assert!(bracket_candidates(10, 10, 12).is_empty()); // empty
+        // Single interior index -> exactly one candidate.
+        assert_eq!(bracket_candidates(10, 12, 12), vec![11]);
+        // Gap smaller than k: at most `span` candidates, no dupes.
+        let c = bracket_candidates(0, 5, 12); // interior 1,2,3,4
+        assert!(c.len() <= 4);
+        assert!(c.iter().all(|&i| (1..=4).contains(&i)));
+        assert!(c.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn bracket_candidates_converge() {
+        // Repeatedly narrowing (low,high) by picking the candidate just below a
+        // fixed head must reach the head in few rounds (the concurrency win).
+        let head = 1000u64;
+        let (mut low, mut high) = (0u64, 4096u64); // head bracketed
+        let mut rounds = 0;
+        while high - low > 1 {
+            rounds += 1;
+            let cand = bracket_candidates(low, high, 12);
+            assert!(!cand.is_empty());
+            // Simulate: present iff idx <= head.
+            let mut rl = low;
+            let mut rh = high;
+            for &idx in &cand {
+                if idx <= head {
+                    rl = rl.max(idx);
+                } else {
+                    rh = rh.min(idx);
+                }
+            }
+            assert!(rl > low || rh < high, "must make progress");
+            low = rl;
+            high = rh;
+        }
+        assert_eq!(low, head);
+        assert!(
+            rounds <= 4,
+            "12-ary over 4096 should converge in <=4 rounds, took {rounds}"
+        );
+    }
+
     /// Cross-check the SOC address derivation `keccak256(id || owner)` against
     /// bee's `TestCreateAddress` vector (pkg/soc/soc_test.go): id = 32 zero
     /// bytes, owner = 8d3766…e632 -> 9d453ebb…6d61dc85. This guards the inner
@@ -431,9 +545,8 @@ mod tests {
     #[test]
     fn soc_create_address_matches_bee_vector() {
         let id = [0u8; 32];
-        let owner = Address::from_slice(
-            &decode_hex("8d3766440f0d7b949a5e32995d09619a7f86e632").unwrap(),
-        );
+        let owner =
+            Address::from_slice(&decode_hex("8d3766440f0d7b949a5e32995d09619a7f86e632").unwrap());
         let mut h = Keccak256::new();
         h.update(id);
         h.update(owner.as_slice());

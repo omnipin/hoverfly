@@ -384,9 +384,13 @@ pub fn is_unroutable_ip4(ip: std::net::Ipv4Addr) -> bool {
 /// `libp2p.direct` SNI host resolves straight back to that private IP — so
 /// every dial to it burns a full dial-timeout for nothing.
 pub fn has_unroutable_ip4(ma: &str) -> bool {
-    let Some(rest) = ma.split("/ip4/").nth(1) else { return false };
+    let Some(rest) = ma.split("/ip4/").nth(1) else {
+        return false;
+    };
     let ip_str = rest.split('/').next().unwrap_or("");
-    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false };
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else {
+        return false;
+    };
     is_unroutable_ip4(ip)
 }
 
