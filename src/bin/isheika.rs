@@ -284,9 +284,34 @@ enum Commands {
         #[arg(long, value_name = "BATCH_ID")]
         batch: String,
 
-        /// Batch depth (typically 17-24)
-        #[arg(long, default_value_t = 20)]
-        depth: u8,
+        /// Batch depth (typically 17-24). When omitted, the depth is read
+        /// from the batch's on-chain struct via `--rpc-url` (and the
+        /// batch owner is verified against `--key`'s address). Passing an
+        /// explicit `--depth` skips the on-chain read entirely.
+        ///
+        /// Defaulting blindly to a fixed depth silently corrupts uploads
+        /// when the real batch depth differs (wrong per-bucket index
+        /// math), so there is intentionally no default — supply `--depth`
+        /// or a working `--rpc-url`.
+        #[arg(long)]
+        depth: Option<u8>,
+
+        /// Gnosis JSON-RPC endpoint used to read the batch's on-chain
+        /// depth + owner when `--depth` is omitted. Ignored when `--depth`
+        /// is supplied. Defaults to a public Gnosis RPC.
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = "https://rpc.gnosischain.com"
+        )]
+        rpc_url: String,
+
+        /// Skip the on-chain owner check that runs when `--depth` is
+        /// omitted. The depth is still read from chain; only the
+        /// owner==key assertion is bypassed (e.g. when stamping on behalf
+        /// of a batch you don't own but are authorised to sign for).
+        #[arg(long)]
+        no_owner_check: bool,
 
         /// Private key (hex, 32 bytes — batch owner's signer)
         #[arg(long, value_name = "KEY")]
@@ -1199,6 +1224,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             file,
             batch,
             depth,
+            rpc_url,
+            no_owner_check,
             key,
             peerlist,
             max_retries,
@@ -1212,6 +1239,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(unix)]
             daemon,
         } => {
+            // Resolve the batch depth. If the user passed `--depth`, trust
+            // it. Otherwise read the batch's on-chain struct: infer depth
+            // and (unless `--no-owner-check`) verify the batch owner
+            // matches `--key`'s address — catching the two classic
+            // silent-failure modes (wrong depth → bad bucket index math;
+            // wrong key → stamps bee rejects → endless "could not push
+            // chunk" retries).
+            let depth: u8 = match depth {
+                Some(d) => d,
+                None => {
+                    let stamp_addr: alloy_primitives::Address =
+                        isheika::batch::MAINNET_POSTAGE_STAMP
+                            .parse()
+                            .expect("hardcoded valid");
+                    eprintln!("depth: not provided, reading batch on-chain via {rpc_url} ...");
+                    let info = isheika::batch::read_batch(&rpc_url, stamp_addr, &batch)
+                        .await
+                        .map_err(|e| {
+                            format!(
+                                "could not read batch depth on-chain (pass --depth to skip, \
+                                 or set a working --rpc-url): {e}"
+                            )
+                        })?;
+                    if info.not_found {
+                        return Err(format!(
+                            "batch {batch} not found on-chain at {} — wrong batch ID or \
+                             not yet mined? Pass --depth to override.",
+                            stamp_addr
+                        )
+                        .into());
+                    }
+                    if !no_owner_check {
+                        // Derive the upload key's address and compare.
+                        let signer_addr = {
+                            let s = SwarmSigner::from_hex_with_nonce(
+                                &key,
+                                "0x0000000000000000000000000000000000000000000000000000000000000000",
+                                cli.network_id,
+                            )?;
+                            alloy_primitives::Address::from(*s.eth_address())
+                        };
+                        if signer_addr != info.owner {
+                            return Err(format!(
+                                "batch owner mismatch: batch {batch} is owned by {} on-chain, \
+                                 but --key derives to {}. bee will reject every stamp signed by \
+                                 this key (\"could not push chunk\"). Use the batch owner's key, \
+                                 or pass --no-owner-check if you are authorised to sign for it.",
+                                info.owner, signer_addr,
+                            )
+                            .into());
+                        }
+                    }
+                    eprintln!(
+                        "depth: {} (read on-chain; owner={}{})",
+                        info.depth,
+                        info.owner,
+                        if info.immutable { ", immutable" } else { "" },
+                    );
+                    info.depth
+                }
+            };
+
             #[cfg(unix)]
             if let Some(sock) = daemon {
                 let req = isheika::daemon::Request::Upload(isheika::daemon::UploadRequest {
