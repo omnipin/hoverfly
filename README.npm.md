@@ -1,14 +1,14 @@
-# @omnipin/isheika
+# @omnipin/hoverfly
 
 Minimal [Swarm](https://www.ethswarm.org/) (Ethereum Swarm) micro-client for the
 browser — `discover`, `fetch`, and `upload` over libp2p WebSocket. This is the
-WebAssembly build of [`omnipin/isheika`](https://github.com/omnipin/isheika); for
+WebAssembly build of [`omnipin/hoverfly`](https://github.com/omnipin/hoverfly); for
 the native CLI, see the repository.
 
 ## Install
 
 ```sh
-npm install @omnipin/isheika
+npm install @omnipin/hoverfly
 ```
 
 ## Usage
@@ -17,19 +17,19 @@ ESM, no bundler required (this is a `wasm-bindgen --target web` build — call t
 default `init()` once to load the wasm module):
 
 ```js
-import init, { IsheikaClient, initThreadPool } from "@omnipin/isheika";
+import init, { HoverflyClient, initThreadPool } from "@omnipin/hoverfly";
 
 await init();                                        // instantiate the wasm
 await initThreadPool(navigator.hardwareConcurrency); // optional: parallel hashing
 
 // All constructor args optional: (privateKeyHex?, networkId = 1, dohUrl?, timeoutSecs = 30)
-const client = new IsheikaClient();
+const client = new HoverflyClient();
 
 const peers = await client.discover("/dnsaddr/mainnet.ethswarm.org", 5); // -> peer count
 const bytes = await client.fetch(rootHex, /* maxRetries */ 3);           // -> Uint8Array
 
 // upload needs a signer key and a postage batch:
-const signer = new IsheikaClient(privateKeyHex);
+const signer = new HoverflyClient(privateKeyHex);
 const root = await signer.upload(data, batchIdHex, depth, 3);            // -> root hash hex
 ```
 
@@ -48,4 +48,4 @@ Cross-Origin-Embedder-Policy: require-corp
 
 ## License
 
-MIT — see [omnipin/isheika](https://github.com/omnipin/isheika).
+MIT — see [omnipin/hoverfly](https://github.com/omnipin/hoverfly).

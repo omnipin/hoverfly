@@ -1,6 +1,6 @@
 # AGENTS.md
 
-isheika is a Rust crate: a minimal, WASM-portable Swarm (Ethereum Swarm)
+hoverfly is a Rust crate: a minimal, WASM-portable Swarm (Ethereum Swarm)
 micro-client. Three user-facing operations: `discover`, `fetch`, `upload`.
 `README.md`, `index.ts`, `package.json`, `bun.lock`, and `node_modules/` are
 vestigial `bun init` artifacts and should be ignored (don't touch them, don't
@@ -47,7 +47,7 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
 
 ## Binaries
 
-- `isheika` (`src/bin/isheika.rs`) — the CLI.
+- `hoverfly` (`src/bin/hoverfly.rs`) — the CLI.
 - `sigcheck` (`src/bin/sigcheck.rs`) — signer/handshake reference comparison
   tool, not user-facing.
 
@@ -145,7 +145,7 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 
 ## Repo conventions
 
-- Multiple git remotes: `github` → GitHub (`omnipin/isheika.git`),
+- Multiple git remotes: `github` → GitHub (`omnipin/hoverfly.git`),
   `rad` → Radicle (push), `iris` → Radicle (HTTPS mirror via
   `iris.radicle.xyz`), `vps` → SSH push to the VPS that runs the
   long-lived daemon. Push targets are explicit; there's no shared
@@ -234,7 +234,7 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   so a fresh runner doesn't have to discover from scratch (which,
   on AWS/Azure egress to a EU-Hetzner-heavy network, is slow).
   Local installs that want fast cold-start can do the same.
-  Regenerate via the `isheika save-peers --socket <sock>` CLI
+  Regenerate via the `hoverfly save-peers --socket <sock>` CLI
   on a daemon that's been running a few hours.
 - **Postage stamp signature validator** (`src/stamp.rs`). Validates
   the 113-byte wire-format stamp shape and recovers the batch
@@ -285,7 +285,7 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   bee's `bee_pusher_sync_time` / `bee_pushsync_push_peer_time` /
   etc. Prometheus metrics so direct A/B comparisons are possible
   against a co-located bee node. See PERFORMANCE.md
-  "Bee-vs-isheika end-to-end comparison" for the numbers.
+  "Bee-vs-hoverfly end-to-end comparison" for the numbers.
 - CLI has split timeouts: `--timeout` (per-operation, default 10 s, applies
   to pushsync / retrieval / pseudosettle substreams) ≠ `--dial-timeout`
   (session open: dial + identify + handshake + pricing, default 3 s). Don't

@@ -19,7 +19,7 @@ export const LANDING_SCRIPT = `${ASSET_PREFIX}landing.js`
 export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js`
 export const DAEMON_FRAME_PATH = `${ASSET_PREFIX}daemon-frame.html`
 /** wasm-bindgen `--target web` entry, vendored from the repo's pkg/. */
-export const ISHEIKA_JS = `${ASSET_PREFIX}isheika/isheika.js`
+export const HOVERFLY_JS = `${ASSET_PREFIX}hoverfly/hoverfly.js`
 
 // ---- Swarm network ----
 export const NETWORK_ID = 1 // 1 = mainnet, 10 = testnet/sepolia
@@ -34,11 +34,11 @@ export const DISCOVER_WAIT_SECS = 8
 export const DAEMON_REFRESH_SECS = 45
 /** Per-chunk retry budget for fetches. */
 export const FETCH_RETRIES = 6
-/** Cloudflare is isheika's built-in default; leave undefined to use it. */
+/** Cloudflare is hoverfly's built-in default; leave undefined to use it. */
 export const DOH_URL: string | undefined = undefined
 
 // ---- persistence ----
-export const IDB_NAME = 'isheika-gateway'
+export const IDB_NAME = 'hoverfly-gateway'
 export const IDB_STORE = 'kv'
 export const IDB_PEERS_KEY = 'peerstore-json'
 /**
@@ -52,12 +52,12 @@ export const IDB_NODEKEY_KEY = 'node-key-hex'
 export const IDB_NONCE_KEY = 'node-nonce-hex'
 /**
  * IndexedDB database name for the persistent, content-addressed chunk cache
- * (L2). Managed inside the isheika wasm via `enableChunkStore`. Immutable
+ * (L2). Managed inside the hoverfly wasm via `enableChunkStore`. Immutable
  * Swarm chunks persist here across fetches and sessions, on top of the SW's
  * file-level Cache API.
  */
-export const IDB_CHUNKS_DB = 'isheika-gw-chunks'
-export const LS_USER_PEERS = 'isheika-gw:user-wss-peers'
+export const IDB_CHUNKS_DB = 'hoverfly-gw-chunks'
+export const LS_USER_PEERS = 'hoverfly-gw:user-wss-peers'
 
 // ---- caching ----
 export const CONTENT_CACHE = 'swarm-content-v2'

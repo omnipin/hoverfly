@@ -79,7 +79,7 @@ where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
     // Per-phase timing emitted at the end as a single tracing line on
-    // the `isheika::profile` target. Run with `RUST_LOG=isheika::profile=trace`
+    // the `hoverfly::profile` target. Run with `RUST_LOG=hoverfly::profile=trace`
     // and pipe through `awk` to get a histogram of where push time goes.
     let t_start = web_time::Instant::now();
 
@@ -106,7 +106,7 @@ where
     let t_receipt_recv = web_time::Instant::now();
 
     tracing::trace!(
-        target: "isheika::profile",
+        target: "hoverfly::profile",
         addr = %hex::encode(address),
         hdr_send_us = (t_hdr_sent - t_start).as_micros() as u64,
         hdr_recv_us = (t_hdr_recv - t_hdr_sent).as_micros() as u64,

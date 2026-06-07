@@ -1,4 +1,4 @@
-//! isheika CLI — `discover` / `fetch` / `upload` against the Swarm network
+//! hoverfly CLI — `discover` / `fetch` / `upload` against the Swarm network
 //! over libp2p WebSocket only, with DoH-only DNS resolution.
 
 use std::path::PathBuf;
@@ -8,13 +8,13 @@ use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 use indicatif::{ProgressBar, ProgressStyle};
-use isheika::client::{
+use hoverfly::client::{
     DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
     ProgressFn, fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex,
     upload_collection, upload_file_with_manifest_ex,
 };
 
-use isheika::{
+use hoverfly::{
     DEFAULT_DOH_URL, Doh, MAINNET_BOOTNODE, PeerStore, SwarmSigner, Transport, TransportConfig,
     UploadFile,
 };
@@ -24,7 +24,7 @@ use tracing_subscriber::FmtSubscriber;
 
 #[derive(Parser)]
 #[command(
-    name = "isheika",
+    name = "hoverfly",
     version,
     about = "Swarm micro-client (TCP + WebSocket on native, WebSocket on WASM)"
 )]
@@ -38,7 +38,7 @@ struct Cli {
     debug: bool,
 
     /// Trace output (trace-level logging; very noisy, intended for
-    /// profile/diagnostic targets like `isheika::profile`).
+    /// profile/diagnostic targets like `hoverfly::profile`).
     #[arg(long, global = true)]
     trace: bool,
 
@@ -68,7 +68,7 @@ struct Cli {
     /// contention per-stream (~lower push latency). Sweet spot is
     /// workload-dependent; see `PERFORMANCE.md`. Default 64.
     #[arg(long, global = true,
-          default_value_t = isheika::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
+          default_value_t = hoverfly::protocols::stream_pool::DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES,
           value_name = "N")]
     substream_upgrade_cap: usize,
 
@@ -225,6 +225,14 @@ enum Commands {
         /// Concurrency for the healthcheck probe phase.
         #[arg(long, default_value_t = 64)]
         healthcheck_concurrency: usize,
+
+        /// Export a browser-ready seed: keep only peers that advertise a
+        /// `/ws` or `/wss` (WebSocket) underlay, and strip each peer's
+        /// non-ws underlays. Browser builds can't open raw TCP, so this
+        /// produces a peers.json the in-browser gateway daemon can use
+        /// directly (e.g. `apps/gateway/public/__gw__/peers.ws.json`).
+        #[arg(long)]
+        ws_only: bool,
     },
 
     /// Fetch content addressed by a 32-byte hex root hash.
@@ -266,7 +274,7 @@ enum Commands {
         concurrency: usize,
 
         /// Connect to a running daemon instead of executing the fetch
-        /// in this process. See `isheika daemon`.
+        /// in this process. See `hoverfly daemon`.
         #[cfg(unix)]
         #[arg(long, value_name = "SOCKET")]
         daemon: Option<PathBuf>,
@@ -367,7 +375,7 @@ enum Commands {
 
         /// Connect to a running daemon instead of executing the upload
         /// in this process. The daemon must own a warm session pool —
-        /// see `isheika daemon`. Mutually exclusive with the in-process
+        /// see `hoverfly daemon`. Mutually exclusive with the in-process
         /// peerlist; the daemon's own peerlist is used.
         #[cfg(unix)]
         #[arg(long, value_name = "SOCKET")]
@@ -480,7 +488,7 @@ enum Commands {
         /// happens under the daemon's stable identity (when
         /// `--listen` + `--identity` are set), so bees don't
         /// reject it via kademlia saturation — unlike the ephemeral
-        /// `isheika discover` subcommand which can be RST'd by
+        /// `hoverfly discover` subcommand which can be RST'd by
         /// every bootnode on a fresh runner.
         #[arg(long, default_value_t = 1, value_name = "N")]
         discover_rounds: usize,
@@ -815,15 +823,15 @@ fn root_hex_to_cid(root_hex: &str) -> Option<String> {
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
-    Some(isheika::cid::reference_to_cid(&arr))
+    Some(hoverfly::cid::reference_to_cid(&arr))
 }
 
 fn guess_content_type(path: &str) -> Option<String> {
-    isheika::mime::guess_from_path(path)
+    hoverfly::mime::guess_from_path(path)
 }
 
 /// Print the session-retirement-cause counters to stderr at upload end.
-/// See `isheika::transport::diag` for what each counter means.
+/// See `hoverfly::transport::diag` for what each counter means.
 /// Format `bytes / elapsed` as a human-readable throughput line.
 /// Uses binary units (KiB/MiB) to match every other "throughput"
 /// number in `PERFORMANCE.md`. Elapsed is captured at the CLI call
@@ -919,7 +927,7 @@ fn parse_address_hex(s: &str) -> Result<[u8; 20], String> {
 }
 
 fn print_session_retire_diag() {
-    use isheika::transport::diag;
+    use hoverfly::transport::diag;
     use std::sync::atomic::Ordering;
     let dead_low = diag::DEAD_RETIRE_LOW_GHOST.load(Ordering::Relaxed);
     let dead_prewarm = diag::DEAD_RETIRE_PREWARM_GHOST.load(Ordering::Relaxed);
@@ -1023,19 +1031,19 @@ fn print_session_retire_diag() {
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
 
-    // The library reads ISHEIKA_BUFFER_MULT from the environment at
+    // The library reads HOVERFLY_BUFFER_MULT from the environment at
     // upload dispatch time (`src/client.rs::push_chunks_inner`). The
     // `--buffer-multiplier` CLI flag plumbs the same knob without
     // requiring the user to export an env var. An explicit env var
     // takes precedence over the CLI default — set the env var from
     // the CLI value only if the env var is unset, so an explicit
-    // `ISHEIKA_BUFFER_MULT=N` from the shell still wins.
-    if std::env::var_os("ISHEIKA_BUFFER_MULT").is_none() {
+    // `HOVERFLY_BUFFER_MULT=N` from the shell still wins.
+    if std::env::var_os("HOVERFLY_BUFFER_MULT").is_none() {
         // Safety: single-threaded at this point (main hasn't done
         // anything else yet); unsafe in nightly's edition-2024
         // because env::set_var is process-wide.
         unsafe {
-            std::env::set_var("ISHEIKA_BUFFER_MULT", cli.buffer_multiplier.to_string());
+            std::env::set_var("HOVERFLY_BUFFER_MULT", cli.buffer_multiplier.to_string());
         }
     }
 
@@ -1079,7 +1087,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             },
         )
         .map_err(|e| format!("--chequebook-per-peer-cap-bzz: {e}"))?;
-        let store = isheika::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
+        let store = hoverfly::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
             .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
         eprintln!(
             "swap: chequebook=0x{} chain_id={} per_peer_cap_bzz={} cheques_file={}",
@@ -1088,7 +1096,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             per_peer_cap,
             cli.cheques_file.display(),
         );
-        Some(isheika::transport::SwapConfig {
+        Some(hoverfly::transport::SwapConfig {
             chequebook: cb,
             chain_id: cli.chequebook_chain_id,
             max_cumulative_per_peer_bzz: per_peer_cap,
@@ -1108,12 +1116,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             discover_concurrency,
             healthcheck,
             healthcheck_concurrency,
+            ws_only,
         } => {
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
-            let progress: isheika::client::DiscoverProgressFn = Arc::new(|ev| {
-                use isheika::client::DiscoverEvent::*;
+            let progress: hoverfly::client::DiscoverProgressFn = Arc::new(|ev| {
+                use hoverfly::client::DiscoverEvent::*;
                 match ev {
                     RoundStarted {
                         round,
@@ -1137,7 +1146,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
             });
-            let discovered = isheika::client::discover_recursive_with_progress(
+            let discovered = hoverfly::client::discover_recursive_with_progress(
                 &transport,
                 &doh,
                 &bootstrap,
@@ -1154,15 +1163,34 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 PeerStore::new()
             };
-            for p in discovered {
+            let mut kept = 0usize;
+            let mut dropped_non_ws = 0usize;
+            for mut p in discovered {
+                if ws_only {
+                    // Keep only browser-dialable (/ws, /wss) underlays; drop the
+                    // peer entirely if it has none. (`discover` already stripped
+                    // unroutable/private IPs, so what's left is publicly dialable.)
+                    p.underlays
+                        .retain(|u| hoverfly::peers::is_ws_underlay(u));
+                    if p.underlays.is_empty() {
+                        dropped_non_ws += 1;
+                        continue;
+                    }
+                }
+                kept += 1;
                 store.upsert(p);
+            }
+            if ws_only {
+                println!(
+                    "ws-only: kept {kept} peer(s) with a /ws underlay, dropped {dropped_non_ws} tcp-only peer(s)"
+                );
             }
 
             if healthcheck {
                 println!("probing {} peers for reachability...", store.len());
-                isheika::client::healthcheck_peers(&transport, &store, healthcheck_concurrency)
+                hoverfly::client::healthcheck_peers(&transport, &store, healthcheck_concurrency)
                     .await;
-                isheika::peers::apply_log(&mut store, transport.reachability_log());
+                hoverfly::peers::apply_log(&mut store, transport.reachability_log());
             }
 
             store.save(&output)?;
@@ -1183,16 +1211,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(unix)]
             if let Some(sock) = daemon {
                 let output = output.ok_or("--output is required when using --daemon")?;
-                let req = isheika::daemon::Request::Fetch(isheika::daemon::FetchRequest {
+                let req = hoverfly::daemon::Request::Fetch(hoverfly::daemon::FetchRequest {
                     hash,
                     path,
                     output: output.clone(),
                     max_retries,
                     concurrency,
                 });
-                let resp = isheika::daemon::call(&sock, &req).await?;
+                let resp = hoverfly::daemon::call(&sock, &req).await?;
                 match resp {
-                    isheika::daemon::Response::Fetched {
+                    hoverfly::daemon::Response::Fetched {
                         bytes_written,
                         content_type,
                     } => {
@@ -1205,7 +1233,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         return Ok(());
                     }
-                    isheika::daemon::Response::Err { message } => {
+                    hoverfly::daemon::Response::Err { message } => {
                         return Err(format!("daemon error: {message}").into());
                     }
                     other => return Err(format!("unexpected daemon response: {:?}", other).into()),
@@ -1216,7 +1244,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut peers = PeerStore::load_or_create(&peerlist);
             if peers.is_empty() {
                 return Err(format!(
-                    "peerlist {} is empty — run `isheika discover` first",
+                    "peerlist {} is empty — run `hoverfly discover` first",
                     peerlist.display()
                 )
                 .into());
@@ -1267,7 +1295,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             // Persist reachability observations back to peers.json on
             // both success and error so the next run starts faster.
-            isheika::peers::apply_log(&mut peers, transport.reachability_log());
+            hoverfly::peers::apply_log(&mut peers, transport.reachability_log());
             let _ = peers.save(&peerlist);
             result?;
         }
@@ -1302,11 +1330,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Some(d) => d,
                 None => {
                     let stamp_addr: alloy_primitives::Address =
-                        isheika::batch::MAINNET_POSTAGE_STAMP
+                        hoverfly::batch::MAINNET_POSTAGE_STAMP
                             .parse()
                             .expect("hardcoded valid");
                     eprintln!("depth: not provided, reading batch on-chain via {rpc_url} ...");
-                    let info = isheika::batch::read_batch(&rpc_url, stamp_addr, &batch)
+                    let info = hoverfly::batch::read_batch(&rpc_url, stamp_addr, &batch)
                         .await
                         .map_err(|e| {
                             format!(
@@ -1355,7 +1383,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             #[cfg(unix)]
             if let Some(sock) = daemon {
-                let req = isheika::daemon::Request::Upload(isheika::daemon::UploadRequest {
+                let req = hoverfly::daemon::Request::Upload(hoverfly::daemon::UploadRequest {
                     file: file.clone(),
                     batch: batch.clone(),
                     depth,
@@ -1376,10 +1404,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // get a throughput number for daemon-mode runs (used
                 // in PERFORMANCE.md A/B comparisons).
                 let upload_started = std::time::Instant::now();
-                let resp = isheika::daemon::call(&sock, &req).await?;
+                let resp = hoverfly::daemon::call(&sock, &req).await?;
                 let elapsed = upload_started.elapsed();
                 match resp {
-                    isheika::daemon::Response::Uploaded { root, bytes } => {
+                    hoverfly::daemon::Response::Uploaded { root, bytes } => {
                         let cid = root_hex_to_cid(&root);
                         println!(
                             "uploaded {} bytes — manifest root: {} (via daemon)",
@@ -1392,7 +1420,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         print_upload_throughput(bytes, elapsed);
                         return Ok(());
                     }
-                    isheika::daemon::Response::Err { message } => {
+                    hoverfly::daemon::Response::Err { message } => {
                         return Err(format!("daemon error: {message}").into());
                     }
                     other => return Err(format!("unexpected daemon response: {:?}", other).into()),
@@ -1426,7 +1454,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // The default snapshot uses best-effort plausible values
             // for the percentile-gated fields (see
             // `protocols::status::StatusSnapshot::default`).
-            let status_snapshot = isheika::protocols::status::StatusSnapshot::default();
+            let status_snapshot = hoverfly::protocols::status::StatusSnapshot::default();
             let transport = match swap_cfg.clone() {
                 Some(sc) => Transport::new(signer.clone(), cfg)
                     .with_swap(sc)
@@ -1483,9 +1511,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/");
                     println!("subdomain:  https://{c}.bzz.limo/");
                 }
-                println!("retrieve a file with: isheika fetch {root_hex} --path <name> -o <out>");
-                println!("list contents with: isheika fetch {root_hex} --list");
-                isheika::peers::apply_log(&mut peers, transport.reachability_log());
+                println!("retrieve a file with: hoverfly fetch {root_hex} --path <name> -o <out>");
+                println!("list contents with: hoverfly fetch {root_hex} --list");
+                hoverfly::peers::apply_log(&mut peers, transport.reachability_log());
                 let _ = peers.save(&peerlist);
                 print_session_retire_diag();
                 return Ok(());
@@ -1558,11 +1586,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/{path}");
                     println!("subdomain:  https://{c}.bzz.limo/{path}");
                 }
-                println!("retrieve with: isheika fetch {root_hex} --path {path} -o {path}");
+                println!("retrieve with: hoverfly fetch {root_hex} --path {path} -o {path}");
                 print_upload_throughput(data.len(), elapsed);
             }
 
-            isheika::peers::apply_log(&mut peers, transport.reachability_log());
+            hoverfly::peers::apply_log(&mut peers, transport.reachability_log());
             let _ = peers.save(&peerlist);
             // Persist cheques.json so the next run's cumulative payouts
             // stay strictly increasing (bee rejects otherwise — see
@@ -1607,7 +1635,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .map(|s| if s.is_empty() { None } else { Some(s) })
                     .unwrap_or(Some("index.html"));
                 let (manifest_root, n_chunks) =
-                    isheika::client::collection_root(&files, index_doc, error_document.as_deref())?;
+                    hoverfly::client::collection_root(&files, index_doc, error_document.as_deref())?;
                 let root_hex = hex::encode(manifest_root.as_bytes());
                 println!(
                     "collection: {} files, {} bytes, {} unique chunks",
@@ -1621,7 +1649,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Bare content root — identical to `upload --raw`.
-            let (file_root, n_chunks) = isheika::client::bmt_root(&data)?;
+            let (file_root, n_chunks) = hoverfly::client::bmt_root(&data)?;
             let file_root_hex = hex::encode(file_root.as_bytes());
 
             // Manifest root — what the default (non-raw) `upload` yields.
@@ -1635,7 +1663,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             });
             let ct = content_type.or_else(|| guess_content_type(&path));
             let (manifest_root, _manifest_chunks) =
-                isheika::manifest::build_single_entry_manifest(&path, file_root, ct.as_deref())
+                hoverfly::manifest::build_single_entry_manifest(&path, file_root, ct.as_deref())
                     .map_err(|e| format!("building manifest: {e}"))?;
             let manifest_root_hex = hex::encode(manifest_root.as_bytes());
 
@@ -1667,7 +1695,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sock_path = socket.clone();
             tokio::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ = isheika::daemon::call(&sock_path, &isheika::daemon::Request::Shutdown)
+                    let _ = hoverfly::daemon::call(&sock_path, &hoverfly::daemon::Request::Shutdown)
                         .await;
                 }
             });
@@ -1701,7 +1729,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             if already_has_p2p {
                                 Ok(base)
                             } else {
-                                let peer_id = isheika::inbound::peer_id_from_identity(&signer);
+                                let peer_id = hoverfly::inbound::peer_id_from_identity(&signer);
                                 Ok(base.with(libp2p::multiaddr::Protocol::P2p(peer_id)))
                             }
                         })
@@ -1715,7 +1743,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .map(|a| format!(" advertise={a}"))
                             .unwrap_or_default(),
                     );
-                    Some(isheika::daemon::ListenConfig {
+                    Some(hoverfly::daemon::ListenConfig {
                         listen: ma,
                         advertise: advertised,
                         identity: signer,
@@ -1724,7 +1752,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         // for mainnet May 2026. Future: expose CLI
                         // flags for the percentile-critical fields if
                         // the defaults start failing.
-                        status_snapshot: isheika::protocols::status::StatusSnapshot::default(),
+                        status_snapshot: hoverfly::protocols::status::StatusSnapshot::default(),
                     })
                 }
                 None => None,
@@ -1741,7 +1769,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if bootnodes.is_empty() {
                 return Err("at least one --bootnode is required".into());
             }
-            isheika::daemon::run(
+            hoverfly::daemon::run(
                 socket,
                 peerlist,
                 cli.network_id,
@@ -1759,14 +1787,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         #[cfg(unix)]
         Commands::SavePeers { socket } => {
-            let resp = isheika::daemon::call(&socket, &isheika::daemon::Request::SavePeers)
+            let resp = hoverfly::daemon::call(&socket, &hoverfly::daemon::Request::SavePeers)
                 .await
                 .map_err(|e| format!("daemon call failed: {e}"))?;
             match resp {
-                isheika::daemon::Response::Ok => {
+                hoverfly::daemon::Response::Ok => {
                     println!("daemon saved peerlist");
                 }
-                isheika::daemon::Response::Err { message } => {
+                hoverfly::daemon::Response::Err { message } => {
                     return Err(format!("daemon refused save: {message}").into());
                 }
                 other => {
@@ -1786,8 +1814,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             network_id,
         } => {
             use alloy_signer_local::PrivateKeySigner;
-            use isheika::signer::derive_overlay;
-            use isheika::transport::proximity;
+            use hoverfly::signer::derive_overlay;
+            use hoverfly::transport::proximity;
 
             // Derive our eth_address from the key — this is the input
             // half of the overlay hash that's fixed by our identity.
@@ -1844,7 +1872,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 (parsed_targets, true)
             } else {
-                let store = isheika::PeerStore::load_or_create(&peerlist);
+                let store = hoverfly::PeerStore::load_or_create(&peerlist);
                 let peers: Vec<[u8; 32]> = store
                     .iter()
                     .filter_map(|p| {
@@ -2022,7 +2050,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 chain_id,
             } => {
                 use alloy_signer_local::PrivateKeySigner;
-                use isheika::batch::{
+                use hoverfly::batch::{
                     CreateBatchParams, MAINNET_BZZ_TOKEN, MAINNET_POSTAGE_STAMP,
                     amount_for_duration, create_batch, depth_for_size, parse_duration, parse_size,
                     read_last_price,

@@ -102,7 +102,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
         // peers add us to their kademlia tables on the inbound
         // verification dial-back.
         swarm.add_external_address(addr.clone());
-        info!(target: "isheika::inbound",
+        info!(target: "hoverfly::inbound",
             "advertising external address {addr}");
     }
 
@@ -134,7 +134,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
         .accept(STATUS_PROTO)
         .map_err(|e| InboundError::StreamControl(format!("accept status: {e:?}")))?;
     // Pullsync substreams (`cursors` + `pullsync`) are NOT accepted.
-    // isheika is an upload client, not a reserve maintainer; we have
+    // hoverfly is an upload client, not a reserve maintainer; we have
     // no chunks to offer back. See [`PeerSession::connect`] for the
     // detailed rationale — when bee opens pullsync to us it gets a
     // multistream `ErrNotSupported`, which bee's puller logs and
@@ -142,7 +142,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
     // task work without harming throughput or salud health.
 
     info!(
-        target: "isheika::inbound",
+        target: "hoverfly::inbound",
         "inbound listener up on {} (peer_id {}, overlay {})",
         cfg.listen,
         our_peer_id,
@@ -162,25 +162,25 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
             ev = swarm.select_next_some() => {
                 match ev {
                     SwarmEvent::NewListenAddr { address, .. } => {
-                        info!(target: "isheika::inbound", "listening on {address}");
+                        info!(target: "hoverfly::inbound", "listening on {address}");
                     }
                     SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
-                        debug!(target: "isheika::inbound",
+                        debug!(target: "hoverfly::inbound",
                             "inbound connection from {peer_id} via {}", endpoint.get_remote_address());
                     }
                     SwarmEvent::ConnectionClosed { peer_id, cause, .. } => {
-                        debug!(target: "isheika::inbound",
+                        debug!(target: "hoverfly::inbound",
                             "connection from {peer_id} closed: {cause:?}");
                     }
                     SwarmEvent::Behaviour(BehaviourEvent::Identify(ev)) => {
                         if let libp2p::identify::Event::Received { peer_id, info, .. } = ev {
-                            debug!(target: "isheika::inbound",
+                            debug!(target: "hoverfly::inbound",
                                 "identify from {peer_id}: agent={} observed_addr={}",
                                 info.agent_version, info.observed_addr);
                         }
                     }
                     SwarmEvent::IncomingConnectionError { error, .. } => {
-                        debug!(target: "isheika::inbound", "incoming conn error: {error}");
+                        debug!(target: "hoverfly::inbound", "incoming conn error: {error}");
                     }
                     _ => {}
                 }
@@ -190,7 +190,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 let signer = signer.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
-                    info!(target: "isheika::inbound",
+                    info!(target: "hoverfly::inbound",
                         "inbound handshake (v15) stream from {peer_id}");
                     let res = tokio::time::timeout(
                         op_timeout,
@@ -202,11 +202,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         ),
                     ).await;
                     match res {
-                        Ok(Ok(())) => info!(target: "isheika::inbound",
+                        Ok(Ok(())) => info!(target: "hoverfly::inbound",
                             "handshake v15 responded to {peer_id}"),
-                        Ok(Err(e)) => warn!(target: "isheika::inbound",
+                        Ok(Err(e)) => warn!(target: "hoverfly::inbound",
                             "handshake v15 from {peer_id} failed: {e}"),
-                        Err(_) => warn!(target: "isheika::inbound",
+                        Err(_) => warn!(target: "hoverfly::inbound",
                             "handshake v15 from {peer_id} timed out"),
                     }
                 });
@@ -216,7 +216,7 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 let signer = signer.clone();
                 let advertised = advertised.clone();
                 tokio::spawn(async move {
-                    info!(target: "isheika::inbound",
+                    info!(target: "hoverfly::inbound",
                         "inbound handshake (v14) stream from {peer_id}");
                     let res = tokio::time::timeout(
                         op_timeout,
@@ -228,11 +228,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         ),
                     ).await;
                     match res {
-                        Ok(Ok(())) => info!(target: "isheika::inbound",
+                        Ok(Ok(())) => info!(target: "hoverfly::inbound",
                             "handshake v14 responded to {peer_id}"),
-                        Ok(Err(e)) => warn!(target: "isheika::inbound",
+                        Ok(Err(e)) => warn!(target: "hoverfly::inbound",
                             "handshake v14 from {peer_id} failed: {e}"),
-                        Err(_) => warn!(target: "isheika::inbound",
+                        Err(_) => warn!(target: "hoverfly::inbound",
                             "handshake v14 from {peer_id} timed out"),
                     }
                 });
@@ -245,11 +245,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         pricing::respond_announcement(&mut stream),
                     ).await;
                     match res {
-                        Ok(Ok(threshold)) => debug!(target: "isheika::inbound",
+                        Ok(Ok(threshold)) => debug!(target: "hoverfly::inbound",
                             "pricing from {peer_id}: threshold {threshold}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                        Ok(Err(e)) => debug!(target: "hoverfly::inbound",
                             "pricing from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
+                        Err(_) => debug!(target: "hoverfly::inbound",
                             "pricing from {peer_id} timed out"),
                     }
                 });
@@ -259,27 +259,27 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                 let cache = cache.clone();
                 tokio::spawn(async move {
                     let cache_len = cache.len();
-                    info!(target: "isheika::inbound",
+                    info!(target: "hoverfly::inbound",
                         "inbound retrieval stream from {peer_id} (cache size {cache_len})");
                     let res = tokio::time::timeout(op_timeout, retrieval::respond(&mut stream, |addr| {
                         let hit = cache.get(addr).map(|c| (c.data.to_vec(), c.stamp.to_vec()));
                         if hit.is_some() {
-                            info!(target: "isheika::inbound",
+                            info!(target: "hoverfly::inbound",
                                 "retrieval HIT addr={} for {peer_id}",
                                 hex::encode(addr));
                         } else {
-                            debug!(target: "isheika::inbound",
+                            debug!(target: "hoverfly::inbound",
                                 "retrieval MISS addr={} for {peer_id}",
                                 hex::encode(addr));
                         }
                         hit
                     })).await;
                     match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                        Ok(Ok(())) => debug!(target: "hoverfly::inbound",
                             "retrieval responded to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                        Ok(Err(e)) => debug!(target: "hoverfly::inbound",
                             "retrieval from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
+                        Err(_) => debug!(target: "hoverfly::inbound",
                             "retrieval from {peer_id} timed out"),
                     }
                 });
@@ -292,11 +292,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         hive::respond_empty(&mut stream),
                     ).await;
                     match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                        Ok(Ok(())) => debug!(target: "hoverfly::inbound",
                             "hive v2 responded (empty) to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                        Ok(Err(e)) => debug!(target: "hoverfly::inbound",
                             "hive v2 from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
+                        Err(_) => debug!(target: "hoverfly::inbound",
                             "hive v2 from {peer_id} timed out"),
                     }
                 });
@@ -309,11 +309,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         hive::respond_empty(&mut stream),
                     ).await;
                     match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                        Ok(Ok(())) => debug!(target: "hoverfly::inbound",
                             "hive v1 responded (empty) to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                        Ok(Err(e)) => debug!(target: "hoverfly::inbound",
                             "hive v1 from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
+                        Err(_) => debug!(target: "hoverfly::inbound",
                             "hive v1 from {peer_id} timed out"),
                     }
                 });
@@ -333,11 +333,11 @@ pub async fn run(cfg: InboundConfig) -> Result<(), InboundError> {
                         status::respond(&mut stream, &snapshot),
                     ).await;
                     match res {
-                        Ok(Ok(())) => debug!(target: "isheika::inbound",
+                        Ok(Ok(())) => debug!(target: "hoverfly::inbound",
                             "status responded to {peer_id}"),
-                        Ok(Err(e)) => debug!(target: "isheika::inbound",
+                        Ok(Err(e)) => debug!(target: "hoverfly::inbound",
                             "status from {peer_id} failed: {e}"),
-                        Err(_) => debug!(target: "isheika::inbound",
+                        Err(_) => debug!(target: "hoverfly::inbound",
                             "status from {peer_id} timed out"),
                     }
                 });

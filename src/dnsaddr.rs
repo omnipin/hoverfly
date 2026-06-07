@@ -83,7 +83,7 @@ async fn resolve_recursive(
             let next: Multiaddr = match payload.parse() {
                 Ok(m) => m,
                 Err(e) => {
-                    tracing::debug!(target: "isheika::dnsaddr", "skip {}: {}", payload, e);
+                    tracing::debug!(target: "hoverfly::dnsaddr", "skip {}: {}", payload, e);
                     continue;
                 }
             };

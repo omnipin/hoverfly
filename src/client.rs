@@ -367,10 +367,27 @@ impl<'a> NetworkedStore<'a> {
         // immutable + content-addressed, so a stored copy is reusable across
         // fetches and sessions. Re-verify the BMT address on read-back so a
         // corrupted/tampered store can never inject a bad chunk.
+        //
+        // The L2 lookup is best-effort and MUST NOT gate retrieval: under a
+        // non-cross-origin-isolated context the wasm-bindgen-rayon thread pool
+        // fails to init (`initThreadPool` errors) and the build runs single-
+        // threaded, where the `indexed-db` crate's transaction future can stall
+        // and never resolve — wedging the whole fetch *before* a single peer is
+        // tried (no `candidate peers` log, nothing stored). Bound the read with
+        // a short timeout: a hit still short-circuits the network, but a stalled
+        // IndexedDB op falls through to retrieval instead of hanging forever.
         #[cfg(target_arch = "wasm32")]
         if let Some(store) = crate::idb_chunk_store::get_store() {
+            use futures::future::Either;
             use nectar_primitives::Chunk;
-            if let Some(wire) = store.get(hex::encode(address.as_bytes())).await {
+            let key = hex::encode(address.as_bytes());
+            let get_fut = std::pin::pin!(store.get(key));
+            let timeout = std::pin::pin!(futures_timer::Delay::new(Duration::from_secs(2)));
+            let maybe_wire = match futures::future::select(get_fut, timeout).await {
+                Either::Left((wire, _)) => wire,
+                Either::Right((_, _)) => None, // L2 read stalled — fall through to network
+            };
+            if let Some(wire) = maybe_wire {
                 if let Ok(cc) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()) {
                     if cc.address() == &address {
                         let chunk = AnyChunk::from(cc);
@@ -408,6 +425,17 @@ impl<'a> NetworkedStore<'a> {
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
         }
+        let dialable = candidates
+            .iter()
+            .filter(|p| p.first_dialable_underlay().is_some())
+            .count();
+        info!(
+            target: "hoverfly::fetch",
+            "chunk {}: {} candidate peers ({} with a dialable /ws[s] underlay)",
+            hex::encode(&address.as_bytes()[..4]),
+            candidates.len(),
+            dialable,
+        );
 
         // Cross-chunk reordering using the shared scoreboard (see the
         // `peer_scores` field on `NetworkedStore`). The base order above is
@@ -456,7 +484,7 @@ impl<'a> NetworkedStore<'a> {
         // VecDeque so DialTooSoon-deferred peers can be re-queued at the back
         // instead of being treated as a peer failure. Tier 1 of the retrieval-
         // loop port (mirroring Bee's `pkg/retrieval` semantics): the keystone
-        // fix for the cooldown-as-failure thrash isheika hits against post-2.8
+        // fix for the cooldown-as-failure thrash hoverfly hits against post-2.8
         // mainnet (~37 `dial too soon` rejections/sec, 0 chunks retrieved).
         use std::collections::{HashMap, HashSet, VecDeque};
         let all_candidates: Vec<&Peer> = candidates.into_iter().take(attempt_cap).collect();
@@ -609,6 +637,7 @@ impl<'a> NetworkedStore<'a> {
         }
 
         let mut last_err = String::from("no peers tried");
+        let mut failed_attempts: usize = 0;
         // If the entire candidate set has cycled as `Deferred` without any
         // making real progress (no `Got`/`Failed`), every peer is in cooldown.
         // Sleep briefly so cooldowns can elapse rather than spinning. Mirrors
@@ -691,7 +720,8 @@ impl<'a> NetworkedStore<'a> {
                     }
                 }
                 AttemptOutcome::Failed(e) => {
-                    warn!(target: "isheika::fetch", "peer {} failed: {}", overlay, e);
+                    failed_attempts = failed_attempts.saturating_add(1);
+                    warn!(target: "hoverfly::fetch", "peer {} failed: {}", overlay, e);
                     last_err = e;
                     consecutive_deferrals = 0;
                     // Tier 2: park failed peer in per-chunk skiplist.
@@ -705,8 +735,16 @@ impl<'a> NetworkedStore<'a> {
                 inflight.push(try_peer(next));
             }
         }
+        warn!(
+            target: "hoverfly::fetch",
+            "chunk {}: all peers failed after {} attempt(s) of {} candidates; last error: {}",
+            hex::encode(&address.as_bytes()[..4]),
+            failed_attempts,
+            initial_deque_len,
+            last_err,
+        );
         Err(ChunkStoreError::Other(format!(
-            "all peers failed: {last_err}"
+            "all peers failed ({failed_attempts}/{initial_deque_len} attempted): {last_err}"
         )))
     }
 }
@@ -785,7 +823,7 @@ impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
         if let Some(c) = self.cache.lock().unwrap().get(address).cloned() {
             return Ok(c);
         }
-        info!(target: "isheika::manifest", "blocking fetch for {}", address);
+        info!(target: "hoverfly::manifest", "blocking fetch for {}", address);
         let handle = tokio::runtime::Handle::current();
         let store = NetworkedStore::with_concurrency(
             self.transport,
@@ -797,7 +835,7 @@ impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
         let chunk = handle.block_on(async move {
             ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &address_copy).await
         })?;
-        info!(target: "isheika::manifest", "got chunk: data.len()={}", chunk.data().len());
+        info!(target: "hoverfly::manifest", "got chunk: data.len()={}", chunk.data().len());
         self.cache.lock().unwrap().insert(*address, chunk.clone());
         Ok(chunk)
     }
@@ -920,7 +958,7 @@ pub async fn discover_recursive_with_progress(
         if frontier.is_empty() {
             break;
         }
-        info!(target: "isheika::discover",
+        info!(target: "hoverfly::discover",
             "round {} of {}: dialing {} peer(s) ({} in parallel)",
             round + 1, max_rounds, frontier.len(), concurrency);
         if let Some(p) = progress.as_ref() {
@@ -941,7 +979,7 @@ pub async fn discover_recursive_with_progress(
         // `transport` clean and produces a single async-block type so
         // FuturesUnordered can hold them all.
         let dial = |ma: Multiaddr| async move {
-            debug!(target: "isheika::discover", "dialing {}", ma);
+            debug!(target: "hoverfly::discover", "dialing {}", ma);
             let res = transport.discover_peers(&ma, wait_per_peer).await;
             (ma, res)
         };
@@ -955,9 +993,28 @@ pub async fn discover_recursive_with_progress(
         while let Some((ma, res)) = inflight.next().await {
             match res {
                 Ok(batch) => {
-                    debug!(target: "isheika::discover",
+                    debug!(target: "hoverfly::discover",
                         "{} returned {} peers", ma, batch.len());
-                    for p in batch {
+                    for mut p in batch {
+                        // Drop underlays we can never dial end-to-end: private
+                        // (RFC1918), loopback, link-local, CGNAT, etc. Bee hive
+                        // gossip routinely includes a node's *internal* address
+                        // (e.g. a k8s pod `10.233.x.x`) alongside its public
+                        // one; keeping the private underlay only wastes a full
+                        // dial-timeout later. Filtering here keeps both the
+                        // native and wasm peerstores (and any `-o` dump) clean.
+                        let before = p.underlays.len();
+                        p.underlays.retain(|u| !crate::peers::has_unroutable_ip4(u));
+                        if p.underlays.len() != before {
+                            debug!(target: "hoverfly::discover",
+                                "peer {}: dropped {} unroutable underlay(s)",
+                                &p.overlay[..p.overlay.len().min(8)],
+                                before - p.underlays.len());
+                        }
+                        // A peer with no routable underlay left is useless to us.
+                        if p.underlays.is_empty() {
+                            continue;
+                        }
                         let key = p.overlay.to_lowercase();
                         if seen_overlays.insert(key) {
                             // Queue this peer as a discovery target for the
@@ -973,7 +1030,7 @@ pub async fn discover_recursive_with_progress(
                     }
                 }
                 Err(e) => {
-                    debug!(target: "isheika::discover",
+                    debug!(target: "hoverfly::discover",
                         "discover from {} failed: {}", ma, e);
                 }
             }
@@ -983,7 +1040,7 @@ pub async fn discover_recursive_with_progress(
             }
         }
 
-        info!(target: "isheika::discover",
+        info!(target: "hoverfly::discover",
             "round {} done: total unique peers = {}", round + 1, all.len());
         if let Some(p) = progress.as_ref() {
             p(DiscoverEvent::RoundFinished {
@@ -1332,7 +1389,7 @@ pub async fn upload_collection(
     for f in &files {
         let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
         debug!(
-            target: "isheika::upload",
+            target: "hoverfly::upload",
             "collection: {} ({} bytes) -> {} chunks (root {})",
             f.path, f.data.len(), file_store.len(), file_root
         );
@@ -1368,7 +1425,7 @@ pub async fn upload_collection(
         stamp_in.push((*addr, wire.to_vec()));
     }
     info!(
-        target: "isheika::upload",
+        target: "hoverfly::upload",
         "collection: {} files ({} bytes) -> {} unique file chunks ({} duplicates skipped) + {} manifest chunks (root {})",
         files.len(), total_bytes, unique_data_chunks,
         raw_chunks.saturating_sub(unique_data_chunks),
@@ -1458,13 +1515,13 @@ pub fn prepare_upload_file_with_manifest(
     let batch_id = parse_batch_id(batch_id_hex)?;
 
     let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
-    info!(target: "isheika::upload", "file: {} bytes -> {} chunks (root {})",
+    info!(target: "hoverfly::upload", "file: {} bytes -> {} chunks (root {})",
         data.len(), file_store.len(), file_root);
 
     let (manifest_root, manifest_chunks) =
         crate::manifest::build_single_entry_manifest(path, file_root, content_type)
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
-    info!(target: "isheika::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
+    info!(target: "hoverfly::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
 
     let mut stamper = build_stamper(signer, batch_id, depth);
     let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
@@ -1729,7 +1786,7 @@ fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
 /// the upload path logs), which the caller can use to size a pool or
 /// to compute the chunk-address set for proximity-targeted discovery.
 ///
-/// Note: this is **not** the same hash `isheika upload` prints by
+/// Note: this is **not** the same hash `hoverfly upload` prints by
 /// default — the default (non-`--raw`) upload wraps the file in a
 /// single-entry mantaray manifest, whose root differs. Use
 /// [`prepare_upload_file_with_manifest`] (or just split + manifest) to
@@ -1799,7 +1856,7 @@ pub fn prepare_upload_bytes(
     let batch_id = parse_batch_id(batch_id_hex)?;
 
     let (root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
-    info!(target: "isheika::upload", "split {} bytes into {} chunks (root {})",
+    info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {})",
         data.len(), store.len(), root);
 
     let mut stamper = build_stamper(signer, batch_id, depth);
@@ -2339,7 +2396,7 @@ async fn push_chunks_concurrent(
     let target_sessions = concurrency.max(1).min(work.len().max(4));
     let pool = SessionPool::open(transport, peers, target_sessions).await?;
     info!(
-        target: "isheika::upload",
+        target: "hoverfly::upload",
         "opened {} peer session(s), pushing {} chunks",
         pool.len(),
         work.len()
@@ -2397,14 +2454,14 @@ pub async fn push_chunks_with_pool(
     // 1.5 k+ attempts in flight on a 32-peer pool and turned 6
     // chunks/s into 0.1 chunks/s.
     //
-    // ISHEIKA_BUFFER_MULT (env var; same semantics as the
+    // HOVERFLY_BUFFER_MULT (env var; same semantics as the
     // --buffer-multiplier CLI flag) multiplies the cap and the
     // pool-size floor. At default 1 the buffer is 128 chunks. Empirical
     // sweet spot on a 50 MiB random VPS upload is
     // `--concurrency 512 --buffer-multiplier 4` (= buffer 512 + pool
     // 512, ~3 in-flight per session at race=3), reaching ~1 MB/s.
     // Larger values overshoot into per-session yamux contention.
-    let mult: usize = std::env::var("ISHEIKA_BUFFER_MULT")
+    let mult: usize = std::env::var("HOVERFLY_BUFFER_MULT")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n: &usize| *n > 0)
@@ -2795,12 +2852,12 @@ pub async fn push_chunks_with_pool(
                                     p(done, total);
                                 }
                                 if done % 25 == 0 || done == total {
-                                    info!(target: "isheika::upload",
+                                    info!(target: "hoverfly::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay));
                                 } else {
-                                    debug!(target: "isheika::upload",
+                                    debug!(target: "hoverfly::upload",
                                         "push ok ({}/{}) via {} (po={}, price={})",
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay), price);
@@ -2809,7 +2866,7 @@ pub async fn push_chunks_with_pool(
                             }
                             Ok(PushOutcome::Overdraft) => {
                                 overdrafts += 1;
-                                debug!(target: "isheika::upload",
+                                debug!(target: "hoverfly::upload",
                                     "overdraft on {} (po={}); trying next peer",
                                     entry.overlay_hex,
                                     chunk_addr.proximity(&entry.overlay));
@@ -2817,7 +2874,7 @@ pub async fn push_chunks_with_pool(
                             Ok(PushOutcome::Shallow(r)) => {
                                 shallows += 1;
                                 let po = chunk_addr.proximity(&entry.overlay) as usize;
-                                debug!(target: "isheika::upload",
+                                debug!(target: "hoverfly::upload",
                                     "shallow receipt on {} (po={}, storage_radius={}); trying next peer",
                                     entry.overlay_hex, po, r.storage_radius);
                                 if best_shallow.as_ref().map(|(p, _)| po > *p).unwrap_or(true) {
@@ -2833,7 +2890,7 @@ pub async fn push_chunks_with_pool(
                                 // lands on a subsequent retry. We surface the
                                 // last error in the eventual `NoPeers`
                                 // return-value if the entire fan-out fails.
-                                debug!(target: "isheika::upload",
+                                debug!(target: "hoverfly::upload",
                                     "push attempt {} via {} (po={}) failed: {}",
                                     n, entry.overlay_hex,
                                     chunk_addr.proximity(&entry.overlay), e);
@@ -2902,7 +2959,7 @@ pub async fn push_chunks_with_pool(
                 let already_attempted = attempt_no;
                 let extra: Vec<usize> = order.iter().skip(already_attempted).copied().collect();
                 if !extra.is_empty() {
-                    debug!(target: "isheika::upload",
+                    debug!(target: "hoverfly::upload",
                         "all {} attempted peers gave overdraft/shallow ({}+{}); trying {} more",
                         already_attempted, overdrafts, shallows, extra.len());
                     for idx in extra {
@@ -2917,7 +2974,7 @@ pub async fn push_chunks_with_pool(
                                     p(done, total);
                                 }
                                 if done % 25 == 0 || done == total {
-                                    info!(target: "isheika::upload",
+                                    info!(target: "hoverfly::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay));
@@ -2932,7 +2989,7 @@ pub async fn push_chunks_with_pool(
                         }
                     }
                 } else if overdrafts > 0 {
-                    debug!(target: "isheika::upload",
+                    debug!(target: "hoverfly::upload",
                         "all peers overdrafted and no more candidates; waiting for refresh");
                     tokio::time::sleep(Duration::from_millis(600)).await;
                     for idx in order.iter().take(cap).copied() {
@@ -2947,7 +3004,7 @@ pub async fn push_chunks_with_pool(
                                     p(done, total);
                                 }
                                 if done % 25 == 0 || done == total {
-                                    info!(target: "isheika::upload",
+                                    info!(target: "hoverfly::upload",
                                         "pushed {}/{} chunks (latest via {} po={})",
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay));
@@ -2980,7 +3037,7 @@ pub async fn push_chunks_with_pool(
                 if let Some(p) = &progress {
                     p(done, total);
                 }
-                info!(target: "isheika::upload",
+                info!(target: "hoverfly::upload",
                     "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft / {} err)",
                     hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts, errors);
                 return Ok::<_, ClientError>(());
@@ -3213,7 +3270,7 @@ pub async fn push_chunks_with_pool(
                     // change the answer. Surface the typed error so
                     // the upload caller can present it cleanly.
                     Err(e @ ClientError::BatchNotFound(_)) => {
-                        warn!(target: "isheika::upload",
+                        warn!(target: "hoverfly::upload",
                             "batch not found on-chain — aborting upload after {}/{} chunks pushed: {}",
                             pushed.load(Ordering::Relaxed), total, e);
                         first_err = Some(e);
@@ -3242,7 +3299,7 @@ pub async fn push_chunks_with_pool(
                         // the upload inside the blocklist window
                         // every time at higher --concurrency.
                         let backoff = Duration::from_millis(500);
-                        info!(target: "isheika::upload",
+                        info!(target: "hoverfly::upload",
                             "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
                             hex::encode(chunk.addr), e, next, MAX_CHUNK_RETRIES,
                             backoff.as_millis());
@@ -3263,7 +3320,7 @@ pub async fn push_chunks_with_pool(
                 entry.prewarm_inflight.store(false, Ordering::Release);
                 match res {
                     Ok(session) => {
-                        debug!(target: "isheika::upload",
+                        debug!(target: "hoverfly::upload",
                             "pre-warm dial for {} ready", entry.overlay_hex);
                         entry.clear_strikes();
                         entry.store_pending(session);
@@ -3294,12 +3351,12 @@ pub async fn push_chunks_with_pool(
                         // striking is fine — the next chunk that wants
                         // this peer will trigger a fresh prewarm
                         // attempt after the cooldown burns off.
-                        debug!(target: "isheika::upload",
+                        debug!(target: "hoverfly::upload",
                             "pre-warm dial for {} failed: {}", entry.overlay_hex, e);
                         if !matches!(&e, TransportError::DialTooSoon { .. })
                             && entry.record_failure(DEAD_SKIP_SECS)
                         {
-                            debug!(target: "isheika::upload",
+                            debug!(target: "hoverfly::upload",
                                 "marked {} dead for {DEAD_SKIP_SECS}s after {} consecutive prewarm failures",
                                 entry.overlay_hex, DEAD_STRIKES);
                         }
@@ -3338,13 +3395,13 @@ pub async fn push_chunks_with_pool(
                             dead_cd += 1;
                         }
                     }
-                    info!(target: "isheika::upload",
+                    info!(target: "hoverfly::upload",
                         "stalled at {}/{} chunks (inflight={}, pool={} \
                          eligible={} dead={} cap={} dead_cd={})",
                         now, total, inflight.len(), entries.len(),
                         eligible, dead, cap_full, dead_cd);
                 } else {
-                    info!(target: "isheika::upload",
+                    info!(target: "hoverfly::upload",
                         "pushed {}/{} chunks (inflight={})",
                         now, total, inflight.len());
                     last_pushed_seen = now;
@@ -3428,12 +3485,12 @@ async fn salud_prefilter(entries: &[std::sync::Arc<SessionEntry>]) {
                 let rtt = match result {
                     Ok(Ok(d)) => Some(d),
                     Ok(Err(e)) => {
-                        debug!(target: "isheika::upload",
+                        debug!(target: "hoverfly::upload",
                             "salud: probe of {} failed: {}", entry.overlay_hex, e);
                         None
                     }
                     Err(_) => {
-                        debug!(target: "isheika::upload",
+                        debug!(target: "hoverfly::upload",
                             "salud: probe of {} timed out", entry.overlay_hex);
                         None
                     }
@@ -3466,7 +3523,7 @@ async fn salud_prefilter(entries: &[std::sync::Arc<SessionEntry>]) {
         // Not enough responding peers to compute a percentile.
         // Don't filter further — better to use the slow ones
         // than to have a tiny pool.
-        info!(target: "isheika::upload",
+        info!(target: "hoverfly::upload",
             "salud: only {} of {} sessions responded — skipping percentile filter",
             rtts.len(), entries.len());
         return;
@@ -3487,7 +3544,7 @@ async fn salud_prefilter(entries: &[std::sync::Arc<SessionEntry>]) {
         }
     }
 
-    info!(target: "isheika::upload",
+    info!(target: "hoverfly::upload",
         "salud: probed {} session(s), 40th-percentile RTT = {:?}, parked {} slow + {} unresponsive ({} healthy)",
         entries.len(),
         threshold,
@@ -3521,13 +3578,13 @@ async fn try_push_with_rotation(
         Err(_) => {
             let fresh = match entry.take_pending() {
                 Some(s) => {
-                    debug!(target: "isheika::upload",
+                    debug!(target: "hoverfly::upload",
                         "rotated to pre-warmed session for {}", entry.overlay_hex);
                     s
                 }
                 None => match transport.open_session(&entry.underlay).await {
                     Ok(s) => {
-                        debug!(target: "isheika::upload",
+                        debug!(target: "hoverfly::upload",
                             "rotated session to {} (sync dial)", entry.overlay_hex);
                         s
                     }
@@ -3550,7 +3607,7 @@ async fn try_push_with_rotation(
                         if !matches!(&e, TransportError::DialTooSoon { .. })
                             && entry.record_failure(DEAD_SKIP_SECS)
                         {
-                            debug!(target: "isheika::upload",
+                            debug!(target: "hoverfly::upload",
                                 "marked {} dead for {DEAD_SKIP_SECS}s after {} consecutive dial failures",
                                 entry.overlay_hex, DEAD_STRIKES);
                         }
@@ -3636,7 +3693,7 @@ async fn try_push_with_rotation(
             if r.is_shallow(net) {
                 crate::transport::diag::PUSH_OUTCOME_SHALLOW
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug!(target: "isheika::upload",
+                debug!(target: "hoverfly::upload",
                     "shallow: chunk={} storer={} po={} storage_radius={}",
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
                 PushOutcome::Shallow(r)
@@ -3650,7 +3707,7 @@ async fn try_push_with_rotation(
                 entry
                     .push_success_count
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                debug!(target: "isheika::upload",
+                debug!(target: "hoverfly::upload",
                     "receipt OK: chunk={} storer={} po={} storage_radius={}",
                     hex::encode(&r.address), hex::encode(storer), po, r.storage_radius);
                 PushOutcome::Receipt(r)
@@ -3805,7 +3862,7 @@ async fn open_session_pool_filtered(
         return Err(ClientError::NoPeers("peerlist empty".into()));
     }
 
-    // ISHEIKA_CONNECTIONS_PER_PEER (default 1) replicates each
+    // HOVERFLY_CONNECTIONS_PER_PEER (default 1) replicates each
     // candidate M times in the dial list, so up to M successful dials
     // become M independent `SessionEntry`s pointing at the same peer.
     // Each entry owns its own libp2p connection (its own yamux pipe),
@@ -3820,12 +3877,12 @@ async fn open_session_pool_filtered(
     // a fresh per-connection yamux pipe each).
     //
     // The motivation is the buffer-scaling negative result
-    // (`ISHEIKA_BUFFER_MULT`): per-connection yamux flow control is
+    // (`HOVERFLY_BUFFER_MULT`): per-connection yamux flow control is
     // the throughput wall once stream_pool's substream-open
     // parallelism is unlocked. Each additional connection adds
     // an independent yamux pipe to the same peer, so push attempts
     // can actually run in parallel on a per-peer basis.
-    let conn_per_peer: usize = std::env::var("ISHEIKA_CONNECTIONS_PER_PEER")
+    let conn_per_peer: usize = std::env::var("HOVERFLY_CONNECTIONS_PER_PEER")
         .ok()
         .and_then(|s| s.parse().ok())
         .filter(|n: &usize| *n > 0)
@@ -3840,7 +3897,7 @@ async fn open_session_pool_filtered(
                 expanded.push(e.clone());
             }
         }
-        debug!(target: "isheika::upload",
+        debug!(target: "hoverfly::upload",
             "multi-connection pool fill: {} unique peers x {} conns/peer = {} dial candidates",
             candidates.len(), conn_per_peer, expanded.len());
         expanded
@@ -3868,7 +3925,7 @@ async fn open_session_pool_filtered(
     while let Some((overlay, overlay_hex, underlay, res, rtt_ms)) = dialing.next().await {
         match res {
             Ok(session) => {
-                debug!(target: "isheika::upload",
+                debug!(target: "hoverfly::upload",
                     "session opened to {} ({}) in {} ms",
                     overlay_hex, underlay, rtt_ms);
                 log.lock()
@@ -3889,7 +3946,7 @@ async fn open_session_pool_filtered(
                     inflight_pushes: std::sync::atomic::AtomicU32::new(0),
                 });
                 if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
-                    info!(target: "isheika::upload",
+                    info!(target: "hoverfly::upload",
                         "pool fill: {}/{} sessions open", sessions.len(), max_sessions);
                 }
                 if sessions.len() >= max_sessions {
@@ -3901,7 +3958,7 @@ async fn open_session_pool_filtered(
                 // on mainnet (~50%+ peers are stale / NAT'd / running
                 // an incompatible bee). Stay at debug so the user-visible
                 // log shows only the successful pool size.
-                debug!(target: "isheika::upload",
+                debug!(target: "hoverfly::upload",
                     "session to {} failed: {}", overlay_hex, e);
                 log.lock()
                     .unwrap()
@@ -3914,7 +3971,7 @@ async fn open_session_pool_filtered(
             dialing.push(dial(overlay, overlay_hex, underlay));
         }
     }
-    info!(target: "isheika::upload",
+    info!(target: "hoverfly::upload",
         "pool fill: done with {} session(s) ({} requested)",
         sessions.len(), max_sessions);
     Ok(sessions)
@@ -3968,7 +4025,7 @@ pub async fn healthcheck_peers(transport: &Transport, peers: &PeerStore, concurr
             inflight.push(probe(overlay_hex, underlay));
         }
     }
-    info!(target: "isheika::discover",
+    info!(target: "hoverfly::discover",
         "healthcheck: {}/{} peers reachable", reached, total);
 }
 

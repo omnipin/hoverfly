@@ -21,7 +21,7 @@ report('loaded', location.href)
 
 let worker: SharedWorker
 try {
-  worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'isheika-daemon' })
+  worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'hoverfly-daemon' })
   worker.port.start()
   worker.onerror = (e) => console.error('[frame] shared worker error', e)
   console.log('[frame] SharedWorker created')

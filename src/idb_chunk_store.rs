@@ -2,14 +2,14 @@
 //!
 //! Swarm chunks are immutable — addressed by the BMT hash of their content — so
 //! once retrieved they can be cached forever and shared across fetches, sites
-//! and sessions. isheika's in-memory chunk cache ([`crate::client::NetworkedStore`])
+//! and sessions. hoverfly's in-memory chunk cache ([`crate::client::NetworkedStore`])
 //! is per-fetch by design (so a long-lived daemon's RAM doesn't grow without
 //! bound); this module adds an L2 that survives reloads.
 //!
 //! The store is held in a `thread_local` rather than threaded through the
 //! retrieval structs: wasm is single-threaded, so it acts as a process-global
 //! cache, which is exactly right for content-addressed data (a chunk is the
-//! same chunk no matter which fetch or which `IsheikaClient` asked for it). It
+//! same chunk no matter which fetch or which `HoverflyClient` asked for it). It
 //! also keeps `NetworkedStore`/`RetrievalCache` unchanged, so nectar's
 //! `ChunkGet` bounds are unaffected.
 //!
@@ -127,7 +127,7 @@ pub fn get_store() -> Option<IdbChunkStore> {
 }
 
 /// Count of chunks served from the persistent L2 cache (across all fetches).
-/// Exposed via `IsheikaClient::chunkStoreHits` for diagnostics — a non-zero
+/// Exposed via `HoverflyClient::chunkStoreHits` for diagnostics — a non-zero
 /// value on a cold in-memory cache proves chunks are coming from IndexedDB.
 static L2_HITS: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
 

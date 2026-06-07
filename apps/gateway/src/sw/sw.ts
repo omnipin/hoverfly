@@ -2,7 +2,7 @@
 //
 // Service worker for a content origin (<cid>.bzz.<host>).
 //
-// It does NOT run isheika itself (the node lives in the shared cross-origin
+// It does NOT run hoverfly itself (the node lives in the shared cross-origin
 // daemon). Instead a controlling document hands it a MessagePort to the daemon
 // (`daemon-port`), and the SW serves Swarm content by RPC over it.
 //
@@ -33,6 +33,12 @@ self.addEventListener('message', (event: ExtendableMessageEvent) => {
   if (msg?.type === 'daemon-port' && event.ports[0] != null) {
     console.log('[sw] received daemon-port')
     daemon = new DaemonRpc(event.ports[0])
+    // Surface the daemon's warm/runtime phase + peer counts here, since the
+    // daemon's own console (SharedWorker context) is awkward to open.
+    daemon.onStatus((s) => {
+      console.log('[sw] daemon status: phase=', s.phase, '| ready=', s.ready, '| warming=', s.warming,
+        '| dialable=', s.dialable, '| peers=', s.peerCount, s.lastError != null ? '| ERROR=' + s.lastError : '')
+    })
     resolveDaemon?.(daemon)
     resolveDaemon = null
   }
@@ -63,7 +69,7 @@ async function serveContent (req: Request): Promise<Response> {
   // of doing a daemon round-trip and emitting a (harmless but noisy) manifest
   // 404 for a file the site simply doesn't ship.
   if (url.pathname === '/favicon.ico') {
-    const headers = new Headers({ 'cache-control': 'no-cache', server: 'isheika-gateway' })
+    const headers = new Headers({ 'cache-control': 'no-cache', server: 'hoverfly-gateway' })
     isolation(headers)
     return new Response(null, { status: 204, headers })
   }
@@ -115,11 +121,11 @@ async function serveContent (req: Request): Promise<Response> {
   // fixed forever (a new site = a new CID = a new origin). So mark responses
   // immutable with a long max-age — the SW already replays them from the
   // persistent Cache API, and this lets the browser's own HTTP cache treat
-  // them as permanent too. (isheika's in-wasm chunk cache is per-fetch only,
+  // them as permanent too. (hoverfly's in-wasm chunk cache is per-fetch only,
   // so this Cache API layer is what gives cross-load / offline persistence.)
   headers.set('cache-control', 'public, max-age=31536000, immutable')
   headers.set('x-swarm-reference', refHex)
-  headers.set('server', 'isheika-gateway')
+  headers.set('server', 'hoverfly-gateway')
   // The boot shell is crossOriginIsolated (COEP: require-corp) so the nested
   // daemon broker iframe → SharedWorker can use shared wasm memory. Per the
   // HTML spec's embedder-policy compatibility check, a nested frame document
@@ -153,8 +159,8 @@ function errorPage (status: number, title: string, detail: string): Response {
 .card{max-width:32rem;padding:2rem;border:1px solid #30363d;border-radius:12px;background:#161b22}
 h1{font-size:1.1rem;margin:0 0 .5rem} code{color:#7ee787;word-break:break-all} .s{color:#8b949e}</style></head>
 <body><div class="card"><h1>${status} · ${escapeHtml(title)}</h1><p class="s">${escapeHtml(detail)}</p>
-<p class="s">Served by the in-browser isheika Swarm gateway.</p></div></body></html>`
-  const headers = new Headers({ 'content-type': 'text/html; charset=utf-8', server: 'isheika-gateway' })
+<p class="s">Served by the in-browser hoverfly Swarm gateway.</p></div></body></html>`
+  const headers = new Headers({ 'content-type': 'text/html; charset=utf-8', server: 'hoverfly-gateway' })
   isolation(headers) // so the error page itself can embed in the require-corp shell
   return new Response(body, { status, headers })
 }

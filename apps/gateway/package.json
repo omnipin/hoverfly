@@ -1,9 +1,9 @@
 {
-  "name": "@isheika/gateway",
+  "name": "@hoverfly/gateway",
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "In-browser Swarm subdomain gateway powered by a shared isheika (wasm) daemon",
+  "description": "In-browser Swarm subdomain gateway powered by a shared hoverfly (wasm) daemon",
   "scripts": {
     "build": "node build.js",
     "watch": "node build.js --watch",

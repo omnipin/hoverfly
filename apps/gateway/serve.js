@@ -2,7 +2,7 @@
 //
 // Serves the built dist/ for both the gateway root (bzz.localhost) and every
 // content subdomain (<cid>.bzz.localhost), and sets the headers required for
-// cross-origin isolation (SharedArrayBuffer) — the isheika wasm is built with
+// cross-origin isolation (SharedArrayBuffer) — the hoverfly wasm is built with
 // shared memory, so the page MUST be cross-origin isolated:
 //
 //   Cross-Origin-Opener-Policy: same-origin
@@ -129,7 +129,7 @@ const UNREGISTER_HTML = `<!doctype html><meta charset=utf8><title>Unregistering�
 </script></body>`
 
 server.listen(PORT, () => {
-  console.log(`\n  isheika Swarm gateway`)
+  console.log(`\n  hoverfly Swarm gateway`)
   console.log(`  ─ root / daemon : http://${INFIX}.localhost:${PORT}`)
   console.log(`  ─ content       : http://<cid>.${INFIX}.localhost:${PORT}`)
   console.log(`\n  (Chrome resolves *.localhost to 127.0.0.1 automatically.)\n`)

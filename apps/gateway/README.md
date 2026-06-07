@@ -1,10 +1,10 @@
-# isheika Swarm gateway (in-browser, subdomain)
+# hoverfly Swarm gateway (in-browser, subdomain)
 
 A browser-only [subdomain gateway](https://specs.ipfs.tech/http-gateways/subdomain-gateway/)
 for **Ethereum Swarm**, inspired by the IPFS
 [service-worker-gateway](https://github.com/ipfs/service-worker-gateway). It
 fetches and verifies Swarm websites **entirely in the browser** using
-[isheika](https://github.com/omnipin/isheika) (the Rust Swarm micro-client)
+[hoverfly](https://github.com/omnipin/hoverfly) (the Rust Swarm micro-client)
 compiled to WebAssembly — no backend gateway, no Bee node to run.
 
 Each site is served from its own origin (`<cid>.bzz.localhost`) for proper
@@ -14,7 +14,7 @@ origin isolation, just like `*.ipfs.dweb.link`.
 ┌─────────────────────────────────────────────────────────────────────┐
 │  bzz.localhost:3000   (gateway root + shared daemon origin)           │
 │  ├── landing page  → enter a Swarm reference, redirect to subdomain   │
-│  ├── daemon.js     → SharedWorker: ONE isheika node for the whole     │
+│  ├── daemon.js     → SharedWorker: ONE hoverfly node for the whole     │
 │  │                   gateway (warm peers + warm session cache)        │
 │  └── daemon-frame.html → broker iframe embedded by content origins    │
 └─────────────────────────────────────────────────────────────────────┘
@@ -31,17 +31,17 @@ origin isolation, just like `*.ipfs.dweb.link`.
 
 ## "Daemon mode", in the browser
 
-isheika's native daemon (`src/daemon.rs`) is a Unix-socket process and can't
+hoverfly's native daemon (`src/daemon.rs`) is a Unix-socket process and can't
 run in a browser. The point of running a daemon — a **long-lived node that
 keeps peers and sessions warm for better stability** — is recreated here with a
 **`SharedWorker` on the gateway root origin**. A `SharedWorker` is keyed by
 origin + script URL, so every gateway tab and every content subdomain's broker
-iframe connects to the **same instance**: one isheika node, one warm
+iframe connects to the **same instance**: one hoverfly node, one warm
 `PeerStore`, one warm retrieval cache (session pool + peer scoreboard) shared
 across all sites. The first request pays discovery; every later one reuses live
 forwarders.
 
-To make that warm cache reusable, this work added two bindings to isheika's
+To make that warm cache reusable, this work added two bindings to hoverfly's
 wasm façade (`src/wasm.rs`) that wrap the already-tested walkers in
 `src/client.rs`:
 
@@ -53,11 +53,11 @@ wasm façade (`src/wasm.rs`) that wrap the already-tested walkers in
 ## Running
 
 ```bash
-# 1. Build the isheika wasm package (from the repo root) if pkg/ is stale:
+# 1. Build the hoverfly wasm package (from the repo root) if pkg/ is stale:
 RUSTUP_TOOLCHAIN=nightly cargo build --release --locked \
   --target wasm32-unknown-unknown --no-default-features --lib
 wasm-bindgen --target web --out-dir pkg \
-  target/wasm32-unknown-unknown/release/isheika.wasm
+  target/wasm32-unknown-unknown/release/hoverfly.wasm
 
 # 2. Build + serve the gateway:
 cd apps/gateway
@@ -101,7 +101,7 @@ For best reliability, point discovery at a WebSocket-capable bee you control
 (`/ip4/…/tcp/…/tls/sni/…/ws/p2p/…` or `/dns4/host/tcp/443/wss/p2p/…`).
 
 > Regenerate the seed from a native daemon:
-> `target/release/isheika discover /dnsaddr/mainnet.ethswarm.org --rounds 3 -o peers.json`
+> `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 -o peers.json`
 > then keep peers whose `underlays` contain `/ws`.
 
 > The wasm `/ws` dial path itself still needs verification in a real browser —
@@ -126,7 +126,7 @@ For best reliability, point discovery at a WebSocket-capable bee you control
 
 ## Cross-origin isolation
 
-The isheika wasm is built with shared memory (atomics), so pages must be
+The hoverfly wasm is built with shared memory (atomics), so pages must be
 **cross-origin isolated**. The dev server sends `Cross-Origin-Opener-Policy:
 same-origin` + `Cross-Origin-Embedder-Policy: credentialless` +
 `Cross-Origin-Resource-Policy: cross-origin` on everything. `credentialless`
@@ -140,13 +140,13 @@ host the SAB-backed SharedWorker. Chrome-first (uses `request.destination`,
 ```
 src/shared/   swarm-cid.ts (CIDv1 <-> ref, ports cid.rs), swarm-ref, parse-request,
               config, protocol (daemon RPC + DaemonRpc client), bytes
-src/daemon/   daemon.ts          SharedWorker: the one warm isheika node
+src/daemon/   daemon.ts          SharedWorker: the one warm hoverfly node
 src/frame/    frame.ts           broker iframe (relays ports to the daemon)
 src/sw/       sw.ts              content-origin service worker
 src/boot/     boot.ts            subdomain boot shell + content iframe
 src/app/      landing.ts         root landing page + daemon status
 public/       index.html, boot.html, daemon-frame.html, __gw__/styles.css
-build.js      esbuild + vendors ../../pkg into dist/__gw__/isheika/
+build.js      esbuild + vendors ../../pkg into dist/__gw__/hoverfly/
 serve.js      subdomain-aware dev server with isolation headers
 scripts/      selftest.ts        pure-logic tests (CID codec, host parsing)
 ```

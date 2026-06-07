@@ -32,7 +32,7 @@
 //!
 //! For an upload-only client this is acceptable: we don't ingest
 //! chunks into a long-term reserve where bad stamps would matter.
-//! isheika doesn't accept pullsync (we don't store chunks), so the
+//! hoverfly doesn't accept pullsync (we don't store chunks), so the
 //! missing batch-owner check has no operational consequence here.
 
 use sha3::{Digest, Keccak256};

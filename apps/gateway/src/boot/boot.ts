@@ -1,6 +1,6 @@
 // Boot shell — the top document served for any navigation to a content
 // subdomain (<cid>.bzz.<host>). It cannot stream the site's top-level HTML
-// itself (the isheika node lives in a cross-origin daemon and the SW can't
+// itself (the hoverfly node lives in a cross-origin daemon and the SW can't
 // reach it before a client exists), so instead it:
 //   1. registers + waits for the content-origin service worker,
 //   2. embeds the cross-origin daemon broker iframe and opens an RPC channel,
@@ -17,6 +17,16 @@ async function main (): Promise<void> {
 
   // Catch-all: log EVERY postMessage the shell receives, to debug the bridge.
   window.addEventListener('message', (e) => {
+    if (e.data?.type === 'frame-error') {
+      // frame.ts reuses this message type for a benign 'loaded' heartbeat as
+      // well as real 'error'/'rejection' reports — only the latter are errors.
+      if (e.data?.tag === 'error' || e.data?.tag === 'rejection') {
+        console.error('[boot] FRAME ERROR', e.data?.tag, '·', e.data?.detail)
+      } else {
+        console.log('[boot] frame', e.data?.tag, '·', e.data?.detail)
+      }
+      return
+    }
     console.log('[boot] MSG from', e.origin, 'type=', e.data?.type, 'src?', e.source === window ? 'self' : 'other')
   })
   console.log('[boot] shell start', location.href)
@@ -124,7 +134,7 @@ function renderShell (): ShellUi {
   const pill = document.createElement('div')
   pill.className = 'gw-pill'
   pill.innerHTML = '<span class="gw-dot"></span><span class="gw-pill-text">starting daemon…</span>'
-  pill.title = 'isheika gateway status — click to hide'
+  pill.title = 'hoverfly gateway status — click to hide'
   pill.addEventListener('click', () => pill.classList.toggle('gw-hidden'))
 
   // Full-viewport loading overlay shown over the (initially blank, white)

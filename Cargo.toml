@@ -1,18 +1,18 @@
 [package]
-name = "isheika"
+name = "hoverfly"
 version = "0.1.3"
 edition = "2024"
 description = "Minimal WASM-portable Swarm micro-client (native: TCP + WebSocket, WASM: WebSocket)"
 license = "MIT"
 
 [lib]
-name = "isheika"
+name = "hoverfly"
 path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
-name = "isheika"
-path = "src/bin/isheika.rs"
+name = "hoverfly"
+path = "src/bin/hoverfly.rs"
 required-features = ["cli"]
 
 [[bin]]

@@ -1,6 +1,6 @@
 name: bench
 
-# Benchmark isheika daemon-mode upload throughput against bee mainnet
+# Benchmark hoverfly daemon-mode upload throughput against bee mainnet
 # from a GitHub-hosted runner. Manually triggered (workflow_dispatch)
 # only — uploads cost real BZZ via the postage batch, and runner IPs
 # rotate so peer warmup cost gets paid every run.
@@ -9,7 +9,7 @@ name: bench
 #   BENCH_BATCH    Postage batch ID (32-byte hex, no 0x prefix)
 #   BENCH_KEY      Signer private key (32-byte hex, 0x prefix optional)
 #   BENCH_NONCE    Vanity overlay nonce (32-byte hex, no 0x prefix)
-#                  Generate locally with `isheika vanity-overlay
+#                  Generate locally with `hoverfly vanity-overlay
 #                  --key <BENCH_KEY> --target-overlay <stable-peer-overlay>
 #                  --target-po 10 --output overlay-nonce`, then
 #                  `cat overlay-nonce`.
@@ -88,12 +88,12 @@ jobs:
         id: bin-cache
         uses: actions/cache@v5
         with:
-          path: target/release/isheika
+          path: target/release/hoverfly
           key: bin-${{ runner.os }}-${{ hashFiles('Cargo.toml', 'Cargo.lock', 'src/**/*.rs', 'build.rs', 'proto/**') }}
 
       - name: Build release binary
         if: steps.bin-cache.outputs.cache-hit != 'true'
-        run: cargo build --release --bin isheika
+        run: cargo build --release --bin hoverfly
 
       - name: Write overlay nonce
         env:
@@ -116,10 +116,10 @@ jobs:
         env:
           BENCH_KEY: ${{ secrets.BENCH_KEY }}
         run: |
-          nohup ./target/release/isheika \
+          nohup ./target/release/hoverfly \
             --buffer-multiplier ${{ inputs.buffer_multiplier }} \
             daemon \
-            --socket /tmp/isheika.sock \
+            --socket /tmp/hoverfly.sock \
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
@@ -154,8 +154,8 @@ jobs:
                bs=1M count=${{ inputs.file_size_mib }} status=none
 
             echo "=== Run $i ==="
-            ./target/release/isheika upload \
-              --daemon /tmp/isheika.sock \
+            ./target/release/hoverfly upload \
+              --daemon /tmp/hoverfly.sock \
               --batch "$BENCH_BATCH" \
               --key "$BENCH_KEY" \
               /tmp/bench-${{ inputs.file_size_mib }}mib.bin 2>&1 \

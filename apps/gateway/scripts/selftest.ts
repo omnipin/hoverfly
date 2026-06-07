@@ -1,5 +1,5 @@
 // Pure-logic self-tests (no DOM): run with `npm run selftest`.
-// Validates the swarm CID codec against isheika's `src/cid.rs` test vector,
+// Validates the swarm CID codec against hoverfly's `src/cid.rs` test vector,
 // CID<->reference round-trips, reference normalization, and host parsing.
 
 import assert from 'node:assert/strict'
@@ -24,7 +24,7 @@ check('base32 round-trips arbitrary bytes', () => {
   }
 })
 
-// isheika src/cid.rs known vector
+// hoverfly src/cid.rs known vector
 const VECTOR_HEX = 'fd33fdeb04ad97c4ae1894077da75bee6f69bc7cbada0e95c3acad74c6dbef35'
 const VECTOR_CID = 'bah5acgza7uz732yevwl4jlqysqdx3j235zxwtpd4xlna5fodvswxjrw3542q'
 

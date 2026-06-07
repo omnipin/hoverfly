@@ -1,5 +1,5 @@
 // Build the gateway: bundle the TS entry points with esbuild, copy static
-// files from public/, and vendor the isheika wasm package from the repo's
+// files from public/, and vendor the hoverfly wasm package from the repo's
 // pkg/ (built via `cargo build --target wasm32-... && wasm-bindgen`).
 
 import * as esbuild from 'esbuild'
@@ -24,11 +24,11 @@ const entryPoints = {
 function copyStatic () {
   cpSync(resolve(here, 'public'), dist, { recursive: true })
   if (existsSync(pkg)) {
-    cpSync(pkg, resolve(assets, 'isheika'), { recursive: true })
+    cpSync(pkg, resolve(assets, 'hoverfly'), { recursive: true })
   } else {
     console.warn(`\n  ⚠  ${pkg} not found — build the wasm first:\n` +
       '     RUSTUP_TOOLCHAIN=nightly cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --lib\n' +
-      '     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/isheika.wasm\n')
+      '     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/hoverfly.wasm\n')
   }
 }
 

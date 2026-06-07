@@ -15,7 +15,7 @@ app.innerHTML = `
   <main class="wrap">
     <h1>Swarm <span class="accent">subdomain gateway</span></h1>
     <p class="lede">Fetches &amp; verifies Swarm websites entirely in your browser via a shared
-      <a href="https://github.com/omnipin/isheika" target="_blank" rel="noopener">isheika</a> node
+      <a href="https://github.com/omnipin/hoverfly" target="_blank" rel="noopener">hoverfly</a> node
       running in daemon mode (one warm node, shared across every site).</p>
 
     <form id="open" class="open">
@@ -67,7 +67,7 @@ $('open').addEventListener('submit', (e) => {
 })
 
 // ---- daemon status ----
-const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'isheika-daemon' })
+const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'hoverfly-daemon' })
 const rpc = new DaemonRpc(worker.port)
 
 function render (s: DaemonStatus): void {

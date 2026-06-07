@@ -10,11 +10,11 @@ name: release
 #   2. On GitHub, "Draft a new release" against the tag, click
 #      "Generate release notes", review, then "Publish release".
 #   3. This workflow fires, builds for each target, and uploads
-#      `isheika-vX.Y.Z-<target>.tar.gz` + .sha256 to the release.
+#      `hoverfly-vX.Y.Z-<target>.tar.gz` + .sha256 to the release.
 #
 # Each tarball ships:
-#   isheika-vX.Y.Z-<target>/
-#     ├── isheika              (stripped binary)
+#   hoverfly-vX.Y.Z-<target>/
+#     ├── hoverfly              (stripped binary)
 #     ├── peers.seed.json      (curated cold-start peer list)
 #     ├── README.md
 #     └── LICENSE
@@ -22,8 +22,8 @@ name: release
 # Each tarball is signed with a SLSA Build Provenance attestation
 # (sigstore-backed). Verify a downloaded asset with:
 #
-#   gh attestation verify isheika-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
-#     -R omnipin/isheika
+#   gh attestation verify hoverfly-v0.2.0-x86_64-unknown-linux-gnu.tar.gz \
+#     -R omnipin/hoverfly
 #
 # The wasm32 target goes to npm instead (job `publish-npm`): it's a
 # browser cdylib, not a CLI binary. Built with nightly + build-std
@@ -32,7 +32,7 @@ name: release
 # NPM_TOKEN, provenance is automatic.
 #
 # First release only: publish by hand once to create the package, then
-# add the trusted publisher (GitHub Actions, repo omnipin/isheika,
+# add the trusted publisher (GitHub Actions, repo omnipin/hoverfly,
 # workflow release.yml) under the npm package's settings.
 #
 # Every release after that publishes tokenlessly from this workflow.
@@ -147,7 +147,7 @@ jobs:
         # the host's ELF flavour. For cross-built targets we run the
         # toolchain's strip from inside the cross docker image.
         run: |
-          bin="target/${{ matrix.target }}/release/isheika"
+          bin="target/${{ matrix.target }}/release/hoverfly"
           case "${{ matrix.target }}" in
             aarch64-unknown-linux-gnu)
               strip_bin=aarch64-linux-gnu-strip ;;
@@ -164,11 +164,11 @@ jobs:
         id: package
         run: |
           ver="${{ github.event.release.tag_name }}"
-          name="isheika-${ver}-${{ matrix.target }}"
+          name="hoverfly-${ver}-${{ matrix.target }}"
           stage="stage/${name}"
           mkdir -p "$stage"
 
-          cp "target/${{ matrix.target }}/release/isheika" "$stage/"
+          cp "target/${{ matrix.target }}/release/hoverfly" "$stage/"
           cp peers.seed.json README.md LICENSE "$stage/"
 
           tar -czf "${name}.tar.gz" -C stage "${name}"
@@ -197,7 +197,7 @@ jobs:
             "${{ steps.package.outputs.sha256 }}"
 
   publish-npm:
-    name: npm (@omnipin/isheika)
+    name: npm (@omnipin/hoverfly)
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -240,7 +240,7 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: |
           cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --lib
-          wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/isheika.wasm
+          wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/hoverfly.wasm
           cp README.npm.md pkg/README.md
 
       - name: Publish to npm
@@ -249,14 +249,14 @@ jobs:
           ver="${{ github.event.release.tag_name }}"
           cat > package.json <<EOF
           {
-            "name": "@omnipin/isheika",
+            "name": "@omnipin/hoverfly",
             "version": "${ver#v}",
             "license": "MIT",
-            "repository": { "type": "git", "url": "git+https://github.com/omnipin/isheika.git" },
+            "repository": { "type": "git", "url": "git+https://github.com/omnipin/hoverfly.git" },
             "type": "module",
-            "main": "isheika.js",
-            "types": "isheika.d.ts",
-            "files": ["isheika_bg.wasm", "isheika.js", "isheika.d.ts", "snippets"]
+            "main": "hoverfly.js",
+            "types": "hoverfly.d.ts",
+            "files": ["hoverfly_bg.wasm", "hoverfly.js", "hoverfly.d.ts", "snippets"]
           }
           EOF
           npm publish --access public

@@ -1,9 +1,9 @@
 //! Postage batch creation against the on-chain `PostageStamp` contract.
 //!
 //! Unlike every other module in this crate, `batch::create` makes
-//! real on-chain RPC calls. The rest of isheika stays RPC-free —
+//! real on-chain RPC calls. The rest of hoverfly stays RPC-free —
 //! this is the one exception, fenced off behind a dedicated CLI
-//! subcommand (`isheika batch create`) so it doesn't contaminate
+//! subcommand (`hoverfly batch create`) so it doesn't contaminate
 //! the upload / fetch / daemon paths.
 //!
 //! ## Flow

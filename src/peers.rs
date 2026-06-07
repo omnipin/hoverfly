@@ -357,6 +357,39 @@ fn is_ws(ma: &str) -> bool {
     ma.contains("/ws") || ma.contains("/wss")
 }
 
+/// Public form of [`is_ws`]: true if the underlay multiaddr carries a
+/// `/ws` or `/wss` (WebSocket) hop — the only underlays a browser build can
+/// dial. Used by the CLI's `discover --ws-only` to export a browser-ready seed.
+pub fn is_ws_underlay(ma: &str) -> bool {
+    is_ws(ma)
+}
+
+/// True if `ip` is not reachable across the public internet: private
+/// (RFC1918), loopback, link-local, unspecified, broadcast, or carrier-grade
+/// NAT (100.64.0.0/10). We can never dial these end-to-end.
+pub fn is_unroutable_ip4(ip: std::net::Ipv4Addr) -> bool {
+    ip.is_private()
+        || ip.is_loopback()
+        || ip.is_link_local()
+        || ip.is_unspecified()
+        || ip.is_broadcast()
+        // 100.64.0.0/10 carrier-grade NAT (also unroutable end-to-end)
+        || (ip.octets()[0] == 100 && (ip.octets()[1] & 0xC0) == 0x40)
+}
+
+/// Reject an underlay multiaddr (string form) whose `/ip4/<ip>` segment is an
+/// unroutable address — see [`is_unroutable_ip4`]. Bee's AutoTLS sometimes
+/// advertises a node's *internal* address (e.g. a Kubernetes pod IP
+/// `10.233.x.x`), which is unreachable from the public internet — and whose
+/// `libp2p.direct` SNI host resolves straight back to that private IP — so
+/// every dial to it burns a full dial-timeout for nothing.
+pub fn has_unroutable_ip4(ma: &str) -> bool {
+    let Some(rest) = ma.split("/ip4/").nth(1) else { return false };
+    let ip_str = rest.split('/').next().unwrap_or("");
+    let Ok(ip) = ip_str.parse::<std::net::Ipv4Addr>() else { return false };
+    is_unroutable_ip4(ip)
+}
+
 /// Cheap string-form check that matches `dnsaddr::is_dialable_multiaddr`
 /// without parsing — used in `upsert` because peer entries arrive as
 /// `Vec<String>`. Requires `/ip4/`: our transport has no DNS resolver
@@ -365,6 +398,11 @@ fn is_ws(ma: &str) -> bool {
 /// timeouts on unreachable underlays later.
 fn is_dialable_str(ma: &str) -> bool {
     if !ma.contains("/ip4/") {
+        return false;
+    }
+    // Drop AutoTLS underlays that advertise a private/internal IP (e.g. k8s pod
+    // `10.x` addresses) — unroutable, so dialing them only wastes timeouts.
+    if has_unroutable_ip4(ma) {
         return false;
     }
     #[cfg(not(target_arch = "wasm32"))]

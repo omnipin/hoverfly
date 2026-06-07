@@ -48,7 +48,7 @@ pub enum Request {
     Upload(UploadRequest),
     Fetch(FetchRequest),
     /// Refresh the daemon's in-memory peerlist from disk (after the
-    /// user has run `isheika discover` against the same peerlist file).
+    /// user has run `hoverfly discover` against the same peerlist file).
     ReloadPeers,
     /// Save the current in-memory peerlist (with reachability
     /// observations) back to its file.
@@ -257,7 +257,7 @@ pub async fn run(
     };
     let peers = PeerStore::load_or_create(&peerlist_path);
     if peers.is_empty() {
-        warn!(target: "isheika::daemon",
+        warn!(target: "hoverfly::daemon",
             "peerlist {} is empty — daemon will refuse uploads until populated",
             peerlist_path.display());
     }
@@ -299,13 +299,13 @@ pub async fn run(
         };
         tokio::spawn(async move {
             if let Err(e) = crate::inbound::run(inbound_cfg).await {
-                warn!(target: "isheika::daemon", "inbound listener exited: {e}");
+                warn!(target: "hoverfly::daemon", "inbound listener exited: {e}");
             }
         });
     }
 
     let listener = UnixListener::bind(&socket_path)?;
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "listening on {} (peerlist {}, pool_target {})",
         socket_path.display(), peerlist_path.display(), pool_target);
 
@@ -330,7 +330,7 @@ pub async fn run(
             // returns, the warm pool is open and subsequent uploads
             // skip the fill.
             if let Err(e) = ensure_pool(&state).await {
-                warn!(target: "isheika::daemon",
+                warn!(target: "hoverfly::daemon",
                     "eager pool fill failed: {e} (will retry lazily on first request)");
                 return;
             }
@@ -357,7 +357,7 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 if let Err(e) = maintain_pool(&state).await {
-                    debug!(target: "isheika::daemon",
+                    debug!(target: "hoverfly::daemon",
                         "pool maintenance tick failed: {e}");
                 }
             }
@@ -387,7 +387,7 @@ pub async fn run(
             loop {
                 tick.tick().await;
                 if let Err(e) = auto_iterate_anchors(&state).await {
-                    debug!(target: "isheika::daemon",
+                    debug!(target: "hoverfly::daemon",
                         "auto-iterate tick failed: {e}");
                 }
             }
@@ -399,7 +399,7 @@ pub async fn run(
     loop {
         tokio::select! {
             _ = shutdown_rx.recv() => {
-                info!(target: "isheika::daemon", "shutdown requested");
+                info!(target: "hoverfly::daemon", "shutdown requested");
                 break;
             }
             accept = listener.accept() => {
@@ -408,7 +408,7 @@ pub async fn run(
                 let shutdown_tx = shutdown_tx.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_conn(state, stream, shutdown_tx).await {
-                        debug!(target: "isheika::daemon", "connection error: {}", e);
+                        debug!(target: "hoverfly::daemon", "connection error: {}", e);
                     }
                 });
             }
@@ -420,7 +420,7 @@ pub async fn run(
     let peers = state.peers.read().await;
     apply_log(&mut peers.clone(), state.transport.reachability_log());
     if let Err(e) = peers.save(&state.peerlist_path) {
-        warn!(target: "isheika::daemon", "failed to save peerlist on shutdown: {}", e);
+        warn!(target: "hoverfly::daemon", "failed to save peerlist on shutdown: {}", e);
     }
     let _ = std::fs::remove_file(&socket_path);
     Ok(())
@@ -635,16 +635,16 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
                             added += 1;
                         }
                     }
-                    debug!(target: "isheika::daemon",
+                    debug!(target: "hoverfly::daemon",
                         "discover via {} contributed {} new peer(s)",
                         bootnode, added);
                 }
-                Err(e) => warn!(target: "isheika::daemon",
+                Err(e) => warn!(target: "hoverfly::daemon",
                     "pre-fill discover via {} failed: {e}", bootnode),
             }
         }
         if !all_fresh.is_empty() {
-            info!(target: "isheika::daemon",
+            info!(target: "hoverfly::daemon",
                 "discovered {} fresh peer(s) across {} bootnode(s) in {} round(s) before pool fill",
                 all_fresh.len(), state.bootnodes.len(), state.discover_rounds);
             let mut peers = state.peers.write().await;
@@ -652,7 +652,7 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
                 peers.upsert(p);
             }
         } else {
-            warn!(target: "isheika::daemon",
+            warn!(target: "hoverfly::daemon",
                 "pre-fill discover returned no peers from any of the {} bootnode(s); \
                  falling back to saved peerlist",
                 state.bootnodes.len());
@@ -661,7 +661,7 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
 
     let peers = state.peers.read().await;
     let pool = Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?);
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "warm pool: {} session(s) open", pool.len());
     *guard = Some(pool.clone());
     Ok(pool)
@@ -700,7 +700,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
     };
     let top = pool.top_peers_by_success(5);
     if top.is_empty() {
-        debug!(target: "isheika::daemon",
+        debug!(target: "hoverfly::daemon",
             "auto-iterate: no peers with successful pushes yet, skipping");
         return Ok(());
     }
@@ -754,7 +754,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
         / current_pos.len() as f64)
         .floor() as u8;
 
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "auto-iterate: top {} peers by push success — current overlay POs={:?} (min={}, avg={})",
         targets.len(), current_pos, current_min_po, current_avg_po);
 
@@ -763,7 +763,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
     // PO above that takes minutes-hours of search per peer).
     let target_po = (current_avg_po + 1).min(16);
     if target_po <= current_min_po {
-        debug!(target: "isheika::daemon",
+        debug!(target: "hoverfly::daemon",
             "auto-iterate: current overlay already meets target PO {} — no search needed",
             target_po);
         return Ok(());
@@ -801,7 +801,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
             best_score = score;
             best_nonce = Some(nonce);
             if min_po >= target_po {
-                info!(target: "isheika::daemon",
+                info!(target: "hoverfly::daemon",
                     "auto-iterate: reached target PO {} after {} attempts ({:.1}s)",
                     target_po,
                     attempt + 1,
@@ -812,7 +812,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
     }
 
     let Some(winning_nonce) = best_nonce else {
-        debug!(target: "isheika::daemon",
+        debug!(target: "hoverfly::daemon",
             "auto-iterate: no improvement over current overlay in {} attempts", MAX_ATTEMPTS);
         return Ok(());
     };
@@ -825,7 +825,7 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
     // is). Writing such "improvements" would spam the suggestion
     // file with noise an operator can't act on.
     if best_min_po <= current_min_po {
-        debug!(target: "isheika::daemon",
+        debug!(target: "hoverfly::daemon",
             "auto-iterate: no min-PO improvement (best={}, current={}) — not writing suggestion",
             best_min_po, current_min_po);
         return Ok(());
@@ -848,12 +848,12 @@ async fn auto_iterate_anchors(state: &Arc<State>) -> Result<(), ClientError> {
     filename.push(".next");
     next_path.set_file_name(filename);
     if let Err(e) = std::fs::write(&next_path, hex::encode(winning_nonce)) {
-        warn!(target: "isheika::daemon",
+        warn!(target: "hoverfly::daemon",
             "auto-iterate: failed to write {}: {e}", next_path.display());
         return Ok(());
     }
 
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "auto-iterate: improvement available — POs={:?} (min={}, vs current min={}). \
          wrote {} — to adopt: mv {} {} && restart",
         pos, best_min_po, current_min_po,
@@ -892,7 +892,7 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
     let after_prune = pool.len();
     let target = state.pool_target;
     if pruned == 0 && after_prune >= target {
-        debug!(target: "isheika::daemon",
+        debug!(target: "hoverfly::daemon",
             "pool maintenance: {} live, no top-up needed", after_prune);
         return Ok(());
     }
@@ -904,13 +904,13 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
     // limiter into temporary blocklisting.
     let max_per_tick = (target / 8).max(8);
     let refill_target = (after_prune + max_per_tick).min(target);
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "pool maintenance: pruned {} dead, {} live, topping up to {} (cap {} per tick)",
         pruned, after_prune, refill_target, max_per_tick);
     // Step 2: dial fresh peers to refill.
     let peers = state.peers.read().await;
     let added = pool.top_up(&state.transport, &*peers, refill_target).await;
-    info!(target: "isheika::daemon",
+    info!(target: "hoverfly::daemon",
         "pool maintenance: added {} session(s), pool now {}",
         added, pool.len());
     Ok(())

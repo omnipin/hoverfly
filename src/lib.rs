@@ -1,4 +1,4 @@
-//! isheika — minimal WASM-portable Swarm micro-client.
+//! hoverfly — minimal WASM-portable Swarm micro-client.
 //!
 //! Three operations: `discover`, `fetch`, `upload`. Networking is libp2p
 //! over plain TCP **and** WebSocket on native builds, WebSocket-only on

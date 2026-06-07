@@ -1,6 +1,6 @@
-//! Compare isheika's signer output to k256's reference implementation.
+//! Compare hoverfly's signer output to k256's reference implementation.
 
-use isheika::SwarmSigner;
+use hoverfly::SwarmSigner;
 use sha3::{Digest, Keccak256};
 
 fn main() {

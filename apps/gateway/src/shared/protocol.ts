@@ -1,4 +1,4 @@
-// Bridge protocol between the shared isheika daemon (SharedWorker) and its
+// Bridge protocol between the shared hoverfly daemon (SharedWorker) and its
 // clients (landing page, content-host document, service worker).
 //
 // The daemon serves RPC on any MessagePort. A port can also carry a special
@@ -17,6 +17,9 @@ export interface DaemonStatus {
   network: number
   bootstrap: string
   lastError?: string
+  /** Coarse warm()/runtime phase, surfaced so clients (SW/page) can see daemon
+   *  progress without opening the SharedWorker console. */
+  phase?: string
 }
 
 interface WithId { id: number }

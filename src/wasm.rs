@@ -1,4 +1,4 @@
-//! WASM bindings — exposes a single `IsheikaClient` class to JavaScript.
+//! WASM bindings — exposes a single `HoverflyClient` class to JavaScript.
 //!
 //! Keep the API symmetric with the CLI: `discover()`, `fetch()`, `upload()`,
 //! all returning Promises. The class holds a `PeerStore` in memory across calls
@@ -7,7 +7,7 @@
 #![cfg(target_arch = "wasm32")]
 
 use core::time::Duration;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -33,17 +33,26 @@ const FETCH_CONCURRENCY: usize = 5;
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
     console_error_panic_hook::set_once();
-    let _ = tracing_wasm::try_set_as_global_default();
+    // Route `tracing` events to the browser console. The default config maps
+    // some levels to `console.debug` (hidden by Chrome's default log level),
+    // and disables span timing noise. Pin a config that:
+    //   - emits each event at its own console level (warn -> console.warn etc.)
+    //     so retrieval `warn!`/`info!` are visible without enabling Verbose, and
+    //   - keeps the `target` (e.g. `hoverfly::fetch`) so events are filterable.
+    let mut builder = tracing_wasm::WASMLayerConfigBuilder::new();
+    builder.set_max_level(tracing::Level::INFO);
+    builder.set_report_logs_in_timings(false);
+    tracing_wasm::set_as_global_default_with_config(builder.build());
 }
 
 #[wasm_bindgen]
-pub struct IsheikaClient {
+pub struct HoverflyClient {
     /// libp2p transport, shared (`Arc`) with the background daemon loop so
     /// foreground fetches and background discovery dial through the same
     /// identity + per-peer dial cooldown.
     transport: Arc<Transport>,
     /// Candidate peer list behind shared interior mutability. The background
-    /// daemon loop (see [`IsheikaClient::start`]) merges freshly-discovered
+    /// daemon loop (see [`HoverflyClient::start`]) merges freshly-discovered
     /// peers in; every fetch snapshots it under a short borrow — never held
     /// across an `.await` — and retrieves against that snapshot. `Rc<RefCell>`
     /// is sound because wasm is single-threaded.
@@ -59,10 +68,37 @@ pub struct IsheikaClient {
     /// `true` once the background daemon loop has been spawned. Guards
     /// against spawning more than one loop on repeated `start()` calls.
     running: Rc<RefCell<bool>>,
+    /// Count of foreground fetches currently in flight. The background
+    /// discovery loop skips its round while this is non-zero: on the browser's
+    /// single ws+yamux connection driver, a discovery round's dial/substream
+    /// churn resets in-flight retrieval substreams (observed as
+    /// `retrieval: unexpected end of file` / `ConnectionReset: Canceled`),
+    /// stalling exactly the cold-load burst (e.g. a 40-module site) it collides
+    /// with. Pausing discovery while fetches run keeps the connections quiet for
+    /// retrieval; discovery resumes once the burst drains. `Rc<Cell>` is sound
+    /// on single-threaded wasm.
+    inflight_fetches: Rc<Cell<usize>>,
+}
+
+/// RAII guard: increments the shared in-flight fetch counter on creation and
+/// decrements on drop, so the background discovery loop can tell when any
+/// foreground fetch is active (and pause). Drop runs on every exit path —
+/// success, error, or early return — so the count can't leak.
+struct FetchGuard(Rc<Cell<usize>>);
+impl FetchGuard {
+    fn new(c: &Rc<Cell<usize>>) -> Self {
+        c.set(c.get() + 1);
+        FetchGuard(c.clone())
+    }
+}
+impl Drop for FetchGuard {
+    fn drop(&mut self) {
+        self.0.set(self.0.get().saturating_sub(1));
+    }
 }
 
 #[wasm_bindgen]
-impl IsheikaClient {
+impl HoverflyClient {
     /// Construct a client. `private_key_hex` is optional — provide it only for upload.
     /// `network_id` defaults to `1` (mainnet). `doh_url` defaults to Cloudflare.
     ///
@@ -80,7 +116,7 @@ impl IsheikaClient {
         doh_url: Option<String>,
         timeout_secs: Option<u32>,
         nonce_hex: Option<String>,
-    ) -> Result<IsheikaClient, JsError> {
+    ) -> Result<HoverflyClient, JsError> {
         let network_id = network_id.unwrap_or(1);
         let doh_url = doh_url.unwrap_or_else(|| DEFAULT_DOH_URL.to_string());
         let timeout = Duration::from_secs(timeout_secs.unwrap_or(30) as u64);
@@ -97,7 +133,14 @@ impl IsheikaClient {
         };
         let cfg = TransportConfig {
             timeout,
-            dial_timeout: Duration::from_secs(3),
+            // Browsers need a far larger dial budget than native: a single dial
+            // covers DNS + the browser's own TLS + WS upgrade to the AutoTLS
+            // `wss://<sni>.libp2p.direct` endpoint, then Noise + Yamux + identify
+            // + bee's handshake/pricing dance — all over a ~100ms+ RTT WebSocket.
+            // The native default (3s, tuned for raw TCP) expires mid-chain in the
+            // browser and surfaces as `peer failed: timeout` for every peer even
+            // though the endpoint is reachable and its cert is valid.
+            dial_timeout: Duration::from_secs(20),
             network_id,
             advertise: None,
             max_concurrent_substream_upgrades:
@@ -112,6 +155,7 @@ impl IsheikaClient {
             network_id,
             cache: RetrievalCache::new(),
             running: Rc::new(RefCell::new(false)),
+            inflight_fetches: Rc::new(Cell::new(0)),
         })
     }
 
@@ -177,6 +221,7 @@ impl IsheikaClient {
             let doh = self.doh.clone();
             let peers = self.peers.clone();
             let running = self.running.clone();
+            let inflight = self.inflight_fetches.clone();
             let bootstrap_ma = bootstrap_ma.clone();
             let interval = Duration::from_secs(interval_secs.max(1) as u64);
             let wait = Duration::from_secs(wait_secs as u64);
@@ -187,6 +232,27 @@ impl IsheikaClient {
                     Delay::new(interval).await;
                     let keep_running = *running.borrow();
                     if !keep_running {
+                        break;
+                    }
+                    // Don't discover while a foreground fetch is in flight: on the
+                    // browser's single ws+yamux driver, a discovery round resets
+                    // in-flight retrieval substreams and stalls the fetch. If a
+                    // fetch (or burst) is active, defer this round — re-check on a
+                    // short cadence and run only once the connections go quiet, so
+                    // discovery still happens between page loads but never mid-load.
+                    let mut deferrals = 0u32;
+                    while inflight.get() > 0 {
+                        // Cap the wait so a wedged in-flight counter (shouldn't
+                        // happen — FetchGuard's Drop always decrements) can't
+                        // starve discovery forever; after ~interval of deferral
+                        // proceed anyway.
+                        if deferrals >= 10 {
+                            break;
+                        }
+                        deferrals += 1;
+                        Delay::new(Duration::from_secs(2)).await;
+                    }
+                    if !*running.borrow() {
                         break;
                     }
                     merge_discovered(&transport, &doh, &peers, &bootstrap_ma, wait).await;
@@ -227,7 +293,7 @@ impl IsheikaClient {
 
     /// Run a single discovery round now and merge the results into the
     /// in-memory peer store. The daemon's background loop does this
-    /// automatically once [`IsheikaClient::start`] has been called; this is
+    /// automatically once [`HoverflyClient::start`] has been called; this is
     /// exposed for an explicit "refresh peers" affordance. Returns the new
     /// peer count.
     pub async fn discover(&self, bootstrap: String, wait_secs: u32) -> Result<usize, JsError> {
@@ -248,6 +314,7 @@ impl IsheikaClient {
     /// Fetch content. `root_hex` is a 32-byte content address in hex.
     /// Reassembles the BMT tree into the full byte stream.
     pub async fn fetch(&self, root_hex: String, max_retries: usize) -> Result<Uint8Array, JsError> {
+        let _guard = FetchGuard::new(&self.inflight_fetches);
         let peers = self.peers.borrow().clone();
         let bytes = fetch_bytes_cached_ex(
             &self.transport,
@@ -274,6 +341,7 @@ impl IsheikaClient {
         path: String,
         max_retries: usize,
     ) -> Result<ManifestFetch, JsError> {
+        let _guard = FetchGuard::new(&self.inflight_fetches);
         let peers = self.peers.borrow().clone();
         let (bytes, content_type) = fetch_manifest_path_cached_ex(
             &self.transport,
@@ -403,11 +471,11 @@ async fn merge_discovered(
             for p in found {
                 store.upsert(p);
             }
-            tracing::info!(target: "isheika::wasm",
+            tracing::info!(target: "hoverfly::wasm",
                 "[daemon] discover round ok: found {} peer(s), store now {}", n, store.len());
         }
         Err(e) => {
-            tracing::warn!(target: "isheika::wasm", "[daemon] discover round failed: {e}");
+            tracing::warn!(target: "hoverfly::wasm", "[daemon] discover round failed: {e}");
         }
     }
 }

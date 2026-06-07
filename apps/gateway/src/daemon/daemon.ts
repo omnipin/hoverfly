@@ -1,11 +1,11 @@
 /// <reference lib="webworker" />
 //
-// The shared in-browser isheika "daemon".
+// The shared in-browser hoverfly "daemon".
 //
 // Runs as a SharedWorker on the gateway ROOT origin (bzz.<host>). Because a
 // SharedWorker is keyed by origin + script URL, every gateway tab and every
 // content subdomain's broker iframe connects to the *same* instance — so there
-// is exactly one long-lived isheika node, one warm peer set and one warm
+// is exactly one long-lived hoverfly node, one warm peer set and one warm
 // session/score cache for the whole gateway. That is the "daemon mode → better
 // peer stability" the native CLI gets from a long-running process, recreated
 // in the browser. (The native unix-socket daemon in `src/daemon.rs` can't run
@@ -23,10 +23,10 @@ import { ATTACH, type DaemonStatus } from '../shared/protocol.ts'
 
 declare const self: SharedWorkerGlobalScope & typeof globalThis
 
-// --- isheika wasm glue (vendored, loaded at runtime so esbuild doesn't try to
+// --- hoverfly wasm glue (vendored, loaded at runtime so esbuild doesn't try to
 //     bundle the wasm-bindgen module — it relies on import.meta.url). ---
 interface ManifestFetch { readonly bytes: Uint8Array, readonly contentType: string | undefined }
-interface IsheikaClient {
+interface HoverflyClient {
   /** Launch the daemon: eager initial discovery + a background maintenance
    *  loop that re-discovers every `intervalSecs`. Resolves with the peer
    *  count after the initial round. Idempotent. */
@@ -46,15 +46,15 @@ interface IsheikaClient {
   exportPeers: () => string
   peerCount: () => number
 }
-interface IsheikaModule {
+interface HoverflyModule {
   default: (input?: any) => Promise<unknown>
   initThreadPool?: (n: number) => Promise<unknown>
-  IsheikaClient: new (key?: string | null, networkId?: bigint | null, doh?: string | null, timeout?: number | null, nonceHex?: string | null) => IsheikaClient
+  HoverflyClient: new (key?: string | null, networkId?: bigint | null, doh?: string | null, timeout?: number | null, nonceHex?: string | null) => HoverflyClient
 }
 // Resolved at runtime (relative to this worker script) so esbuild leaves the
 // dynamic import alone — the wasm-bindgen module must load itself + its wasm
 // via import.meta.url, so it must NOT be bundled.
-const ISHEIKA_URL = new URL('isheika/isheika.js', self.location.href).href
+const HOVERFLY_URL = new URL('hoverfly/hoverfly.js', self.location.href).href
 
 const status: DaemonStatus = {
   ready: false,
@@ -66,11 +66,11 @@ const status: DaemonStatus = {
 }
 
 const ports = new Set<MessagePort>()
-let client: IsheikaClient | null = null
+let client: HoverflyClient | null = null
 let warmPromise: Promise<void> | null = null
 let statusTimer: ReturnType<typeof setInterval> | null = null
 
-// NB: every IsheikaClient method now takes `&self` (the node keeps its peers
+// NB: every HoverflyClient method now takes `&self` (the node keeps its peers
 // behind interior mutability and runs discovery on a background task inside the
 // wasm daemon), so overlapping calls no longer trip wasm-bindgen's mutable-
 // borrow guard. Fetches can run concurrently with each other and with the
@@ -145,6 +145,15 @@ function broadcastStatus (): void {
   }
 }
 
+/** Record + broadcast a coarse warm/runtime phase. Logs to the daemon console
+ *  AND pushes it over the status channel so the SW/page can see daemon
+ *  progress without opening the SharedWorker console. */
+function setPhase (phase: string): void {
+  status.phase = phase
+  console.log('[daemon] phase:', phase)
+  broadcastStatus()
+}
+
 /** Count peers that expose at least one browser-dialable (/ws or /wss) underlay. */
 function countDialable (peersJson: string): number {
   try {
@@ -176,12 +185,13 @@ async function warm (): Promise<void> {
   status.warming = true
   broadcastStatus()
   try {
-    console.log('[daemon] warm: importing', ISHEIKA_URL)
-    const mod = await import(/* @vite-ignore */ ISHEIKA_URL) as IsheikaModule
-    console.log('[daemon] warm: init wasm')
+    setPhase('importing wasm (cOI=' + String((self as any).crossOriginIsolated) + ')')
+    const mod = await import(/* @vite-ignore */ HOVERFLY_URL) as HoverflyModule
+    setPhase('instantiating wasm')
     await mod.default() // instantiate wasm (shared memory; needs crossOriginIsolated)
-    console.log('[daemon] warm: wasm ready')
+    setPhase('wasm ready')
     if (typeof mod.initThreadPool === 'function') {
+      setPhase('init thread pool')
       try { await mod.initThreadPool(self.navigator.hardwareConcurrency || 4) } catch (e) {
         // single-threaded fetch is fine; hashing parallelism is for uploads
         console.warn('[daemon] initThreadPool unavailable, continuing single-threaded:', e)
@@ -189,13 +199,16 @@ async function warm (): Promise<void> {
     }
     // Reuse a persisted node identity (key + overlay nonce) so this browser
     // daemon keeps one stable Swarm overlay across reloads — see config.ts.
+    setPhase('loading identity')
     const identity = await loadOrCreateIdentity()
-    const c = new mod.IsheikaClient(identity.key, BigInt(NETWORK_ID), DOH_URL ?? undefined, 30, identity.nonce)
+    setPhase('constructing client')
+    const c = new mod.HoverflyClient(identity.key, BigInt(NETWORK_ID), DOH_URL ?? undefined, 30, identity.nonce)
     client = c
 
     // Enable the persistent L2 chunk cache (IndexedDB) before any fetch. Best
     // effort: if storage is unavailable the daemon still works, just without
     // cross-session chunk persistence (the SW file cache still applies).
+    setPhase('enabling chunk store')
     try {
       await c.enableChunkStore(IDB_CHUNKS_DB)
       console.log('[daemon] chunk store enabled:', IDB_CHUNKS_DB)
@@ -203,6 +216,7 @@ async function warm (): Promise<void> {
       console.warn('[daemon] chunk store unavailable:', e)
     }
 
+    setPhase('loading peers')
     const saved = await idbGet(IDB_PEERS_KEY)
     if (saved != null) {
       try { c.loadPeers(saved); refreshCounts() } catch (e) { console.warn('[daemon] loadPeers (idb) failed:', e) }
@@ -217,18 +231,38 @@ async function warm (): Promise<void> {
     }
     console.log('[daemon] warm: peers loaded, count=', status.peerCount, 'dialable=', status.dialable)
 
-    // Launch the daemon: this runs one eager discovery round (so the first
-    // fetch starts with fresh, browser-dialable peers — the live bootnodes
-    // advertise /ws and hive gossip surfaces current AutoTLS ws peers, since
-    // the committed seed goes stale) and then keeps the peer set warm on a
-    // background loop inside the wasm node. `fetch` just talks to it.
-    console.log('[daemon] starting daemon (eager discover + maintenance loop)')
-    const count = await c.start(status.bootstrap, DAEMON_REFRESH_SECS, DISCOVER_WAIT_SECS)
+    console.log('[daemon] warm: peers loaded, count=', status.peerCount, 'dialable=', status.dialable)
+
+    // Start the daemon: one eager discovery round + the maintenance loop. The
+    // eager round dials peers on the shared swarm; on the browser's single
+    // ws+yamux connection driver, a discovery round running CONCURRENTLY with a
+    // retrieval resets the in-flight retrieval substream (observed as
+    // `retrieval: unexpected end of file` / `ConnectionReset: Canceled`). So we
+    // AWAIT the eager round here — restoring "discover, then fetch" ordering —
+    // before marking ready and admitting fetches. The maintenance loop then
+    // only re-discovers every DAEMON_REFRESH_SECS (≥45s), leaving long quiet
+    // windows for retrieval. We bound the await with a timeout so a stalled
+    // bootnode dial can't wedge warm forever; start() keeps running in the
+    // background past the timeout (its loop is already spawned internally).
+    setPhase('eager discovery (peers may collide with fetch if skipped)')
+    const startPromise = c.start(status.bootstrap, DAEMON_REFRESH_SECS, DISCOVER_WAIT_SECS)
+      .then((count) => {
+        refreshCounts()
+        console.log('[daemon] daemon up: peers=', count, 'dialable=', status.dialable)
+        void idbSet(IDB_PEERS_KEY, c.exportPeers())
+        broadcastStatus()
+      })
+      .catch((e) => { console.warn('[daemon] start() failed:', errMsg(e)) })
+    try {
+      await Promise.race([
+        startPromise,
+        new Promise<void>((resolve) => setTimeout(resolve, (DISCOVER_WAIT_SECS + 4) * 1000))
+      ])
+    } catch { /* timeout: proceed; start() continues in background */ }
     refreshCounts()
-    console.log('[daemon] daemon up: peers=', count, 'dialable=', status.dialable)
-    void idbSet(IDB_PEERS_KEY, c.exportPeers())
 
     status.ready = true
+    setPhase('ready (' + String(status.dialable) + ' dialable peers)')
   } catch (e) {
     status.lastError = errMsg(e)
     console.error('[daemon] warm failed:', e)
@@ -297,7 +331,17 @@ interface FetchResult { httpStatus: number, contentType?: string, body?: ArrayBu
 
 async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchResult> {
   console.log('[daemon] fetchPath:', refHex.slice(0, 12), 'path=', rawPath, '(await warm)')
-  await ensureWarm()
+  // Bound the wait on warm so a wedged init (e.g. wasm shared-memory failure)
+  // surfaces as a 503 to the SW instead of hanging the request forever.
+  try {
+    await Promise.race([
+      ensureWarm(),
+      new Promise<never>((_, reject) =>
+        setTimeout(() => reject(new Error('daemon warm timed out')), 30_000))
+    ])
+  } catch (e) {
+    return { httpStatus: 503, error: status.lastError ?? errMsg(e) }
+  }
   const c = client
   if (c == null) return { httpStatus: 503, error: status.lastError ?? 'daemon not ready' }
 
@@ -309,27 +353,48 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   let lastErr: string | undefined
   for (const candidate of candidates) {
     try {
-      console.log('[daemon] fetchPath: calling client.fetchManifestPath', candidate)
-      const r = await c.fetchManifestPath(refHex, candidate, FETCH_RETRIES)
+      setPhase('fetching ' + (candidate || '(root)') + ' from ' + status.dialable + ' peers…')
+      // Bound each manifest fetch: if a wss:// dial hangs without timing out
+      // inside the wasm (the unverified browser /ws dial path), surface it as
+      // a timeout error instead of leaving the SW request pending forever.
+      const r = await withFetchTimeout(
+        c.fetchManifestPath(refHex, candidate, FETCH_RETRIES),
+        FETCH_TIMEOUT_MS,
+        candidate
+      )
       const bytes = r.bytes.slice()
-      console.log('[daemon] fetchPath: got', candidate, bytes.length, 'bytes (L2 chunk hits so far:', c.chunkStoreHits() + ')')
+      setPhase('got ' + candidate + ' (' + bytes.length + ' bytes, L2 hits ' + c.chunkStoreHits() + ')')
       return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer }
     } catch (e) {
-      console.log('[daemon] fetchPath:', candidate, 'failed:', errMsg(e))
+      setPhase('fetch ' + candidate + ' failed: ' + errMsg(e))
       lastErr = errMsg(e)
     }
   }
 
-  // Last resort: maybe `refHex` is a raw single file (not a manifest) and the
-  // request is for the root.
-  if (p === '') {
-    try {
-      const bytes = (await c.fetch(refHex, FETCH_RETRIES)).slice()
-      return { httpStatus: 200, contentType: 'application/octet-stream', body: bytes.buffer }
-    } catch (e) { lastErr = errMsg(e) }
-  }
-
+  // NB: no raw-chunk fallback here. Previously, when manifest resolution failed
+  // for the root we fetched `refHex` as a raw chunk and returned it as
+  // `application/octet-stream`. For a website reference that raw chunk is the
+  // mantaray manifest node itself (binary), and serving octet-stream for a
+  // top-level *document* navigation makes the browser DOWNLOAD it (a stray file
+  // in ~/Downloads) instead of showing anything useful. A genuine single-file
+  // reference is already served by `fetchManifestPath` above (it returns the
+  // file bytes with a real Content-Type), so the only thing this fallback ever
+  // produced for a website was a junk download. Return the error instead so the
+  // SW renders a readable error page and we can see *why* resolution failed.
   return { httpStatus: 404, error: lastErr ?? 'not found' }
+}
+
+/** Per-candidate fetch ceiling. Must comfortably exceed the wasm transport's
+ *  per-peer dial budget (20s) times a couple of sequential peer attempts, so a
+ *  slow-but-working browser ws dial isn't cut off prematurely — while still
+ *  bounding a wholly wedged fetch. */
+const FETCH_TIMEOUT_MS = 90_000
+
+function withFetchTimeout<T> (p: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error('fetch timed out after ' + ms + 'ms for ' + label)), ms)
+    p.then((v) => { clearTimeout(t); resolve(v) }, (e) => { clearTimeout(t); reject(e) })
+  })
 }
 
 function errMsg (e: unknown): string {

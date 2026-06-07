@@ -403,7 +403,7 @@ addressable peerset.
 
 For context, bee-light reports ~822 KiB/s on the same 5 MiB random
 upload — but that's its `deferred-upload` time which returns ~22×
-faster than chunks are actually retrievable (see "Bee-vs-isheika
+faster than chunks are actually retrievable (see "Bee-vs-hoverfly
 end-to-end comparison" below). On a fully-durable-receipt basis
 (we wait for every receipt before returning) our **1.03 MiB/s
 median beats bee-light's own reported deferred-upload number by
@@ -414,11 +414,11 @@ median beats bee-light's own reported deferred-upload number by
 
 For daemon mode on a VPS with a reasonable upload workload:
 
-    isheika \
+    hoverfly \
       --nonce-file overlay-nonce \
       --buffer-multiplier 2 \
       daemon \
-      --socket /tmp/isheika.sock \
+      --socket /tmp/hoverfly.sock \
       --pool-size 256 \
       --listen /ip4/0.0.0.0/tcp/1635 \
       --identity 0xYOUR_KEY \
@@ -479,12 +479,12 @@ client; the third is mainnet's reality.
   a small or attrited pool the user-supplied number is an upper
   bound, not a guarantee.
 - **Pool + buffer scaling together unlocks ~1 MB/s on a VPS.**
-  The earlier `ISHEIKA_BUFFER_MULT` sweep showed pure buffer scaling
+  The earlier `HOVERFLY_BUFFER_MULT` sweep showed pure buffer scaling
   regressed (at fixed pool=128, doubling buffer 1→2→4→8 went
   20→24→34→65 s). That was at *fixed* pool. The actual lever is
   **scale pool and buffer together** so per-session in-flight stays
   constant while total in-flight grows. Now exposed as
-  `--buffer-multiplier` (CLI) / `ISHEIKA_BUFFER_MULT` (env). VPS
+  `--buffer-multiplier` (CLI) / `HOVERFLY_BUFFER_MULT` (env). VPS
   sweep, 50 MiB random, single-process `upload --raw`:
 
   | Configuration | Time | Throughput |
@@ -550,7 +550,7 @@ single cap overlaps the median of another.
 
 ## Multi-connection-per-peer sweep (also a negative result)
 
-Commit `f6ad6ff` added `ISHEIKA_CONNECTIONS_PER_PEER` to test the
+Commit `f6ad6ff` added `HOVERFLY_CONNECTIONS_PER_PEER` to test the
 buffer-scaling negative's followup hypothesis: that opening multiple
 independent yamux pipes per peer would relieve the per-connection
 contention. VPS workload (5 MiB random tar, 3335-peer pool,
@@ -572,7 +572,7 @@ are *also* the ones that aren't fast in the first place. At the
 workload sizes we test, single-connection with default buffer is
 already at or near the per-overlay ceiling.
 
-Both env knobs (`ISHEIKA_BUFFER_MULT`, `ISHEIKA_CONNECTIONS_PER_PEER`)
+Both env knobs (`HOVERFLY_BUFFER_MULT`, `HOVERFLY_CONNECTIONS_PER_PEER`)
 stay in the code as investigator tools but should not be the default
 recommendation.
 
@@ -678,7 +678,7 @@ to ~1000). At `--concurrency 128` on today's mainnet:
   sessions don't change the closest-peer distribution much.
 
 The planner, dialer, CLI flag (`--aor-budget`), env knob
-(`ISHEIKA_AOR_BUDGET`), and `SessionPool::extend_one` were removed.
+(`HOVERFLY_AOR_BUDGET`), and `SessionPool::extend_one` were removed.
 The receipt-driven storage-radius routing (`in_aor()`, two-bucket
 sort) **stays** — it's independent of JIT-AOR, only the *seeding*
 of `storage_radius` from JIT plan data was tied to the dialer.
@@ -719,7 +719,7 @@ section for the wire pieces. Activation:
 ```
 # Caller is responsible for the chequebook contract existing and
 # being funded with BZZ. Its issuer() must equal --key's eth address.
-isheika upload \
+hoverfly upload \
   --batch <BATCH> --key <HEX_KEY> \
   --chequebook 0xYOUR_CHEQUEBOOK_ADDR \
   --chequebook-per-peer-cap-bzz 100000000000000000 \
@@ -881,18 +881,18 @@ underlay, and only marks us Public if the ping succeeds. There's no
 median and has the tightest distribution.** Activation:
 
 ```
-isheika daemon \
-  --socket /tmp/isheika.sock \
+hoverfly daemon \
+  --socket /tmp/hoverfly.sock \
   --peerlist peers.json \
   --pool-size 64 \
   --listen /ip4/0.0.0.0/tcp/1634 \
   --identity 0x<HEX_KEY> \
   --advertise /ip4/<PUBLIC_IP>/tcp/1634 &
 
-isheika upload \
+hoverfly upload \
   --batch <BATCH> --key 0x<HEX_KEY> \
   --concurrency 64 \
-  --daemon /tmp/isheika.sock \
+  --daemon /tmp/hoverfly.sock \
   ./file.bin
 ```
 
@@ -978,9 +978,9 @@ feature, or a bee whose bin has room), serving status correctly
 prevents the secondary Unhealthy mark. But it cannot fix
 present-day mainnet throughput.
 
-## Bee-vs-isheika end-to-end comparison (May 2026)
+## Bee-vs-hoverfly end-to-end comparison (May 2026)
 
-Apples-to-apples: bee 2.7.1 vs isheika, **same VPS, same identity,
+Apples-to-apples: bee 2.7.1 vs hoverfly, **same VPS, same identity,
 same batch, 5 MiB random files, end-to-end retrievability via
 `bzz.limo` (NOT local bee API "uploaded" — that's a deferred-upload
 lie which returns in ~0.7s before chunks actually propagate)**.
@@ -989,8 +989,8 @@ lie which returns in ~0.7s before chunks actually propagate)**.
 |---|---|---:|
 | Bee 2.7.1 HTTP `/bytes` (deferred=true) | 540, 375, 333, 320 | **354** |
 | Bee 2.7.1 HTTP `/bytes` (deferred=false, sync) | wire=720, e2e=510 | **510** |
-| isheika one-shot c=64 | 137, 114, 137 | **137** |
-| isheika c=256 mult=2 timeout=3 | 111, 80, 100 | **100** |
+| hoverfly one-shot c=64 | 137, 114, 137 | **137** |
+| hoverfly c=256 mult=2 timeout=3 | 111, 80, 100 | **100** |
 
 **Bee is 2.6-7× faster end-to-end depending on configuration.**
 
@@ -1003,7 +1003,7 @@ We added end-of-upload histograms that mirror bee's
 
 **Per-stream RTT (wall-clock for one pushsync substream):**
 
-| Bucket | Bee (4114 pushes) | isheika (2069 pushes, c=256 mult=2) |
+| Bucket | Bee (4114 pushes) | hoverfly (2069 pushes, c=256 mult=2) |
 |---|---:|---:|
 | <100 ms | 71% | 77% |
 | 100-500 ms | 28% | 4% |
@@ -1017,7 +1017,7 @@ is 30× worse**: ~22% of our pushes take 2-5 seconds vs bee's 0.05%.
 
 **Per-chunk wall-clock (entry to dispatcher → receipt):**
 
-| Bucket | isheika (1354 chunks, c=256 mult=2) |
+| Bucket | hoverfly (1354 chunks, c=256 mult=2) |
 |---|---:|
 | <500ms | 54% (chunks that landed first-racer fast) |
 | 500ms-2s | 6% |
@@ -1124,7 +1124,7 @@ waiting for propagation after the API/client returns):
 - **Bee**: 0.74s POST → 16s retrievable. Bee returns 22× faster
   than chunks are actually durable. The HTTP API hard-lies about
   completion via deferred-upload semantics (default ON).
-- **isheika**: 32-41s push → 37-45s retrievable. We're only
+- **hoverfly**: 32-41s push → 37-45s retrievable. We're only
   9-15% slower than fully durable — we don't lie, we wait for
   receipts before returning.
 
@@ -1137,7 +1137,7 @@ descending order of probable impact:
    permanent member, never bin-prune-disconnect it. Our pool
    has transient sessions: ~64 active at any time, each dies
    within seconds to RST (see "Session-death cause"). The
-   network treats bee as a citizen; isheika as a tourist.
+   network treats bee as a citizen; hoverfly as a tourist.
 2. **Local AOR storage at depth ~9.** ~1/512 of chunks bee
    uploads land in its own AOR (`pkg/pusher/pusher.go:266`,
    `ErrWantSelf` short-circuit) and are stored locally with no
@@ -1447,7 +1447,7 @@ connection.
 
 Running the daemon with default random nonce against the same
 batch + key + bench file we use everywhere, with
-`RUST_LOG=isheika::profile=trace`:
+`RUST_LOG=hoverfly::profile=trace`:
 
 - **2841 `pushsync_phases` events for 1293 chunks** = 2.2 push
   attempts per chunk on average (3.5× overhead).
@@ -1533,14 +1533,14 @@ variance (worst run 153 vs single-target's 103).
 
     # 1. Run a normal-overlay upload to populate peers.json and
     # generate a trace with top-pusher info.
-    isheika daemon --identity 0xXXX --advertise ... -v ...
+    hoverfly daemon --identity 0xXXX --advertise ... -v ...
 
     # 2. Identify the top 5-10 peers from the daemon log
     # (`pushed N/M chunks (latest via <overlay> po=K)` lines,
-    # or the `do_pushsync_outer` traces if RUST_LOG=isheika::profile=trace).
+    # or the `do_pushsync_outer` traces if RUST_LOG=hoverfly::profile=trace).
 
     # 3. Run vanity-overlay search against those targets:
-    isheika vanity-overlay --key 0xXXX \
+    hoverfly vanity-overlay --key 0xXXX \
       --target-overlay <peer1_overlay> \
       --target-overlay <peer2_overlay> \
       --target-overlay <peer3_overlay> \
@@ -1548,7 +1548,7 @@ variance (worst run 153 vs single-target's 103).
       --output overlay-nonce
 
     # 4. Restart daemon with the new nonce file:
-    isheika --nonce-file overlay-nonce daemon ...
+    hoverfly --nonce-file overlay-nonce daemon ...
 
 Higher target_po = stronger anchor but exponentially more search
 cost. Above ~12-14 the search starts taking minutes; above ~20 it

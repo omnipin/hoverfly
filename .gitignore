@@ -6,7 +6,7 @@ peers.json
 # `peers.seed.json` is checked in: an IP-diverse cold-start seed
 # harvested from a long-running daemon (~800 peers across ~800 unique
 # /32 IPs as of the last refresh; regenerate via
-# `isheika save-peers --socket <sock>` against a daemon that's been
+# `hoverfly save-peers --socket <sock>` against a daemon that's been
 # running long enough to accumulate kademlia memberships). Used by CI
 # (which has no persistent peerlist) and by fresh local installs.
 # Lives alongside the gitignored `peers.json` that gets written at

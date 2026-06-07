@@ -563,7 +563,7 @@ fn behaviour(keypair: &Keypair, max_concurrent_substream_upgrades: usize) -> Beh
         ),
         identify: libp2p::identify::Behaviour::new(
             libp2p::identify::Config::new("/swarm/0.1.0".to_string(), keypair.public())
-                .with_agent_version(format!("isheika/{}", crate::VERSION)),
+                .with_agent_version(format!("hoverfly/{}", crate::VERSION)),
         ),
         ping: libp2p::ping::Behaviour::new(libp2p::ping::Config::default()),
     }
@@ -885,7 +885,7 @@ impl Transport {
                 ev = hive_in_v2.next() => {
                     match ev {
                         Some((pid, mut stream)) if pid == peer_id => {
-                            debug!(target: "isheika::hive",
+                            debug!(target: "hoverfly::hive",
                                 "inbound hive v2 stream opened (batch {})", batches_read + 1);
                             match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
                                 Ok(mut batch) => {
@@ -893,11 +893,11 @@ impl Transport {
                                     peers.append(&mut batch);
                                     batches_read += 1;
                                     last_batch_at = Some(web_time::Instant::now());
-                                    info!(target: "isheika::hive",
+                                    info!(target: "hoverfly::hive",
                                         "read {} peers (batch {}, total {})",
                                         n, batches_read, peers.len());
                                 }
-                                Err(e) => debug!(target: "isheika::hive", "read_peers err: {}", e),
+                                Err(e) => debug!(target: "hoverfly::hive", "read_peers err: {}", e),
                             }
                         }
                         Some(_) => {}
@@ -907,7 +907,7 @@ impl Transport {
                 ev = hive_in_v1.next() => {
                     match ev {
                         Some((pid, mut stream)) if pid == peer_id => {
-                            debug!(target: "isheika::hive",
+                            debug!(target: "hoverfly::hive",
                                 "inbound hive v1 stream opened (batch {})", batches_read + 1);
                             match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
                                 Ok(mut batch) => {
@@ -915,11 +915,11 @@ impl Transport {
                                     peers.append(&mut batch);
                                     batches_read += 1;
                                     last_batch_at = Some(web_time::Instant::now());
-                                    info!(target: "isheika::hive",
+                                    info!(target: "hoverfly::hive",
                                         "read {} peers (batch {}, total {})",
                                         n, batches_read, peers.len());
                                 }
-                                Err(e) => debug!(target: "isheika::hive", "read_peers err: {}", e),
+                                Err(e) => debug!(target: "hoverfly::hive", "read_peers err: {}", e),
                             }
                         }
                         Some(_) => {}
@@ -1047,7 +1047,7 @@ impl PeerSession {
         // EOF, not a protocol NACK.
         let status_in = accept(&mut control, STATUS_PROTO)?;
         // We deliberately do NOT accept pullsync substreams (cursors
-        // or pullsync). isheika is an upload client, not a reserve
+        // or pullsync). hoverfly is an upload client, not a reserve
         // maintainer — we have no chunks to offer back. Earlier we
         // accepted both and responded with empty cursors / empty
         // offers to "look like a citizen", but:
@@ -1162,7 +1162,7 @@ impl PeerSession {
                 Err(e) => {
                     diag::HIVE_ANNOUNCE_FAIL.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     tracing::debug!(
-                        target: "isheika::transport",
+                        target: "hoverfly::transport",
                         "hive announce to {} failed: {} — session continues",
                         peer_id, e
                     );
@@ -1196,7 +1196,7 @@ impl PeerSession {
                     }),
                     Err(e) => {
                         tracing::debug!(
-                            target: "isheika::transport",
+                            target: "hoverfly::transport",
                             "swap handshake failed with {}: {} — falling back to pseudosettle-only",
                             peer_id, e
                         );
@@ -1570,7 +1570,7 @@ impl SessionState {
         let open_us = (t_opened - t_start).as_micros() as u64;
         let total_us = (t_pushed - t_start).as_micros() as u64;
         tracing::trace!(
-            target: "isheika::profile",
+            target: "hoverfly::profile",
             peer = %self.peer_id,
             open_stream_us = open_us,
             push_total_us = (t_pushed - t_opened).as_micros() as u64,
@@ -1719,7 +1719,7 @@ impl SessionState {
             acc.last_settle = Some(web_time::Instant::now());
             acc.balance_plur = acc.balance_plur.saturating_sub(accepted);
             debug!(
-                target: "isheika::transport",
+                target: "hoverfly::transport",
                 "pseudosettle with {}: asked={} accepted={} balance={} reserve={}",
                 self.peer_id, owed, accepted, acc.balance_plur, acc.reserve_plur,
             );
@@ -1733,7 +1733,7 @@ impl SessionState {
             if let Err(e) = self.try_emit_cheque(remaining_after_pseudo).await {
                 diag::CHEQUE_FAILED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 tracing::debug!(
-                    target: "isheika::transport",
+                    target: "hoverfly::transport",
                     "cheque emission to {} failed: {} — leaving balance in place",
                     self.peer_id, e
                 );
@@ -1814,7 +1814,7 @@ impl SessionState {
                     .map_err(|e| TransportError::Swap(e.to_string()))?;
                 if let Err(e) = store.save() {
                     tracing::warn!(
-                        target: "isheika::transport",
+                        target: "hoverfly::transport",
                         "cheques.json save failed: {} — continuing in-memory only", e
                     );
                 }
@@ -1864,7 +1864,7 @@ impl SessionState {
         }
         diag::CHEQUE_EMITTED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         tracing::debug!(
-            target: "isheika::transport",
+            target: "hoverfly::transport",
             "cheque emitted to {}: {} PLUR → {} BZZ-wei (cumulative {})",
             self.peer_id, plur_to_settle, amount_bzz, cumulative,
         );
@@ -1981,7 +1981,7 @@ impl SessionDriver {
                             }));
                             let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
                             if ghost >= GHOST_BALANCE_LIMIT_PLUR && accept_new {
-                                debug!(target: "isheika::transport",
+                                debug!(target: "hoverfly::transport",
                                     "session {} retiring at ghost_balance={} after {} pushes",
                                     self.state.peer_id, ghost, used);
                                 diag::GHOST_RETIRE.fetch_add(1, Ordering::Relaxed);
@@ -2026,7 +2026,7 @@ impl SessionDriver {
                         } else {
                             diag::DEAD_RETIRE_LOW_GHOST.fetch_add(1, Ordering::Relaxed);
                         }
-                        debug!(target: "isheika::transport",
+                        debug!(target: "hoverfly::transport",
                             "session {} retiring: underlying connection dead, ghost_balance={}",
                             self.state.peer_id, ghost);
                         accept_new = false;
@@ -2034,13 +2034,13 @@ impl SessionDriver {
                         // Subsequent dead task on already-retiring session;
                         // not counted but log at trace for diagnostics.
                         let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
-                        tracing::trace!(target: "isheika::transport",
+                        tracing::trace!(target: "hoverfly::transport",
                             "session {} additional dead task on retiring session, ghost_balance={}",
                             self.state.peer_id, ghost);
                     } else {
                         let ghost = self.state.ghost_balance_plur.load(Ordering::Relaxed);
                         if ghost >= GHOST_BALANCE_LIMIT_PLUR && accept_new {
-                            debug!(target: "isheika::transport",
+                            debug!(target: "hoverfly::transport",
                                 "session {} retiring at ghost_balance={}",
                                 self.state.peer_id, ghost);
                             diag::GHOST_RETIRE.fetch_add(1, Ordering::Relaxed);
@@ -2242,7 +2242,7 @@ async fn prep_connection(
                     endpoint,
                     ..
                 } if pid == peer_id => {
-                    info!(target: "isheika::transport", "connected to {}", pid);
+                    info!(target: "hoverfly::transport", "connected to {}", pid);
                     peer_underlay = Some(endpoint.get_remote_address().clone());
                 }
                 SwarmEvent::OutgoingConnectionError {
@@ -2260,7 +2260,7 @@ async fn prep_connection(
                         peer_id: pid, info, ..
                     } if pid == peer_id && !identify_received => {
                         identify_received = true;
-                        info!(target: "isheika::transport", "identify received; observed_addr={}", info.observed_addr);
+                        info!(target: "hoverfly::transport", "identify received; observed_addr={}", info.observed_addr);
                         swarm.add_external_address(info.observed_addr.clone());
                         swarm.behaviour_mut().identify.push([peer_id]);
                         push_in_flight = true;
@@ -2268,7 +2268,7 @@ async fn prep_connection(
                     libp2p::identify::Event::Pushed { peer_id: pid, .. }
                         if pid == peer_id && push_in_flight =>
                     {
-                        info!(target: "isheika::transport", "identify push acknowledged");
+                        info!(target: "hoverfly::transport", "identify push acknowledged");
                         return Ok(peer_underlay.unwrap_or_else(Multiaddr::empty));
                     }
                     _ => {}
@@ -2290,7 +2290,7 @@ async fn do_handshake(
     advertised: Option<&Multiaddr>,
 ) -> Result<handshake::HandshakeResult, TransportError> {
     let local_peer_id = *swarm.local_peer_id();
-    info!(target: "isheika::transport", "opening outbound handshake");
+    info!(target: "hoverfly::transport", "opening outbound handshake");
 
     // Try v15 first (bee 2.8.0+). Bee ≤ 2.7.x's libp2p multistream
     // negotiation will reject the v15 protocol id with
@@ -2301,7 +2301,7 @@ async fn do_handshake(
         match poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO_V15)).await {
             Ok(s) => (s, handshake::Version::V15),
             Err(e) if is_unsupported_protocol(&e) => {
-                debug!(target: "isheika::transport",
+                debug!(target: "hoverfly::transport",
                     "peer rejected handshake/15.0.0, falling back to 14.0.0");
                 let s = poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO_V14))
                     .await
@@ -2384,7 +2384,7 @@ async fn do_handshake(
         }
     };
     close_stream_polled(swarm, &mut stream).await;
-    info!(target: "isheika::transport",
+    info!(target: "hoverfly::transport",
         "outbound handshake complete (version={:?})", hs_result.version);
     Ok(hs_result)
 }
@@ -2432,14 +2432,14 @@ async fn do_pricing(
             _ = swarm.select_next_some() => {}
         }
     }
-    info!(target: "isheika::transport", "opening outbound pricing");
+    info!(target: "hoverfly::transport", "opening outbound pricing");
     let mut stream = poll_until(swarm, control.open_stream(peer_id, PRICING_PROTO))
         .await
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
     poll_until(swarm, write_then_read_empty_headers(&mut stream)).await?;
     poll_until(swarm, pricing::announce(&mut stream)).await?;
     close_stream_polled(swarm, &mut stream).await;
-    info!(target: "isheika::transport",
+    info!(target: "hoverfly::transport",
         "outbound pricing complete (peer threshold {} PLUR)", peer_threshold);
     Ok(peer_threshold)
 }
@@ -2654,7 +2654,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
     Ok(swarm)
 }
 
-/// Build a libp2p swarm with the standard isheika transport stack
+/// Build a libp2p swarm with the standard hoverfly transport stack
 /// (plain TCP + TCP-over-WS, noise auth, yamux multiplex, identify +
 /// libp2p_stream behaviours). Exposed `pub(crate)` so the daemon's
 /// inbound listener can share the same code path with a separately

@@ -1,4 +1,4 @@
-# Benchmark isheika daemon-mode upload throughput against bee mainnet
+# Benchmark hoverfly daemon-mode upload throughput against bee mainnet
 # from a CircleCI Docker executor. Mirrors the GitHub Actions workflow
 # in `.github/workflows/bench.yml` for cross-CI comparison.
 #
@@ -7,7 +7,7 @@
 # CircleCI UI "Trigger Pipeline" button with `run_bench=true`, or via
 # the API:
 #
-#   curl -X POST https://circleci.com/api/v2/project/gh/omnipin/isheika/pipeline \
+#   curl -X POST https://circleci.com/api/v2/project/gh/omnipin/hoverfly/pipeline \
 #     -H "Circle-Token: $CIRCLE_TOKEN" \
 #     -H "Content-Type: application/json" \
 #     -d '{"parameters": {"run_bench": true}}'
@@ -85,7 +85,7 @@ jobs:
       # the binary cache below restores it only on a source-hash hit.
       - run:
           name: Drop possibly-stale binary from cargo cache
-          command: rm -f target/release/isheika
+          command: rm -f target/release/hoverfly
 
       - restore_cache:
           name: Restore built binary
@@ -95,8 +95,8 @@ jobs:
       - run:
           name: Build release binary (if not cached)
           command: |
-            if [ ! -x target/release/isheika ]; then
-              cargo build --release --bin isheika
+            if [ ! -x target/release/hoverfly ]; then
+              cargo build --release --bin hoverfly
             fi
 
       - save_cache:
@@ -111,7 +111,7 @@ jobs:
           name: Save built binary
           key: bin-v3-{{ arch }}-{{ checksum "/tmp/source.sha256" }}
           paths:
-            - target/release/isheika
+            - target/release/hoverfly
 
       - run:
           name: Write overlay nonce
@@ -128,10 +128,10 @@ jobs:
           name: Start daemon
           background: true
           command: |
-            ./target/release/isheika \
+            ./target/release/hoverfly \
               --buffer-multiplier << pipeline.parameters.buffer_multiplier >> \
               daemon \
-              --socket /tmp/isheika.sock \
+              --socket /tmp/hoverfly.sock \
               --pool-size << pipeline.parameters.pool_size >> \
               --listen /ip4/0.0.0.0/tcp/1635 \
               --identity "$BENCH_KEY" \
@@ -165,8 +165,8 @@ jobs:
                  bs=1M count=<< pipeline.parameters.file_size_mib >> status=none
 
               echo "=== Run $i ==="
-              ./target/release/isheika upload \
-                --daemon /tmp/isheika.sock \
+              ./target/release/hoverfly upload \
+                --daemon /tmp/hoverfly.sock \
                 --batch "$BENCH_BATCH" \
                 --key "$BENCH_KEY" \
                 /tmp/bench-<< pipeline.parameters.file_size_mib >>mib.bin 2>&1 \

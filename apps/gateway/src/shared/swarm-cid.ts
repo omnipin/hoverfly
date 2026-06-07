@@ -1,6 +1,6 @@
 // Swarm reference <-> CIDv1 multibase encoding.
 //
-// Port of isheika `src/cid.rs`. A raw 32-byte Swarm reference is 64 hex
+// Port of hoverfly `src/cid.rs`. A raw 32-byte Swarm reference is 64 hex
 // chars, which exceeds the 63-char DNS label limit, so it cannot be used
 // directly as a subdomain. Instead we encode it the same way bzz.limo / the
 // ENS `contenthash` spec do:
