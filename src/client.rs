@@ -1790,6 +1790,138 @@ pub fn collection_root(
     Ok((manifest_root, seen.len()))
 }
 
+/// Compute the full set of unique chunk addresses a `*.tar`-style
+/// collection splits into, including the manifest chunks — i.e. exactly
+/// the set [`upload_collection`] would push. No network, key, or stamping.
+///
+/// This is the address set the uploader needs *storer* peers close to, so
+/// it's the input to [`analyze_coverage`] for proximity-targeted discovery.
+pub fn collection_chunk_addresses(
+    files: &[UploadFile],
+    index_document: Option<&str>,
+    error_document: Option<&str>,
+) -> Result<Vec<[u8; 32]>, ClientError> {
+    use crate::manifest::CollectionEntry;
+
+    if files.is_empty() {
+        return Err(ClientError::Manifest("collection is empty".into()));
+    }
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
+    for f in files {
+        let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        for (addr, _chunk) in file_store.into_chunks() {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(addr.as_bytes());
+            seen.insert(a);
+        }
+        entries.push(CollectionEntry {
+            path: f.path.clone(),
+            reference: file_root,
+            content_type: f.content_type.clone(),
+        });
+    }
+    let (_root, manifest_chunks) =
+        crate::manifest::build_collection_manifest(&entries, index_document, error_document)
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
+    for (addr, _wire) in manifest_chunks.iter() {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(addr.as_bytes());
+        seen.insert(a);
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Compute the full set of unique chunk addresses a single file splits
+/// into (the bare content chunks, no manifest). No network or key.
+pub fn file_chunk_addresses(data: &[u8]) -> Result<Vec<[u8; 32]>, ClientError> {
+    let (_root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for (addr, _chunk) in store.into_chunks() {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(addr.as_bytes());
+        seen.insert(a);
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Per-chunk proximity-coverage of a peer set, used to drive
+/// proximity-targeted discovery (`discover --for-file`).
+///
+/// For each chunk address we find the *maximum* proximity order (PO) to
+/// any peer overlay in `peer_overlays` — that's the closest peer that
+/// could store (or forward one short hop to) the chunk. A chunk is
+/// "covered at depth D" when some peer reaches PO ≥ D to it. The lower a
+/// chunk's best PO, the more it costs to push (price scales with
+/// `MaxPO − PO`) and the more likely the lone close peer gets
+/// rate-limited — those are the chunks discovery should chase more peers
+/// for.
+#[derive(Debug, Clone)]
+pub struct CoverageReport {
+    /// Total unique chunk addresses analyzed.
+    pub total_chunks: usize,
+    /// `best_po_histogram[p]` = number of chunks whose closest peer is at
+    /// exactly proximity order `p` (index 0..=MAX_PO).
+    pub best_po_histogram: Vec<usize>,
+    /// Number of chunks with NO peer at or above `min_po` — the chunks
+    /// most at risk of slow/throttled pushes.
+    pub undercovered: usize,
+    /// The `min_po` threshold this report was computed against.
+    pub min_po: u8,
+}
+
+impl CoverageReport {
+    /// Fraction of chunks that have at least one peer at PO ≥ `min_po`.
+    pub fn covered_fraction(&self) -> f64 {
+        if self.total_chunks == 0 {
+            return 1.0;
+        }
+        let covered = self.total_chunks - self.undercovered;
+        covered as f64 / self.total_chunks as f64
+    }
+}
+
+/// Compute how well `peer_overlays` covers `chunk_addrs` in proximity
+/// space. `min_po` is the proximity order considered "good enough" to
+/// count a chunk as covered (a reasonable default is the network's
+/// neighborhood depth / storage radius, e.g. 8). Pure CPU; no I/O.
+pub fn analyze_coverage(
+    chunk_addrs: &[[u8; 32]],
+    peer_overlays: &[[u8; 32]],
+    min_po: u8,
+) -> CoverageReport {
+    use crate::transport::proximity;
+    let max_po = crate::transport::MAX_PO;
+    let mut hist = vec![0usize; (max_po as usize) + 1];
+    let mut undercovered = 0usize;
+    for chunk in chunk_addrs {
+        let mut best: u8 = 0;
+        let mut found = false;
+        for overlay in peer_overlays {
+            let po = proximity(overlay, chunk);
+            if po > best || !found {
+                best = po;
+                found = true;
+            }
+        }
+        if found {
+            hist[best as usize] += 1;
+            if best < min_po {
+                undercovered += 1;
+            }
+        } else {
+            // No peers at all → maximally under-covered.
+            undercovered += 1;
+        }
+    }
+    CoverageReport {
+        total_chunks: chunk_addrs.len(),
+        best_po_histogram: hist,
+        undercovered,
+        min_po,
+    }
+}
+
 pub fn prepare_upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,
