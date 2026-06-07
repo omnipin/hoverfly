@@ -228,19 +228,37 @@ const PROBE_BAND: u32 = 12;
 /// indices that DON'T exist, and without a deadline every such "miss" pays the
 /// full give-up cost, making resolution glacial. Mirroring bee's asyncFinder
 /// (which bounds each probe to 1s), we cap each probe so a missing index fails
-/// fast and the search advances. Slightly more generous than bee's 1s to
-/// absorb browser ws round-trip latency.
-const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
+/// fast and the search advances. Once the search is concurrent this is the
+/// dominant cost (each round waits its slowest *absent* probe), so keep it
+/// tight; 1.5s leaves headroom over bee's 1s for browser ws round-trip latency
+/// while roughly halving per-round cost vs the initial 3s.
+const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
-/// Resolve the **latest** update of a sequence feed and return the content
-/// reference it points at.
+/// Resolve the **latest** update of a sequence feed and return
+/// `(content_reference, resolved_index)`.
 ///
-/// Finds the head with an exponential probe (find the first missing index by
-/// doubling) followed by a binary search in `[last_present, first_missing)`,
-/// which costs ~`2·log2(n)` chunk fetches instead of `n`. Then parses the head
-/// update as a single-owner chunk (via nectar) and extracts the wrapped
-/// content reference from its CAC body.
-pub async fn resolve_latest<S>(store: &S, feed: &Feed) -> Result<ChunkAddress, ResolveError>
+/// `after` is a hint of the last known head index (0 if unknown). Because a
+/// feed's head only moves forward, a good hint usually resolves the head in a
+/// single fast round; the caller should persist the returned index and pass it
+/// back next time (see [`crate::client::RetrievalCache`] feed-index cache).
+///
+/// Search strategy, by cost: a *present* probe answers fast (a close peer has
+/// it); an *absent* probe is the expensive one (it waits `PROBE_TIMEOUT` for a
+/// miss). So we minimize rounds that hinge on an absent probe:
+///
+/// 1. **Forward gallop from `after`** (steady-state fast path): probe a small
+///    band `after+1, after+2, …` concurrently. If none are present, `after` is
+///    still the head — done in one round of cheap present-or-fast-miss probes.
+///    If some are present, gallop the band forward (doubling) until a round has
+///    a missing index, which brackets the head.
+/// 2. **Cold bracket** (no/!stale hint): concurrent exponential boundary search
+///    from index 0 to bracket the head.
+/// 3. **Concurrent k-ary narrowing** of the final bracket.
+pub async fn resolve_latest<S>(
+    store: &S,
+    feed: &Feed,
+    after: u64,
+) -> Result<(ChunkAddress, u64), ResolveError>
 where
     S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
 {
@@ -248,45 +266,50 @@ where
 
     tracing::info!(
         target: "hoverfly::feed",
-        "resolving sequence feed: owner={} topic={}",
+        "resolving sequence feed: owner={} topic={} after={}",
         feed.owner,
-        hex::encode(feed.topic)
+        hex::encode(feed.topic),
+        after
     );
-    // Index 0 must exist for the feed to have any update at all.
-    let chunk0 = match get_update(store, feed, 0).await? {
-        Some(c) => c,
-        None => return Err(ResolveError::Feed(FeedError::NoUpdate)),
-    };
 
-    // --- Phase 1: concurrent exponential boundary search. ---
-    // Each SOC lookup is a slow network round-trip, so probe a whole band of
-    // doubling indices (1,2,4,8,…) AT ONCE rather than one-at-a-time (mirrors
-    // bee's asyncFinder doubling fan-out). From the batch results, `lo` = the
-    // highest index found present, `hi` = the lowest index found absent. The
-    // true head is somewhere in [lo, hi).
-    let mut lo = 0u64; // highest present
-    let mut last_chunk = chunk0;
-    let mut hi = u64::MAX; // lowest absent (MAX = "not yet found")
+    // Anchor the search. With a hint, confirm `after` is present and gallop
+    // forward from it; otherwise confirm index 0 exists at all. A stale/too-high
+    // hint falls back to a cold search from 0 (index 0 must exist for any feed).
+    // `lo` = highest index proven present (+ its chunk); `hi` = lowest proven
+    // absent (u64::MAX = not yet bracketed).
+    let (mut lo, mut last_chunk): (u64, AnyChunk<DEFAULT_BODY_SIZE>) =
+        match get_update(store, feed, after).await? {
+            Some(c) => (after, c),
+            None if after != 0 => match get_update(store, feed, 0).await? {
+                Some(c) => (0, c),
+                None => return Err(ResolveError::Feed(FeedError::NoUpdate)),
+            },
+            None => return Err(ResolveError::Feed(FeedError::NoUpdate)),
+        };
+    let mut hi: u64 = u64::MAX;
 
-    // Probe levels 0..PROBE_BAND (indices 2^1..2^BAND) concurrently per round;
-    // if all present, advance the base and probe the next band.
-    let mut base = 1u64;
-    'outer: loop {
+    // --- Forward boundary search: gallop doubling bands from `lo` until a band
+    // contains a missing index (which sets `hi`). The very first band starting
+    // just above a good hint usually finds the boundary immediately. ---
+    let mut step = 1u64;
+    'outer: while hi == u64::MAX {
         let mut futs = FuturesUnordered::new();
+        let mut probed_top = lo;
         for k in 0..PROBE_BAND {
-            let idx = base.saturating_mul(1u64 << k);
+            // Probe lo+step, lo+2·step, lo+4·step, … within this band.
+            let off = step.saturating_mul(1u64 << k);
+            let idx = lo.saturating_add(off);
             if idx > MAX_PROBE_INDEX {
                 break;
             }
+            probed_top = probed_top.max(idx);
             futs.push(async move { (idx, get_update(store, feed, idx).await) });
         }
         if futs.is_empty() {
             break;
         }
         let mut any_present = false;
-        let mut top = base; // highest index probed this round
         while let Some((idx, res)) = futs.next().await {
-            top = top.max(idx);
             match res? {
                 Some(c) => {
                     any_present = true;
@@ -302,25 +325,18 @@ where
                 }
             }
         }
-        // If we found an absent index, the boundary is bracketed; stop probing.
         if hi != u64::MAX {
-            break 'outer;
+            break 'outer; // bracketed
         }
-        // All present in this band — jump the base past the top we probed.
-        if !any_present || top >= MAX_PROBE_INDEX {
-            break;
+        if !any_present || probed_top >= MAX_PROBE_INDEX {
+            break; // head is `lo` (no higher index exists)
         }
-        base = top.saturating_mul(2);
+        // All present — advance: next band starts above what we probed, with a
+        // larger step so a far-ahead head is reached in a few doubling rounds.
+        step = (probed_top - lo).saturating_add(1);
     }
 
-    // --- Phase 2: concurrent k-ary search of the bracket (lo present, hi absent).
-    // A plain binary search here is SEQUENTIAL — each step waits a full round-
-    // trip (and a miss waits the whole PROBE_TIMEOUT), which dominated total
-    // resolution time. Instead, split the open interval (low, high) into
-    // PROBE_BAND equally-spaced candidate indices and probe them ALL at once;
-    // the results narrow the bracket to (highest-present, lowest-absent) in a
-    // single round. This collapses ~log2(gap) sequential probes into
-    // ~log_PROBE_BAND(gap) concurrent rounds (a 64-wide gap: 1 round vs ~6).
+    // --- Concurrent k-ary narrowing of the bracket (lo present, hi absent). ---
     if hi != u64::MAX {
         let mut low = lo;
         let mut high = hi;
@@ -351,10 +367,8 @@ where
                     }
                 }
             }
-            // Make progress guard: if the round somehow didn't tighten the
-            // bracket (shouldn't happen), stop to avoid an infinite loop.
             if round_low == low && round_high == high {
-                break;
+                break; // no progress guard
             }
             if let Some(c) = round_chunk {
                 last_chunk = c;
@@ -367,8 +381,7 @@ where
 
     // `last_chunk` is the head update SOC, parsed+validated by the retrieval
     // layer. `AnyChunk::data()` on a single-owner chunk returns its *wrapped*
-    // CAC body — exactly the feed payload (`span+timestamp+reference`) — so we
-    // extract the content reference from it directly.
+    // CAC body — exactly the feed payload (`span+timestamp+reference`).
     let reference = reference_from_payload(last_chunk.data().as_ref())?;
     tracing::info!(
         target: "hoverfly::feed",
@@ -376,7 +389,7 @@ where
         lo,
         hex::encode(reference)
     );
-    Ok(ChunkAddress::new(reference))
+    Ok((ChunkAddress::new(reference), lo))
 }
 
 /// Fetch the feed update at index `i`. Returns `Ok(None)` if the update chunk

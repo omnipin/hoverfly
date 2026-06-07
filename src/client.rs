@@ -226,11 +226,31 @@ const PEER_SCORE_MIN: i32 = -3;
 pub struct RetrievalCache {
     sessions: std::sync::Arc<tokio::sync::Mutex<HashMap<String, CachedSession>>>,
     peer_scores: std::sync::Arc<std::sync::Mutex<HashMap<String, i32>>>,
+    /// Last resolved sequence index per feed (key = owner||topic hex). A feed's
+    /// head only ever moves forward, so the previous resolution is a strong
+    /// hint: the next lookup starts a short forward gallop from here instead of
+    /// a full cold search. Steady-state (a daemon re-serving the same feed-
+    /// backed site) this turns resolution into ~1 fast round.
+    feed_index: std::sync::Arc<std::sync::Mutex<HashMap<String, u64>>>,
 }
 
 impl RetrievalCache {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Last known head index for a feed, if previously resolved.
+    pub fn feed_hint(&self, key: &str) -> Option<u64> {
+        self.feed_index.lock().unwrap().get(key).copied()
+    }
+
+    /// Record the resolved head index for a feed (monotonic: never moves back).
+    pub fn set_feed_hint(&self, key: &str, index: u64) {
+        let mut m = self.feed_index.lock().unwrap();
+        let e = m.entry(key.to_string()).or_insert(0);
+        if index > *e {
+            *e = index;
+        }
     }
 }
 
@@ -1168,7 +1188,7 @@ pub async fn fetch_manifest_path_cached_ex(
     // root chunk is hit by both phases so the cache saves a round-trip.
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
-    let root = resolve_feed_root(&store, root).await?;
+    let root = resolve_feed_root(&store, root, Some(cache)).await?;
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
@@ -1203,7 +1223,7 @@ pub async fn list_manifest_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
-    let root = resolve_feed_root(&store, root).await?;
+    let root = resolve_feed_root(&store, root, None).await?;
     walk_manifest(&store, root, Vec::new()).await
 }
 
@@ -1243,6 +1263,7 @@ fn validate_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEF
 async fn resolve_feed_root(
     store: &NetworkedStore<'_>,
     root: ChunkAddress,
+    cache: Option<&RetrievalCache>,
 ) -> Result<ChunkAddress, ClientError> {
     use crate::feed::{Feed, resolve_latest};
     use crate::manifest::{decode_node, extract_feed_meta};
@@ -1257,9 +1278,19 @@ async fn resolve_feed_root(
     };
     let feed = Feed::from_manifest_meta(&owner_hex, &topic_hex, &ty)
         .map_err(|e| ClientError::Feed(e.to_string()))?;
-    let resolved = resolve_latest(store, &feed)
+
+    // Use the last resolved index for this feed as a forward-search hint, so a
+    // daemon re-serving the same feed-backed site resolves the head in ~1 round
+    // instead of a full cold search. Key the cache on owner||topic.
+    let feed_key = format!("{}{}", owner_hex.to_lowercase(), topic_hex.to_lowercase());
+    let after = cache.and_then(|c| c.feed_hint(&feed_key)).unwrap_or(0);
+
+    let (resolved, index) = resolve_latest(store, &feed, after)
         .await
         .map_err(|e| ClientError::Feed(e.to_string()))?;
+    if let Some(c) = cache {
+        c.set_feed_hint(&feed_key, index);
+    }
     Ok(resolved)
 }
 
