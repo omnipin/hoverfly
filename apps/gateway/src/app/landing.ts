@@ -4,7 +4,7 @@
 // it on its own content subdomain. Connects to the shared daemon SharedWorker
 // directly (same origin) to show live peer status and trigger discovery.
 
-import { DAEMON_WORKER_SCRIPT, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS } from '../shared/config.ts'
+import { DAEMON_WORKER_SCRIPT, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, IDB_CHUNKS_DB } from '../shared/config.ts'
 import { DaemonRpc, type DaemonStatus } from '../shared/protocol.ts'
 import { subdomainUrl } from '../shared/parse-request.ts'
 import { normalizeRef } from '../shared/swarm-ref.ts'
@@ -15,7 +15,7 @@ const app = document.getElementById('app') as HTMLElement
 
 app.innerHTML = `
   <main class="wrap">
-    <h1>Swarm <span class="accent">subdomain gateway</span></h1>
+    <h1>Hoverfly <span class="accent">Swarm gateway</span></h1>
     <p class="lede">Fetches &amp; verifies Swarm websites entirely in your browser via a shared
       <a href="https://github.com/omnipin/hoverfly" target="_blank" rel="noopener">hoverfly</a> node
       running in daemon mode (one warm node, shared across every site).</p>
@@ -35,6 +35,7 @@ app.innerHTML = `
       </div>
       <dl class="stats">
         <div><dt>Dialable peers</dt><dd id="peers">–</dd></div>
+        <div><dt>Cached chunks</dt><dd id="chunks">–</dd></div>
         <div><dt>Network</dt><dd id="net">–</dd></div>
       </dl>
       <details class="adv">
@@ -129,3 +130,65 @@ $('discover').addEventListener('click', () => {
     if (!r.ok && r.error != null) { errEl.textContent = 'Discover failed: ' + r.error; errEl.hidden = false }
   })
 })
+
+// ---- cached-chunk counter (live) ----
+//
+// The daemon SharedWorker persists retrieved Swarm chunks in the
+// `hoverfly-gw-chunks` IndexedDB (object store `chunks`, one record per chunk
+// address). That DB lives on this ROOT origin — the same origin as this page —
+// and every fetch (even those initiated from a content subdomain) routes
+// through the root-origin daemon, so its chunk count reflects ALL cached
+// content. We count the keys here in plain JS and poll so the number ticks up
+// live as sites are fetched.
+const CHUNK_STORE = 'chunks'
+const chunksEl = $<HTMLElement>('chunks')
+
+/** Open the chunk DB read-only WITHOUT bumping its version, so we never race
+ *  the daemon's `open(name, 1)`. Returns null if it doesn't exist yet (no
+ *  fetch has happened, so the daemon hasn't created it). */
+function openChunkDb (): Promise<IDBDatabase | null> {
+  return new Promise((resolve) => {
+    let created = false
+    const req = indexedDB.open(IDB_CHUNKS_DB)
+    // If onupgradeneeded fires, the DB (or store) didn't exist — abort the
+    // accidental creation and report "not ready" rather than leaving an empty
+    // DB that shadows the daemon's.
+    req.onupgradeneeded = () => { created = true }
+    req.onsuccess = () => {
+      const db = req.result
+      if (created || !db.objectStoreNames.contains(CHUNK_STORE)) {
+        db.close()
+        resolve(null)
+        return
+      }
+      resolve(db)
+    }
+    req.onerror = () => resolve(null)
+    req.onblocked = () => resolve(null)
+  })
+}
+
+async function countChunks (): Promise<number | null> {
+  const db = await openChunkDb()
+  if (db == null) return null
+  try {
+    return await new Promise<number>((resolve, reject) => {
+      const r = db.transaction(CHUNK_STORE, 'readonly').objectStore(CHUNK_STORE).count()
+      r.onsuccess = () => resolve(r.result)
+      r.onerror = () => reject(r.error)
+    })
+  } catch {
+    return null
+  } finally {
+    db.close()
+  }
+}
+
+const numberFmt = new Intl.NumberFormat()
+async function refreshChunkCount (): Promise<void> {
+  const n = await countChunks()
+  chunksEl.textContent = n == null ? '–' : numberFmt.format(n)
+}
+
+void refreshChunkCount()
+setInterval(() => { void refreshChunkCount() }, 2000)
