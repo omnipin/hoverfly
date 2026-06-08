@@ -1,9 +1,27 @@
 //! Minimal mantaray v0.1/v0.2 decoder + walker.
 //!
-//! Why not use `nectar-mantaray`? Its decoder rejects nodes with `ref_size = 0`
-//! (intermediate trie nodes that carry no entry), which bee produces in the wild.
-//! This walker accepts both `ref_size = 0` and `ref_size = 32` and follows the
-//! fork structure as described in the bee spec and weeb-3's reference impl.
+//! Why not use `nectar-mantaray`? The historical reason — its decoder rejecting
+//! bee's `ref_size = 0` empty terminal nodes — was fixed upstream
+//! (nxm-rs/nectar#35) and we now pin a rev that includes it. But two structural
+//! gaps still keep this hand-rolled decoder in place:
+//!
+//! 1. **No async traversal.** nectar's only public manifest walk
+//!    (`Manifest::walk` / `lookup` / `entries`) is bounded on `SyncChunkGet`.
+//!    Our store is an async libp2p networked store that can't implement the
+//!    synchronous trait, and on wasm there's no blocking adapter to bridge it.
+//!    Tracked upstream at nxm-rs/nectar#37.
+//! 2. **No public fork/metadata access.** `Node`'s `forks`, `metadata`, and
+//!    `entry` fields are `pub(crate)`, so even decoding a node with nectar
+//!    leaves us unable to drive our own parallel fork descent or read per-fork
+//!    `Content-Type` / feed metadata through the public API.
+//!
+//! So this stays a self-contained decoder + walker: it parses both
+//! `ref_size = 0` and `ref_size = 32` nodes and follows the fork structure per
+//! the bee spec and weeb-3's reference impl. Once nectar#37 lands (async walk)
+//! and the `Node` accessors are public, this can be retired in favour of
+//! nectar's decoder — that's a separate change needing end-to-end manifest
+//! verification. (Note: the *encoder* side already uses `nectar-mantaray`; see
+//! `build_single_entry_manifest` / `build_collection_manifest`.)
 
 use nectar_primitives::chunk::ChunkAddress;
 use std::collections::BTreeMap;
