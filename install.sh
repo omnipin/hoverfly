@@ -18,7 +18,8 @@ BIN_DIR=${HOVERFLY_BIN_DIR:-$HOME/.local/bin}
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)        TARGET=x86_64-unknown-linux-gnu ;;
   Linux-aarch64)       TARGET=aarch64-unknown-linux-gnu ;;
-  Darwin-x86_64)       TARGET=x86_64-apple-darwin ;;
+  # No x86_64-apple-darwin prebuilt: Intel Macs are discontinued. Intel
+  # Mac users fall through to the build-from-source message below.
   Darwin-arm64)        TARGET=aarch64-apple-darwin ;;
   *)
     echo "no prebuilt binary for $(uname -s)-$(uname -m)" >&2

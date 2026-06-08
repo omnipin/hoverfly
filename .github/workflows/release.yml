@@ -64,12 +64,11 @@ jobs:
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-latest
             use-cross: true
-          - target: x86_64-apple-darwin
-            # `macos-13` is the last GHA Intel runner. If/when it
-            # retires, switch to `macos-latest` and build with
-            # `--target x86_64-apple-darwin` cross from M-series.
-            runner: macos-13
-            use-cross: false
+          # Apple Silicon only. Intel Macs were discontinued (last models
+          # 2020-2023; line ended 2024), so we no longer ship an
+          # x86_64-apple-darwin build. If a need resurfaces it can be
+          # cross-built from a macos-latest (M-series) runner with
+          # `--target x86_64-apple-darwin`.
           - target: aarch64-apple-darwin
             runner: macos-latest
             use-cross: false
