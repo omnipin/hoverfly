@@ -8,6 +8,8 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod batch;
+#[cfg(all(not(target_arch = "wasm32"), feature = "bridge"))]
+pub mod bridge;
 pub mod cache;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod cheques;

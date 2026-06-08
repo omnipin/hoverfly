@@ -656,6 +656,103 @@ enum Commands {
         #[command(subcommand)]
         action: BatchAction,
     },
+
+    /// Bridge funds from another chain to xDAI + BZZ on Gnosis via Relay.
+    ///
+    /// Solves the setup chicken-and-egg: `batch create` needs the signer's
+    /// address to already hold a little xDAI (gas) and some BZZ on Gnosis.
+    /// This command funds it from a token you hold on Ethereum, Base,
+    /// Optimism, or Arbitrum, using the permissionless Relay API
+    /// (<https://docs.relay.link>) — no API key required.
+    ///
+    /// `--to both` (default) checks the recipient's xDAI balance on Gnosis
+    /// and only tops up gas if it's below the threshold, then swaps the
+    /// rest to BZZ. NOTE: Relay needs a little native gas on the *origin*
+    /// chain to broadcast the deposit transaction (it covers destination
+    /// gas, not origin).
+    ///
+    /// Like `batch`, this is the rare subcommand that makes on-chain RPC
+    /// calls. It's an optional compile-time feature (`bridge`, on by
+    /// default); build with `--no-default-features --features cli` to omit
+    /// it entirely.
+    #[cfg(feature = "bridge")]
+    Bridge {
+        /// Origin chain: ethereum | base | optimism | arbitrum (or a
+        /// numeric EVM chain id for any other Relay-supported chain).
+        #[arg(long, value_name = "CHAIN")]
+        from_chain: String,
+
+        /// Origin token to spend. Either:
+        ///   - a token **symbol** (e.g. `USDC`), resolved to the canonical
+        ///     address AND decimals on `--from-chain` via Relay's token
+        ///     list — no need to know the address or `--from-decimals`; or
+        ///   - a raw **0x address** (used verbatim, with `--from-decimals`).
+        /// Omit entirely to spend the chain's native gas token (ETH).
+        #[arg(long, value_name = "SYMBOL|ADDR")]
+        from_token: Option<String>,
+
+        /// Amount of the origin token to spend, in whole units (e.g.
+        /// `2.5`). Combined with the token's decimals to compute the
+        /// on-wire amount.
+        #[arg(long, value_name = "AMOUNT")]
+        amount: String,
+
+        /// Decimals to assume when `--from-token` is a raw 0x address.
+        /// Ignored when `--from-token` is a symbol or omitted (decimals
+        /// are resolved automatically then). USDC/USDT = 6; most ERC-20s
+        /// = 18. Defaults to 6 (the common stablecoin case).
+        #[arg(long, default_value_t = 6, value_name = "N")]
+        from_decimals: u8,
+
+        /// What to acquire on Gnosis: bzz | xdai | both.
+        #[arg(long, default_value = "both", value_name = "TARGET")]
+        to: String,
+
+        /// Origin chain JSON-RPC endpoint. Required — used to broadcast
+        /// the deposit transaction Relay returns and to read the origin
+        /// native-gas balance.
+        #[arg(long = "rpc-url", value_name = "URL")]
+        origin_rpc_url: String,
+
+        /// Gnosis JSON-RPC endpoint, used for the `--to both` xDAI
+        /// balance check. Ignored for `--to bzz` / `--to xdai`.
+        #[arg(
+            long,
+            value_name = "URL",
+            default_value = "https://rpc.gnosischain.com"
+        )]
+        gnosis_rpc_url: String,
+
+        /// Signer private key (hex, 32 bytes). Pays origin gas and signs
+        /// the deposit. Its derived address is the default `--recipient`.
+        #[arg(long, value_name = "HEX")]
+        key: String,
+
+        /// Recipient on Gnosis. Defaults to the signer's address (the
+        /// usual case: fund your own upload key).
+        #[arg(long, value_name = "ADDR")]
+        recipient: Option<String>,
+
+        /// Optional Relay API key. Not required (Relay is permissionless);
+        /// only raises the rate limit.
+        #[arg(long, value_name = "KEY")]
+        api_key: Option<String>,
+
+        /// `--to both`: top up xDAI only when the recipient's balance is
+        /// below this many whole xDAI. Default 1.0.
+        #[arg(long, default_value_t = 1.0, value_name = "XDAI")]
+        xdai_topup_threshold: f64,
+
+        /// `--to both`: how much xDAI (whole units) to acquire when
+        /// topping up. Default 1.0.
+        #[arg(long, default_value_t = 1.0, value_name = "XDAI")]
+        xdai_topup_amount: f64,
+
+        /// Overall timeout (seconds) for each leg's origin-receipt wait
+        /// and Relay fill poll. Default 180.
+        #[arg(long, default_value_t = 180, value_name = "SECS")]
+        bridge_timeout: u64,
+    },
 }
 
 #[cfg(unix)]
@@ -2174,7 +2271,135 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 println!("  create_tx:   0x{}", hex::encode(info.create_tx));
             }
         },
+
+        #[cfg(feature = "bridge")]
+        Commands::Bridge {
+            from_chain,
+            from_token,
+            amount,
+            from_decimals,
+            to,
+            origin_rpc_url,
+            gnosis_rpc_url,
+            key,
+            recipient,
+            api_key,
+            xdai_topup_threshold,
+            xdai_topup_amount,
+            bridge_timeout,
+        } => {
+            use hoverfly::bridge::{
+                BridgeParams, BridgeTarget, RelayClient, TradeType, bridge, chain_id_from_name,
+                resolve_token,
+            };
+
+            let origin_chain_id = chain_id_from_name(&from_chain)
+                .ok_or_else(|| format!("--from-chain: unknown chain '{from_chain}'"))?;
+            let target = BridgeTarget::parse(&to).map_err(|e| format!("{e}"))?;
+
+            let signer: alloy_signer_local::PrivateKeySigner = key
+                .trim_start_matches("0x")
+                .parse()
+                .map_err(|e| format!("--key: {e}"))?;
+            let signer_addr = alloy_signer::Signer::address(&signer);
+
+            let recipient = match recipient {
+                Some(r) => {
+                    let b = parse_address_hex(&r).map_err(|e| format!("--recipient: {e}"))?;
+                    alloy_primitives::Address::from(b)
+                }
+                None => signer_addr,
+            };
+
+            // Resolve --from-token: a bare symbol (e.g. "USDC") is looked
+            // up against Relay's chain token list for both address AND
+            // decimals; a raw 0x address is used verbatim with
+            // --from-decimals; omitted means the native gas token.
+            let relay = RelayClient::new(api_key.clone());
+            let token = resolve_token(
+                &relay,
+                origin_chain_id,
+                from_token.as_deref(),
+                from_decimals,
+            )
+            .await
+            .map_err(|e| format!("--from-token: {e}"))?;
+
+            // Convert whole-unit amounts to smallest-unit U256 via the
+            // resolved decimals.
+            let amount_units: f64 = amount
+                .trim()
+                .parse()
+                .map_err(|e| format!("--amount: bad number '{amount}': {e}"))?;
+            let amount_wire = whole_to_smallest_unit(amount_units, token.decimals)
+                .ok_or_else(|| format!("--amount: '{amount}' out of range"))?;
+
+            let to_wei_18 = |x: f64| -> u128 { (x * 1e18) as u128 };
+
+            let params = BridgeParams {
+                origin_chain_id,
+                origin_currency: token.address,
+                amount: amount_wire,
+                target,
+                recipient,
+                origin_rpc_url,
+                gnosis_rpc_url,
+                trade_type: TradeType::ExactInput,
+                api_key,
+                xdai_topup_threshold_wei: to_wei_18(xdai_topup_threshold),
+                xdai_topup_amount_wei: to_wei_18(xdai_topup_amount),
+                timeout: Duration::from_secs(bridge_timeout),
+            };
+
+            println!(
+                "bridging {} {} (decimals {}) on chain {} -> {} on Gnosis, recipient {} ...",
+                amount,
+                from_token.as_deref().unwrap_or("native"),
+                token.decimals,
+                origin_chain_id,
+                to,
+                recipient
+            );
+            println!("  (Relay is permissionless; this may take a few minutes per leg)");
+
+            let outcome = bridge(&signer, params).await?;
+
+            println!("bridge complete. recipient: {}", outcome.recipient);
+            for leg in &outcome.legs {
+                println!(
+                    "  leg [{}]: ~{} {}",
+                    leg.label, leg.output_formatted, leg.output_symbol
+                );
+                println!("    requestId: {}", leg.request_id);
+                for (i, h) in leg.origin_tx_hashes.iter().enumerate() {
+                    println!("    origin tx {}: 0x{}", i + 1, hex::encode(h));
+                }
+            }
+            println!(
+                "next: hoverfly batch create --rpc-url {} --key <KEY> --size <SIZE> --duration <DURATION>",
+                "https://rpc.gnosischain.com"
+            );
+        }
     }
 
     Ok(())
+}
+
+/// Convert a whole-unit amount (e.g. `2.5` USDC) to its smallest-unit
+/// integer representation given `decimals`. Returns `None` on negative or
+/// non-finite input. Uses string-free f64 math; fine for the precision
+/// the CLI needs (Relay re-quotes exact amounts anyway).
+#[cfg(feature = "bridge")]
+fn whole_to_smallest_unit(whole: f64, decimals: u8) -> Option<alloy_primitives::U256> {
+    if !whole.is_finite() || whole < 0.0 {
+        return None;
+    }
+    // Multiply in f64 then round; for the magnitudes the CLI handles
+    // (< ~10^15 smallest units) this stays well within f64's 2^53 exact
+    // integer range.
+    let scaled = (whole * 10f64.powi(decimals as i32)).round();
+    if !scaled.is_finite() || scaled < 0.0 {
+        return None;
+    }
+    Some(alloy_primitives::U256::from(scaled as u128))
 }

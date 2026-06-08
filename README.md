@@ -65,9 +65,19 @@ hoverfly vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
 
 One-time, CPU-bound (seconds to minutes). The resulting `overlay-nonce` is your Swarm identity together with `--key` — keep it.
 
-### 3. Create a postage batch
+### 3. Obtain xDAI + BZZ on Gnosis
 
-Uploads need a postage stamp batch on-chain. Fund the address from step 1 with a little xDAI (for gas) and some BZZ (for the batch itself), then:
+The address from step 1 needs a little xDAI (for gas) and some BZZ (to fund the batch). The optional `bridge` command obtains both via [Relay](https://docs.relay.link) — for example, from USDC on Base:
+
+```bash
+hoverfly bridge --from-chain base --from-token USDC --amount 3 --to both --rpc-url https://mainnet.base.org --key 0xYOUR_KEY
+```
+
+`--from-token` takes a symbol (resolved to the canonical address automatically) or a raw `0x` address.
+
+### 4. Create a postage batch
+
+Once the address holds xDAI + BZZ:
 
 ```bash
 hoverfly batch create --rpc-url https://rpc.gnosischain.com --key 0xYOUR_KEY --size 2GB --duration 30d
@@ -84,7 +94,7 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 # 200 with a JSON body = ready to use
 ```
 
-### 4. Run the daemon
+### 5. Run the daemon
 
 A long-lived daemon holds a warm session pool across uploads. Filling a 256-session pool takes ~80 s; the daemon pays that once at startup
 instead of on every upload, which is a big win for repeated or one-shot-heavy workloads. For a single upload you can skip this step and pass `--peerlist` directly to `hoverfly upload`.
@@ -99,7 +109,7 @@ The repo ships a curated `peers.seed.json`; the daemon loads it via `--peerlist`
 cp peers.seed.json peers.json
 ```
 
-### 5. Upload
+### 6. Upload
 
 ```bash
 hoverfly upload --daemon /tmp/hoverfly.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
