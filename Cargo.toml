@@ -39,10 +39,10 @@ futures-bounded = { path = "vendor/futures-bounded" }
 
 [dependencies]
 # Nectar primitives (BMT, chunks, file split/join, mantaray, postage)
-nectar-primitives = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386" }
-nectar-mantaray   = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386" }
-nectar-postage    = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386", features = ["std"] }
-nectar-postage-issuer = { git = "https://github.com/nxm-rs/nectar", rev = "650e608636975c476361cc43f4b69d9eae52b386", features = ["std", "local-signer"] }
+nectar-primitives = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2" }
+nectar-mantaray   = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2" }
+nectar-postage    = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2", features = ["std"] }
+nectar-postage-issuer = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2", features = ["std", "local-signer"] }
 
 # alloy crypto (matches nectar's signer)
 alloy-primitives = { version = "1.5.4", default-features = false, features = ["getrandom"] }
