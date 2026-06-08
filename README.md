@@ -6,15 +6,13 @@ Experimental [Swarm][swarm] light client. Works natively and in a browser.
 
 ## Features
 
-- **Light node functionality.** End-to-end content and upload and download.
-- **Static peerlist bootstrap.** Faster peer discovery with cached peer info.
+- **Light node functionality.** End-to-end content upload and download.
+- **Browser-friendly.** Use [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) in a browser.
 - **Collection support.** Upload, download and list content-addressable tarballs.
-- **Onchain postage batch creation.** Single command postage batch issuance, no `bee` needed.
+- **Onchain postage batch creation.** Buy storage straight from the CLI.
 - **One-shot and daemon modes.** Static commands for ease of use, daemon mode for max performance and warm connection pool.
-- **Cross-platform.** Supports WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
-- **JavaScript bindings.** Use [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) in a browser.
+- **Cross-platform.** Compiles to WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
 - **Small size.** 5MB gzipped, 14MB unpacked x86 Linux binary.
-- **Build-provenance attestation.** Each release is signed via SLSA. Verify via `gh attestation verify`.
 - **CI-friendly.** ~400-500KB/s uploads in GitHub Actions.
 
 ## Install
