@@ -520,6 +520,19 @@ enum Commands {
             default_values_t = [MAINNET_BOOTNODE.to_string()],
         )]
         bootnode: Vec<String>,
+
+        /// Skip the pre-pool-fill bootnode discover entirely and warm
+        /// the session pool straight from the saved peerlist. Use this
+        /// when `peers.json` is already populated (the common case for
+        /// a long-running node): it removes the serial discover round
+        /// from the cold-start path, so pool fill begins dialing known
+        /// peers immediately instead of waiting on a recursive hive
+        /// crawl. `--bootnode` is then ignored for the eager fill (the
+        /// background maintenance loop still works off the peerlist).
+        /// On a stale/empty peerlist, prefer leaving discover on (run
+        /// `hoverfly discover` first, or omit this flag).
+        #[arg(long, default_value_t = false)]
+        no_discover: bool,
     },
 
     /// Send a SavePeers request to a running daemon, forcing it to
@@ -1691,6 +1704,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             advertise,
             discover_rounds,
             bootnode,
+            no_discover,
         } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
@@ -1761,17 +1775,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 None => None,
             };
 
-            let doh = Doh::with_url(&cli.doh_url);
-            let bootnodes: Vec<Multiaddr> = bootnode
-                .iter()
-                .map(|s| {
-                    s.parse::<Multiaddr>()
-                        .map_err(|e| format!("invalid --bootnode multiaddr {s}: {e}"))
-                })
-                .collect::<Result<_, _>>()?;
-            if bootnodes.is_empty() {
-                return Err("at least one --bootnode is required".into());
-            }
+            // When `--no-discover` is set, the daemon warms its session
+            // pool straight from the saved peerlist and skips the
+            // pre-fill bootnode discover. `--bootnode` is then ignored
+            // for the eager fill (we don't even resolve it). Otherwise
+            // we require at least one bootnode and pass DoH + bootnodes
+            // through so `ensure_pool` runs the discover before fill.
+            let discover = if no_discover {
+                None
+            } else {
+                let doh = Doh::with_url(&cli.doh_url);
+                let bootnodes: Vec<Multiaddr> = bootnode
+                    .iter()
+                    .map(|s| {
+                        s.parse::<Multiaddr>()
+                            .map_err(|e| format!("invalid --bootnode multiaddr {s}: {e}"))
+                    })
+                    .collect::<Result<_, _>>()?;
+                if bootnodes.is_empty() {
+                    return Err(
+                        "at least one --bootnode is required (or pass --no-discover)".into(),
+                    );
+                }
+                Some((doh, bootnodes))
+            };
             hoverfly::daemon::run(
                 socket,
                 peerlist,
@@ -1781,7 +1808,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 Duration::from_secs(cli.timeout),
                 listen_cfg,
                 swap_cfg.clone(),
-                Some((doh, bootnodes)),
+                discover,
                 Some(cli.nonce_file.clone()),
                 discover_rounds,
             )

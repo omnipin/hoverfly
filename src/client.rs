@@ -3936,15 +3936,38 @@ async fn open_session_pool_filtered(
         })
         .collect();
     spread_across_address_space(&mut all);
-    // Peers that failed hard within their backoff window (rank 3) sink to
-    // the very back of the dial parade so the initial dial window isn't
-    // spent waiting on known-dead hosts' timeouts; rank 0-2 keep their
-    // quality-aware, address-spread order from `spread_across_address_space`.
-    let (fresh, stale): (Vec<_>, Vec<_>) =
-        all.into_iter().partition(|&(_, _, _, rank, _)| rank < 3);
-    let candidates: Vec<(SwarmAddress, String, Multiaddr)> = fresh
+    // Front-load by reachability rank, then keep the address-space spread
+    // *within* each rank tier. `dial_rank` is: 0 = recent success,
+    // 1 = never tried (or a stale failure past its backoff, worth a retry),
+    // 2 = soft failure (in backoff), 3 = hard failure (>=3 consecutive).
+    //
+    // A *stable* sort by rank preserves the PO-bin round-robin order that
+    // `spread_across_address_space` just produced, so each tier is still
+    // spread across the address space — we just dial all known-live peers
+    // before any never-tried one, never-tried before soft-failed, and
+    // soft-failed before hard-failed. This is what lets a warm pool fill
+    // hit its first N sessions almost entirely on recent-success peers
+    // (fast RTT, no dial-timeout gambles) instead of interleaving cold
+    // candidates into the initial dial window.
+    //
+    // Rank 0 additionally tiebreaks on last-seen RTT (field 4, ms, lower
+    // is faster) so the very front of the parade is the fastest known-live
+    // peers. The address spread within rank 0 is mostly preserved because
+    // RTT rarely ties; if it ever fully sorted away the spread we'd lose
+    // bin coverage, but rank-0 peers are by definition reachable, so any
+    // of them opens a session quickly regardless of proximity.
+    all.sort_by(|a, b| {
+        a.3.cmp(&b.3) // primary: rank ascending (0 best)
+            .then_with(|| {
+                if a.3 == 0 {
+                    a.4.cmp(&b.4) // rank 0 only: faster RTT first
+                } else {
+                    std::cmp::Ordering::Equal // keep spread order for other ranks
+                }
+            })
+    });
+    let candidates: Vec<(SwarmAddress, String, Multiaddr)> = all
         .into_iter()
-        .chain(stale.into_iter())
         .map(|(o, hex, u, _, _)| (o, hex, u))
         .collect();
     if candidates.is_empty() {
