@@ -1936,6 +1936,183 @@ pub fn collection_root(
     Ok((manifest_root, seen.len()))
 }
 
+/// Compute the full set of unique chunk addresses a `*.tar`-style
+/// collection splits into, including the manifest chunks — i.e. exactly
+/// the set [`upload_collection`] would push. No network, key, or stamping.
+pub fn collection_chunk_addresses(
+    files: &[UploadFile],
+    index_document: Option<&str>,
+    error_document: Option<&str>,
+) -> Result<Vec<[u8; 32]>, ClientError> {
+    use crate::manifest::CollectionEntry;
+
+    if files.is_empty() {
+        return Err(ClientError::Manifest("collection is empty".into()));
+    }
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
+    for f in files {
+        let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        for (addr, _chunk) in file_store.into_chunks() {
+            let mut a = [0u8; 32];
+            a.copy_from_slice(addr.as_bytes());
+            seen.insert(a);
+        }
+        entries.push(CollectionEntry {
+            path: f.path.clone(),
+            reference: file_root,
+            content_type: f.content_type.clone(),
+        });
+    }
+    let (_root, manifest_chunks) =
+        crate::manifest::build_collection_manifest(&entries, index_document, error_document)
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
+    for (addr, _wire) in manifest_chunks.iter() {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(addr.as_bytes());
+        seen.insert(a);
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Compute the full set of unique chunk addresses a single file splits
+/// into (the bare content chunks, no manifest). No network or key.
+pub fn file_chunk_addresses(data: &[u8]) -> Result<Vec<[u8; 32]>, ClientError> {
+    let (_root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    for (addr, _chunk) in store.into_chunks() {
+        let mut a = [0u8; 32];
+        a.copy_from_slice(addr.as_bytes());
+        seen.insert(a);
+    }
+    Ok(seen.into_iter().collect())
+}
+
+/// Per-chunk proximity-coverage of a peer set (drives `discover --for-file`).
+#[derive(Debug, Clone)]
+pub struct CoverageReport {
+    pub total_chunks: usize,
+    /// `best_po_histogram[p]` = number of chunks whose closest peer is at
+    /// exactly proximity order `p` (index 0..=MAX_PO).
+    pub best_po_histogram: Vec<usize>,
+    /// Chunks with NO peer at or above `min_po`.
+    pub undercovered: usize,
+    pub min_po: u8,
+}
+
+impl CoverageReport {
+    /// Fraction of chunks that have at least one peer at PO >= `min_po`.
+    pub fn covered_fraction(&self) -> f64 {
+        if self.total_chunks == 0 {
+            return 1.0;
+        }
+        (self.total_chunks - self.undercovered) as f64 / self.total_chunks as f64
+    }
+}
+
+/// Compute how well `peer_overlays` covers `chunk_addrs` in proximity space.
+/// For each chunk we take the max proximity order to any peer overlay; a chunk
+/// is "covered" when that best PO >= `min_po`. Pure CPU, no I/O.
+pub fn analyze_coverage(
+    chunk_addrs: &[[u8; 32]],
+    peer_overlays: &[[u8; 32]],
+    min_po: u8,
+) -> CoverageReport {
+    use crate::transport::proximity;
+    let max_po = crate::transport::MAX_PO;
+    let mut hist = vec![0usize; (max_po as usize) + 1];
+    let mut undercovered = 0usize;
+    for chunk in chunk_addrs {
+        let mut best: u8 = 0;
+        let mut found = false;
+        for overlay in peer_overlays {
+            let po = proximity(overlay, chunk);
+            if !found || po > best {
+                best = po;
+                found = true;
+            }
+        }
+        if found {
+            hist[best as usize] += 1;
+            if best < min_po {
+                undercovered += 1;
+            }
+        } else {
+            undercovered += 1;
+        }
+    }
+    CoverageReport {
+        total_chunks: chunk_addrs.len(),
+        best_po_histogram: hist,
+        undercovered,
+        min_po,
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    #[test]
+    fn proximity_extremes_and_threshold() {
+        let chunk = [0xAAu8; 32];
+        // Exact match -> PO 31 (MAX_PO).
+        let exact = chunk;
+        // Fully opposite -> PO 0.
+        let far = [0x55u8; 32];
+        let r = analyze_coverage(&[chunk], &[exact, far], 8);
+        assert_eq!(r.total_chunks, 1);
+        assert_eq!(r.undercovered, 0, "exact-match peer covers it");
+        assert_eq!(r.best_po_histogram[crate::transport::MAX_PO as usize], 1);
+        assert_eq!(r.covered_fraction(), 1.0);
+
+        // Only a far peer -> undercovered at PO>=8.
+        let r2 = analyze_coverage(&[chunk], &[far], 8);
+        assert_eq!(r2.undercovered, 1);
+        assert!(r2.covered_fraction() < 1.0);
+    }
+
+    #[test]
+    fn empty_chunks_is_fully_covered() {
+        let r = analyze_coverage(&[], &[[0u8; 32]], 8);
+        assert_eq!(r.covered_fraction(), 1.0);
+    }
+
+    #[test]
+    fn best_po_bins_at_shared_leading_bits() {
+        // A peer sharing exactly N leading bits with the chunk lands at PO N.
+        // chunk = all zeros; peer differs first at bit 10 (byte 1, bit 0x20)
+        // => 10 shared leading bits => PO 10.
+        let chunk = [0u8; 32];
+        let mut peer = [0u8; 32];
+        peer[1] = 0x20; // bits: byte0 = 00000000 (8 shared), byte1 = 00100000
+        //               first differing bit is bit index 10 -> PO 10
+        let r = analyze_coverage(&[chunk], &[peer], 8);
+        assert_eq!(
+            r.best_po_histogram[10], 1,
+            "peer sharing 10 leading bits should bin at PO 10, got {:?}",
+            r.best_po_histogram
+        );
+        assert_eq!(r.undercovered, 0, "PO 10 >= min_po 8");
+        // Same peer but a stricter threshold marks it under-covered.
+        let r2 = analyze_coverage(&[chunk], &[peer], 12);
+        assert_eq!(r2.undercovered, 1, "PO 10 < min_po 12");
+    }
+
+    #[test]
+    fn picks_closest_among_multiple_peers() {
+        let chunk = [0u8; 32];
+        let near = chunk; // PO 31
+        let mut mid = [0u8; 32];
+        mid[0] = 0x01; // differs at bit 7 -> PO 7
+        let far = [0xFFu8; 32]; // PO 0
+        // best PO must be the max (the exact peer), not the mid/far ones.
+        let r = analyze_coverage(&[chunk], &[far, mid, near], 8);
+        assert_eq!(r.best_po_histogram[crate::transport::MAX_PO as usize], 1);
+        assert_eq!(r.undercovered, 0);
+    }
+}
+
 pub fn prepare_upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,

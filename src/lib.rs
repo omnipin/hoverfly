@@ -48,8 +48,9 @@ pub use nectar_primitives::{
 };
 
 pub use client::{
-    ClientError, ManifestEntry, SessionPool, StampedChunk, UploadFile, bmt_root, collection_root,
-    discover, fetch_bytes, fetch_manifest_path, list_manifest, prepare_upload_bytes,
+    ClientError, CoverageReport, ManifestEntry, SessionPool, StampedChunk, UploadFile,
+    analyze_coverage, bmt_root, collection_chunk_addresses, collection_root, discover, fetch_bytes,
+    fetch_manifest_path, file_chunk_addresses, list_manifest, prepare_upload_bytes,
     push_chunks_with_pool, upload_bytes, upload_collection,
 };
 pub use peers::{Peer, PeerStore};

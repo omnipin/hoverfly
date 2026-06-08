@@ -233,6 +233,21 @@ enum Commands {
         /// directly (e.g. `apps/gateway/public/__gw__/peers.ws.json`).
         #[arg(long)]
         ws_only: bool,
+
+        /// Proximity-targeted discovery: after the crawl, analyze how well the
+        /// discovered peer set covers the chunk-address space of this file (or
+        /// `*.tar` collection), reported per proximity-order bin. Chunk
+        /// addresses are derived locally (same split as `upload`); no upload
+        /// occurs. Under-covered chunks have no nearby storer, so they push to
+        /// far peers (pricier, exhaust free settlement) — the throughput wall.
+        /// If coverage is poor, raise `--rounds`.
+        #[arg(long, value_name = "FILE")]
+        for_file: Option<PathBuf>,
+
+        /// (With `--for-file`) Proximity order at/above which a chunk counts as
+        /// covered by a peer. Defaults to 8 (a typical bee neighborhood depth).
+        #[arg(long, default_value_t = 8, value_name = "PO")]
+        min_po: u8,
     },
 
     /// Fetch content addressed by a 32-byte hex root hash.
@@ -841,6 +856,38 @@ fn guess_content_type(path: &str) -> Option<String> {
 /// quantity `time` would report for `real`, but printed by the
 /// binary so it can survive `> file` redirection without bash
 /// timing-output going to stderr.
+/// Print a human-readable proximity-coverage report (see
+/// [`hoverfly::client::analyze_coverage`]).
+fn print_coverage_report(report: &hoverfly::CoverageReport) {
+    let pct = report.covered_fraction() * 100.0;
+    println!(
+        "coverage @ PO>={}: {:.1}% ({} of {} chunks have a peer this close; {} under-covered)",
+        report.min_po,
+        pct,
+        report.total_chunks - report.undercovered,
+        report.total_chunks,
+        report.undercovered,
+    );
+    let parts: Vec<String> = report
+        .best_po_histogram
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| **n > 0)
+        .map(|(po, n)| format!("{po}:{n}"))
+        .collect();
+    if !parts.is_empty() {
+        println!("  best-PO histogram (po:chunks): {}", parts.join(" "));
+    }
+    if report.undercovered > 0 {
+        eprintln!(
+            "note: {} chunk(s) lack a peer at PO>={}. They push to far peers \
+             (pricier, more likely to exhaust a peer's free settlement allowance). \
+             Re-run with a higher --rounds to densify coverage.",
+            report.undercovered, report.min_po,
+        );
+    }
+}
+
 fn print_upload_throughput(bytes: usize, elapsed: std::time::Duration) {
     let secs = elapsed.as_secs_f64();
     if secs <= 0.0 || bytes == 0 {
@@ -1117,7 +1164,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             healthcheck,
             healthcheck_concurrency,
             ws_only,
+            for_file,
+            min_po,
         } => {
+            // Derive the target chunk-address set up-front (fail fast on a bad
+            // file before spending time on a network crawl).
+            let target_chunks: Option<Vec<[u8; 32]>> = match for_file.as_ref() {
+                Some(path) => {
+                    let data = std::fs::read(path)?;
+                    let is_tar = path
+                        .extension()
+                        .and_then(|s| s.to_str())
+                        .map(|s| s.eq_ignore_ascii_case("tar"))
+                        .unwrap_or(false);
+                    let addrs = if is_tar {
+                        let files = read_tar_files(&data)?;
+                        if files.is_empty() {
+                            return Err("tar archive contains no regular files".into());
+                        }
+                        hoverfly::client::collection_chunk_addresses(
+                            &files,
+                            Some("index.html"),
+                            None,
+                        )?
+                    } else {
+                        hoverfly::client::file_chunk_addresses(&data)?
+                    };
+                    println!(
+                        "proximity target: {} ({} unique chunks, min PO {})",
+                        path.display(),
+                        addrs.len(),
+                        min_po
+                    );
+                    Some(addrs)
+                }
+                None => None,
+            };
+
             let signer = SwarmSigner::random(cli.network_id);
             let transport = Transport::new(signer, cfg);
             let bootstrap: Multiaddr = peer.parse()?;
@@ -1194,6 +1277,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
             store.save(&output)?;
             println!("wrote {} peers to {}", store.len(), output.display());
+
+            // Proximity-targeted report: how well does the discovered set cover
+            // this file's chunk-address space?
+            if let Some(chunks) = target_chunks {
+                let overlays: Vec<[u8; 32]> =
+                    store.iter().filter_map(|p| p.overlay_bytes()).collect();
+                let report = hoverfly::client::analyze_coverage(&chunks, &overlays, min_po);
+                print_coverage_report(&report);
+            }
         }
 
         Commands::Fetch {
