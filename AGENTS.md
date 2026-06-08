@@ -54,6 +54,12 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
 Both require `--features cli` (default). The `cli` feature gates `clap`,
 `tracing-subscriber`, `tar`, and `indicatif`.
 
+The `bridge` feature (default-on) gates the optional `hoverfly bridge`
+subcommand and `src/bridge.rs`. Compile it out with `--no-default-features
+--features cli`. It adds no new dependencies (reuses the reqwest + alloy
+signing stack already pulled in for `batch.rs`) and is native-only
+(`#[cfg(all(not(target_arch = "wasm32"), feature = "bridge"))]`).
+
 ## Tests / verification
 
 There is no test suite. `dev-dependencies = tokio-test` exists but no
@@ -125,6 +131,22 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   `status` responder is inbound-only; bee's `pkg/salud` probes us
   via `/swarm/status/1.1.0/status` to decide whether to mark us
   Healthy in its kademlia metrics collector.
+- `src/bridge.rs` — `#[cfg(all(not(target_arch = "wasm32"), feature =
+  "bridge"))]`. The *second* RPC-touching module (alongside `batch.rs`),
+  feature-gated and native-only. Funds the signer's Gnosis address with
+  xDAI + BZZ from another chain via the permissionless Relay REST API
+  (`POST /quote/v2` → broadcast the returned origin-chain deposit tx(s) →
+  poll `/intents/status/v3` until the solver fills on Gnosis). Signs
+  **type-2 (EIP-1559)** origin txs (`sign_eip1559_tx`), unlike `batch.rs`'
+  legacy type-0 — the L2 origins return 1559 fee fields. `--to both` uses
+  the Beeport pattern: conditional xDAI gas top-up (only when the
+  recipient is below threshold) followed by a BZZ swap, so it's one origin
+  swap in the common case and two when a top-up is needed. No API key
+  required (Relay is permissionless). `--from-token` accepts a bare symbol
+  (e.g. `USDC`), resolved to the canonical address + decimals via Relay's
+  `/chains` token list (`resolve_token`); a raw `0x` address is used
+  verbatim with `--from-decimals`; omitted = native gas token. Verified
+  end-to-end on Base→Gnosis mainnet (both address and symbol forms).
 - `src/cheques.rs` — `#[cfg(not(target_arch = "wasm32"))]`. JSON-backed
   per-peer cumulative-payout sidecar (`cheques.json`). Required to
   persist across CLI runs because bee rejects non-strictly-increasing

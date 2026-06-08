@@ -21,8 +21,15 @@ path = "src/bin/sigcheck.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli"]
+default = ["cli", "bridge"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:tar", "dep:indicatif"]
+# Optional cross-chain bridge command (`hoverfly bridge`): fund the
+# signer's address with xDAI + BZZ on Gnosis from another chain via the
+# Relay API (https://docs.relay.link). On by default; compile it out with
+# `--no-default-features --features cli`. Native-only (reuses reqwest +
+# the alloy signing stack already pulled in for `batch.rs`); adds no new
+# dependencies.
+bridge = []
 
 # Redirect futures-bounded to a vendored copy whose `Delay::tokio` falls back to
 # futures-timer on wasm32 (real tokio's timer panics in the browser). Fixes the
