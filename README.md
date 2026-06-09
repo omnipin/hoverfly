@@ -86,8 +86,9 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 
 ### 4. Run the daemon
 
-A long-lived daemon holds a warm session pool across uploads. Filling a 256-session pool takes ~80 s; the daemon pays that once at startup
-instead of on every upload, which is a big win for repeated or one-shot-heavy workloads. For a single upload you can skip this step and pass `--peerlist` directly to `hoverfly upload`.
+A long-lived daemon holds a warm session pool across uploads, so it pays the pool-fill cost once at startup instead of on every upload — a big win for repeated or one-shot-heavy workloads. For a single upload you can skip this step and pass `--peerlist` directly to `hoverfly upload`.
+
+Startup cost depends on how warm the peerlist is. On a cold or stale `peers.json` the daemon runs a bootnode discover round before filling the pool; on a warm one (enough recently-reachable peers) it skips discover automatically and fills straight from the peerlist, opening the pool in well under a second. The daemon persists reachability observations on shutdown, so a node that has run before restarts warm.
 
 ```bash
 hoverfly daemon --socket /tmp/hoverfly.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
