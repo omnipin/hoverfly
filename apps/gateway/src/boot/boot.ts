@@ -27,7 +27,12 @@ async function main (): Promise<void> {
       }
       return
     }
-    console.log('[boot] MSG from', e.origin, 'type=', e.data?.type, 'src?', e.source === window ? 'self' : 'other')
+    // Only log messages that carry a recognizable type. The content site (and
+    // its libraries) post plenty of internal, typeless self-messages; logging
+    // every one floods the console (esp. since syncHead polls on an interval).
+    if (e.data?.type != null) {
+      console.log('[boot] MSG from', e.origin, 'type=', e.data.type, 'src?', e.source === window ? 'self' : 'other')
+    }
   })
   console.log('[boot] shell start', location.href)
   const ui = renderShell()
@@ -167,22 +172,145 @@ function renderShell (): ShellUi {
     setTimeout(() => pill.classList.add('gw-min'), 1500)
   }
 
-  // Dismiss the overlay as soon as the site's document has parsed and its entry
-  // scripts have run (DOMContentLoaded ⇒ readyState 'interactive'), NOT on the
-  // full `load` event. Images and other late subresources are retrieved from
-  // Swarm chunk-by-chunk and can lag badly or never arrive; `load` waits for
-  // all of them, so gating on it leaves the overlay stuck over an already
-  // interactive page. `load` still acts as a happy-path accelerator, and a hard
-  // cap guards against a wholly stalled navigation.
+  // Mirror the content iframe's <title> onto the top document so the browser
+  // tab/titlebar shows the SITE's title, not the shell's static "Loading…"
+  // placeholder. The tab only ever reflects the top-level document's title, and
+  // the real site renders in a child iframe whose title never propagates — so
+  // without this the tab is stuck on the boot placeholder forever. The content
+  // frame is same-origin (<cid>.bzz.host, like the shell), so we can read its
+  // title; client-side route changes (VitePress et al. are SPAs) update the
+  // child's title, so we re-sync on an interval and via a MutationObserver.
+  const syncTitle = (): void => {
+    try {
+      const doc = frame.contentDocument
+      if (doc == null || (doc.URL ?? 'about:').startsWith('about:')) return
+      const t = doc.title.trim()
+      if (t !== '' && t !== document.title) document.title = t
+    } catch { /* cross-origin or transiently inaccessible — leave the tab title as-is */ }
+  }
+
+  // Mirror the content iframe's favicon onto the top document, same rationale as
+  // the title: the tab icon reflects the TOP document (the boot shell), whose
+  // hardcoded /__gw__/favicon.svg is meant only as a fallback while loading. The
+  // real site's <link rel="icon"> lives in the child iframe and the browser
+  // ignores it for the tab, so the gateway icon would otherwise never give way
+  // to the site's own. We lazily create a dedicated top-document <link> the
+  // first time the site declares an icon, so the shell's fallback icon stays put
+  // when a site ships none (rather than blanking the tab).
+  let currentIconHref = ''
+  const syncIcon = (): void => {
+    try {
+      const doc = frame.contentDocument
+      if (doc == null || (doc.URL ?? 'about:').startsWith('about:')) return
+      // Only adopt an icon the site EXPLICITLY declares. We don't probe
+      // /favicon.ico: the content SW answers that with a 204 (see sw.ts), so
+      // adopting it would blank the tab instead of keeping the shell fallback.
+      const link = doc.querySelector<HTMLLinkElement>('link[rel~="icon"]')
+      const href = link?.href ?? ''
+      if (href === '' || href === currentIconHref) return
+      currentIconHref = href
+
+      // Chrome only re-reads the tab favicon when an icon <link> is (re)inserted
+      // into <head>; mutating an existing link's .href is silently ignored. So
+      // we remove ALL existing icon links (the shell fallback + any prior site
+      // icon we added) and append a freshly-created node every time the href
+      // changes, which reliably forces a re-evaluation.
+      document.head.querySelectorAll('link[rel~="icon"], link[rel="apple-touch-icon"], link[rel="mask-icon"]')
+        .forEach((el) => el.remove())
+      const fresh = document.createElement('link')
+      fresh.rel = 'icon'
+      if (link?.type != null && link.type !== '') fresh.type = link.type
+      fresh.href = href
+      document.head.appendChild(fresh)
+    } catch { /* cross-origin or transiently inaccessible — keep the fallback icon */ }
+  }
+
+  const syncHead = (): void => { syncTitle(); syncIcon() }
+  const watchHead = (): void => {
+    syncHead()
+    // Prefer a <head> MutationObserver for instant, event-driven title/icon
+    // updates (incl. SPA client-side navigations). Only if we can't attach one
+    // (head not ready yet, or cross-origin) do we fall back to polling — and we
+    // poll just long enough for the head to become observable, then stop, so we
+    // don't run a 1s interval for the life of the page.
+    let observing = false
+    const tryObserve = (): boolean => {
+      if (observing) return true
+      try {
+        const head = frame.contentDocument?.head
+        if (head != null) {
+          new MutationObserver(syncHead).observe(head, { subtree: true, childList: true, characterData: true })
+          observing = true
+        }
+      } catch { /* cross-origin: stay on the poll fallback */ }
+      return observing
+    }
+    if (!tryObserve()) {
+      let ticks = 0
+      const poll = setInterval(() => {
+        syncHead()
+        // Stop once observing, or after ~30s (a frame we still can't observe by
+        // then is cross-origin/unreadable, so further polling is pointless).
+        if (tryObserve() || ++ticks > 30) clearInterval(poll)
+      }, 1000)
+    }
+  }
+
+  // True once the iframe document has parsed AND every render-blocking
+  // stylesheet it declares has actually loaded. We deliberately do NOT wait for
+  // the full `load` event: images and other late subresources are retrieved
+  // from Swarm chunk-by-chunk and can lag badly or never arrive, so `load`
+  // would leave the overlay stuck over an already-usable page.
+  //
+  // But `interactive`/DOMContentLoaded alone is too early HERE: unlike a normal
+  // origin server, this gateway serves CSS over the same slow Swarm-via-daemon
+  // path as everything else, so at DOMContentLoaded the stylesheets are
+  // typically still in flight. Revealing then shows parsed-but-unstyled (blank)
+  // HTML. So we additionally require all <link rel="stylesheet"> elements to be
+  // resolved. A stylesheet link exposes a non-null `.sheet` once it has loaded
+  // and parsed; it stays null while pending. A link that errored fires `load`'s
+  // sibling `error` and its `.sheet` stays null forever — we treat a link as
+  // "resolved" if its sheet is present OR it has finished (load/error) so a
+  // 404'd stylesheet can't wedge the overlay open.
+  const stylesheetsReady = (doc: Document): boolean => {
+    const links = Array.from(doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"]'))
+    return links.every((link) => {
+      if (link.disabled) return true
+      try { if (link.sheet != null) return true } catch { /* cross-origin sheet: treat via settled flag below */ }
+      // `settled` is stamped by the per-link load/error listeners attached in
+      // watchContentReady; absent that, fall back to "not ready yet".
+      return (link as HTMLLinkElement & { __gwSettled?: boolean }).__gwSettled === true
+    })
+  }
+
+  // Poll the iframe document until it's parsed and its stylesheets have loaded,
+  // then reveal. `load` still acts as a happy-path accelerator, and a hard cap
+  // guards against a wholly stalled navigation (e.g. a stylesheet that never
+  // arrives from Swarm).
   const watchContentReady = (): void => {
     const started = Date.now()
+    const tracked = new WeakSet<HTMLLinkElement>()
     const poll = setInterval(() => {
       let ready = false
       try {
         const doc = frame.contentDocument
         const rs = doc?.readyState
         // Ignore the initial about:blank document still present mid-navigation.
-        ready = !(doc?.URL ?? '').startsWith('about:') && (rs === 'interactive' || rs === 'complete')
+        const docReady = doc != null && !(doc.URL ?? '').startsWith('about:') &&
+          (rs === 'interactive' || rs === 'complete')
+        if (docReady && doc != null) {
+          // Attach one-shot load/error listeners to any stylesheet links we
+          // haven't seen yet, so an errored sheet is recorded as settled and
+          // can't hold the overlay open indefinitely.
+          for (const link of doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"]')) {
+            if (tracked.has(link)) continue
+            tracked.add(link)
+            const mark = (): void => { (link as HTMLLinkElement & { __gwSettled?: boolean }).__gwSettled = true }
+            link.addEventListener('load', mark, { once: true })
+            link.addEventListener('error', mark, { once: true })
+          }
+          ready = stylesheetsReady(doc)
+        }
       } catch { ready = false } // transiently inaccessible while navigating
       if (ready) {
         clearInterval(poll)
@@ -194,7 +322,16 @@ function renderShell (): ShellUi {
     }, 150)
   }
 
-  frame.addEventListener('load', () => { if (contentRequested) reveal() })
+  // The full `load` event is the happy path: by then stylesheets are loaded
+  // too. Guard against the intermediate about:blank document whose `load` fires
+  // before the real navigation commits — revealing then would dismiss the
+  // overlay over a blank frame.
+  frame.addEventListener('load', () => {
+    if (!contentRequested) return
+    let realDoc = false
+    try { realDoc = !(frame.contentDocument?.URL ?? 'about:').startsWith('about:') } catch { realDoc = true }
+    if (realDoc) { reveal(); syncHead() }
+  })
 
   return {
     loadContent (path) {
@@ -202,6 +339,7 @@ function renderShell (): ShellUi {
       loadingText.textContent = 'Loading Swarm site…'
       frame.src = path
       watchContentReady()
+      watchHead()
     },
     phase (primary, sub) {
       loadingText.textContent = primary

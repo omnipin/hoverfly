@@ -170,6 +170,16 @@ h1{font-size:1.1rem;margin:0 0 .5rem} code{color:#7ee787;word-break:break-all} .
 function isolation (headers: Headers): void {
   headers.set('cross-origin-embedder-policy', 'require-corp')
   headers.set('cross-origin-resource-policy', 'same-origin')
+  // Allow CORS-mode requests to succeed. Even same-origin subresources fetched
+  // with `crossorigin` (e.g. Next.js self-hosted fonts emit
+  // `<link rel="preload" as="font" crossorigin="anonymous">`) are issued in
+  // CORS mode, and under COEP: require-corp a CORS-mode response with no
+  // Access-Control-Allow-Origin is a CORS failure — which silently breaks font
+  // loading / framework hydration and leaves the page blank/unstyled. Swarm
+  // content is public and content-addressed, so `*` is safe. `crossorigin`
+  // without a value (or ="anonymous") is an uncredentialed request, so `*` is
+  // accepted (it would only be rejected for credentialed requests).
+  headers.set('access-control-allow-origin', '*')
 }
 
 function escapeHtml (s: string): string {
