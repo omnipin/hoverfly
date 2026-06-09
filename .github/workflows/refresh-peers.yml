@@ -1,0 +1,116 @@
+name: refresh-peers
+
+# Periodically rebuild peers.seed.json by running `hoverfly discover`
+# against the mainnet bootnode for several recursive rounds, with a
+# reachability healthcheck so the dial-cache fields (last_dial_*,
+# consecutive_failures) are populated. Discovered peers whose underlays
+# are all unroutable (RFC1918/CGNAT/loopback) are already stripped by
+# `discover` itself; the healthcheck annotates (does NOT drop) the rest.
+
+on:
+  schedule:
+    # Every 5 hours (00:00, 05:00, 10:00, 15:00, 20:00 UTC).
+    - cron: "0 */5 * * *"
+  # Allow manual runs from the Actions tab.
+  workflow_dispatch:
+    inputs:
+      rounds:
+        description: "Number of recursive discovery hops"
+        required: false
+        default: "5"
+      discover_concurrency:
+        description: "Peers dialed in parallel per round"
+        required: false
+        default: "256"
+
+# Only one refresh at a time; cancel an in-flight run if a newer one starts.
+concurrency:
+  group: refresh-peers
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # Discover (5 rounds) + healthcheck against thousands of peers can run
+    # a while; cap generously so a slow network round doesn't hang forever.
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download latest hoverfly release binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TARGET: x86_64-unknown-linux-gnu
+        run: |
+          set -euo pipefail
+          # Resolve the latest (non-draft, non-prerelease) release tag.
+          tag="$(gh release view --repo "${{ github.repository }}" --json tagName -q .tagName)"
+          echo "Latest release: $tag"
+          asset="hoverfly-${tag}-${TARGET}.tar.gz"
+          echo "Fetching asset: $asset"
+          gh release download "$tag" \
+            --repo "${{ github.repository }}" \
+            --pattern "$asset" \
+            --pattern "${asset}.sha256" \
+            --clobber
+          # Verify checksum (the .sha256 references the bare filename).
+          sha256sum -c "${asset}.sha256"
+          # Extract; the tarball wraps the binary in a dir named after the
+          # full target triple. Pull the `hoverfly` binary out regardless of
+          # the wrapping directory name.
+          tar -xzf "$asset"
+          bin_path="$(find . -type f -name hoverfly -perm -u+x | head -n1)"
+          if [ -z "$bin_path" ]; then
+            # Fallback for tarballs that don't preserve the +x bit.
+            bin_path="$(find . -type f -name hoverfly | head -n1)"
+          fi
+          install -m 0755 "$bin_path" /usr/local/bin/hoverfly
+          hoverfly --version
+
+      - name: Run discover (5 rounds, with healthcheck)
+        env:
+          ROUNDS: ${{ github.event.inputs.rounds || '5' }}
+          DISCOVER_CONCURRENCY: ${{ github.event.inputs.discover_concurrency || '256' }}
+        run: |
+          set -euo pipefail
+          # Write to a temp file so a failed/partial run never clobbers the
+          # committed seed. `--healthcheck` populates the reachability cache
+          # (last_dial_success_unix / last_dial_failure_unix / rtt / failures)
+          # but keeps every peer in the list (annotate, not drop).
+          hoverfly discover \
+            --output peers.seed.next.json \
+            --rounds "$ROUNDS" \
+            --discover-concurrency "$DISCOVER_CONCURRENCY" \
+            --healthcheck
+
+          # Sanity: the run must have produced a non-trivial peerlist before
+          # we replace the committed file. Bail (without committing) if the
+          # network round came back nearly empty — better to keep the old
+          # seed than to commit a degenerate one.
+          count="$(python3 -c 'import json,sys; print(len(json.load(open("peers.seed.next.json")).get("peers",{})))')"
+          echo "Discovered peer count: $count"
+          if [ "$count" -lt 500 ]; then
+            echo "::warning::Only $count peers discovered (<500); keeping existing seed and exiting without commit."
+            exit 0
+          fi
+          mv -f peers.seed.next.json peers.seed.json
+
+      - name: Commit refreshed peers.seed.json
+        run: |
+          set -euo pipefail
+          # If the discover step bailed early the temp file may still exist
+          # and peers.seed.json is unchanged — `git diff` handles that.
+          rm -f peers.seed.next.json
+          if git diff --quiet -- peers.seed.json; then
+            echo "peers.seed.json unchanged; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add peers.seed.json
+          git commit -m "chore(peers): refresh peers.seed.json [skip ci]"
+          git push
