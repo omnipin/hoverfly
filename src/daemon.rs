@@ -416,9 +416,13 @@ pub async fn run(
     }
 
     // Persist the peerlist before exiting so reachability observations
-    // collected during the daemon's lifetime aren't lost.
-    let peers = state.peers.read().await;
-    apply_log(&mut peers.clone(), state.transport.reachability_log());
+    // collected during the daemon's lifetime aren't lost. Take a write
+    // lock and apply the reachability log *in place* before saving — an
+    // earlier version applied it to a throwaway `peers.clone()` and then
+    // saved the un-updated original, silently dropping every dial result
+    // learned during the session. Mirror the `SavePeers` handler.
+    let mut peers = state.peers.write().await;
+    apply_log(&mut peers, state.transport.reachability_log());
     if let Err(e) = peers.save(&state.peerlist_path) {
         warn!(target: "hoverfly::daemon", "failed to save peerlist on shutdown: {}", e);
     }
@@ -615,8 +619,7 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
     let skip_discover = {
         let peers = state.peers.read().await;
         let now = crate::peers::now_unix();
-        let warm = peers
-            .fresh_known_good_count(now, crate::peers::KNOWN_GOOD_FRESHNESS_SECS);
+        let warm = peers.fresh_known_good_count(now, crate::peers::KNOWN_GOOD_FRESHNESS_SECS);
         if warm >= crate::peers::WARM_PEERLIST_MIN_KNOWN_GOOD {
             info!(target: "hoverfly::daemon",
                 "peerlist is warm ({warm} fresh known-good peer(s) ≥ {}); \
