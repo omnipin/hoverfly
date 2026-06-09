@@ -416,9 +416,13 @@ pub async fn run(
     }
 
     // Persist the peerlist before exiting so reachability observations
-    // collected during the daemon's lifetime aren't lost.
-    let peers = state.peers.read().await;
-    apply_log(&mut peers.clone(), state.transport.reachability_log());
+    // collected during the daemon's lifetime aren't lost. Take a write
+    // lock and apply the reachability log *in place* before saving — an
+    // earlier version applied it to a throwaway `peers.clone()` and then
+    // saved the un-updated original, silently dropping every dial result
+    // learned during the session. Mirror the `SavePeers` handler.
+    let mut peers = state.peers.write().await;
+    apply_log(&mut peers, state.transport.reachability_log());
     if let Err(e) = peers.save(&state.peerlist_path) {
         warn!(target: "hoverfly::daemon", "failed to save peerlist on shutdown: {}", e);
     }
@@ -605,7 +609,33 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
     // total wall clock is roughly `rounds × ceil(frontier/16) ×
     // 5s` in the worst case, but practically bounded by the
     // QUIET_FOR short-circuit inside `discover_peers`.
-    if let Some(doh) = state.doh.as_ref() {
+    // Auto-skip the pre-fill discover when the saved peerlist is
+    // already warm: if it holds enough *fresh known-good* peers (a
+    // recent successful dial on record, no newer failure, dialable
+    // underlay), the pool can fill straight from disk and the serial
+    // discover round would only add latency with no benefit. On a
+    // cold/stale peerlist the count falls short and discover runs, so
+    // the node still self-heals.
+    let skip_discover = {
+        let peers = state.peers.read().await;
+        let now = crate::peers::now_unix();
+        let warm = peers.fresh_known_good_count(now, crate::peers::KNOWN_GOOD_FRESHNESS_SECS);
+        if warm >= crate::peers::WARM_PEERLIST_MIN_KNOWN_GOOD {
+            info!(target: "hoverfly::daemon",
+                "peerlist is warm ({warm} fresh known-good peer(s) ≥ {}); \
+                 skipping pre-fill discover and filling pool from peerlist",
+                crate::peers::WARM_PEERLIST_MIN_KNOWN_GOOD);
+            true
+        } else {
+            debug!(target: "hoverfly::daemon",
+                "peerlist not warm enough ({warm} fresh known-good peer(s) < {}); \
+                 running pre-fill discover",
+                crate::peers::WARM_PEERLIST_MIN_KNOWN_GOOD);
+            false
+        }
+    };
+
+    if let Some(doh) = state.doh.as_ref().filter(|_| !skip_discover) {
         // Iterate every configured bootnode, accumulating their
         // hive responses. A peer that bin-saturates and rejects our
         // /swarm/handshake/14.0.0/handshake substream contributes

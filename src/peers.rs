@@ -62,6 +62,22 @@ fn is_zero_u16(x: &u16) -> bool {
 /// is given a chance again on the next run a few minutes later.
 pub const RECENT_FAILURE_SECS: u64 = 300;
 
+/// A successful dial older than this is considered stale for the
+/// purposes of the daemon's "skip discover" heuristic — the peer may
+/// well have churned since. Tuned generously (15 min) because a peer
+/// that answered within the last few minutes is overwhelmingly likely
+/// to still be up, and the cost of a wrong "skip" is only that the
+/// background maintenance loop re-discovers shortly after.
+pub const KNOWN_GOOD_FRESHNESS_SECS: u64 = 900;
+
+/// Minimum number of fresh known-good peers (see
+/// [`PeerStore::fresh_known_good_count`]) required for the daemon to
+/// skip its pre-pool-fill bootnode discover. Below this the eager
+/// discover runs so a cold/stale peerlist self-heals; at or above it
+/// the pool fills straight from the warm peerlist with no added
+/// latency.
+pub const WARM_PEERLIST_MIN_KNOWN_GOOD: usize = 8;
+
 /// Outcome of a dial attempt, recorded in a [`ReachabilityLog`] so the
 /// session-pool dial loop and healthcheck probe can feed observations
 /// back to a writable [`PeerStore`] without holding a `&mut` reference
@@ -338,6 +354,28 @@ impl PeerStore {
         scored.into_iter().take(limit).map(|(_, p)| p).collect()
     }
 
+    /// Number of peers that are *known-good and fresh*: a successful
+    /// dial is on record with no more-recent failure (`dial_rank == 0`),
+    /// and that success happened within `freshness_secs`. These are the
+    /// peers the session pool can dial immediately without a discover
+    /// round — they answered recently and have a dialable underlay.
+    ///
+    /// Used by the daemon to decide whether the pre-pool-fill bootnode
+    /// discover is worth its serial cost: on a warm peerlist (plenty of
+    /// fresh known-good peers) discover adds latency with no benefit; on
+    /// a cold/stale one it's what makes the node self-heal.
+    pub fn fresh_known_good_count(&self, now_unix: u64, freshness_secs: u64) -> usize {
+        self.peers
+            .values()
+            .filter(|p| {
+                p.dial_rank(now_unix) == 0
+                    && p.first_dialable_underlay().is_some()
+                    && p.last_dial_success_unix
+                        .is_some_and(|s| now_unix.saturating_sub(s) <= freshness_secs)
+            })
+            .count()
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Self {
         match std::fs::read_to_string(&path) {
@@ -493,5 +531,53 @@ mod tests {
         assert_eq!(p.failure_backoff_secs(), RECENT_FAILURE_SECS); // 480 capped to 300
         p.consecutive_failures = 9;
         assert_eq!(p.failure_backoff_secs(), RECENT_FAILURE_SECS);
+    }
+
+    /// Build a peer with a dialable ws underlay and a successful dial
+    /// `success_age` seconds ago (None = never dialed).
+    fn dialable_peer(overlay: &str, success_age: Option<u64>) -> Peer {
+        let mut p = Peer {
+            overlay: overlay.to_string(),
+            underlays: vec!["/ip4/1.2.3.4/tcp/1634/ws".to_string()],
+            ..Peer::default()
+        };
+        p.last_dial_success_unix = success_age.map(|a| NOW - a);
+        p
+    }
+
+    #[test]
+    fn fresh_known_good_counts_only_recent_successful_dialable_peers() {
+        let mut store = PeerStore::new();
+        // Fresh + known-good + dialable → counts.
+        store.upsert(dialable_peer("aa", Some(10)));
+        store.upsert(dialable_peer("bb", Some(KNOWN_GOOD_FRESHNESS_SECS - 1)));
+        // Successful but stale (older than freshness window) → excluded.
+        store.upsert(dialable_peer("cc", Some(KNOWN_GOOD_FRESHNESS_SECS + 1)));
+        // Never dialed (rank 1, no success) → excluded.
+        store.upsert(dialable_peer("dd", None));
+        // Recent success but no dialable underlay → excluded.
+        let mut no_underlay = dialable_peer("ee", Some(10));
+        no_underlay.underlays.clear();
+        // upsert drops peers with no underlay, so insert by hand.
+        store.peers.insert("ee".to_string(), no_underlay);
+
+        assert_eq!(
+            store.fresh_known_good_count(NOW, KNOWN_GOOD_FRESHNESS_SECS),
+            2
+        );
+    }
+
+    #[test]
+    fn fresh_known_good_excludes_more_recent_failure() {
+        let mut store = PeerStore::new();
+        let mut p = dialable_peer("aa", Some(100));
+        // A failure newer than the success demotes it below rank 0.
+        p.last_dial_failure_unix = Some(NOW - 10);
+        p.consecutive_failures = 1;
+        store.upsert(p);
+        assert_eq!(
+            store.fresh_known_good_count(NOW, KNOWN_GOOD_FRESHNESS_SECS),
+            0
+        );
     }
 }
