@@ -3,7 +3,8 @@
 // pkg/ (built via `cargo build --target wasm32-... && wasm-bindgen`).
 
 import * as esbuild from 'esbuild'
-import { copyFileSync, cpSync, existsSync, mkdirSync, rmSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -51,7 +52,28 @@ const options = {
   sourcemap: true,
   target: ['chrome120'],
   logLevel: 'info',
-  define: { 'process.env.NODE_ENV': '"production"' }
+  define: {
+    'process.env.NODE_ENV': '"production"',
+    // Build version stamped into the daemon SharedWorker URL + name so a new
+    // deploy spawns a FRESH worker instead of rejoining the stale instance a
+    // browser keeps alive across reloads (SharedWorker is keyed by origin +
+    // script URL + name and persists until every client closes). Derived from
+    // the vendored wasm's content hash, since the daemon going stale only
+    // matters when the wasm changes; falls back to the build timestamp.
+    __GW_VERSION__: JSON.stringify(daemonVersion())
+  }
+}
+
+/** Short content hash of the vendored wasm (the thing whose change makes a
+ *  running daemon stale). Falls back to the build time if pkg/ isn't present
+ *  yet (the wasm is vendored just below in copyStatic). */
+function daemonVersion () {
+  try {
+    const wasm = readFileSync(resolve(pkg, 'hoverfly_bg.wasm'))
+    return createHash('sha256').update(wasm).digest('hex').slice(0, 12)
+  } catch {
+    return 't' + Date.now().toString(36)
+  }
 }
 
 rmSync(dist, { recursive: true, force: true })
