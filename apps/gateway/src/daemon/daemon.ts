@@ -379,6 +379,11 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   const hasExtension = /\.[^./]+$/.test(lastSeg)
   let candidates: string[]
   if (p === '' || p.endsWith('/')) {
+    // Directory/root: the bare path resolves on its own when the manifest
+    // carries a `website-index-document` (bee collection upload) — the wasm
+    // manifest walker honours that root metadata and redirects to the index —
+    // or for a single-file reference. `<dir>index.html` is the explicit
+    // fallback for manifests without that metadata.
     candidates = [p, p + 'index.html']
   } else if (hasExtension) {
     candidates = [p]
