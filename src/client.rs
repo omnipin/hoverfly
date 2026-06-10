@@ -252,6 +252,25 @@ impl RetrievalCache {
             *e = index;
         }
     }
+
+    /// Export all known feed hints as `{ "<owner||topic hex>": <index>, … }`.
+    /// Used by the browser daemon to persist hints to IndexedDB so a returning
+    /// visitor anchors near the feed head instead of galloping from 0 (the
+    /// difference between a ~1s warm resolve and a ~30s cold one).
+    pub fn export_feed_hints(&self) -> HashMap<String, u64> {
+        self.feed_index.lock().unwrap().clone()
+    }
+
+    /// Merge persisted feed hints back in (monotonic — never lowers a hint).
+    pub fn import_feed_hints(&self, hints: HashMap<String, u64>) {
+        let mut m = self.feed_index.lock().unwrap();
+        for (k, v) in hints {
+            let e = m.entry(k).or_insert(0);
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
 }
 
 impl<'a> NetworkedStore<'a> {
@@ -440,12 +459,13 @@ impl<'a> NetworkedStore<'a> {
         // `max_retries == 0` means "no cap"; otherwise it bounds the number
         // of peer attempts before giving up.
         let now = crate::peers::now_unix();
-        let (fresh, stale): (Vec<_>, Vec<_>) = self
-            .peers
-            .closest(&address, usize::MAX)
-            .into_iter()
-            .partition(|p| !p.is_recently_unreachable(now));
-        let mut candidates: Vec<&Peer> = fresh.into_iter().chain(stale.into_iter()).collect();
+        // Proximity-ordered candidate list (closest to the chunk address first).
+        // Bee's retrieval *forwards* a request through the receiving peer's
+        // kademlia table toward the chunk's neighborhood, so any reachable
+        // forwarder can ultimately serve any chunk — but a peer closer to the
+        // chunk is more likely to hold it locally (or be one hop from it), so
+        // proximity is the right *secondary* signal.
+        let mut candidates: Vec<&Peer> = self.peers.closest(&address, usize::MAX);
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
         }
@@ -461,29 +481,64 @@ impl<'a> NetworkedStore<'a> {
             dialable,
         );
 
-        // Cross-chunk reordering using the shared scoreboard (see the
-        // `peer_scores` field on `NetworkedStore`). The base order above is
-        // proximity-first (closest peers most likely to hold the chunk
-        // locally). But on a real hive-crawl pool most proximity-close peers
-        // are dead, and re-sweeping them per chunk is what makes a 1340-chunk
-        // fetch hang. We do a STABLE 3-way partition that preserves proximity
-        // order *within* each tier:
-        //   tier 0 — score > 0: proven reachable forwarders → front
-        //   tier 1 — score == 0: not yet tried / recovered  → middle
-        //   tier 2 — score < 0: recently timed out / dead   → back
-        // After the first chunk discovers the live forwarders, every later
-        // chunk hits them immediately instead of paying the timeout sweep.
+        // Order candidates so the concurrency window is filled with peers we can
+        // ACTUALLY reach and that we've SEEN forward, before anything else. The
+        // previous ordering was proximity-first with reachability/score only as
+        // a tie-breaker, which on mainnet meant the window filled with the
+        // closest peers — overwhelmingly TCP-only (not browser-dialable) or
+        // dead — so a `/ws`-only browser node burned its whole per-peer timeout
+        // budget on peers it could never use and never reached a live forwarder
+        // (observed: hundreds of `peer … failed: timeout`, 0 chunks).
+        //
+        // Sort key is `(reachability_class, forwarder_class)`; proximity
+        // (already encoded in `candidates`' order) is preserved within each
+        // bucket by the stable sort. Lower = tried sooner.
+        //
+        // reachability class:
+        //   0 — proven forwarder this fetch (score > 0) AND dialable
+        //   1 — dialable, not-yet-tried/recovered, not recently-unreachable
+        //   2 — dialable but recently failed to dial (worth a late retry)
+        //   3 — dialable but score < 0 (timed out for an earlier chunk)
+        //   4 — NOT browser-dialable (only usable natively over TCP) — last
+        //
+        // forwarder class (within a reachability bucket): only FULL nodes
+        // forward retrieval toward the chunk's neighborhood; light nodes answer
+        // only from their own reserve, so a far-from-chunk light node almost
+        // never has it and just burns a timeout. Prefer known full nodes, then
+        // unknown (not yet probed), then known-light:
+        //   0 — full_node == Some(true)
+        //   1 — full_node == None (unknown)
+        //   2 — full_node == Some(false) (light)
+        //
+        // On native (TCP) every peer is dialable so the non-dialable bucket is
+        // empty and behaviour is proximity+forwarder within classes 0-3; in the
+        // browser the non-dialable wall is shoved to the very back where it
+        // can't starve the concurrency window of reachable forwarders.
         {
             let scores = self.peer_scores.lock().unwrap();
-            if !scores.is_empty() {
-                candidates.sort_by_key(|p| {
-                    match scores.get(&p.overlay.to_lowercase()).copied().unwrap_or(0) {
-                        s if s > 0 => 0u8,
-                        0 => 1,
-                        _ => 2,
+            candidates.sort_by_key(|p| {
+                let dialable = p.first_dialable_underlay().is_some();
+                let reach = if !dialable {
+                    4u8
+                } else {
+                    let score = scores.get(&p.overlay.to_lowercase()).copied().unwrap_or(0);
+                    if score > 0 {
+                        0
+                    } else if score < 0 {
+                        3
+                    } else if p.is_recently_unreachable(now) {
+                        2
+                    } else {
+                        1
                     }
-                });
-            }
+                };
+                let forwarder = match p.full_node {
+                    Some(true) => 0u8,
+                    None => 1,
+                    Some(false) => 2,
+                };
+                (reach, forwarder)
+            });
         }
         let attempt_cap = if self.max_retries == 0 {
             candidates.len()
@@ -1196,12 +1251,42 @@ pub async fn fetch_manifest_path_cached_ex(
     concurrency: usize,
     cache: &RetrievalCache,
 ) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let (bytes, content_type, _feed_resolved) = fetch_manifest_path_cached_meta(
+        transport,
+        peers,
+        root_hex,
+        path,
+        max_retries_per_chunk,
+        concurrency,
+        cache,
+    )
+    .await?;
+    Ok((bytes, content_type))
+}
+
+/// Like [`fetch_manifest_path_cached_ex`] but also reports whether the
+/// reference was feed-backed (i.e. **mutable** — the gateway must not cache it
+/// as immutable, since a feed's reference is stable but its head moves
+/// forward). Returned as a tuple so callers that don't care can
+/// `let (b, c, _) = …`.
+pub async fn fetch_manifest_path_cached_meta(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    cache: &RetrievalCache,
+) -> Result<(Vec<u8>, Option<String>, bool), ClientError> {
     let root = parse_root(root_hex)?;
     // Single store shared between path lookup and content fetch; the
     // root chunk is hit by both phases so the cache saves a round-trip.
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
-    let root = resolve_feed_root(&store, root, Some(cache)).await?;
+    let ResolvedRoot {
+        root,
+        feed_resolved,
+    } = resolve_feed_root(&store, root, Some(cache)).await?;
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
@@ -1211,7 +1296,7 @@ pub async fn fetch_manifest_path_cached_ex(
         .with_concurrency(concurrency.max(1).max(8))
         .read_all()
         .await?;
-    Ok((bytes, content_type))
+    Ok((bytes, content_type, feed_resolved))
 }
 
 /// List entries in the mantaray manifest at `root_hex`.
@@ -1236,7 +1321,7 @@ pub async fn list_manifest_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
-    let root = resolve_feed_root(&store, root, None).await?;
+    let root = resolve_feed_root(&store, root, None).await?.root;
     walk_manifest(&store, root, Vec::new()).await
 }
 
@@ -1273,11 +1358,21 @@ fn validate_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEF
 /// otherwise return `root` unchanged. This lets feed-backed references (e.g.
 /// mutable ENS sites like `swarm.eth`) be fetched transparently: callers walk
 /// the returned root as an ordinary content manifest.
+/// Outcome of [`resolve_feed_root`]: the content root to walk, plus whether the
+/// supplied reference was a *feed manifest* (i.e. mutable). The mutability flag
+/// is surfaced all the way to the gateway so it can avoid caching feed-backed
+/// content as immutable (a feed's reference is stable but its content changes).
+struct ResolvedRoot {
+    root: ChunkAddress,
+    /// True iff `root` was resolved through a feed (mutable content).
+    feed_resolved: bool,
+}
+
 async fn resolve_feed_root(
     store: &NetworkedStore<'_>,
     root: ChunkAddress,
     cache: Option<&RetrievalCache>,
-) -> Result<ChunkAddress, ClientError> {
+) -> Result<ResolvedRoot, ClientError> {
     use crate::feed::{Feed, resolve_latest};
     use crate::manifest::{decode_node, extract_feed_meta};
 
@@ -1287,7 +1382,11 @@ async fn resolve_feed_root(
     let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
     let Some((owner_hex, topic_hex, ty)) = extract_feed_meta(&node) else {
-        return Ok(root); // ordinary content manifest
+        // ordinary content manifest — immutable, content-addressed
+        return Ok(ResolvedRoot {
+            root,
+            feed_resolved: false,
+        });
     };
     let feed = Feed::from_manifest_meta(&owner_hex, &topic_hex, &ty)
         .map_err(|e| ClientError::Feed(e.to_string()))?;
@@ -1304,7 +1403,10 @@ async fn resolve_feed_root(
     if let Some(c) = cache {
         c.set_feed_hint(&feed_key, index);
     }
-    Ok(resolved)
+    Ok(ResolvedRoot {
+        root: resolved,
+        feed_resolved: true,
+    })
 }
 
 async fn lookup_manifest_path(
@@ -1312,10 +1414,15 @@ async fn lookup_manifest_path(
     root: ChunkAddress,
     path: &str,
 ) -> Result<(ChunkAddress, Option<String>), ClientError> {
-    use crate::manifest::decode_node;
+    use crate::manifest::{decode_node, extract_index_document};
     let mut current = root;
-    let mut remaining: &[u8] = path.as_bytes();
+    // Owned so we can redirect to a website-index-document mid-walk (a borrow
+    // of `path` couldn't be replaced with a freshly-derived index name).
+    let mut remaining: Vec<u8> = path.as_bytes().to_vec();
     let mut last_content_type: Option<String> = None;
+    // Guards the one-shot redirect to a `website-index-document` so a
+    // pathological manifest (index pointing back at an empty path) can't loop.
+    let mut index_redirected = false;
 
     loop {
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &current)
@@ -1324,10 +1431,26 @@ async fn lookup_manifest_path(
         let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         if remaining.is_empty() {
-            return node
-                .entry
-                .map(|addr| (addr, last_content_type.clone()))
-                .ok_or_else(|| ClientError::Manifest(format!("path {path} has no entry")));
+            if let Some(addr) = node.entry {
+                return Ok((addr, last_content_type.clone()));
+            }
+            // No bare entry at this node. A collection upload (bee's
+            // `POST /bzz` with a tar/multipart body) doesn't put a file at the
+            // manifest root; instead it records a `website-index-document`
+            // (e.g. "index.html") in the root metadata, and gateways resolve
+            // the root to THAT entry. Honour it here so `--path /` (and the
+            // gateway's empty-path candidate) resolve to the index document
+            // the bee way, instead of failing with "no entry". (This is why a
+            // site whose root has only an `index.html` fork — e.g. omnipin.eth
+            // — returned "path / has no entry".)
+            if !index_redirected {
+                if let Some(idx) = extract_index_document(&node) {
+                    index_redirected = true;
+                    remaining = idx.into_bytes();
+                    continue; // re-walk from the current node toward `idx`
+                }
+            }
+            return Err(ClientError::Manifest(format!("path {path} has no entry")));
         }
 
         let first = remaining[0];
@@ -1343,7 +1466,7 @@ async fn lookup_manifest_path(
         if let Some(ct) = fork.metadata.get("Content-Type") {
             last_content_type = Some(ct.clone());
         }
-        remaining = &remaining[fork.prefix.len()..];
+        remaining = remaining[fork.prefix.len()..].to_vec();
         current = fork.reference;
     }
 }

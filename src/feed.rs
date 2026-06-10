@@ -249,6 +249,17 @@ const ANCHOR_ATTEMPTS: u32 = 4;
 /// `/ws` peers — scarce on mainnet, so the first probe of a cold session often
 /// races a barely-warm pool).
 const ANCHOR_RETRY_DELAY: Duration = Duration::from_millis(750);
+/// Per-attempt deadline for the **anchor** probe. Unlike an interior
+/// head-finding probe (which speculatively asks for indices that may not exist,
+/// so must fail fast at `PROBE_TIMEOUT`), the anchor — index 0, or a hint we
+/// previously resolved — is KNOWN to exist for any published feed. So give it
+/// the retrieval layer's real budget to dial/forward through the scarce `/ws`
+/// pool instead of the tight 1.5s speculative cap. On a cold mobile session the
+/// first forwarder dial alone can exceed 1.5s, which made all four 1.5s anchor
+/// attempts expire before the pool warmed — surfacing as a false
+/// "feed has no updates" (observed on Android/Vanadium). A generous cap lets a
+/// single attempt actually retrieve index 0.
+const ANCHOR_PROBE_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Resolve the **latest** update of a sequence feed and return
 /// `(content_reference, resolved_index)`.
@@ -439,8 +450,24 @@ async fn probe_update<S>(store: &S, feed: &Feed, i: u64) -> Result<Probe, Resolv
 where
     S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
 {
+    probe_update_with(store, feed, i, PROBE_TIMEOUT).await
+}
+
+/// Like [`probe_update`] but with a caller-chosen deadline. The anchor uses a
+/// generous one (`ANCHOR_PROBE_TIMEOUT`) because index 0 is known to exist; an
+/// interior search probe uses the tight `PROBE_TIMEOUT` so a missing index
+/// fails fast.
+async fn probe_update_with<S>(
+    store: &S,
+    feed: &Feed,
+    i: u64,
+    deadline: Duration,
+) -> Result<Probe, ResolveError>
+where
+    S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
+{
     let addr = ChunkAddress::new(feed.update_address(i));
-    match tokio::time::timeout(PROBE_TIMEOUT, store.get(&addr)).await {
+    match tokio::time::timeout(deadline, store.get(&addr)).await {
         Ok(Ok(c)) => Ok(Probe::Present(c)),
         Ok(Err(ChunkStoreError::NotFound { .. })) => Ok(Probe::Absent),
         // "no peer found" / "all peers failed" => nobody is serving this SOC
@@ -489,7 +516,7 @@ where
     S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
 {
     for attempt in 0..ANCHOR_ATTEMPTS {
-        match probe_update(store, feed, i).await? {
+        match probe_update_with(store, feed, i, ANCHOR_PROBE_TIMEOUT).await? {
             Probe::Present(c) => return Ok(Some(c)),
             // A definitive not-found is trustworthy: stop immediately.
             Probe::Absent => return Ok(None),

@@ -13,10 +13,44 @@ export const GATEWAY_INFIX = 'bzz'
  */
 export const ASSET_PREFIX = '/__gw__/'
 
+/**
+ * Query marker the boot shell appends when it loads the real site into its
+ * content iframe (`/?__gw_content=1`). Both the top shell navigation and the
+ * inner content-iframe navigation are `mode: 'navigate'` + `destination:
+ * 'document'`, so the service worker cannot otherwise tell them apart — without
+ * this it would pass the iframe navigation through to the network too, which
+ * returns the boot shell again (Caddy `try_files {path} /boot.html`). The
+ * iframe would then re-run boot.js, see `window.top !== window`, and bail —
+ * leaving a blank page and never fetching any Swarm chunks. The SW treats a
+ * document navigation carrying this marker as Swarm content; it is stripped
+ * before the path is resolved against the manifest.
+ */
+export const CONTENT_MARKER = '__gw_content'
+
 export const SW_SCRIPT = `${ASSET_PREFIX}sw.js`
 export const BOOT_SCRIPT = `${ASSET_PREFIX}boot.js`
 export const LANDING_SCRIPT = `${ASSET_PREFIX}landing.js`
-export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js`
+
+/**
+ * Build version, stamped by build.js (`define`) from the vendored wasm's
+ * content hash. Used to key the daemon SharedWorker so a new deploy spawns a
+ * fresh instance instead of rejoining the stale one the browser keeps alive
+ * across reloads. Defaults to `'dev'` when not injected (e.g. typecheck).
+ */
+declare const __GW_VERSION__: string | undefined
+export const GW_VERSION: string =
+  typeof __GW_VERSION__ !== 'undefined' ? __GW_VERSION__ : 'dev'
+
+/**
+ * Daemon SharedWorker script URL, version-tagged. A SharedWorker is keyed by
+ * (origin, script URL, name); changing the query when the wasm changes forces
+ * the browser to start a new worker rather than rejoin the previous deploy's
+ * (possibly wedged) instance. All clients in the same deploy use the same
+ * value, so they still share one daemon.
+ */
+export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js?v=${GW_VERSION}`
+/** Matching SharedWorker `name` (also part of the worker key). */
+export const DAEMON_WORKER_NAME = `hoverfly-daemon-${GW_VERSION}`
 export const DAEMON_FRAME_PATH = `${ASSET_PREFIX}daemon-frame.html`
 /** wasm-bindgen `--target web` entry, vendored from the repo's pkg/. */
 export const HOVERFLY_JS = `${ASSET_PREFIX}hoverfly/hoverfly.js`
@@ -50,6 +84,13 @@ export const IDB_PEERS_KEY = 'peerstore-json'
  */
 export const IDB_NODEKEY_KEY = 'node-key-hex'
 export const IDB_NONCE_KEY = 'node-nonce-hex'
+/**
+ * Persisted feed head-index hints (`exportFeedHints`/`loadFeedHints`). A feed's
+ * head only moves forward, so the last resolved index lets a returning visitor
+ * resolve a feed (e.g. swarm.eth) in ~1 fast round from the cached head instead
+ * of a cold gallop from index 0 (~30s observed on the thin browser pool).
+ */
+export const IDB_FEED_HINTS_KEY = 'feed-hints-json'
 /**
  * IndexedDB database name for the persistent, content-addressed chunk cache
  * (L2). Managed inside the hoverfly wasm via `enableChunkStore`. Immutable

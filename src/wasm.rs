@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_ex,
+    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
     list_manifest_ex, upload_bytes,
 };
 use crate::doh::Doh;
@@ -26,9 +26,16 @@ use crate::peers::PeerStore;
 use crate::signer::SwarmSigner;
 use crate::transport::{Transport, TransportConfig};
 
-/// Per-chunk peer racing for browser fetches. Mirrors the CLI default
-/// (`client::DEFAULT_FETCH_CONCURRENCY`).
-const FETCH_CONCURRENCY: usize = 5;
+/// Per-chunk peer racing for browser fetches. Higher than the CLI default
+/// because the browser is /ws-only against a SCARCE, flaky forwarder pool: most
+/// dialed peers are slow or non-forwarding, so a wider race per chunk is what
+/// actually lands a fast forwarder quickly. This matters most on mobile, which
+/// runs single-threaded (no `initThreadPool`) over a higher-latency link —
+/// observed pulling chunks but timing out before a page completed. 5 left too
+/// few slots in flight when several were stuck on slow peers; 12 keeps the
+/// pipeline full without overwhelming the single ws+yamux connection driver
+/// (each retrieval now closes its substream promptly, so slots free up fast).
+const FETCH_CONCURRENCY: usize = 12;
 
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
@@ -177,6 +184,26 @@ impl HoverflyClient {
     #[wasm_bindgen(js_name = "peerCount")]
     pub fn peer_count(&self) -> usize {
         self.peers.borrow().len()
+    }
+
+    /// Export resolved feed head-index hints as a JSON object
+    /// `{ "<owner||topic hex>": <index>, … }`. The browser daemon persists this
+    /// to IndexedDB so a returning visitor resolves a feed (e.g. swarm.eth) in
+    /// ~1 fast round from the cached head instead of a cold ~30s gallop from 0.
+    #[wasm_bindgen(js_name = "exportFeedHints")]
+    pub fn export_feed_hints(&self) -> Result<String, JsError> {
+        serde_json::to_string(&self.cache.export_feed_hints()).map_err(into_js_err)
+    }
+
+    /// Merge persisted feed hints (JSON object as produced by
+    /// [`Self::export_feed_hints`]) back into the cache. Monotonic — never
+    /// lowers a hint, so a stale persisted value can't move a feed backwards.
+    #[wasm_bindgen(js_name = "loadFeedHints")]
+    pub fn load_feed_hints(&self, hints_json: &str) -> Result<(), JsError> {
+        let hints: std::collections::HashMap<String, u64> =
+            serde_json::from_str(hints_json).map_err(into_js_err)?;
+        self.cache.import_feed_hints(hints);
+        Ok(())
     }
 
     /// Start the in-browser daemon: a long-lived background task that keeps
@@ -348,7 +375,7 @@ impl HoverflyClient {
     ) -> Result<ManifestFetch, JsError> {
         let _guard = FetchGuard::new(&self.inflight_fetches);
         let peers = self.peers.borrow().clone();
-        let (bytes, content_type) = fetch_manifest_path_cached_ex(
+        let (bytes, content_type, feed_resolved) = fetch_manifest_path_cached_meta(
             &self.transport,
             &peers,
             &root_hex,
@@ -362,6 +389,7 @@ impl HoverflyClient {
         Ok(ManifestFetch {
             bytes,
             content_type,
+            feed_resolved,
         })
     }
 
@@ -433,6 +461,7 @@ impl HoverflyClient {
 pub struct ManifestFetch {
     bytes: Vec<u8>,
     content_type: Option<String>,
+    feed_resolved: bool,
 }
 
 #[wasm_bindgen]
@@ -447,6 +476,16 @@ impl ManifestFetch {
     #[wasm_bindgen(getter, js_name = "contentType")]
     pub fn content_type(&self) -> Option<String> {
         self.content_type.clone()
+    }
+
+    /// True iff the reference resolved through a **feed manifest** — i.e. the
+    /// content is mutable (the feed's reference is stable but its head moves
+    /// forward). The gateway uses this to avoid caching feed-backed responses
+    /// as immutable, which would otherwise pin a visitor to one feed update
+    /// forever and break later updates.
+    #[wasm_bindgen(getter, js_name = "feedResolved")]
+    pub fn feed_resolved(&self) -> bool {
+        self.feed_resolved
     }
 }
 

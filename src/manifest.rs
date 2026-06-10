@@ -235,6 +235,32 @@ pub fn extract_feed_meta(node: &Node) -> Option<(String, String, String)> {
     None
 }
 
+/// If `node` carries a website **index document** (bee's
+/// `website-index-document` metadata, written on the root-path `/` fork by a
+/// collection upload), return the index filename (e.g. `"index.html"`). A
+/// gateway/joiner should resolve a request for the manifest root to this entry
+/// instead of expecting a bare root entry — bee's `serveManifestRootMetadata`
+/// does the same. Returns `None` for a manifest without website metadata.
+pub fn extract_index_document(node: &Node) -> Option<String> {
+    // The root metadata lives on the `/` fork (first byte `b'/'`). Fall back to
+    // scanning all forks for robustness against encoder placement differences.
+    if let Some(fork) = node.forks.get(&b'/') {
+        if let Some(idx) = fork.metadata.get(WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY) {
+            if !idx.is_empty() {
+                return Some(idx.clone());
+            }
+        }
+    }
+    for fork in node.forks.values() {
+        if let Some(idx) = fork.metadata.get(WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY) {
+            if !idx.is_empty() {
+                return Some(idx.clone());
+            }
+        }
+    }
+    None
+}
+
 /// One file entry to include in a collection manifest.
 pub struct CollectionEntry {
     /// In-manifest path (e.g. `"index.html"`, `"static/app.css"`). Used as
@@ -374,5 +400,45 @@ mod tests {
             "e0d7def5074db9d98c0a5ed6f391a22056843677eeade90718002f696d636af1"
         );
         assert_eq!(ty, "Sequence");
+    }
+
+    /// A collection manifest built with `index_document = Some("index.html")`
+    /// must round-trip so that `extract_index_document` recovers it from the
+    /// decoded root node. This is the read-side guard for the bug where a
+    /// website whose root has only an `index.html` fork (no bare root entry —
+    /// e.g. omnipin.eth) resolved its root via the `website-index-document`
+    /// metadata. Without honouring it, `--path /` (and the gateway's empty-path
+    /// candidate) failed with "path / has no entry".
+    #[test]
+    fn extract_index_document_round_trip() {
+        let entries = vec![
+            CollectionEntry {
+                path: "index.html".to_string(),
+                reference: ChunkAddress::new([1u8; 32]),
+                content_type: Some("text/html".to_string()),
+            },
+            CollectionEntry {
+                path: "app.css".to_string(),
+                reference: ChunkAddress::new([2u8; 32]),
+                content_type: Some("text/css".to_string()),
+            },
+        ];
+        let (root, chunks) =
+            build_collection_manifest(&entries, Some("index.html"), None).expect("build manifest");
+
+        // Find and decode the root node chunk (its address == manifest root).
+        let root_chunk = chunks
+            .iter()
+            .find(|(addr, _)| *addr == root)
+            .map(|(_, wire)| wire.clone())
+            .expect("root chunk present in returned chunk set");
+        // `chunks` payloads are CAC data with the 8-byte span prefix; strip it
+        // the way the retrieval path does before decoding the mantaray node.
+        let node = decode_node(&root_chunk[8..]).expect("decode collection manifest root");
+        assert_eq!(
+            extract_index_document(&node).as_deref(),
+            Some("index.html"),
+            "root must expose its website-index-document"
+        );
     }
 }
