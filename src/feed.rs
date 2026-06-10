@@ -727,8 +727,8 @@ mod tests {
             &self,
             address: &ChunkAddress,
         ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
-            let key: [u8; 32] = <[u8; 32]>::try_from(address.as_ref())
-                .expect("chunk address is 32 bytes");
+            let key: [u8; 32] =
+                <[u8; 32]>::try_from(address.as_ref()).expect("chunk address is 32 bytes");
             if let Some(q) = self.scripts.lock().unwrap().get_mut(&key) {
                 if let Some(o) = q.pop_front() {
                     return match o {
@@ -761,9 +761,13 @@ mod tests {
         // index 0: two transient failures, then present (head).
         scripts.insert(
             a0,
-            [Outcome::Transient, Outcome::Transient, Outcome::Present(head_chunk(reference))]
-                .into_iter()
-                .collect(),
+            [
+                Outcome::Transient,
+                Outcome::Transient,
+                Outcome::Present(head_chunk(reference)),
+            ]
+            .into_iter()
+            .collect(),
         );
         // index 1: genuinely absent -> head is 0.
         scripts.insert(a1, [Outcome::NotFound].into_iter().collect());
@@ -792,7 +796,10 @@ mod tests {
         let err = resolve_latest(&store, &feed, 0)
             .await
             .expect_err("empty feed must error");
-        assert!(matches!(err, ResolveError::Feed(FeedError::NoUpdate)), "got {err:?}");
+        assert!(
+            matches!(err, ResolveError::Feed(FeedError::NoUpdate)),
+            "got {err:?}"
+        );
     }
 
     /// Exhausting all anchor attempts on persistent transient failure surfaces
@@ -816,6 +823,9 @@ mod tests {
         let err = resolve_latest(&store, &feed, 0)
             .await
             .expect_err("persistent transient must bound out to NoUpdate");
-        assert!(matches!(err, ResolveError::Feed(FeedError::NoUpdate)), "got {err:?}");
+        assert!(
+            matches!(err, ResolveError::Feed(FeedError::NoUpdate)),
+            "got {err:?}"
+        );
     }
 }
