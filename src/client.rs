@@ -2880,8 +2880,8 @@ pub async fn push_chunks_with_pool(
                 // below). Sort lives inside build_order so the rebuilt
                 // candidate list is also PO-prioritised.
                 order.sort_by(|&a, &b| {
-                    let pa = chunk_addr.proximity(&pool[a].overlay);
-                    let pb = chunk_addr.proximity(&pool[b].overlay);
+                    let pa: u8 = chunk_addr.proximity(&pool[a].overlay).into();
+                    let pb: u8 = chunk_addr.proximity(&pool[b].overlay).into();
                     let aor = |idx: usize, po: u8| -> u8 {
                         match pool[idx].in_aor(po) {
                             Some(true) => 0,
@@ -3119,7 +3119,7 @@ pub async fn push_chunks_with_pool(
                             }
                             Ok(PushOutcome::Shallow(r)) => {
                                 shallows += 1;
-                                let po = chunk_addr.proximity(&entry.overlay) as usize;
+                                let po = usize::from(chunk_addr.proximity(&entry.overlay));
                                 debug!(target: "hoverfly::upload",
                                     "shallow receipt on {} (po={}, storage_radius={}); trying next peer",
                                     entry.overlay_hex, po, r.storage_radius);
