@@ -25,7 +25,14 @@ declare const self: SharedWorkerGlobalScope & typeof globalThis
 
 // --- hoverfly wasm glue (vendored, loaded at runtime so esbuild doesn't try to
 //     bundle the wasm-bindgen module — it relies on import.meta.url). ---
-interface ManifestFetch { readonly bytes: Uint8Array, readonly contentType: string | undefined }
+interface ManifestFetch {
+  readonly bytes: Uint8Array
+  readonly contentType: string | undefined
+  /** True iff the reference resolved through a feed manifest — i.e. the content
+   *  is mutable (feed head moves forward), so the gateway must not cache it as
+   *  immutable. Older wasm builds don't expose this getter; treated as false. */
+  readonly feedResolved?: boolean
+}
 interface HoverflyClient {
   /** Launch the daemon: eager initial discovery + a background maintenance
    *  loop that re-discovers every `intervalSecs`. Resolves with the peer
@@ -329,7 +336,7 @@ function guessType (path: string): string {
   return MIME[ext] ?? 'application/octet-stream'
 }
 
-interface FetchResult { httpStatus: number, contentType?: string, body?: ArrayBuffer, error?: string }
+interface FetchResult { httpStatus: number, contentType?: string, body?: ArrayBuffer, error?: string, mutable?: boolean }
 
 async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchResult> {
   console.log('[daemon] fetchPath:', refHex.slice(0, 12), 'path=', rawPath, '(await warm)')
@@ -393,7 +400,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       )
       const bytes = r.bytes.slice()
       setPhase('got ' + candidate + ' (' + bytes.length + ' bytes, L2 hits ' + c.chunkStoreHits() + ')')
-      return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer }
+      return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer, mutable: r.feedResolved === true }
     } catch (e) {
       setPhase('fetch ' + candidate + ' failed: ' + errMsg(e))
       lastErr = errMsg(e)
@@ -421,7 +428,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
         )
         const bytes = r.bytes.slice()
         setPhase('got ' + only.path + ' (' + bytes.length + ' bytes, single-file)')
-        return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer }
+        return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer, mutable: r.feedResolved === true }
       }
     } catch (e) {
       lastErr = errMsg(e)
@@ -481,7 +488,7 @@ function serveRpc (port: MessagePort): void {
         case 'fetchPath': {
           const r = await handleFetchPath(msg.refHex, msg.path)
           port.postMessage(
-            { kind: 'fetchPath', id: msg.id, ok: r.httpStatus < 400, httpStatus: r.httpStatus, contentType: r.contentType, body: r.body, error: r.error },
+            { kind: 'fetchPath', id: msg.id, ok: r.httpStatus < 400, httpStatus: r.httpStatus, contentType: r.contentType, body: r.body, error: r.error, mutable: r.mutable === true },
             r.body != null ? [r.body] : []
           )
           break

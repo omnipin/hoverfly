@@ -1196,12 +1196,42 @@ pub async fn fetch_manifest_path_cached_ex(
     concurrency: usize,
     cache: &RetrievalCache,
 ) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let (bytes, content_type, _feed_resolved) = fetch_manifest_path_cached_meta(
+        transport,
+        peers,
+        root_hex,
+        path,
+        max_retries_per_chunk,
+        concurrency,
+        cache,
+    )
+    .await?;
+    Ok((bytes, content_type))
+}
+
+/// Like [`fetch_manifest_path_cached_ex`] but also reports whether the
+/// reference was feed-backed (i.e. **mutable** — the gateway must not cache it
+/// as immutable, since a feed's reference is stable but its head moves
+/// forward). Returned as a tuple so callers that don't care can
+/// `let (b, c, _) = …`.
+pub async fn fetch_manifest_path_cached_meta(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    cache: &RetrievalCache,
+) -> Result<(Vec<u8>, Option<String>, bool), ClientError> {
     let root = parse_root(root_hex)?;
     // Single store shared between path lookup and content fetch; the
     // root chunk is hit by both phases so the cache saves a round-trip.
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
-    let root = resolve_feed_root(&store, root, Some(cache)).await?;
+    let ResolvedRoot {
+        root,
+        feed_resolved,
+    } = resolve_feed_root(&store, root, Some(cache)).await?;
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
@@ -1211,7 +1241,7 @@ pub async fn fetch_manifest_path_cached_ex(
         .with_concurrency(concurrency.max(1).max(8))
         .read_all()
         .await?;
-    Ok((bytes, content_type))
+    Ok((bytes, content_type, feed_resolved))
 }
 
 /// List entries in the mantaray manifest at `root_hex`.
@@ -1236,7 +1266,7 @@ pub async fn list_manifest_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
-    let root = resolve_feed_root(&store, root, None).await?;
+    let root = resolve_feed_root(&store, root, None).await?.root;
     walk_manifest(&store, root, Vec::new()).await
 }
 
@@ -1273,11 +1303,21 @@ fn validate_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEF
 /// otherwise return `root` unchanged. This lets feed-backed references (e.g.
 /// mutable ENS sites like `swarm.eth`) be fetched transparently: callers walk
 /// the returned root as an ordinary content manifest.
+/// Outcome of [`resolve_feed_root`]: the content root to walk, plus whether the
+/// supplied reference was a *feed manifest* (i.e. mutable). The mutability flag
+/// is surfaced all the way to the gateway so it can avoid caching feed-backed
+/// content as immutable (a feed's reference is stable but its content changes).
+struct ResolvedRoot {
+    root: ChunkAddress,
+    /// True iff `root` was resolved through a feed (mutable content).
+    feed_resolved: bool,
+}
+
 async fn resolve_feed_root(
     store: &NetworkedStore<'_>,
     root: ChunkAddress,
     cache: Option<&RetrievalCache>,
-) -> Result<ChunkAddress, ClientError> {
+) -> Result<ResolvedRoot, ClientError> {
     use crate::feed::{Feed, resolve_latest};
     use crate::manifest::{decode_node, extract_feed_meta};
 
@@ -1287,7 +1327,11 @@ async fn resolve_feed_root(
     let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
     let Some((owner_hex, topic_hex, ty)) = extract_feed_meta(&node) else {
-        return Ok(root); // ordinary content manifest
+        // ordinary content manifest — immutable, content-addressed
+        return Ok(ResolvedRoot {
+            root,
+            feed_resolved: false,
+        });
     };
     let feed = Feed::from_manifest_meta(&owner_hex, &topic_hex, &ty)
         .map_err(|e| ClientError::Feed(e.to_string()))?;
@@ -1304,7 +1348,10 @@ async fn resolve_feed_root(
     if let Some(c) = cache {
         c.set_feed_hint(&feed_key, index);
     }
-    Ok(resolved)
+    Ok(ResolvedRoot {
+        root: resolved,
+        feed_resolved: true,
+    })
 }
 
 async fn lookup_manifest_path(

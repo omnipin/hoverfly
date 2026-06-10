@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_ex,
+    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
     list_manifest_ex, upload_bytes,
 };
 use crate::doh::Doh;
@@ -348,7 +348,7 @@ impl HoverflyClient {
     ) -> Result<ManifestFetch, JsError> {
         let _guard = FetchGuard::new(&self.inflight_fetches);
         let peers = self.peers.borrow().clone();
-        let (bytes, content_type) = fetch_manifest_path_cached_ex(
+        let (bytes, content_type, feed_resolved) = fetch_manifest_path_cached_meta(
             &self.transport,
             &peers,
             &root_hex,
@@ -362,6 +362,7 @@ impl HoverflyClient {
         Ok(ManifestFetch {
             bytes,
             content_type,
+            feed_resolved,
         })
     }
 
@@ -433,6 +434,7 @@ impl HoverflyClient {
 pub struct ManifestFetch {
     bytes: Vec<u8>,
     content_type: Option<String>,
+    feed_resolved: bool,
 }
 
 #[wasm_bindgen]
@@ -447,6 +449,16 @@ impl ManifestFetch {
     #[wasm_bindgen(getter, js_name = "contentType")]
     pub fn content_type(&self) -> Option<String> {
         self.content_type.clone()
+    }
+
+    /// True iff the reference resolved through a **feed manifest** — i.e. the
+    /// content is mutable (the feed's reference is stable but its head moves
+    /// forward). The gateway uses this to avoid caching feed-backed responses
+    /// as immutable, which would otherwise pin a visitor to one feed update
+    /// forever and break later updates.
+    #[wasm_bindgen(getter, js_name = "feedResolved")]
+    pub fn feed_resolved(&self) -> bool {
+        self.feed_resolved
     }
 }
 
