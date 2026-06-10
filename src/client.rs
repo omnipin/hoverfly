@@ -401,7 +401,7 @@ impl<'a> NetworkedStore<'a> {
         // a short timeout: a hit still short-circuits the network, but a stalled
         // IndexedDB op falls through to retrieval instead of hanging forever.
         #[cfg(target_arch = "wasm32")]
-        if let Some(store) = crate::idb_chunk_store::get_store() {
+        if let Some(store) = crate::idb_chunk_store::get_store().await {
             use futures::future::Either;
             use nectar_primitives::Chunk;
             let key = hex::encode(address.as_bytes());
@@ -719,13 +719,18 @@ impl<'a> NetworkedStore<'a> {
                     self.cache.lock().unwrap().insert(address, chunk.clone());
                     // Write-back to the persistent L2 (browser). Fire-and-forget
                     // so the IndexedDB write never blocks retrieval — the chunk
-                    // is already in L1 for this session.
+                    // is already in L1 for this session. `get_store()` is awaited
+                    // INSIDE the spawned task so the per-thread handle is opened
+                    // on whichever worker thread runs the task (it's thread-
+                    // affine; see idb_chunk_store's threading note).
                     #[cfg(target_arch = "wasm32")]
-                    if let Some(store) = crate::idb_chunk_store::get_store() {
+                    {
                         let key = hex::encode(address.as_bytes());
                         let wire = wire_form(&chunk);
                         wasm_bindgen_futures::spawn_local(async move {
-                            store.put(key, wire).await;
+                            if let Some(store) = crate::idb_chunk_store::get_store().await {
+                                store.put(key, wire).await;
+                            }
                         });
                     }
                     return Ok(chunk);
