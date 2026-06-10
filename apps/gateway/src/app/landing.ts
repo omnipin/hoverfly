@@ -150,10 +150,20 @@ function openChunkDb (): Promise<IDBDatabase | null> {
   return new Promise((resolve) => {
     let created = false
     const req = indexedDB.open(IDB_CHUNKS_DB)
-    // If onupgradeneeded fires, the DB (or store) didn't exist — abort the
-    // accidental creation and report "not ready" rather than leaving an empty
-    // DB that shadows the daemon's.
-    req.onupgradeneeded = () => { created = true }
+    // If onupgradeneeded fires, the DB (or store) didn't exist. We MUST abort
+    // the upgrade transaction here: a versionless `open()` of a non-existent DB
+    // otherwise commits an empty version-1 database. The daemon opens with
+    // `open(name, 1, …)` — the SAME version — so its store-creating
+    // `onupgradeneeded` would then NEVER fire, leaving a permanent storeless DB
+    // that shadows the daemon's and pins the counter at "–". Aborting rolls the
+    // creation back so the daemon still gets to run its v1 upgrade.
+    req.onupgradeneeded = (e) => {
+      created = true
+      try { (e.target as IDBOpenDBRequest).transaction?.abort() } catch { /* ignore */ }
+    }
+    // An aborted upgrade surfaces as onerror; treat it as "not ready", not a
+    // real failure (and swallow the abort so it doesn't reject elsewhere).
+    req.onerror = () => resolve(null)
     req.onsuccess = () => {
       const db = req.result
       if (created || !db.objectStoreNames.contains(CHUNK_STORE)) {
@@ -163,7 +173,6 @@ function openChunkDb (): Promise<IDBDatabase | null> {
       }
       resolve(db)
     }
-    req.onerror = () => resolve(null)
     req.onblocked = () => resolve(null)
   })
 }

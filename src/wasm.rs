@@ -276,10 +276,15 @@ impl HoverflyClient {
     /// IndexedDB database name to use.
     #[wasm_bindgen(js_name = "enableChunkStore")]
     pub async fn enable_chunk_store(&self, db_name: String) -> Result<(), JsError> {
-        let store = crate::idb_chunk_store::IdbChunkStore::open(&db_name)
+        // Open once here to verify the database is usable (so a storage error
+        // surfaces to the caller now, not silently on the first fetch). The
+        // opened handle is bound to THIS thread; the retrieval paths run on
+        // rayon worker threads and open their own per-thread handles lazily —
+        // see `idb_chunk_store`'s threading note. So we only record the name.
+        let _verify = crate::idb_chunk_store::IdbChunkStore::open(&db_name)
             .await
             .map_err(into_js_err)?;
-        crate::idb_chunk_store::set_store(store);
+        crate::idb_chunk_store::set_store_name(db_name);
         Ok(())
     }
 
