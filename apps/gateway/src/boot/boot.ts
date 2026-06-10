@@ -87,6 +87,32 @@ async function main (): Promise<void> {
   controller.postMessage({ type: 'daemon-port' }, [mintDaemonPort(rpcPort)])
   console.log('[boot] handed daemon-port to SW; loading content', location.pathname + location.search)
 
+  // The port above lives only in the SW's in-memory state, and the browser
+  // terminates idle service workers at will (Chrome: ~30s idle). A restarted
+  // SW instance broadcasts `request-daemon-port`; answer it by minting a fresh
+  // port off our daemon channel. Without this, every fetch after an SW restart
+  // waited out a 25s daemon-bridge timeout and 504'd — a dead black page even
+  // though the daemon itself was still happily pulling chunks.
+  navigator.serviceWorker.addEventListener('message', (e: MessageEvent) => {
+    if (e.data?.type !== 'request-daemon-port') return
+    const target = (e.source as ServiceWorker | null) ?? navigator.serviceWorker.controller
+    if (target == null) return
+    console.log('[boot] SW asked for a daemon port — re-minting')
+    target.postMessage({ type: 'daemon-port' }, [mintDaemonPort(rpcPort)])
+  })
+
+  // Keepalive: ping the SW on an interval. Each ping dispatches a real
+  // `message` event, which is a functional event and so extends the SW's
+  // lifetime in Chrome (a pending MessagePort reply from the daemon does NOT
+  // count as activity). This stops the browser from idle-killing the worker in
+  // the middle of a long Swarm retrieval. The whole gateway needs a live SW for
+  // every request anyway, so keeping it warm while a shell tab is open is the
+  // intended behaviour, not a leak — the worker can still die the moment the
+  // tab closes.
+  setInterval(() => {
+    navigator.serviceWorker.controller?.postMessage({ type: 'ping' })
+  }, 20_000)
+
   // Load the real site into the content iframe. The marker tells the SW this
   // document navigation is Swarm content (not the boot shell) — see
   // CONTENT_MARKER. Without it the iframe nav passes through to the network and
@@ -352,53 +378,49 @@ function renderShell (): ShellUi {
     }
   }
 
-  // True once the iframe document has parsed AND every render-blocking
-  // stylesheet it declares has actually loaded. We deliberately do NOT wait for
-  // the full `load` event: images and other late subresources are retrieved
-  // from Swarm chunk-by-chunk and can lag badly or never arrive, so `load`
-  // would leave the overlay stuck over an already-usable page.
-  //
-  // But `interactive`/DOMContentLoaded alone is too early HERE: unlike a normal
-  // origin server, this gateway serves CSS over the same slow Swarm-via-daemon
-  // path as everything else, so at DOMContentLoaded the stylesheets are
-  // typically still in flight. Revealing then shows parsed-but-unstyled (blank)
-  // HTML. So we additionally require all <link rel="stylesheet"> elements to be
-  // resolved. A stylesheet link exposes a non-null `.sheet` once it has loaded
-  // and parsed; it stays null while pending. A link that errored fires `load`'s
-  // sibling `error` and its `.sheet` stays null forever — we treat a link as
-  // "resolved" if its sheet is present OR it has finished (load/error) so a
-  // 404'd stylesheet can't wedge the overlay open.
-  const stylesheetsReady = (doc: Document): boolean => {
-    const links = Array.from(doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"]'))
-    return links.every((link) => {
-      if (link.disabled) return true
-      try { if (link.sheet != null) return true } catch { /* cross-origin sheet: treat via settled flag below */ }
-      // `settled` is stamped by the per-link load/error listeners attached in
-      // watchContentReady; absent that, fall back to "not ready yet".
-      return (link as HTMLLinkElement & { __gwSettled?: boolean }).__gwSettled === true
-    })
+  // Stylesheet gate. The overlay must NEVER lift over parsed-but-unstyled
+  // HTML: unlike a normal origin server, this gateway serves CSS over the same
+  // slow Swarm-via-daemon path as everything else, so at DOMContentLoaded the
+  // stylesheets are typically still in flight — and a Swarm CSS fetch can
+  // legitimately take minutes on a cold node. So we wait for EVERY
+  // <link rel="stylesheet"> to actually load (non-null `.sheet`) before
+  // revealing, for as long as the SW could still deliver it (STYLE_BUDGET).
+  // A sheet whose fetch errors (e.g. the SW's 504 after a wedged retrieval)
+  // gets ONE transparent retry — transient chunk-retrieval failures are common
+  // on the thin browser peer pool — and if it errors again the shell shows the
+  // error overlay instead of unstyled content. We deliberately do NOT wait for
+  // the full `load` event as the primary signal: images and other late
+  // subresources can lag badly or never arrive, and they don't blank the page
+  // the way missing CSS does.
+  type LinkEl = HTMLLinkElement & { __gwState?: 'loaded' | 'failed' }
+  const sheetState = (doc: Document): 'ready' | 'pending' | 'failed' => {
+    let failed = false
+    for (const link of Array.from(doc.querySelectorAll<LinkEl>('link[rel~="stylesheet"]'))) {
+      if (link.disabled) continue
+      try { if (link.sheet != null) continue } catch { /* inaccessible sheet: rely on listener state */ }
+      if (link.__gwState === 'failed') { failed = true; continue }
+      return 'pending' // not loaded, not failed -> still in flight (or untracked yet)
+    }
+    return failed ? 'failed' : 'ready'
   }
 
-  // Poll the iframe document until it's parsed and its stylesheets have loaded,
-  // then reveal. `load` still acts as a happy-path accelerator, and a hard cap
-  // guards against a wholly stalled navigation (e.g. a stylesheet that never
-  // arrives from Swarm).
-  // Time budgets. STYLE_CAP: once the document has committed, how long we wait
-  // for its stylesheets before revealing the parsed (possibly unstyled) page
-  // anyway — a stylesheet may never arrive from Swarm, and a parsed page beats
-  // a stuck overlay. DOC_CAP: how long we wait for ANY real document to commit
-  // before giving up. This must comfortably exceed the daemon's per-fetch
-  // ceiling (90s) since on a cold node the first HTML fetch can legitimately
-  // take that long; revealing earlier would just dismiss the overlay over a
-  // blank iframe (the observed "blank page" symptom).
-  const STYLE_CAP_MS = 20_000
+  // Time budgets. STYLE_BUDGET: once the document has committed, how long we
+  // keep waiting for its stylesheets. This must cover the SW's whole per-request
+  // budget (~290s: daemon worst case 3 candidates × 90s, see sw.ts) — if it
+  // expires we show a clear failure, NEVER the unstyled page. DOC_CAP: how long
+  // we wait for ANY real document to commit before giving up. This must
+  // comfortably exceed the daemon's per-fetch ceiling (90s) since on a cold
+  // node the first HTML fetch can legitimately take that long; revealing
+  // earlier would just dismiss the overlay over a blank iframe (the observed
+  // "blank page" symptom).
+  const STYLE_BUDGET_MS = 300_000
   const DOC_CAP_MS = 100_000
   const watchContentReady = (): void => {
     const started = Date.now()
     let docCommittedAt: number | null = null
     const tracked = new WeakSet<HTMLLinkElement>()
     const poll = setInterval(() => {
-      let ready = false
+      let state: 'ready' | 'pending' | 'failed' = 'pending'
       let docCommitted = false
       try {
         const doc = frame.contentDocument
@@ -409,28 +431,43 @@ function renderShell (): ShellUi {
         if (docReady && doc != null) {
           docCommitted = true
           // Attach one-shot load/error listeners to any stylesheet links we
-          // haven't seen yet, so an errored sheet is recorded as settled and
-          // can't hold the overlay open indefinitely.
-          for (const link of doc.querySelectorAll<HTMLLinkElement>('link[rel~="stylesheet"]')) {
+          // haven't seen yet. `load` marks the link loaded; `error` retries the
+          // fetch ONCE by swapping in a fresh clone (re-setting the same href is
+          // not a reliable refetch), then marks it failed for good.
+          for (const link of doc.querySelectorAll<LinkEl>('link[rel~="stylesheet"]')) {
             if (tracked.has(link)) continue
             tracked.add(link)
-            const mark = (): void => { (link as HTMLLinkElement & { __gwSettled?: boolean }).__gwSettled = true }
-            link.addEventListener('load', mark, { once: true })
-            link.addEventListener('error', mark, { once: true })
+            link.addEventListener('load', () => { link.__gwState = 'loaded' }, { once: true })
+            link.addEventListener('error', () => {
+              if (link.dataset.gwRetried !== '1') {
+                console.warn('[boot] stylesheet failed, retrying once:', link.href)
+                const clone = link.cloneNode() as LinkEl
+                clone.dataset.gwRetried = '1'
+                link.replaceWith(clone) // the next poll tick tracks the clone
+              } else {
+                console.error('[boot] stylesheet failed after retry:', link.href)
+                link.__gwState = 'failed'
+              }
+            }, { once: true })
           }
-          ready = stylesheetsReady(doc)
+          state = sheetState(doc)
         }
-      } catch { ready = false } // transiently inaccessible while navigating
+      } catch { state = 'pending' } // transiently inaccessible while navigating
       if (docCommitted && docCommittedAt == null) docCommittedAt = Date.now()
       const now = Date.now()
-      if (ready) {
+      if (docCommitted && state === 'ready') {
         clearInterval(poll)
         setTimeout(reveal, 400) // brief grace for first paint / hydration
-      } else if (docCommittedAt != null && now - docCommittedAt > STYLE_CAP_MS) {
-        // Document is here but stylesheets stalled — reveal the page as-is
-        // rather than holding a blank overlay over usable (if unstyled) content.
+      } else if (docCommitted && state === 'failed') {
+        // A stylesheet is permanently unretrievable (failed twice). Showing the
+        // page would mean blank/unstyled HTML — surface a failure instead.
         clearInterval(poll)
-        reveal()
+        failShell('The site\u2019s HTML arrived but a stylesheet could not be retrieved from Swarm, so the page would render unstyled. Reload to retry.')
+      } else if (docCommittedAt != null && now - docCommittedAt > STYLE_BUDGET_MS) {
+        // Stylesheets still in flight after the SW's whole request budget —
+        // they're not coming. Never reveal unstyled HTML; fail clearly.
+        clearInterval(poll)
+        failShell('Timed out fetching this site\u2019s stylesheets from Swarm. Reload to retry.')
       } else if (docCommittedAt == null && now - started > DOC_CAP_MS) {
         // No document ever committed: the fetch is wedged (no peers / no chunks).
         // Don't reveal a blank iframe — surface a clear failure so the user knows
@@ -441,15 +478,24 @@ function renderShell (): ShellUi {
     }, 150)
   }
 
-  // The full `load` event is the happy path: by then stylesheets are loaded
-  // too. Guard against the intermediate about:blank document whose `load` fires
-  // before the real navigation commits — revealing then would dismiss the
-  // overlay over a blank frame.
+  // The full `load` event is the happy path: by then stylesheets are normally
+  // loaded too. Two guards: (1) the intermediate about:blank document, whose
+  // `load` fires before the real navigation commits — revealing then would
+  // dismiss the overlay over a blank frame; (2) `load` also fires when a
+  // stylesheet ERRORED (an errored subresource doesn't block the event), so
+  // only reveal here if every sheet really loaded — otherwise leave it to the
+  // poll above, which retries the sheet and otherwise fails the shell rather
+  // than ever revealing unstyled HTML.
   frame.addEventListener('load', () => {
     if (!contentRequested) return
-    let realDoc = false
-    try { realDoc = !(frame.contentDocument?.URL ?? 'about:').startsWith('about:') } catch { realDoc = true }
-    if (realDoc) { reveal(); syncHead() }
+    let ok = false
+    try {
+      const doc = frame.contentDocument
+      if (doc == null) return
+      if ((doc.URL ?? 'about:').startsWith('about:')) return
+      ok = sheetState(doc) === 'ready'
+    } catch { ok = true } // cross-origin/unreadable: can't inspect, reveal as before
+    if (ok) { reveal(); syncHead() }
   })
 
   return {
