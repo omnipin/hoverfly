@@ -128,10 +128,14 @@ async function serveContent (req: Request): Promise<Response> {
   console.log('[sw] fetchPath', refHex.slice(0, 12) + '…', 'path=', path || '(root)')
   let res
   try {
-    res = await rpc.fetchPath(refHex, path)
+    // Bound the RPC so a lost/dropped daemon message can't hang the document
+    // request forever (which would leave the boot overlay stuck with no error).
+    // The daemon bounds each candidate at 90s and tries up to 3, so allow
+    // headroom over that worst case (3×90s) before declaring the bridge dead.
+    res = await withTimeout(rpc.fetchPath(refHex, path), 300_000)
   } catch (e) {
     console.error('[sw] fetchPath RPC error', e)
-    return errorPage(502, 'Daemon RPC failed', (e as Error).message)
+    return errorPage(504, 'Swarm fetch timed out', (e as Error).message)
   }
 
   console.log('[sw] fetchPath result ' + JSON.stringify({ path, ok: res.ok, httpStatus: res.httpStatus, bytes: res.body?.byteLength, contentType: res.contentType, error: res.error }))

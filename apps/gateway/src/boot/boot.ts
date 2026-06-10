@@ -478,7 +478,12 @@ function renderShell (): ShellUi {
       }
       text.textContent = msg
       // Mirror live daemon status into the overlay while the site is loading.
-      if (!loaded) loadingSub.textContent = msg
+      // Prefer the daemon's PHASE (e.g. "fetching index.html… from 152 peers",
+      // "got index.html (40000 bytes, …)") over the bare peer count: on mobile
+      // the slow path otherwise looks frozen at "152 peers" with no signal that
+      // retrieval is actually progressing (or where it's stuck). Fall back to
+      // the peer count before any fetch phase exists.
+      if (!loaded) loadingSub.textContent = (s.phase != null && s.phase !== '') ? s.phase : msg
       if (loaded) setTimeout(() => pill.classList.add('gw-min'), 1500)
     },
     fail (msg) { failShell(msg) }
