@@ -26,9 +26,16 @@ use crate::peers::PeerStore;
 use crate::signer::SwarmSigner;
 use crate::transport::{Transport, TransportConfig};
 
-/// Per-chunk peer racing for browser fetches. Mirrors the CLI default
-/// (`client::DEFAULT_FETCH_CONCURRENCY`).
-const FETCH_CONCURRENCY: usize = 5;
+/// Per-chunk peer racing for browser fetches. Higher than the CLI default
+/// because the browser is /ws-only against a SCARCE, flaky forwarder pool: most
+/// dialed peers are slow or non-forwarding, so a wider race per chunk is what
+/// actually lands a fast forwarder quickly. This matters most on mobile, which
+/// runs single-threaded (no `initThreadPool`) over a higher-latency link —
+/// observed pulling chunks but timing out before a page completed. 5 left too
+/// few slots in flight when several were stuck on slow peers; 12 keeps the
+/// pipeline full without overwhelming the single ws+yamux connection driver
+/// (each retrieval now closes its substream promptly, so slots free up fast).
+const FETCH_CONCURRENCY: usize = 12;
 
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
