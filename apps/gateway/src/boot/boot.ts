@@ -8,7 +8,7 @@
 //   4. renders the actual website in a full-viewport child iframe, whose
 //      requests the SW now serves as Swarm content via the daemon.
 
-import { CONTENT_MARKER, DAEMON_FRAME_PATH, SW_SCRIPT } from '../shared/config.ts'
+import { CONTENT_MARKER, DAEMON_FRAME_PATH, GW_VERSION, SW_SCRIPT } from '../shared/config.ts'
 import { DaemonRpc, mintDaemonPort, type DaemonStatus } from '../shared/protocol.ts'
 import { daemonOrigin } from '../shared/parse-request.ts'
 
@@ -103,7 +103,47 @@ function contentUrl (pathname: string, search: string): string {
 }
 
 async function ensureControllingSW (): Promise<ServiceWorker> {
-  await navigator.serviceWorker.register(SW_SCRIPT, { scope: '/' })
+  const reg = await navigator.serviceWorker.register(SW_SCRIPT, { scope: '/' })
+  // Force an update check. A normal (non-private) tab that visited an EARLIER
+  // deploy is already controlled by that deploy's (outdated) sw.js — e.g. one
+  // built before the content-iframe routing fix, which passed the iframe nav
+  // through and left the page blank. `controller` is non-null immediately in
+  // that case, so without this we'd run against the stale SW. update() fetches
+  // the new sw.js; if it differs, a new worker installs and we reload once it
+  // takes control (below). This is why a fresh private tab worked but a normal
+  // tab didn't.
+  try { await reg.update() } catch { /* offline / transient — proceed */ }
+
+  // A new worker is installing or waiting (i.e. the active controller is stale).
+  // It calls skipWaiting()+clients.claim() on activate, which fires
+  // `controllerchange`; reload once so the page runs under the new SW. Guard
+  // the reload per DEPLOY VERSION so we reload at most once per upgrade, never
+  // in a loop.
+  const pending = reg.installing ?? reg.waiting
+  const reloadKey = 'gw-reloaded-' + GW_VERSION
+  if (pending != null && navigator.serviceWorker.controller != null &&
+      sessionStorage.getItem(reloadKey) == null) {
+    return await new Promise<ServiceWorker>((resolve) => {
+      let reloaded = false
+      const maybeReload = (): void => {
+        if (reloaded) return
+        reloaded = true
+        sessionStorage.setItem(reloadKey, '1')
+        location.reload()
+      }
+      navigator.serviceWorker.addEventListener('controllerchange', maybeReload)
+      // Fallback: if the new worker never activates within 5s, proceed with
+      // whatever controls the page rather than hanging.
+      setTimeout(() => {
+        if (reloaded) return
+        navigator.serviceWorker.removeEventListener('controllerchange', maybeReload)
+        if (navigator.serviceWorker.controller != null) {
+          resolve(navigator.serviceWorker.controller)
+        }
+      }, 5000)
+    })
+  }
+
   await navigator.serviceWorker.ready
   if (navigator.serviceWorker.controller != null) return navigator.serviceWorker.controller
   return await new Promise<ServiceWorker>((resolve, reject) => {
@@ -139,11 +179,22 @@ function connectDaemon (): Promise<MessagePort> {
   console.log('[boot] embedding daemon frame', iframe.src)
   return new Promise<MessagePort>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('daemon frame did not load (no frame-ready from ' + origin + ')')), 30_000)
+    const done = (): void => { window.removeEventListener('message', onMessage); clearTimeout(timeout) }
     const onMessage = (e: MessageEvent): void => {
-      if (e.data?.type === 'frame-ready') console.log('[boot] got frame-ready from', e.origin)
-      if (e.origin !== origin || e.data?.type !== 'frame-ready') return
-      window.removeEventListener('message', onMessage)
-      clearTimeout(timeout)
+      if (e.origin !== origin) return
+      // The broker frame reports a fatal init failure (e.g. SharedWorker
+      // unsupported — notably Firefox without module-worker support, where
+      // `new SharedWorker(url, {type:'module'})` throws). Surface it
+      // immediately with the real reason instead of waiting out the 30s
+      // frame-ready timeout and showing a bare blank page.
+      if (e.data?.type === 'frame-error' && e.data?.tag === 'error') {
+        done()
+        reject(new Error('daemon frame failed: ' + String(e.data?.detail ?? 'unknown error')))
+        return
+      }
+      if (e.data?.type !== 'frame-ready') return
+      console.log('[boot] got frame-ready from', e.origin)
+      done()
       const channel = new MessageChannel()
       iframe.contentWindow?.postMessage({ type: 'connect' }, origin, [channel.port2])
       resolve(channel.port1)
