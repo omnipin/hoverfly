@@ -106,6 +106,17 @@ fn is_batch_not_found(e: &TransportError) -> bool {
 /// block faster ones. Set to 1 to restore the legacy sequential behavior.
 pub const DEFAULT_FETCH_CONCURRENCY: usize = 5;
 
+/// How many DISTINCT chunks the file joiner pulls at once, given the per-chunk
+/// peer-race width. This is the dominant throughput knob for a file body, and
+/// is intentionally decoupled from (and larger than) the per-chunk race: once
+/// the session pool is warm, a few forwarders serve many chunks in parallel, so
+/// we want lots of chunks in flight rather than many redundant peer attempts on
+/// each. Bounded so we don't blow past the warm pool's aggregate
+/// `MAX_INFLIGHT_PER_SESSION` capacity or the single ws+yamux driver's budget.
+pub fn joiner_concurrency(per_chunk_race: usize) -> usize {
+    (per_chunk_race.saturating_mul(6)).clamp(24, 48)
+}
+
 /// Default number of peers dialed in parallel per discover round. Each
 /// peer is held until bee finishes its gossip burst (~1 s typical;
 /// capped at `wait_per_peer`); parallelising avoids 70-peer-round-2
@@ -198,9 +209,14 @@ type CachedSession = (
     std::sync::Arc<tokio::sync::Semaphore>,
 );
 
-/// Maximum concurrent fetches against a single `PeerSession`. Mirrors Bee's
-/// `IN_FLIGHT_CAP = 4`.
-const MAX_INFLIGHT_PER_SESSION: usize = 4;
+/// Maximum concurrent fetches against a single `PeerSession`. Bee uses
+/// `IN_FLIGHT_CAP = 4` per peer for fairness across many requesters, but a
+/// read-only browser client pulls from a SCARCE set of warm forwarders — with
+/// only a handful fast, a 4-cap leaves the joiner's chunks-in-flight starved
+/// (effective throughput ≈ warm_forwarders × cap). 8 lets each good forwarder
+/// serve more of the joiner's parallel chunks; each retrieval now closes its
+/// substream promptly so this stays within yamux's per-connection budget.
+const MAX_INFLIGHT_PER_SESSION: usize = 8;
 
 /// Score a peer reaches (and is clamped to) on a protocol-level response.
 /// Small so that a couple of consecutive timeouts demote a peer that has gone
@@ -1189,16 +1205,21 @@ pub async fn fetch_bytes_cached_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
-    // Drive nectar's BMT joiner with the same per-chunk concurrency as
-    // our network store so deep trees don't bottleneck on its default
-    // (8). Each chunk fetch already races peers internally; this is the
-    // outer "chunks in flight" knob.
+    // Drive nectar's BMT joiner with a HIGHER chunks-in-flight count than the
+    // per-chunk peer-race width. These are different knobs: `concurrency` (the
+    // store's) is how many peers we race for ONE chunk — useful while cold for
+    // discovery, wasteful once warm (the extra attempts just consume substream
+    // slots). The joiner's concurrency is how many DISTINCT chunks pull at once,
+    // which is the real throughput lever. Decoupling them (and giving the joiner
+    // the larger value via `joiner_concurrency`) pumps many chunks through the
+    // few warm forwarders instead of redundantly racing each chunk against the
+    // whole pool.
     let bytes =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
             store, root,
         )
         .await?
-        .with_concurrency(concurrency.max(1).max(8))
+        .with_concurrency(joiner_concurrency(concurrency))
         .read_all()
         .await?;
     Ok(bytes)
@@ -1293,7 +1314,7 @@ pub async fn fetch_manifest_path_cached_meta(
             store, target,
         )
         .await?
-        .with_concurrency(concurrency.max(1).max(8))
+        .with_concurrency(joiner_concurrency(concurrency))
         .read_all()
         .await?;
     Ok((bytes, content_type, feed_resolved))
