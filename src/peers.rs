@@ -39,6 +39,15 @@ pub struct Peer {
     /// 32-byte nonce used to derive overlay (hex). Zero by default.
     #[serde(default)]
     pub nonce: Option<String>,
+    /// Whether the peer advertised itself as a full node in its handshake
+    /// `Ack` (the same bit Bee surfaces in `/peers`). `None` until we've
+    /// completed a handshake with it (discovery learns overlays via hive
+    /// gossip without dialing every peer, so this stays unknown until a real
+    /// connection). Full nodes forward retrieval requests into the network;
+    /// light nodes only answer from their own reserve. Used to PRIORITISE
+    /// (not filter) forwarders during retrieval — light nodes are still kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_node: Option<bool>,
 
     /// Reachability cache, updated by dial attempts (session pool open,
     /// healthcheck, etc.). Persists across CLI runs so we don't waste
@@ -84,7 +93,14 @@ pub const WARM_PEERLIST_MIN_KNOWN_GOOD: usize = 8;
 /// across many concurrent dials.
 #[derive(Clone, Copy, Debug)]
 pub enum DialResult {
-    Success { rtt_ms: u32 },
+    /// A completed handshake. `full_node` is the peer's advertised node mode
+    /// (the bit Bee shows in `/peers`); `None` if the dial path didn't reach
+    /// the handshake's Ack (shouldn't happen for a real success, but keeps the
+    /// type honest for non-handshake "reachable" signals).
+    Success {
+        rtt_ms: u32,
+        full_node: Option<bool>,
+    },
     Failure,
 }
 
@@ -105,7 +121,9 @@ pub fn apply_log(store: &mut PeerStore, log: &ReachabilityLog) {
     };
     for (overlay, result) in entries {
         match result {
-            DialResult::Success { rtt_ms } => store.record_dial_success(&overlay, rtt_ms),
+            DialResult::Success { rtt_ms, full_node } => {
+                store.record_dial_success(&overlay, rtt_ms, full_node)
+            }
             DialResult::Failure => store.record_dial_failure(&overlay),
         }
     }
@@ -299,6 +317,11 @@ impl PeerStore {
                 if existing.nonce.is_none() {
                     existing.nonce = peer.nonce;
                 }
+                // Learn node mode if we didn't already know it (a fresh
+                // handshake is authoritative; hive gossip never sets it).
+                if peer.full_node.is_some() {
+                    existing.full_node = peer.full_node;
+                }
                 // Reachability is monotonic on each field — take the newer.
                 if peer.last_dial_success_unix > existing.last_dial_success_unix {
                     existing.last_dial_success_unix = peer.last_dial_success_unix;
@@ -319,13 +342,17 @@ impl PeerStore {
     }
 
     /// Record a successful dial for the peer with this overlay (hex).
-    /// No-op if the peer isn't in the store.
-    pub fn record_dial_success(&mut self, overlay_hex: &str, rtt_ms: u32) {
+    /// No-op if the peer isn't in the store. `full_node` is the peer's
+    /// advertised node mode from the handshake; recorded when known.
+    pub fn record_dial_success(&mut self, overlay_hex: &str, rtt_ms: u32, full_node: Option<bool>) {
         let key = overlay_hex.to_lowercase();
         if let Some(p) = self.peers.get_mut(&key) {
             p.last_dial_success_unix = Some(now_unix());
             p.last_dial_rtt_ms = Some(rtt_ms);
             p.consecutive_failures = 0;
+            if full_node.is_some() {
+                p.full_node = full_node;
+            }
         }
     }
 
