@@ -252,6 +252,25 @@ impl RetrievalCache {
             *e = index;
         }
     }
+
+    /// Export all known feed hints as `{ "<owner||topic hex>": <index>, … }`.
+    /// Used by the browser daemon to persist hints to IndexedDB so a returning
+    /// visitor anchors near the feed head instead of galloping from 0 (the
+    /// difference between a ~1s warm resolve and a ~30s cold one).
+    pub fn export_feed_hints(&self) -> HashMap<String, u64> {
+        self.feed_index.lock().unwrap().clone()
+    }
+
+    /// Merge persisted feed hints back in (monotonic — never lowers a hint).
+    pub fn import_feed_hints(&self, hints: HashMap<String, u64>) {
+        let mut m = self.feed_index.lock().unwrap();
+        for (k, v) in hints {
+            let e = m.entry(k).or_insert(0);
+            if v > *e {
+                *e = v;
+            }
+        }
+    }
 }
 
 impl<'a> NetworkedStore<'a> {

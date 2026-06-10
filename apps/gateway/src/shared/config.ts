@@ -85,6 +85,13 @@ export const IDB_PEERS_KEY = 'peerstore-json'
 export const IDB_NODEKEY_KEY = 'node-key-hex'
 export const IDB_NONCE_KEY = 'node-nonce-hex'
 /**
+ * Persisted feed head-index hints (`exportFeedHints`/`loadFeedHints`). A feed's
+ * head only moves forward, so the last resolved index lets a returning visitor
+ * resolve a feed (e.g. swarm.eth) in ~1 fast round from the cached head instead
+ * of a cold gallop from index 0 (~30s observed on the thin browser pool).
+ */
+export const IDB_FEED_HINTS_KEY = 'feed-hints-json'
+/**
  * IndexedDB database name for the persistent, content-addressed chunk cache
  * (L2). Managed inside the hoverfly wasm via `enableChunkStore`. Immutable
  * Swarm chunks persist here across fetches and sessions, on top of the SW's
