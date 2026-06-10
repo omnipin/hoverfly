@@ -234,6 +234,22 @@ const PROBE_BAND: u32 = 12;
 /// while roughly halving per-round cost vs the initial 3s.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// How many times to re-probe the *anchor* index before concluding a feed has
+/// no updates. The anchor is special: index 0 must exist for any published
+/// feed, and a cached hint index was proven present on a prior resolve, so a
+/// bounded "absent" there (a `PROBE_TIMEOUT` expiry or a transient "all peers
+/// failed" while the session pool is still warming) is almost always a FALSE
+/// negative — not proof the feed is empty. Interior probes can over-report
+/// "absent" harmlessly (it just ends a search band), but a false-absent anchor
+/// aborts the whole resolve with `NoUpdate`. So we retry the anchor with a
+/// short backoff to let the daemon warm dialable peers, and only surface
+/// `NoUpdate` after exhausting these attempts on a genuine, repeated miss.
+const ANCHOR_ATTEMPTS: u32 = 4;
+/// Backoff between anchor re-probes (gives the session pool time to dial more
+/// `/ws` peers — scarce on mainnet, so the first probe of a cold session often
+/// races a barely-warm pool).
+const ANCHOR_RETRY_DELAY: Duration = Duration::from_millis(750);
+
 /// Resolve the **latest** update of a sequence feed and return
 /// `(content_reference, resolved_index)`.
 ///
@@ -277,10 +293,17 @@ where
     // hint falls back to a cold search from 0 (index 0 must exist for any feed).
     // `lo` = highest index proven present (+ its chunk); `hi` = lowest proven
     // absent (u64::MAX = not yet bracketed).
+    //
+    // The anchor probe is hardened against false-absents (timeout / transient
+    // "all peers failed" on a cold session pool): unlike interior probes, an
+    // anchor miss aborts the whole resolve, so we retry it before believing it.
+    // See `confirm_anchor`.
     let (mut lo, mut last_chunk): (u64, AnyChunk<DEFAULT_BODY_SIZE>) =
-        match get_update(store, feed, after).await? {
+        match confirm_anchor(store, feed, after).await? {
             Some(c) => (after, c),
-            None if after != 0 => match get_update(store, feed, 0).await? {
+            // Hint missed even after retries: fall back to a cold search from 0,
+            // also hardened. If index 0 is genuinely absent, the feed is empty.
+            None if after != 0 => match confirm_anchor(store, feed, 0).await? {
                 Some(c) => (0, c),
                 None => return Err(ResolveError::Feed(FeedError::NoUpdate)),
             },
@@ -392,10 +415,49 @@ where
     Ok((ChunkAddress::new(reference), lo))
 }
 
+/// Outcome of a single bounded probe, distinguishing *why* a chunk was absent.
+/// Interior head-finding collapses all absences to "advance the search", but
+/// the anchor needs to tell a definitive miss apart from a transient one.
+enum Probe {
+    /// The update chunk was retrieved.
+    Present(AnyChunk<DEFAULT_BODY_SIZE>),
+    /// Definitive network "not found": no peer holds this SOC address. For an
+    /// anchor (index 0 or a previously-resolved hint) this is the only signal
+    /// strong enough to conclude the feed is empty.
+    Absent,
+    /// Inconclusive: the probe hit `PROBE_TIMEOUT` or a transient retrieval
+    /// failure ("all peers failed" / "no peer found") — likely a cold/warming
+    /// session pool, not proof of absence. Retryable.
+    Unresolved,
+}
+
+/// One bounded probe of update index `i`. Races retrieval against
+/// `PROBE_TIMEOUT` so a miss fails fast (bee's asyncFinder bounds each probe to
+/// 1s likewise). `tokio::time::timeout` is portable: native uses real tokio,
+/// wasm uses tokio_with_wasm (gloo-timer backed).
+async fn probe_update<S>(store: &S, feed: &Feed, i: u64) -> Result<Probe, ResolveError>
+where
+    S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
+{
+    let addr = ChunkAddress::new(feed.update_address(i));
+    match tokio::time::timeout(PROBE_TIMEOUT, store.get(&addr)).await {
+        Ok(Ok(c)) => Ok(Probe::Present(c)),
+        Ok(Err(ChunkStoreError::NotFound { .. })) => Ok(Probe::Absent),
+        // "no peer found" / "all peers failed" => nobody is serving this SOC
+        // right now. For the search this means "advance", but it is NOT a
+        // definitive not-found, so mark it Unresolved (retryable at the anchor).
+        Ok(Err(ChunkStoreError::Other(msg))) if is_absent_retrieval(&msg) => Ok(Probe::Unresolved),
+        Ok(Err(e)) => Err(ResolveError::Fetch(e.to_string())),
+        // Timed out — inconclusive, retryable at the anchor.
+        Err(_) => Ok(Probe::Unresolved),
+    }
+}
+
 /// Fetch the feed update at index `i`. Returns `Ok(None)` if the update chunk
-/// doesn't exist (a network "not found"), `Ok(Some(chunk))` if it does, and
-/// `Err` only on a genuine fetch failure (so a missing index ends the search
-/// rather than aborting it).
+/// is absent (definitive not-found OR a bounded/transient miss — both end the
+/// search band), `Ok(Some(chunk))` if present, and `Err` only on a genuine
+/// fetch failure. Used for interior head-finding probes, where over-reporting
+/// "absent" is harmless.
 async fn get_update<S>(
     store: &S,
     feed: &Feed,
@@ -404,25 +466,48 @@ async fn get_update<S>(
 where
     S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
 {
-    let addr = ChunkAddress::new(feed.update_address(i));
-
-    // Bound the probe: race the retrieval against a deadline. A probe that
-    // doesn't resolve within PROBE_TIMEOUT is treated as "absent" for the
-    // search (bee's asyncFinder does the same with a 1s per-probe ctx). This is
-    // what makes head-finding fast — missing indices no longer pay the full
-    // exhaustive-retrieval give-up cost. `tokio::time::timeout` is portable
-    // here: native uses real tokio, wasm uses tokio_with_wasm (both have the
-    // `time` feature, gloo-timer backed on wasm).
-    match tokio::time::timeout(PROBE_TIMEOUT, store.get(&addr)).await {
-        Ok(Ok(c)) => Ok(Some(c)),
-        Ok(Err(ChunkStoreError::NotFound { .. })) => Ok(None),
-        // "no peer found" / "all peers failed" => nobody is serving this SOC
-        // address right now; treat as absent for head-finding.
-        Ok(Err(ChunkStoreError::Other(msg))) if is_absent_retrieval(&msg) => Ok(None),
-        Ok(Err(e)) => Err(ResolveError::Fetch(e.to_string())),
-        // Timed out — treat as absent.
-        Err(_) => Ok(None),
+    match probe_update(store, feed, i).await? {
+        Probe::Present(c) => Ok(Some(c)),
+        Probe::Absent | Probe::Unresolved => Ok(None),
     }
+}
+
+/// Confirm whether an *anchor* index (a previously-resolved hint, or index 0)
+/// is present, retrying through inconclusive misses.
+///
+/// Returns `Ok(Some(chunk))` if present, `Ok(None)` only after a **definitive**
+/// not-found or after `ANCHOR_ATTEMPTS` exhausted on repeated inconclusive
+/// misses. This is the fix for the rare "feed has no updates" flake: a single
+/// timed-out or transiently-failed probe of a chunk that must exist no longer
+/// aborts the whole resolve.
+async fn confirm_anchor<S>(
+    store: &S,
+    feed: &Feed,
+    i: u64,
+) -> Result<Option<AnyChunk<DEFAULT_BODY_SIZE>>, ResolveError>
+where
+    S: ChunkGet<DEFAULT_BODY_SIZE, Error = ChunkStoreError>,
+{
+    for attempt in 0..ANCHOR_ATTEMPTS {
+        match probe_update(store, feed, i).await? {
+            Probe::Present(c) => return Ok(Some(c)),
+            // A definitive not-found is trustworthy: stop immediately.
+            Probe::Absent => return Ok(None),
+            // Inconclusive (timeout / transient peer failure): back off and
+            // retry — the session pool may still be warming dialable peers.
+            Probe::Unresolved => {
+                if attempt + 1 < ANCHOR_ATTEMPTS {
+                    tracing::debug!(
+                        target: "hoverfly::feed",
+                        "anchor probe index={} inconclusive (attempt {}/{}); retrying",
+                        i, attempt + 1, ANCHOR_ATTEMPTS
+                    );
+                    tokio::time::sleep(ANCHOR_RETRY_DELAY).await;
+                }
+            }
+        }
+    }
+    Ok(None)
 }
 
 /// Heuristic: a retrieval error string that indicates the chunk simply isn't
@@ -568,5 +653,142 @@ mod tests {
             hex::encode(addr),
             "9d453ebb73b2fedaaf44ceddcf7a0aa37f3e3d6453fea5841c31f0ea6d61dc85"
         );
+    }
+
+    // ---- resolve_latest anchor-resilience (the "feed has no updates" flake) ----
+
+    use nectar_primitives::chunk::ContentChunk;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+
+    fn test_feed() -> Feed {
+        Feed::from_manifest_meta(
+            "00112233445566778899aabbccddeeff00112233",
+            &"22".repeat(32),
+            "Sequence",
+        )
+        .unwrap()
+    }
+
+    /// A content chunk whose body is a valid feed payload pointing at `reference`
+    /// (`span(8) || timestamp(8) || reference(32)`), used as a stand-in head SOC
+    /// update — `resolve_latest` only reads `.data()` and parses the payload.
+    fn head_chunk(reference: [u8; 32]) -> AnyChunk<DEFAULT_BODY_SIZE> {
+        let mut body = vec![0u8; PAYLOAD_PREFIX];
+        body.extend_from_slice(&reference);
+        AnyChunk::from(ContentChunk::<DEFAULT_BODY_SIZE>::new(body).unwrap())
+    }
+
+    /// Per-address scripted outcome for one `get` call.
+    enum Outcome {
+        Present(AnyChunk<DEFAULT_BODY_SIZE>),
+        NotFound,
+        Transient, // "all peers failed" -> Probe::Unresolved (retryable)
+    }
+
+    /// Mock store: returns a scripted sequence of outcomes per address, so we can
+    /// simulate transient anchor failures that resolve on retry. Thread-safe via
+    /// a Mutex (ChunkGet requires Send + Sync).
+    struct MockStore {
+        scripts: Mutex<HashMap<[u8; 32], std::collections::VecDeque<Outcome>>>,
+        present: Mutex<HashMap<[u8; 32], AnyChunk<DEFAULT_BODY_SIZE>>>,
+    }
+
+    impl ChunkGet<DEFAULT_BODY_SIZE> for MockStore {
+        type Error = ChunkStoreError;
+        async fn get(
+            &self,
+            address: &ChunkAddress,
+        ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+            let key: [u8; 32] = <[u8; 32]>::try_from(address.as_ref())
+                .expect("chunk address is 32 bytes");
+            if let Some(q) = self.scripts.lock().unwrap().get_mut(&key) {
+                if let Some(o) = q.pop_front() {
+                    return match o {
+                        Outcome::Present(c) => Ok(c),
+                        Outcome::NotFound => Err(ChunkStoreError::not_found(address)),
+                        Outcome::Transient => {
+                            Err(ChunkStoreError::Other("all peers failed".into()))
+                        }
+                    };
+                }
+            }
+            if let Some(c) = self.present.lock().unwrap().get(&key) {
+                return Ok(c.clone());
+            }
+            Err(ChunkStoreError::not_found(address))
+        }
+    }
+
+    /// A single transient (then-successful) probe of index 0 must NOT abort the
+    /// resolve with `NoUpdate` — `confirm_anchor` retries through it. This is the
+    /// regression guard for the rare `swarm.eth` "feed has no updates" flake.
+    #[tokio::test]
+    async fn anchor_retries_through_transient_then_resolves() {
+        let feed = test_feed();
+        let reference = [0x7Au8; 32];
+        let a0 = feed.update_address(0);
+        let a1 = feed.update_address(1);
+
+        let mut scripts: HashMap<_, std::collections::VecDeque<Outcome>> = HashMap::new();
+        // index 0: two transient failures, then present (head).
+        scripts.insert(
+            a0,
+            [Outcome::Transient, Outcome::Transient, Outcome::Present(head_chunk(reference))]
+                .into_iter()
+                .collect(),
+        );
+        // index 1: genuinely absent -> head is 0.
+        scripts.insert(a1, [Outcome::NotFound].into_iter().collect());
+
+        let store = MockStore {
+            scripts: Mutex::new(scripts),
+            present: Mutex::new(HashMap::new()),
+        };
+
+        let (addr, index) = resolve_latest(&store, &feed, 0)
+            .await
+            .expect("must resolve through transient anchor misses, not error NoUpdate");
+        assert_eq!(index, 0);
+        assert_eq!(*addr.as_ref(), reference);
+    }
+
+    /// A definitive not-found at index 0 (no transient noise) still concludes the
+    /// feed is empty immediately — we don't paper over genuinely empty feeds.
+    #[tokio::test]
+    async fn definitive_absent_anchor_reports_no_updates() {
+        let feed = test_feed();
+        let store = MockStore {
+            scripts: Mutex::new(HashMap::new()), // all addresses -> NotFound
+            present: Mutex::new(HashMap::new()),
+        };
+        let err = resolve_latest(&store, &feed, 0)
+            .await
+            .expect_err("empty feed must error");
+        assert!(matches!(err, ResolveError::Feed(FeedError::NoUpdate)), "got {err:?}");
+    }
+
+    /// Exhausting all anchor attempts on persistent transient failure surfaces
+    /// `NoUpdate` (bounded), rather than hanging forever.
+    #[tokio::test]
+    async fn anchor_gives_up_after_persistent_transient() {
+        let feed = test_feed();
+        let a0 = feed.update_address(0);
+        let mut scripts: HashMap<_, std::collections::VecDeque<Outcome>> = HashMap::new();
+        // Always transient at index 0, more than ANCHOR_ATTEMPTS times.
+        scripts.insert(
+            a0,
+            std::iter::repeat_with(|| Outcome::Transient)
+                .take(ANCHOR_ATTEMPTS as usize + 2)
+                .collect(),
+        );
+        let store = MockStore {
+            scripts: Mutex::new(scripts),
+            present: Mutex::new(HashMap::new()),
+        };
+        let err = resolve_latest(&store, &feed, 0)
+            .await
+            .expect_err("persistent transient must bound out to NoUpdate");
+        assert!(matches!(err, ResolveError::Feed(FeedError::NoUpdate)), "got {err:?}");
     }
 }
