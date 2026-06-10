@@ -13,8 +13,13 @@ name: refresh-peers
 
 on:
   schedule:
-    # Every 5 hours (00:00, 05:00, 10:00, 15:00, 20:00 UTC).
-    - cron: "0 */5 * * *"
+    # Hourly. Mainnet /ws peers go stale within ~2-3 hours (AutoTLS SNI
+    # addresses rotate, nodes churn), so a 5-hour cadence often left the
+    # committed cold-start seed stale by the time a fresh visitor dialed it.
+    # Refreshing every hour keeps the seed well inside the staleness window.
+    # Cheap: a run is a few minutes, `concurrency` serialises overlapping
+    # runs, and `[skip ci]` commits don't trigger other workflows.
+    - cron: "0 * * * *"
   # Allow manual runs from the Actions tab.
   workflow_dispatch:
     inputs:
