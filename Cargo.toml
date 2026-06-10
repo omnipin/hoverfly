@@ -39,20 +39,23 @@ futures-bounded = { path = "vendor/futures-bounded" }
 
 [dependencies]
 # Nectar primitives (BMT, chunks, file split/join, mantaray, postage)
-nectar-primitives = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2" }
-nectar-mantaray   = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2" }
-nectar-postage    = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2", features = ["std"] }
-nectar-postage-issuer = { git = "https://github.com/nxm-rs/nectar", rev = "bafa3ac882db2a83c483b4f371db7d355ed2cfc2", features = ["std", "local-signer"] }
+nectar-primitives = "0.1.0"
+nectar-mantaray   = "0.1.0"
+nectar-postage    = { version = "0.1.0", features = ["std"] }
+nectar-postage-issuer = { version = "0.1.0", features = ["std", "local-signer"] }
 
-# alloy crypto (matches nectar's signer)
-alloy-primitives = { version = "1.5.4", default-features = false, features = ["getrandom"] }
-alloy-signer = { version = "1.5.2", default-features = false, features = ["eip712"] }
-alloy-signer-local = { version = "1.5.2", default-features = false }
+# alloy crypto (matches nectar's signer: nectar 0.1.0 is on the alloy 2.0
+# signer line, so hoverfly must track it too or the BatchStamper signer types
+# won't unify). alloy-primitives/alloy-sol-types version independently of the
+# signer crates and stay on the 1.x line.
+alloy-primitives = { version = "1.6", default-features = false, features = ["getrandom"] }
+alloy-signer = { version = "2.0", default-features = false, features = ["eip712"] }
+alloy-signer-local = { version = "2.0", default-features = false }
 # alloy-sol-types is pulled transitively but we depend on its `sol!` macro
 # and `Eip712Domain` / `SolStruct` directly for cheque signing. Keep it
 # default-features-off for the same wasm-getrandom reasons as the rest of
 # the alloy stack.
-alloy-sol-types = { version = "1.5", default-features = false }
+alloy-sol-types = { version = "1.6", default-features = false }
 # JSON-encodes `[]byte` as base64-STANDARD; needed for cheque wire
 # compatibility with bee (`SignedCheque.Signature` field).
 base64 = { version = "0.22", default-features = false, features = ["alloc"] }

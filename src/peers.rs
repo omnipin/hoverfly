@@ -373,7 +373,7 @@ impl PeerStore {
             .values()
             .filter_map(|p| {
                 let overlay = p.overlay_address()?;
-                let po = target.proximity(&overlay);
+                let po: u8 = target.proximity(&overlay).into();
                 Some((po, p))
             })
             .collect();
