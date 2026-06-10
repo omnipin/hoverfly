@@ -6,6 +6,10 @@ name: refresh-peers
 # consecutive_failures) are populated. Discovered peers whose underlays
 # are all unroutable (RFC1918/CGNAT/loopback) are already stripped by
 # `discover` itself; the healthcheck annotates (does NOT drop) the rest.
+#
+# Also derives peers.ws.json — the browser-dialable (ws/wss-underlay)
+# subset of the same harvest — which the gateway serves as its cold-start
+# seed via the apps/gateway/public/__gw__/peers.ws.json symlink.
 
 on:
   schedule:
@@ -99,18 +103,60 @@ jobs:
           fi
           mv -f peers.seed.next.json peers.seed.json
 
-      - name: Commit refreshed peers.seed.json
+      - name: Derive peers.ws.json (browser-dialable subset)
+        run: |
+          set -euo pipefail
+          # Skip if the discover step bailed early (peers.seed.json unchanged).
+          if [ -f peers.seed.next.json ]; then
+            echo "Discover bailed; keeping existing peers.ws.json."
+            exit 0
+          fi
+          # peers.ws.json is the browser seed served by the gateway
+          # (apps/gateway/public/__gw__/peers.ws.json symlinks here): keep
+          # only peers with a /ws or /wss underlay, strip non-ws underlays,
+          # and drop the dial-cache annotations (timestamps would churn the
+          # committed file every run; the browser daemon re-probes anyway).
+          # Mirrors `hoverfly discover --ws-only` / `is_ws_underlay` in
+          # src/peers.rs.
+          python3 - <<'EOF'
+          import json
+
+          seed = json.load(open("peers.seed.json"))
+          out = {}
+          for overlay, p in seed["peers"].items():
+              ws = [u for u in p["underlays"] if "/ws" in u]
+              if not ws:
+                  continue
+              out[overlay] = {
+                  "overlay": p["overlay"],
+                  "underlays": ws,
+                  "eth_address": p.get("eth_address"),
+                  "nonce": p.get("nonce"),
+              }
+          count = len(out)
+          print(f"ws-only: kept {count} of {len(seed['peers'])} peers")
+          # Sanity: don't replace the committed browser seed with a
+          # degenerate one if the network round was light on ws peers.
+          if count < 50:
+              print(f"::warning::Only {count} ws peers (<50); keeping existing peers.ws.json.")
+              raise SystemExit(0)
+          with open("peers.ws.json", "w") as f:
+              json.dump({"peers": out}, f, indent=2)
+              f.write("\n")
+          EOF
+
+      - name: Commit refreshed peerlists
         run: |
           set -euo pipefail
           # If the discover step bailed early the temp file may still exist
-          # and peers.seed.json is unchanged — `git diff` handles that.
+          # and both peerlists are unchanged — `git diff` handles that.
           rm -f peers.seed.next.json
-          if git diff --quiet -- peers.seed.json; then
-            echo "peers.seed.json unchanged; nothing to commit."
+          if git diff --quiet -- peers.seed.json peers.ws.json; then
+            echo "peerlists unchanged; nothing to commit."
             exit 0
           fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add peers.seed.json
-          git commit -m "chore(peers): refresh peers.seed.json [skip ci]"
+          git add peers.seed.json peers.ws.json
+          git commit -m "chore(peers): refresh peers.seed.json + peers.ws.json [skip ci]"
           git push
