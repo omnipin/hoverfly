@@ -8,7 +8,7 @@
 // daemon directly over the transferred port; this frame is out of the hot path.
 
 import { ATTACH } from '../shared/protocol.ts'
-import { DAEMON_WORKER_SCRIPT } from '../shared/config.ts'
+import { DAEMON_WORKER_NAME, DAEMON_WORKER_SCRIPT } from '../shared/config.ts'
 
 // Surface any frame error to the embedder (its console is hard to capture).
 const report = (tag: string, detail: unknown): void => {
@@ -21,7 +21,7 @@ report('loaded', location.href)
 
 let worker: SharedWorker
 try {
-  worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'hoverfly-daemon' })
+  worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: DAEMON_WORKER_NAME })
   worker.port.start()
   worker.onerror = (e) => console.error('[frame] shared worker error', e)
   console.log('[frame] SharedWorker created')

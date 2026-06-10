@@ -40,6 +40,9 @@ export interface FetchPathResponse extends WithId {
   contentType?: string
   body?: ArrayBuffer
   error?: string
+  /** True iff the reference resolved through a feed manifest (mutable content).
+   *  The SW must not cache such responses as immutable — see sw.ts. */
+  mutable?: boolean
 }
 
 export type DaemonResponse = StatusResponse | DiscoverResponse | FetchPathResponse

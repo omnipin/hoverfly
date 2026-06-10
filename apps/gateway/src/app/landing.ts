@@ -4,7 +4,7 @@
 // it on its own content subdomain. Connects to the shared daemon SharedWorker
 // directly (same origin) to show live peer status and trigger discovery.
 
-import { DAEMON_WORKER_SCRIPT, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, IDB_CHUNKS_DB } from '../shared/config.ts'
+import { DAEMON_WORKER_NAME, DAEMON_WORKER_SCRIPT, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, IDB_CHUNKS_DB } from '../shared/config.ts'
 import { DaemonRpc, type DaemonStatus } from '../shared/protocol.ts'
 import { subdomainUrl } from '../shared/parse-request.ts'
 import { normalizeRef } from '../shared/swarm-ref.ts'
@@ -95,7 +95,7 @@ async function handleOpen (): Promise<void> {
 }
 
 // ---- daemon status ----
-const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: 'hoverfly-daemon' })
+const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: DAEMON_WORKER_NAME })
 const rpc = new DaemonRpc(worker.port)
 
 function render (s: DaemonStatus): void {
