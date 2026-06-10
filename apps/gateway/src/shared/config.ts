@@ -30,7 +30,27 @@ export const CONTENT_MARKER = '__gw_content'
 export const SW_SCRIPT = `${ASSET_PREFIX}sw.js`
 export const BOOT_SCRIPT = `${ASSET_PREFIX}boot.js`
 export const LANDING_SCRIPT = `${ASSET_PREFIX}landing.js`
-export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js`
+
+/**
+ * Build version, stamped by build.js (`define`) from the vendored wasm's
+ * content hash. Used to key the daemon SharedWorker so a new deploy spawns a
+ * fresh instance instead of rejoining the stale one the browser keeps alive
+ * across reloads. Defaults to `'dev'` when not injected (e.g. typecheck).
+ */
+declare const __GW_VERSION__: string | undefined
+export const GW_VERSION: string =
+  typeof __GW_VERSION__ !== 'undefined' ? __GW_VERSION__ : 'dev'
+
+/**
+ * Daemon SharedWorker script URL, version-tagged. A SharedWorker is keyed by
+ * (origin, script URL, name); changing the query when the wasm changes forces
+ * the browser to start a new worker rather than rejoin the previous deploy's
+ * (possibly wedged) instance. All clients in the same deploy use the same
+ * value, so they still share one daemon.
+ */
+export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js?v=${GW_VERSION}`
+/** Matching SharedWorker `name` (also part of the worker key). */
+export const DAEMON_WORKER_NAME = `hoverfly-daemon-${GW_VERSION}`
 export const DAEMON_FRAME_PATH = `${ASSET_PREFIX}daemon-frame.html`
 /** wasm-bindgen `--target web` entry, vendored from the repo's pkg/. */
 export const HOVERFLY_JS = `${ASSET_PREFIX}hoverfly/hoverfly.js`
