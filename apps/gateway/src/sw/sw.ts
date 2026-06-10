@@ -21,9 +21,19 @@ import { cidToReference } from '../shared/swarm-cid.ts'
 
 declare const self: ServiceWorkerGlobalScope
 
+// The daemon bridge is an in-memory MessagePort, and the browser terminates
+// idle service workers at will (Chrome: ~30s idle timer, plus a hard ~5min cap
+// per event). A terminated SW restarts with a FRESH global scope on the next
+// fetch — the port is gone, and a port cannot be persisted. So the port must be
+// RE-ACQUIRABLE at any time: whenever a fetch needs the daemon and there's no
+// live port, the SW broadcasts `request-daemon-port` to its window clients and
+// the boot shell answers by minting a new port off its own daemon channel (see
+// boot.ts). Without this, the first fetch after an SW restart waited 25s on a
+// promise nothing would ever resolve and 504'd every request — the observed
+// "page dies after ~half a minute, black page" failure.
 let daemon: DaemonRpc | null = null
-let resolveDaemon: ((r: DaemonRpc) => void) | null = null
-const daemonReady = new Promise<DaemonRpc>((resolve) => { resolveDaemon = resolve })
+let daemonWaiters: Array<(d: DaemonRpc) => void> = []
+let askTimer: ReturnType<typeof setInterval> | null = null
 
 self.addEventListener('install', () => { console.log('[sw] install'); void self.skipWaiting() })
 self.addEventListener('activate', (event) => { console.log('[sw] activate + claim'); event.waitUntil(self.clients.claim()) })
@@ -31,18 +41,66 @@ self.addEventListener('activate', (event) => { console.log('[sw] activate + clai
 self.addEventListener('message', (event: ExtendableMessageEvent) => {
   const msg = event.data
   if (msg?.type === 'daemon-port' && event.ports[0] != null) {
-    console.log('[sw] received daemon-port')
-    daemon = new DaemonRpc(event.ports[0])
-    // Surface the daemon's warm/runtime phase + peer counts here, since the
-    // daemon's own console (SharedWorker context) is awkward to open.
-    daemon.onStatus((s) => {
-      console.log('[sw] daemon status: phase=', s.phase, '| ready=', s.ready, '| warming=', s.warming,
-        '| dialable=', s.dialable, '| peers=', s.peerCount, s.lastError != null ? '| ERROR=' + s.lastError : '')
-    })
-    resolveDaemon?.(daemon)
-    resolveDaemon = null
+    adoptDaemonPort(event.ports[0])
+    return
   }
+  // Keepalive from the boot shell. The message event itself is what matters:
+  // it's a functional event, so dispatching it extends the SW's lifetime in
+  // Chrome (messages arriving on a transferred MessagePort do NOT — only real
+  // SW events count). This keeps the worker from being idle-killed mid-load
+  // while a slow Swarm fetch is the only thing happening.
+  if (msg?.type === 'ping') return
 })
+
+function adoptDaemonPort (port: MessagePort): void {
+  console.log('[sw] received daemon-port')
+  const rpc = new DaemonRpc(port)
+  daemon = rpc
+  // If the far end goes away (daemon worker replaced by a new deploy, broker
+  // context gone), drop the cached bridge so the next fetch re-acquires a live
+  // one instead of timing out against a dead port. (`close` on MessagePort is
+  // recent — Chrome 126+ — hence optional; the RPC-timeout fallback in
+  // serveContent covers older browsers.)
+  port.addEventListener?.('close', () => {
+    if (daemon === rpc) { console.warn('[sw] daemon port closed'); daemon = null }
+  })
+  // Surface the daemon's warm/runtime phase + peer counts here, since the
+  // daemon's own console (SharedWorker context) is awkward to open.
+  daemon.onStatus((s) => {
+    console.log('[sw] daemon status: phase=', s.phase, '| ready=', s.ready, '| warming=', s.warming,
+      '| dialable=', s.dialable, '| peers=', s.peerCount, s.lastError != null ? '| ERROR=' + s.lastError : '')
+  })
+  if (askTimer != null) { clearInterval(askTimer); askTimer = null }
+  const waiters = daemonWaiters
+  daemonWaiters = []
+  for (const w of waiters) w(daemon)
+}
+
+/** Ask every window client (the boot shell listens) to mint us a daemon port. */
+function broadcastPortRequest (): void {
+  self.clients.matchAll({ type: 'window' }).then((clients) => {
+    if (clients.length === 0) console.warn('[sw] no window clients to request a daemon port from')
+    for (const c of clients) c.postMessage({ type: 'request-daemon-port' })
+  }).catch(() => { /* transient */ })
+}
+
+/** Resolve the daemon bridge, re-requesting the port from clients if this SW
+ *  instance doesn't hold one (fresh start after termination). Re-broadcasts
+ *  every 2s while waiting — the shell may still be mid-boot the first time. */
+function getDaemon (timeoutMs: number): Promise<DaemonRpc> {
+  if (daemon != null) return Promise.resolve(daemon)
+  broadcastPortRequest()
+  if (askTimer == null) askTimer = setInterval(broadcastPortRequest, 2_000)
+  return new Promise<DaemonRpc>((resolve, reject) => {
+    const waiter = (d: DaemonRpc): void => { clearTimeout(t); resolve(d) }
+    const t = setTimeout(() => {
+      daemonWaiters = daemonWaiters.filter((w) => w !== waiter)
+      if (daemonWaiters.length === 0 && askTimer != null) { clearInterval(askTimer); askTimer = null }
+      reject(new Error('no client supplied a daemon port in time'))
+    }, timeoutMs)
+    daemonWaiters.push(waiter)
+  })
+}
 
 self.addEventListener('fetch', (event: FetchEvent) => {
   const req = event.request
@@ -80,7 +138,14 @@ self.addEventListener('fetch', (event: FetchEvent) => {
   event.respondWith(serveContent(req))
 })
 
+// Total budget for one fetch event. Chrome hard-kills a service worker whose
+// event hasn't settled within ~5 minutes — if we blow past that, the request
+// dies as a bare network error (no error page at all). Stay under the cap so
+// the worst case is still OUR 504 page, not a dead worker.
+const EVENT_BUDGET_MS = 290_000
+
 async function serveContent (req: Request): Promise<Response> {
+  const started = Date.now()
   const url = new URL(req.url)
 
   // The browser auto-probes /favicon.ico for the top-level document. The
@@ -119,7 +184,10 @@ async function serveContent (req: Request): Promise<Response> {
 
   let rpc: DaemonRpc
   try {
-    rpc = await withTimeout(daemonReady, 25_000)
+    // On a warm shell this resolves instantly (port already held) or within
+    // milliseconds (shell re-mints on request); the 25s only covers a shell
+    // that is itself still booting its daemon bridge.
+    rpc = await getDaemon(25_000)
   } catch {
     console.warn('[sw] daemon bridge not connected for', path)
     return errorPage(504, 'Daemon bridge not connected', 'The gateway shell did not provide a daemon channel in time.')
@@ -130,11 +198,18 @@ async function serveContent (req: Request): Promise<Response> {
   try {
     // Bound the RPC so a lost/dropped daemon message can't hang the document
     // request forever (which would leave the boot overlay stuck with no error).
-    // The daemon bounds each candidate at 90s and tries up to 3, so allow
-    // headroom over that worst case (3×90s) before declaring the bridge dead.
-    res = await withTimeout(rpc.fetchPath(refHex, path), 300_000)
+    // The daemon bounds each candidate at 90s and tries up to 3 (≈270s worst
+    // case), so give it the rest of the event budget — but no more, or Chrome
+    // kills the whole worker before we can return an error page.
+    const remaining = Math.max(5_000, EVENT_BUDGET_MS - (Date.now() - started))
+    res = await withTimeout(rpc.fetchPath(refHex, path), remaining)
   } catch (e) {
     console.error('[sw] fetchPath RPC error', e)
+    // The silence may mean the port is dead (daemon replaced/edge closed), not
+    // just a slow fetch. Drop the cached bridge so the NEXT request re-acquires
+    // a fresh port (costs one request-daemon-port round trip, ~ms) instead of
+    // hanging against a dead channel forever.
+    if (daemon === rpc) daemon = null
     return errorPage(504, 'Swarm fetch timed out', (e as Error).message)
   }
 
