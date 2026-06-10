@@ -93,8 +93,9 @@ What the daemon does:
 - Ships a committed **`public/__gw__/peers.ws.json`** seed (ws peers harvested
   from mainnet) so the first fetch has something to dial immediately. It's a
   symlink to the repo-root `peers.ws.json`, which the `refresh-peers` GitHub
-  workflow re-derives from `peers.seed.json` every 5 hours (ws/wss underlays
-  only); `build.js` materializes it into a real file in `dist/`.
+  workflow re-derives from `peers.seed.json` hourly (ws/wss underlays only —
+  these go stale within ~2-3h, so the seed is kept fresh well inside that
+  window); `build.js` materializes it into a real file in `dist/`.
 - Always runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to
   refresh from the live bootnodes (the seed goes stale), persisting the result
   to IndexedDB.
