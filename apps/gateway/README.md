@@ -91,7 +91,10 @@ can serve arbitrary chunks.
 What the daemon does:
 
 - Ships a committed **`public/__gw__/peers.ws.json`** seed (ws peers harvested
-  from mainnet) so the first fetch has something to dial immediately.
+  from mainnet) so the first fetch has something to dial immediately. It's a
+  symlink to the repo-root `peers.ws.json`, which the `refresh-peers` GitHub
+  workflow re-derives from `peers.seed.json` every 5 hours (ws/wss underlays
+  only); `build.js` materializes it into a real file in `dist/`.
 - Always runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to
   refresh from the live bootnodes (the seed goes stale), persisting the result
   to IndexedDB.
@@ -100,9 +103,9 @@ The landing page shows a live **dialable peer count** and a **Discover** box.
 For best reliability, point discovery at a WebSocket-capable bee you control
 (`/ip4/…/tcp/…/tls/sni/…/ws/p2p/…` or `/dns4/host/tcp/443/wss/p2p/…`).
 
-> Regenerate the seed from a native daemon:
-> `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 -o peers.json`
-> then keep peers whose `underlays` contain `/ws`.
+> Regenerate the seed by hand (the cron workflow normally does this):
+> `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 --ws-only -o peers.ws.json`
+> from the repo root.
 
 > The wasm `/ws` dial path itself still needs verification in a real browser —
 > the peer availability and multiaddr shape are confirmed here, but the
