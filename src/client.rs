@@ -548,8 +548,13 @@ impl<'a> NetworkedStore<'a> {
                 // workloads use `PeerSession`"). Falls back to `Deferred` /
                 // `Failed` for the connect-time errors the original
                 // `Transport::fetch_chunk` would have surfaced.
+                let mut peer_full_node: Option<bool> = None;
                 let res = match self.get_or_open_session(&underlay).await {
                     Ok((session, sem)) => {
+                        // Record the peer's advertised node mode (full vs light)
+                        // so a successful dial can persist it — full nodes
+                        // forward retrieval, light nodes only serve local reserve.
+                        peer_full_node = Some(session.peer_full_node());
                         // Cap concurrent fetches against this session to
                         // [`MAX_INFLIGHT_PER_SESSION`] (Bee's `IN_FLIGHT_CAP`).
                         // The permit is dropped at end of this block, releasing
@@ -582,7 +587,10 @@ impl<'a> NetworkedStore<'a> {
                     Ok(delivery) => {
                         log.lock().unwrap().insert(
                             overlay.to_lowercase(),
-                            crate::peers::DialResult::Success { rtt_ms },
+                            crate::peers::DialResult::Success {
+                                rtt_ms,
+                                full_node: peer_full_node,
+                            },
                         );
                         // Proven reachable forwarder — promote for every later
                         // chunk this fetch (see `peer_scores` field rationale).
@@ -4045,9 +4053,13 @@ async fn open_session_pool_filtered(
                 debug!(target: "hoverfly::upload",
                     "session opened to {} ({}) in {} ms",
                     overlay_hex, underlay, rtt_ms);
-                log.lock()
-                    .unwrap()
-                    .insert(overlay_hex.to_lowercase(), DialResult::Success { rtt_ms });
+                log.lock().unwrap().insert(
+                    overlay_hex.to_lowercase(),
+                    DialResult::Success {
+                        rtt_ms,
+                        full_node: Some(session.peer_full_node()),
+                    },
+                );
                 sessions.push(SessionEntry {
                     overlay,
                     overlay_hex,
@@ -4120,20 +4132,23 @@ pub async fn healthcheck_peers(transport: &Transport, peers: &PeerStore, concurr
         let started = web_time::Instant::now();
         let res = transport.open_session(&underlay).await;
         let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
-        (overlay_hex, res.is_ok(), rtt_ms)
+        // Capture the peer's node mode from the handshake before dropping it.
+        let full_node = res.as_ref().ok().map(|s| s.peer_full_node());
+        (overlay_hex, full_node, rtt_ms)
     };
     for (overlay_hex, underlay) in iter.by_ref().take(concurrency) {
         inflight.push(probe(overlay_hex, underlay));
     }
     let mut reached = 0usize;
-    while let Some((overlay_hex, ok, rtt_ms)) = inflight.next().await {
+    while let Some((overlay_hex, full_node, rtt_ms)) = inflight.next().await {
+        let ok = full_node.is_some();
         if ok {
             reached += 1;
         }
         log.lock().unwrap().insert(
             overlay_hex.to_lowercase(),
             if ok {
-                DialResult::Success { rtt_ms }
+                DialResult::Success { rtt_ms, full_node }
             } else {
                 DialResult::Failure
             },

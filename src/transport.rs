@@ -956,6 +956,11 @@ pub struct PeerSession {
     /// the upload layer to pre-warm a replacement session before this
     /// one hits its rotation limit.
     state: std::sync::Arc<SessionState>,
+    /// The peer's advertised node mode from its handshake `Ack` (the bit
+    /// Bee surfaces in `/peers`). Full nodes forward retrieval requests;
+    /// light nodes only answer from their own reserve. Surfaced so the
+    /// retrieval layer can record it into the peerstore for prioritisation.
+    peer_full_node: bool,
 }
 
 enum SessionCommand {
@@ -1244,11 +1249,17 @@ impl PeerSession {
             cmd_tx,
             peer_id,
             state: session_state,
+            peer_full_node: hs_result.peer_full_node,
         })
     }
 
     pub const fn peer_id(&self) -> PeerId {
         self.peer_id
+    }
+
+    /// The peer's advertised node mode (full vs light) from the handshake.
+    pub const fn peer_full_node(&self) -> bool {
+        self.peer_full_node
     }
 
     /// Pushes attempted on this session's underlying connection so far.
@@ -2385,7 +2396,8 @@ async fn do_handshake(
     };
     close_stream_polled(swarm, &mut stream).await;
     info!(target: "hoverfly::transport",
-        "outbound handshake complete (version={:?})", hs_result.version);
+        "outbound handshake complete (version={:?} peer_full_node={})",
+        hs_result.version, hs_result.peer_full_node);
     Ok(hs_result)
 }
 
