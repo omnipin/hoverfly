@@ -28,7 +28,29 @@ pub struct ChunkDelivery {
 }
 
 /// Send a single retrieval request and read the delivery.
+///
+/// The substream is **gracefully closed** before returning (on every path).
+/// One retrieval = one substream, and bee-side yamux caps the number of
+/// concurrent streams per connection. A plain `drop` of the libp2p `Stream`
+/// only resets it lazily, so under rapid back-to-back fetches over one warm
+/// session the per-connection stream slots fill up and subsequent
+/// `open_stream` calls block until they time out — observed as retrieval
+/// wedging after ~150 chunks (and a reload squeezing through only a handful
+/// more, because the SharedWorker daemon keeps the same saturated sessions).
+/// Closing the write side here lets yamux free the slot promptly, mirroring
+/// bee's half-close after it finishes a retrieval exchange.
 pub async fn fetch<S>(stream: &mut S, addr: &[u8; 32]) -> Result<ChunkDelivery, RetrievalError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+{
+    let result = fetch_inner(stream, addr).await;
+    // Best-effort graceful close regardless of outcome; the slot must be
+    // released even when the exchange errored.
+    close(stream).await;
+    result
+}
+
+async fn fetch_inner<S>(stream: &mut S, addr: &[u8; 32]) -> Result<ChunkDelivery, RetrievalError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
@@ -59,6 +81,16 @@ where
     })
 }
 
+/// Gracefully close the write half of a finished retrieval substream so the
+/// yamux stream slot is released promptly instead of leaking until reset.
+async fn close<S>(stream: &mut S)
+where
+    S: futures::AsyncWrite + Unpin,
+{
+    use futures::AsyncWriteExt;
+    let _ = stream.close().await;
+}
+
 /// Server-side retrieval handler. Mirrors `fetch` from the other end:
 /// read empty headers, write empty headers, read `Request { addr }`,
 /// then call `lookup(addr)` and write the resulting `Delivery`.
@@ -68,7 +100,18 @@ where
 /// (`Delivery { err: "chunk not found" }`). Mirroring bee's behaviour,
 /// any framing / IO error during the write of an error response is
 /// silently dropped — the peer will time out the stream and move on.
-pub async fn respond<S, F>(stream: &mut S, mut lookup: F) -> Result<(), RetrievalError>
+pub async fn respond<S, F>(stream: &mut S, lookup: F) -> Result<(), RetrievalError>
+where
+    S: futures::AsyncRead + futures::AsyncWrite + Unpin,
+    F: FnMut(&[u8; 32]) -> Option<(Vec<u8>, Vec<u8>)>,
+{
+    let result = respond_inner(stream, lookup).await;
+    // Release the inbound stream slot promptly (same rationale as `fetch`).
+    close(stream).await;
+    result
+}
+
+async fn respond_inner<S, F>(stream: &mut S, mut lookup: F) -> Result<(), RetrievalError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
     F: FnMut(&[u8; 32]) -> Option<(Vec<u8>, Vec<u8>)>,
