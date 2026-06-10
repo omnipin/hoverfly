@@ -41,6 +41,8 @@ interface HoverflyClient {
   /** Manual one-shot discovery round (the daemon loop does this automatically). */
   discover: (bootstrap: string, waitSecs: number) => Promise<number>
   fetchManifestPath: (rootHex: string, path: string, maxRetries: number) => Promise<ManifestFetch>
+  /** List every entry in the manifest as JSON: [{path, reference, contentType}]. */
+  listManifest: (rootHex: string, maxRetries: number) => Promise<string>
   fetch: (rootHex: string, maxRetries: number) => Promise<Uint8Array>
   loadPeers: (json: string) => void
   exportPeers: () => string
@@ -347,7 +349,13 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
 
   const p = rawPath.replace(/^\/+/, '')
   // Build the manifest lookup candidates for the requested path:
-  //   - ""  /  "dir/"        -> directory index:  "<p>index.html"
+  //   - ""  /  "dir/"        -> try the bare path FIRST, then "<p>index.html".
+  //     The bare path matters for SINGLE-FILE references: `hoverfly upload`
+  //     (and bee's single-file `POST /bzz`) produce a manifest whose root node
+  //     carries a top-level entry — so resolving the empty path "" yields the
+  //     file directly (e.g. deboot.eth points at a bare JSON file, no
+  //     index.html exists). For a multi-file website the bare root has no entry
+  //     and we fall through to "index.html" as before.
   //   - "dir/file.png"       -> the path itself ONLY. A last segment with a file
   //                             extension is a file, never a directory; appending
   //                             "/index.html" (e.g. "uploads/0626.png/index.html")
@@ -364,7 +372,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   const hasExtension = /\.[^./]+$/.test(lastSeg)
   let candidates: string[]
   if (p === '' || p.endsWith('/')) {
-    candidates = [p + 'index.html']
+    candidates = [p, p + 'index.html']
   } else if (hasExtension) {
     candidates = [p]
   } else {
@@ -388,6 +396,34 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer }
     } catch (e) {
       setPhase('fetch ' + candidate + ' failed: ' + errMsg(e))
+      lastErr = errMsg(e)
+    }
+  }
+
+  // Single-file fallback for the root. `hoverfly upload <file>` and bee's
+  // single-file `POST /bzz` build a manifest with ONE entry stored at the
+  // file's basename (e.g. "deboot.json"), no index.html and no root entry — so
+  // neither "" nor "index.html" resolves. When the root is requested, list the
+  // manifest and, if it holds exactly one entry, serve that file. This is what
+  // public Swarm gateways do for single-file references. Scoped to the root so
+  // a genuine deep 404 on a multi-file site still surfaces as a 404.
+  if (p === '') {
+    try {
+      const list = JSON.parse(await c.listManifest(refHex, FETCH_RETRIES)) as Array<{ path: string, contentType?: string }>
+      const files = list.filter(e => e.path !== '' && e.path !== '/')
+      if (files.length === 1) {
+        const only = files[0]
+        setPhase('single-file fallback: fetching ' + only.path)
+        const r = await withFetchTimeout(
+          c.fetchManifestPath(refHex, only.path, FETCH_RETRIES),
+          FETCH_TIMEOUT_MS,
+          only.path
+        )
+        const bytes = r.bytes.slice()
+        setPhase('got ' + only.path + ' (' + bytes.length + ' bytes, single-file)')
+        return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer }
+      }
+    } catch (e) {
       lastErr = errMsg(e)
     }
   }
