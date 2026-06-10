@@ -440,12 +440,13 @@ impl<'a> NetworkedStore<'a> {
         // `max_retries == 0` means "no cap"; otherwise it bounds the number
         // of peer attempts before giving up.
         let now = crate::peers::now_unix();
-        let (fresh, stale): (Vec<_>, Vec<_>) = self
-            .peers
-            .closest(&address, usize::MAX)
-            .into_iter()
-            .partition(|p| !p.is_recently_unreachable(now));
-        let mut candidates: Vec<&Peer> = fresh.into_iter().chain(stale.into_iter()).collect();
+        // Proximity-ordered candidate list (closest to the chunk address first).
+        // Bee's retrieval *forwards* a request through the receiving peer's
+        // kademlia table toward the chunk's neighborhood, so any reachable
+        // forwarder can ultimately serve any chunk — but a peer closer to the
+        // chunk is more likely to hold it locally (or be one hop from it), so
+        // proximity is the right *secondary* signal.
+        let mut candidates: Vec<&Peer> = self.peers.closest(&address, usize::MAX);
         if candidates.is_empty() {
             return Err(ChunkStoreError::Other("no peers in peerlist".into()));
         }
@@ -461,29 +462,64 @@ impl<'a> NetworkedStore<'a> {
             dialable,
         );
 
-        // Cross-chunk reordering using the shared scoreboard (see the
-        // `peer_scores` field on `NetworkedStore`). The base order above is
-        // proximity-first (closest peers most likely to hold the chunk
-        // locally). But on a real hive-crawl pool most proximity-close peers
-        // are dead, and re-sweeping them per chunk is what makes a 1340-chunk
-        // fetch hang. We do a STABLE 3-way partition that preserves proximity
-        // order *within* each tier:
-        //   tier 0 — score > 0: proven reachable forwarders → front
-        //   tier 1 — score == 0: not yet tried / recovered  → middle
-        //   tier 2 — score < 0: recently timed out / dead   → back
-        // After the first chunk discovers the live forwarders, every later
-        // chunk hits them immediately instead of paying the timeout sweep.
+        // Order candidates so the concurrency window is filled with peers we can
+        // ACTUALLY reach and that we've SEEN forward, before anything else. The
+        // previous ordering was proximity-first with reachability/score only as
+        // a tie-breaker, which on mainnet meant the window filled with the
+        // closest peers — overwhelmingly TCP-only (not browser-dialable) or
+        // dead — so a `/ws`-only browser node burned its whole per-peer timeout
+        // budget on peers it could never use and never reached a live forwarder
+        // (observed: hundreds of `peer … failed: timeout`, 0 chunks).
+        //
+        // Sort key is `(reachability_class, forwarder_class)`; proximity
+        // (already encoded in `candidates`' order) is preserved within each
+        // bucket by the stable sort. Lower = tried sooner.
+        //
+        // reachability class:
+        //   0 — proven forwarder this fetch (score > 0) AND dialable
+        //   1 — dialable, not-yet-tried/recovered, not recently-unreachable
+        //   2 — dialable but recently failed to dial (worth a late retry)
+        //   3 — dialable but score < 0 (timed out for an earlier chunk)
+        //   4 — NOT browser-dialable (only usable natively over TCP) — last
+        //
+        // forwarder class (within a reachability bucket): only FULL nodes
+        // forward retrieval toward the chunk's neighborhood; light nodes answer
+        // only from their own reserve, so a far-from-chunk light node almost
+        // never has it and just burns a timeout. Prefer known full nodes, then
+        // unknown (not yet probed), then known-light:
+        //   0 — full_node == Some(true)
+        //   1 — full_node == None (unknown)
+        //   2 — full_node == Some(false) (light)
+        //
+        // On native (TCP) every peer is dialable so the non-dialable bucket is
+        // empty and behaviour is proximity+forwarder within classes 0-3; in the
+        // browser the non-dialable wall is shoved to the very back where it
+        // can't starve the concurrency window of reachable forwarders.
         {
             let scores = self.peer_scores.lock().unwrap();
-            if !scores.is_empty() {
-                candidates.sort_by_key(|p| {
-                    match scores.get(&p.overlay.to_lowercase()).copied().unwrap_or(0) {
-                        s if s > 0 => 0u8,
-                        0 => 1,
-                        _ => 2,
+            candidates.sort_by_key(|p| {
+                let dialable = p.first_dialable_underlay().is_some();
+                let reach = if !dialable {
+                    4u8
+                } else {
+                    let score = scores.get(&p.overlay.to_lowercase()).copied().unwrap_or(0);
+                    if score > 0 {
+                        0
+                    } else if score < 0 {
+                        3
+                    } else if p.is_recently_unreachable(now) {
+                        2
+                    } else {
+                        1
                     }
-                });
-            }
+                };
+                let forwarder = match p.full_node {
+                    Some(true) => 0u8,
+                    None => 1,
+                    Some(false) => 2,
+                };
+                (reach, forwarder)
+            });
         }
         let attempt_cap = if self.max_retries == 0 {
             candidates.len()
