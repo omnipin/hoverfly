@@ -16,8 +16,8 @@
 
 import {
   DAEMON_REFRESH_SECS, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, DOH_URL,
-  FETCH_RETRIES, IDB_CHUNKS_DB, IDB_NAME, IDB_NODEKEY_KEY, IDB_NONCE_KEY,
-  IDB_PEERS_KEY, IDB_STORE, NETWORK_ID
+  FETCH_RETRIES, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
+  IDB_NONCE_KEY, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID
 } from '../shared/config.ts'
 import { ATTACH, type DaemonStatus } from '../shared/protocol.ts'
 
@@ -54,6 +54,10 @@ interface HoverflyClient {
   loadPeers: (json: string) => void
   exportPeers: () => string
   peerCount: () => number
+  /** Export resolved feed head-index hints as JSON ({ "<owner||topic>": idx }). */
+  exportFeedHints: () => string
+  /** Merge persisted feed hints back in (monotonic). */
+  loadFeedHints: (json: string) => void
 }
 interface HoverflyModule {
   default: (input?: any) => Promise<unknown>
@@ -177,6 +181,17 @@ function countDialable (peersJson: string): number {
   } catch { return 0 }
 }
 
+/** Persist resolved feed head-index hints to IndexedDB (best effort, fire and
+ *  forget). Cheap and idempotent — the cache exports the full hint map. */
+function persistFeedHints (): void {
+  const c = client
+  if (c == null) return
+  try {
+    const json = c.exportFeedHints()
+    if (json != null && json !== '{}') void idbSet(IDB_FEED_HINTS_KEY, json)
+  } catch { /* best effort */ }
+}
+
 function refreshCounts (): void {
   if (client == null) return
   try {
@@ -240,7 +255,13 @@ async function warm (): Promise<void> {
     }
     console.log('[daemon] warm: peers loaded, count=', status.peerCount, 'dialable=', status.dialable)
 
-    console.log('[daemon] warm: peers loaded, count=', status.peerCount, 'dialable=', status.dialable)
+    // Restore persisted feed head-index hints so a returning visitor resolves a
+    // feed (e.g. swarm.eth) in ~1 fast round from the cached head instead of a
+    // cold gallop from index 0 (observed ~30s on a cold session vs ~1.5s warm).
+    try {
+      const hints = await idbGet(IDB_FEED_HINTS_KEY)
+      if (hints != null) { c.loadFeedHints(hints); console.log('[daemon] feed hints restored') }
+    } catch (e) { console.warn('[daemon] loadFeedHints failed:', e) }
 
     // Start the daemon: one eager discovery round + the maintenance loop. The
     // eager round dials peers on the shared swarm; on the browser's single
@@ -405,6 +426,10 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       )
       const bytes = r.bytes.slice()
       setPhase('got ' + candidate + ' (' + bytes.length + ' bytes, L2 hits ' + c.chunkStoreHits() + ')')
+      // A feed-resolved fetch may have advanced a feed's cached head index;
+      // persist hints so the next session resolves it fast (best effort, off
+      // the hot path).
+      if (r.feedResolved === true) persistFeedHints()
       return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer, mutable: r.feedResolved === true }
     } catch (e) {
       setPhase('fetch ' + candidate + ' failed: ' + errMsg(e))

@@ -186,6 +186,26 @@ impl HoverflyClient {
         self.peers.borrow().len()
     }
 
+    /// Export resolved feed head-index hints as a JSON object
+    /// `{ "<owner||topic hex>": <index>, … }`. The browser daemon persists this
+    /// to IndexedDB so a returning visitor resolves a feed (e.g. swarm.eth) in
+    /// ~1 fast round from the cached head instead of a cold ~30s gallop from 0.
+    #[wasm_bindgen(js_name = "exportFeedHints")]
+    pub fn export_feed_hints(&self) -> Result<String, JsError> {
+        serde_json::to_string(&self.cache.export_feed_hints()).map_err(into_js_err)
+    }
+
+    /// Merge persisted feed hints (JSON object as produced by
+    /// [`Self::export_feed_hints`]) back into the cache. Monotonic — never
+    /// lowers a hint, so a stale persisted value can't move a feed backwards.
+    #[wasm_bindgen(js_name = "loadFeedHints")]
+    pub fn load_feed_hints(&self, hints_json: &str) -> Result<(), JsError> {
+        let hints: std::collections::HashMap<String, u64> =
+            serde_json::from_str(hints_json).map_err(into_js_err)?;
+        self.cache.import_feed_hints(hints);
+        Ok(())
+    }
+
     /// Start the in-browser daemon: a long-lived background task that keeps
     /// the peer set warm. It runs one discovery round immediately — so the
     /// first fetch already has fresh, browser-dialable peers to race — then
