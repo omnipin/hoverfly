@@ -131,12 +131,16 @@ For best reliability, point discovery at a WebSocket-capable bee you control
 
 The hoverfly wasm is built with shared memory (atomics), so pages must be
 **cross-origin isolated**. The dev server sends `Cross-Origin-Opener-Policy:
-same-origin` + `Cross-Origin-Embedder-Policy: credentialless` +
-`Cross-Origin-Resource-Policy: cross-origin` on everything. `credentialless`
-keeps the cross-origin broker iframe and the wasm loading without extra CORP
-hassle. The broker iframe is granted `allow="cross-origin-isolated"` so it can
-host the SAB-backed SharedWorker. Chrome-first (uses `request.destination`,
-`credentialless`, module SharedWorkers).
+same-origin` + `Cross-Origin-Embedder-Policy: require-corp` +
+`Cross-Origin-Resource-Policy: cross-origin` on everything. `require-corp` (not
+`credentialless`) is required: `credentialless` partitions the cross-origin
+broker iframe into a **separate agent cluster**, so its `postMessage` to the
+content-origin shell wouldn't land and the daemon `SharedWorker` wouldn't be
+genuinely shared. `require-corp` keeps the broker iframe in the same agent
+cluster — embeddable cross-subdomain via the `Cross-Origin-Resource-Policy:
+cross-origin` header above — and the SAB-backed SharedWorker stays shared. The
+broker iframe is granted `allow="cross-origin-isolated"` so it can host the
+SharedWorker. Chrome-first (uses `request.destination`, module SharedWorkers).
 
 ## Layout
 

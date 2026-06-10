@@ -1,0 +1,11 @@
+<!doctype html><meta charset=utf8><title>Unregistering…</title>
+<body style="font:15px system-ui;background:#0e1116;color:#e6edf3;display:grid;place-items:center;height:100vh;margin:0">
+<div>Unregistering service worker &amp; clearing caches…</div>
+<script type="module">
+  if ('serviceWorker' in navigator) {
+    const regs = await navigator.serviceWorker.getRegistrations()
+    await Promise.all(regs.map(r => r.unregister()))
+  }
+  if (globalThis.caches) { for (const k of await caches.keys()) await caches.delete(k) }
+  location.href = '/'
+</script></body>

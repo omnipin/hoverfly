@@ -78,8 +78,20 @@ check('parseHost: subdomain', () => {
   assert.equal(h.id, VECTOR_CID)
   assert.equal(h.rootHost, 'bzz.localhost:3000')
 })
-check('parseHost: other', () => {
-  assert.equal(parseHost('example.com').kind, 'other')
+check('parseHost: infix-less root (production apex)', () => {
+  const h = parseHost('browserbzz.link')
+  assert.equal(h.kind, 'root')
+  assert.equal(h.rootHost, 'browserbzz.link')
+})
+check('parseHost: infix-less content subdomain (production)', () => {
+  const h = parseHost(`${VECTOR_CID}.browserbzz.link`)
+  assert.equal(h.kind, 'subdomain')
+  assert.equal(h.id, VECTOR_CID)
+  assert.equal(h.rootHost, 'browserbzz.link')
+})
+check('parseHost: infix-less non-CID subdomain is treated as root', () => {
+  // e.g. www.<apex> — not a content origin, so it falls through to root.
+  assert.equal(parseHost('www.browserbzz.link').kind, 'root')
 })
 
 console.log(`\n${passed} checks passed.`)

@@ -1,0 +1,89 @@
+# Hoverfly Swarm subdomain gateway — Caddy static server (VPS deploy).
+#
+# Topology (mirrors serve.js):
+#   browserbzz.link            -> gateway ROOT + shared daemon origin (index.html)
+#   *.browserbzz.link          -> one CONTENT origin per Swarm site  (boot.html)
+#
+# Every response is cross-origin isolated so the hoverfly wasm (shared memory /
+# atomics) can run a SAB-backed SharedWorker:
+#   Cross-Origin-Opener-Policy:   same-origin
+#   Cross-Origin-Embedder-Policy: require-corp     (NOT credentialless — that
+#       partitions the broker iframe and breaks the shared daemon)
+#   Cross-Origin-Resource-Policy: cross-origin
+#
+# TLS: on-demand (HTTP-01). The stock caddy binary issues a cert per hostname
+# on first request — no wildcard cert, no DNS API token, no xcaddy build. An
+# `ask` endpoint gates issuance so caddy only mints certs for hostnames that
+# belong to this gateway (the apex, or a single-label <cid> subdomain).
+#
+# DNS required (Namecheap → Advanced DNS):
+#   A  @  167.17.40.160
+#   A  *  167.17.40.160      ← wildcard, for the <cid> content subdomains
+#
+# Deploy layout on the VPS:
+#   /var/www/bzz-gateway/dist        the built assets (rsynced from local)
+#   /etc/caddy/Caddyfile             this file
+#   served by the caddy systemd unit
+
+{
+	# On-demand TLS: caddy asks this endpoint before issuing a cert for a host.
+	# Only 2xx => issue. This prevents random hostnames pointed at this IP from
+	# minting certs (which would burn Let's Encrypt rate limits).
+	on_demand_tls {
+		ask http://127.0.0.1:9111/check
+	}
+}
+
+# ── snippets ────────────────────────────────────────────────────────────────
+
+(isolation) {
+	header {
+		Cross-Origin-Opener-Policy "same-origin"
+		Cross-Origin-Embedder-Policy "require-corp"
+		Cross-Origin-Resource-Policy "cross-origin"
+		Cache-Control "no-cache"
+		-Server
+	}
+	# the service worker must control the whole origin
+	@sw path /__gw__/sw.js
+	header @sw Service-Worker-Allowed "/"
+}
+
+(site) {
+	import isolation
+	root * /var/www/bzz-gateway/dist
+	encode zstd gzip
+
+	# gateway "unregister" escape hatch (serve.js: ?gw-unregister) — serve the
+	# inline unregister page generated at deploy time.
+	@unregister query gw-unregister=*
+	handle @unregister {
+		rewrite * /__gw__/unregister.html
+		file_server
+	}
+}
+
+# ── gateway root + daemon origin ────────────────────────────────────────────
+
+browserbzz.link {
+	import site
+	handle {
+		try_files {path} /index.html
+		file_server
+	}
+}
+
+# ── content origins: <cid>.browserbzz.link ─────────────────────────────────
+# Single-label subdomains only (a base32 CIDv1 is one DNS label). on_demand
+# gates cert issuance via the ask endpoint above.
+
+*.browserbzz.link {
+	tls {
+		on_demand
+	}
+	import site
+	handle {
+		try_files {path} /boot.html
+		file_server
+	}
+}
