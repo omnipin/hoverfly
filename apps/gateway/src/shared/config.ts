@@ -13,6 +13,20 @@ export const GATEWAY_INFIX = 'bzz'
  */
 export const ASSET_PREFIX = '/__gw__/'
 
+/**
+ * Query marker the boot shell appends when it loads the real site into its
+ * content iframe (`/?__gw_content=1`). Both the top shell navigation and the
+ * inner content-iframe navigation are `mode: 'navigate'` + `destination:
+ * 'document'`, so the service worker cannot otherwise tell them apart — without
+ * this it would pass the iframe navigation through to the network too, which
+ * returns the boot shell again (Caddy `try_files {path} /boot.html`). The
+ * iframe would then re-run boot.js, see `window.top !== window`, and bail —
+ * leaving a blank page and never fetching any Swarm chunks. The SW treats a
+ * document navigation carrying this marker as Swarm content; it is stripped
+ * before the path is resolved against the manifest.
+ */
+export const CONTENT_MARKER = '__gw_content'
+
 export const SW_SCRIPT = `${ASSET_PREFIX}sw.js`
 export const BOOT_SCRIPT = `${ASSET_PREFIX}boot.js`
 export const LANDING_SCRIPT = `${ASSET_PREFIX}landing.js`

@@ -14,7 +14,7 @@
 //   - iframe navigation + subresources on this origin -> served as Swarm
 //     content via the daemon bridge.
 
-import { ASSET_PREFIX, CONTENT_CACHE } from '../shared/config.ts'
+import { ASSET_PREFIX, CONTENT_CACHE, CONTENT_MARKER } from '../shared/config.ts'
 import { DaemonRpc } from '../shared/protocol.ts'
 import { parseHost } from '../shared/parse-request.ts'
 import { cidToReference } from '../shared/swarm-cid.ts'
@@ -50,9 +50,30 @@ self.addEventListener('fetch', (event: FetchEvent) => {
 
   if (url.origin !== self.location.origin) return // not ours
   if (url.pathname.startsWith(ASSET_PREFIX)) return // gateway's own assets
+
+  // A document navigation is EITHER the top boot shell (passthrough → network
+  // returns boot.html) OR a document inside the content iframe the shell hosts.
+  // Both have mode 'navigate' + destination 'document', so we need another
+  // signal to tell them apart:
+  //   1. CONTENT_MARKER query — set by the boot shell on the INITIAL iframe load
+  //      (boot.ts contentUrl), the one reliable cross-browser discriminator.
+  //   2. `Sec-Fetch-Dest: iframe` — set by the browser for a NESTED document
+  //      navigation (in-iframe link clicks / full-page nav within the site),
+  //      which the marker wouldn't cover. Chrome 80+/Firefox 90+/Safari 16.4+.
+  // Either signal => serve Swarm content; neither => it's the top shell, pass
+  // through. (Without this the iframe nav would re-fetch boot.html, the inner
+  // boot.js would see window.top !== window and bail, and the page would stay
+  // blank with no chunk fetches — the observed failure.)
   if (req.mode === 'navigate' && req.destination === 'document') {
-    console.log('[sw] passthrough top-level document nav', url.pathname)
-    return // boot shell
+    const isContent = url.searchParams.has(CONTENT_MARKER) ||
+      req.headers.get('sec-fetch-dest') === 'iframe'
+    if (!isContent) {
+      console.log('[sw] passthrough top-level document nav', url.pathname)
+      return // boot shell
+    }
+    console.log('[sw] serve content iframe document', url.pathname)
+    event.respondWith(serveContent(req))
+    return
   }
 
   console.log('[sw] serve content:', url.pathname, 'dest=', req.destination, 'mode=', req.mode)
@@ -90,6 +111,9 @@ async function serveContent (req: Request): Promise<Response> {
 
   const cache = await caches.open(CONTENT_CACHE)
   const cacheKey = new Request(`${url.origin}${url.pathname}`)
+  // A cache hit is ALWAYS safe to serve: we only ever store immutable,
+  // content-addressed responses below (feed-backed/mutable responses are never
+  // written to the cache). So a present entry can't be a stale feed head.
   const cached = await cache.match(cacheKey)
   if (cached != null) return cached
 
@@ -117,14 +141,22 @@ async function serveContent (req: Request): Promise<Response> {
 
   const headers = new Headers()
   headers.set('content-type', res.contentType ?? 'application/octet-stream')
-  // A CID origin is content-addressed and immutable: every path under it is
-  // fixed forever (a new site = a new CID = a new origin). So mark responses
-  // immutable with a long max-age — the SW already replays them from the
-  // persistent Cache API, and this lets the browser's own HTTP cache treat
-  // them as permanent too. (hoverfly's in-wasm chunk cache is per-fetch only,
-  // so this Cache API layer is what gives cross-load / offline persistence.)
-  headers.set('cache-control', 'public, max-age=31536000, immutable')
+  // Mutability depends on whether the reference resolved through a FEED
+  // manifest. A feed's reference (e.g. an ENS contenthash like swarm.eth) is
+  // stable, but the content it points at moves forward with each feed update —
+  // so it must NOT be cached as immutable, or a visitor would be pinned to the
+  // first feed head they ever fetched and never see updates (and mixed-version
+  // splits — cached HTML vs freshly-resolved assets from a newer head — surface
+  // as broken/unstyled pages). A bare content-addressed CID, by contrast, is
+  // fixed forever (new site = new CID = new origin).
+  if (res.mutable === true) {
+    // Revalidate every load; allow brief reuse but force a freshness check.
+    headers.set('cache-control', 'no-cache, max-age=0, must-revalidate')
+  } else {
+    headers.set('cache-control', 'public, max-age=31536000, immutable')
+  }
   headers.set('x-swarm-reference', refHex)
+  if (res.mutable === true) headers.set('x-swarm-mutable', '1')
   headers.set('server', 'hoverfly-gateway')
   // The boot shell is crossOriginIsolated (COEP: require-corp) so the nested
   // daemon broker iframe → SharedWorker can use shared wasm memory. Per the
@@ -137,8 +169,13 @@ async function serveContent (req: Request): Promise<Response> {
   isolation(headers)
   const response = new Response(res.body, { status: 200, headers })
 
-  // Cache immutable content-addressed responses (best effort, off the hot path).
-  void cache.put(cacheKey, response.clone()).catch(() => {})
+  // Only persist immutable, content-addressed responses. Feed-backed (mutable)
+  // content is intentionally NOT cached: the daemon re-resolves the feed head
+  // on every fetch, so caching it would defeat updates and risk serving a stale
+  // head from the Cache API forever (the bug this guards against).
+  if (res.mutable !== true) {
+    void cache.put(cacheKey, response.clone()).catch(() => {})
+  }
   return response
 }
 
