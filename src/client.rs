@@ -1395,10 +1395,15 @@ async fn lookup_manifest_path(
     root: ChunkAddress,
     path: &str,
 ) -> Result<(ChunkAddress, Option<String>), ClientError> {
-    use crate::manifest::decode_node;
+    use crate::manifest::{decode_node, extract_index_document};
     let mut current = root;
-    let mut remaining: &[u8] = path.as_bytes();
+    // Owned so we can redirect to a website-index-document mid-walk (a borrow
+    // of `path` couldn't be replaced with a freshly-derived index name).
+    let mut remaining: Vec<u8> = path.as_bytes().to_vec();
     let mut last_content_type: Option<String> = None;
+    // Guards the one-shot redirect to a `website-index-document` so a
+    // pathological manifest (index pointing back at an empty path) can't loop.
+    let mut index_redirected = false;
 
     loop {
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &current)
@@ -1407,10 +1412,26 @@ async fn lookup_manifest_path(
         let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         if remaining.is_empty() {
-            return node
-                .entry
-                .map(|addr| (addr, last_content_type.clone()))
-                .ok_or_else(|| ClientError::Manifest(format!("path {path} has no entry")));
+            if let Some(addr) = node.entry {
+                return Ok((addr, last_content_type.clone()));
+            }
+            // No bare entry at this node. A collection upload (bee's
+            // `POST /bzz` with a tar/multipart body) doesn't put a file at the
+            // manifest root; instead it records a `website-index-document`
+            // (e.g. "index.html") in the root metadata, and gateways resolve
+            // the root to THAT entry. Honour it here so `--path /` (and the
+            // gateway's empty-path candidate) resolve to the index document
+            // the bee way, instead of failing with "no entry". (This is why a
+            // site whose root has only an `index.html` fork — e.g. omnipin.eth
+            // — returned "path / has no entry".)
+            if !index_redirected {
+                if let Some(idx) = extract_index_document(&node) {
+                    index_redirected = true;
+                    remaining = idx.into_bytes();
+                    continue; // re-walk from the current node toward `idx`
+                }
+            }
+            return Err(ClientError::Manifest(format!("path {path} has no entry")));
         }
 
         let first = remaining[0];
@@ -1426,7 +1447,7 @@ async fn lookup_manifest_path(
         if let Some(ct) = fork.metadata.get("Content-Type") {
             last_content_type = Some(ct.clone());
         }
-        remaining = &remaining[fork.prefix.len()..];
+        remaining = remaining[fork.prefix.len()..].to_vec();
         current = fork.reference;
     }
 }
