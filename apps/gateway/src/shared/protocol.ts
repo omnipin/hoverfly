@@ -14,12 +14,25 @@ export interface DaemonStatus {
   peerCount: number
   /** peers with a browser-dialable (/ws or /wss) underlay. */
   dialable: number
+  /** peers we currently hold a live retrieval session (open connection) to —
+   *  the warm forwarder set. Distinct from `dialable` (peers that merely
+   *  advertise a /ws[s] underlay): this counts connections actually
+   *  established. This is the count surfaced to users as "connected peers". */
+  connected: number
   network: number
   bootstrap: string
   lastError?: string
   /** Coarse warm()/runtime phase, surfaced so clients (SW/page) can see daemon
    *  progress without opening the SharedWorker console. */
   phase?: string
+  /** The Swarm reference (hex) the current `phase` belongs to, when the phase
+   *  describes a specific per-CID fetch (e.g. "fetching index.html …"). The
+   *  daemon is SHARED across every content origin, so its `phase` is global —
+   *  without this, one CID's boot shell would display another CID's in-flight
+   *  file progress. A content shell shows `phase` only when this is null (a
+   *  daemon-lifecycle phase: warming/ready) or equals its OWN reference.
+   *  Undefined for lifecycle phases. */
+  phaseRef?: string
 }
 
 interface WithId { id: number }
