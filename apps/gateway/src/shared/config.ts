@@ -42,15 +42,24 @@ export const GW_VERSION: string =
   typeof __GW_VERSION__ !== 'undefined' ? __GW_VERSION__ : 'dev'
 
 /**
- * Daemon SharedWorker script URL, version-tagged. A SharedWorker is keyed by
- * (origin, script URL, name); changing the query when the wasm changes forces
- * the browser to start a new worker rather than rejoin the previous deploy's
- * (possibly wedged) instance. All clients in the same deploy use the same
- * value, so they still share one daemon.
+ * Daemon SharedWorker script URL + name. A SharedWorker is keyed by
+ * (origin, script URL, name), so these are kept STABLE (no per-deploy version
+ * tag) — every tab and every content-subdomain broker iframe joins the exact
+ * same single instance, instead of a new deploy spawning a parallel worker that
+ * coexists with the old one until every stale client closes (which left several
+ * daemons running at once, each holding its own wss connections).
+ *
+ * The previous version tag existed to dodge a "wedged stale daemon" after a wasm
+ * change; that's handled instead by the daemon's own self-healing (the
+ * maintenance loop re-discovers and re-warms continuously) and by clients
+ * fetching `daemon.js` fresh on a cold start. The cost of a stable key — a
+ * just-deployed tab can rejoin an already-running older worker — is acceptable:
+ * one warm daemon beats N stale ones, and the next time every tab is closed the
+ * worker dies and the new code loads.
  */
-export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js?v=${GW_VERSION}`
-/** Matching SharedWorker `name` (also part of the worker key). */
-export const DAEMON_WORKER_NAME = `hoverfly-daemon-${GW_VERSION}`
+export const DAEMON_WORKER_SCRIPT = `${ASSET_PREFIX}daemon.js`
+/** Matching SharedWorker `name` (also part of the worker key). Stable. */
+export const DAEMON_WORKER_NAME = 'hoverfly-daemon'
 export const DAEMON_FRAME_PATH = `${ASSET_PREFIX}daemon-frame.html`
 /** wasm-bindgen `--target web` entry, vendored from the repo's pkg/. */
 export const HOVERFLY_JS = `${ASSET_PREFIX}hoverfly/hoverfly.js`
@@ -66,10 +75,62 @@ export const DISCOVER_WAIT_SECS = 8
  * maintenance loop. The first round runs eagerly at `start()`.
  */
 export const DAEMON_REFRESH_SECS = 45
-/** Per-chunk retry budget for fetches. */
-export const FETCH_RETRIES = 6
+/**
+ * How often (seconds) the daemon re-reads its live "connected peers" count and
+ * broadcasts it to the UI. Decoupled from DAEMON_REFRESH_SECS: reading the
+ * session count is cheap (a single lock-guarded `len()` — no dialing), so it can
+ * tick fast for a live-feeling counter, while the expensive discovery + pool
+ * re-warm (which dials peers and must stay infrequent to avoid colliding with
+ * in-flight fetches on the single ws+yamux driver) stays on DAEMON_REFRESH_SECS.
+ */
+export const STATUS_POLL_SECS = 5
+/**
+ * Per-chunk peer-attempt cap for fetches — how many candidate forwarders a
+ * single chunk tries before failing. On the thin, flaky browser /ws pool a
+ * given chunk commonly needs to walk past several reachable-but-empty peers
+ * (`storage: not found`) or dead dials before hitting a forwarder that has it,
+ * so a small cap (was 6) made LARGE files fail: a multi-hundred-chunk video
+ * fails entirely if any ONE chunk exhausts its 6 attempts (observed:
+ * `all peers failed (6/6 attempted): timeout`). With ~262 candidates per chunk,
+ * a much larger cap lets retrieval explore enough forwarders to find the chunk;
+ * a genuinely unretrievable chunk still bails at the daemon's 90s per-fetch
+ * ceiling, so this can't hang. (0 would mean "try every candidate, no cap".)
+ */
+export const FETCH_RETRIES = 24
+/**
+ * Target size of the warm retrieval-session pool — the wasm "daemon mode"
+ * connection pool. The daemon proactively opens sessions to dialable ws peers
+ * and the wasm maintenance loop keeps the pool topped up in the background (see
+ * `HoverflyClient::start`'s `warm_pool` arg), so the warm forwarder set — and
+ * the "connected peers" the gateway shows — climbs at idle and the first site
+ * load reuses live sessions instead of dialing cold.
+ *
+ * `0` means UNLIMITED: warm every reachable dialable peer (the effective
+ * ceiling is just how many of the scarce, flaky browser /ws peers actually
+ * accept a connection). A positive value caps the pool at that many sessions.
+ * Passed to `start()` so warming happens inside wasm (between page loads, gated
+ * on no in-flight fetch). Also used by the JS-side prewarm nudge/poll.
+ */
+export const PREWARM_SESSIONS = 0
 /** Cloudflare is hoverfly's built-in default; leave undefined to use it. */
 export const DOH_URL: string | undefined = undefined
+/**
+ * Cold-start peer seed, fetched fresh from the GitHub raw CDN at daemon warm
+ * time. The `refresh-peers` workflow re-derives `peers.ws.json` from a live
+ * mainnet harvest HOURLY and commits it to `main`; mainnet /ws[s] underlays go
+ * stale within ~2-3h (AutoTLS SNI rotation, churn), so the committed file is the
+ * freshest seed available. The locally-bundled copy (`peers.ws.json` in dist/,
+ * a build-time symlink snapshot) is only as fresh as the last gateway DEPLOY —
+ * which can be days old — so we prefer the CDN at runtime and fall back to the
+ * local copy only when the CDN is unreachable (offline / GitHub down / rate
+ * limited). raw.githubusercontent.com serves it with `access-control-allow-
+ * origin: *` + `cross-origin-resource-policy: cross-origin` (so the fetch
+ * succeeds from the cross-origin-isolated daemon) and a 5-minute `max-age` (so
+ * it tracks the hourly cron closely without hammering origin). Set to undefined
+ * to disable the CDN seed and use only the bundled copy.
+ */
+export const PEERS_SEED_URL: string | undefined =
+  'https://raw.githubusercontent.com/omnipin/hoverfly/main/peers.ws.json'
 
 // ---- persistence ----
 export const IDB_NAME = 'hoverfly-gateway'
