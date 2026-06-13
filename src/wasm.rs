@@ -37,6 +37,40 @@ use crate::transport::{Transport, TransportConfig};
 /// browser throughput around ~20 chunks/s.)
 const FETCH_CONCURRENCY: usize = 4;
 
+/// Default warm retrieval-session pool target the in-browser daemon keeps open
+/// in the background (see [`HoverflyClient::start`]). This is the in-wasm
+/// analogue of the native daemon's warm connection pool: rather than opening
+/// retrieval sessions lazily on the first fetch (cold), the daemon proactively
+/// dials browser-dialable (/ws[s]) forwarders and keeps them warm, so
+/// `connectedPeerCount` is non-zero at idle and the first site load reuses live
+/// sessions instead of dialing cold.
+///
+/// `0` (the default) means UNLIMITED — warm every reachable dialable peer. The
+/// effective ceiling is then just how many of the (scarce, flaky) browser /ws
+/// peers actually accept a connection; each is a live wss connection multiplexed
+/// over the single ws+yamux driver. A positive value caps the pool at that many
+/// sessions instead.
+const DEFAULT_WARM_POOL: usize = 0;
+
+/// How many maintenance ticks between background re-discovery rounds in the
+/// browser daemon. Discovery is a one-shot path (throwaway swarm per peer — see
+/// the loop in [`HoverflyClient::start`]), so running it every tick churns the
+/// connection driver for little gain once the peer store is warm. At the default
+/// 45s tick, `8` re-discovers roughly every 6 minutes — enough to track peer
+/// churn without the per-tick swarm-rebuild flood. The warm session pool (the
+/// connections retrieval reuses) is still topped up every tick.
+const DISCOVER_EVERY_N: u64 = 8;
+
+/// Human-readable label for a warm-pool target in logs: `usize::MAX` is the
+/// unlimited sentinel, anything else is a concrete cap.
+fn warm_pool_label(target: usize) -> String {
+    if target == usize::MAX {
+        "unlimited".to_string()
+    } else {
+        format!("target {target}")
+    }
+}
+
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
     console_error_panic_hook::set_once();
@@ -186,6 +220,33 @@ impl HoverflyClient {
         self.peers.borrow().len()
     }
 
+    /// Number of peers we currently hold a live retrieval session (open
+    /// connection) to — the warm forwarder set. This is distinct from
+    /// `peerCount` (peers merely *known* in the store, mostly TCP-only) and from
+    /// the JS-side "dialable" count (peers that *advertise* a /ws[s] underlay but
+    /// we may never have reached): it counts connections actually established and
+    /// reused for retrieval. The gateway surfaces this as "connected peers".
+    #[wasm_bindgen(js_name = "connectedPeerCount")]
+    pub async fn connected_peer_count(&self) -> usize {
+        self.cache.connected_count().await
+    }
+
+    /// Proactively open retrieval sessions to up to `target` dialable (ws/wss)
+    /// peers so the warm forwarder set is non-zero before the first fetch. The
+    /// browser daemon calls this after warming (and on its maintenance tick) so
+    /// the gateway shows live "connected peers" at idle and the first site load
+    /// reuses already-open sessions instead of dialing cold. Returns the total
+    /// session count now cached. Best-effort: unreachable peers are skipped.
+    ///
+    /// `target == 0` means UNLIMITED (dial every reachable dialable peer),
+    /// matching [`HoverflyClient::start`]'s `warm_pool` convention.
+    #[wasm_bindgen(js_name = "prewarmSessions")]
+    pub async fn prewarm_sessions(&self, target: usize) -> usize {
+        let target = if target == 0 { usize::MAX } else { target };
+        let peers = self.peers.borrow().clone();
+        self.cache.prewarm(&self.transport, &peers, target).await
+    }
+
     /// Export resolved feed head-index hints as a JSON object
     /// `{ "<owner||topic hex>": <index>, … }`. The browser daemon persists this
     /// to IndexedDB so a returning visitor resolves a feed (e.g. swarm.eth) in
@@ -218,6 +279,17 @@ impl HoverflyClient {
     /// simply talk to the running daemon. Because every method takes `&self`,
     /// fetches run concurrently with the background loop with no locking.
     ///
+    /// `warm_pool` is the target size of the warm retrieval-session pool the
+    /// daemon keeps open in the background (defaults to [`DEFAULT_WARM_POOL`]).
+    /// This is what makes wasm "daemon mode" a real warm pool rather than just a
+    /// fresh address book: after the eager discovery round (and on every quiet
+    /// maintenance tick) the daemon dials browser-dialable forwarders and keeps
+    /// the connections warm, so `connectedPeerCount` climbs at idle and the
+    /// first fetch reuses live sessions. Pass `0` (the default) to warm
+    /// UNLIMITED peers — every reachable dialable peer; the effective ceiling is
+    /// then just how many /ws peers actually accept a connection. A positive
+    /// value caps the pool at that many sessions.
+    ///
     /// Idempotent: a second call refreshes peers but does not spawn a second
     /// loop. Returns the peer count after the initial round.
     pub async fn start(
@@ -225,7 +297,15 @@ impl HoverflyClient {
         bootstrap: String,
         interval_secs: u32,
         wait_secs: u32,
+        warm_pool: Option<u32>,
     ) -> Result<usize, JsError> {
+        // 0 (or omitted -> default 0) => unlimited: dial every reachable peer.
+        // `prewarm` treats usize::MAX as "no cap" (it never reaches the target,
+        // so it drains the whole candidate list).
+        let warm_pool = match warm_pool.map(|n| n as usize).unwrap_or(DEFAULT_WARM_POOL) {
+            0 => usize::MAX,
+            n => n,
+        };
         let bootstrap_ma: Multiaddr = bootstrap
             .parse()
             .map_err(|e: libp2p::multiaddr::Error| into_js_err(e))?;
@@ -240,6 +320,22 @@ impl HoverflyClient {
         )
         .await;
 
+        // Eager pool warm-up: open the warm retrieval-session pool now, off the
+        // freshly-filled peer store, so `connectedPeerCount` is non-zero before
+        // the first fetch and the first site load reuses these sessions instead
+        // of dialing cold. Best effort — unreachable peers are skipped. Runs only
+        // on the first `start()` (when the loop is about to be spawned); a repeat
+        // `start()` just refreshes peers and lets the loop keep the pool topped.
+        if !*self.running.borrow() {
+            let peers_snapshot = self.peers.borrow().clone();
+            let n = self
+                .cache
+                .prewarm(&self.transport, &peers_snapshot, warm_pool)
+                .await;
+            tracing::info!(target: "hoverfly::wasm",
+                "[daemon] eager warm-up: {} session(s) open ({})", n, warm_pool_label(warm_pool));
+        }
+
         // Spawn the maintenance loop exactly once.
         let already_running = *self.running.borrow();
         if !already_running {
@@ -249,24 +345,28 @@ impl HoverflyClient {
             let peers = self.peers.clone();
             let running = self.running.clone();
             let inflight = self.inflight_fetches.clone();
+            let cache = self.cache.clone();
             let bootstrap_ma = bootstrap_ma.clone();
             let interval = Duration::from_secs(interval_secs.max(1) as u64);
             let wait = Duration::from_secs(wait_secs as u64);
             wasm_bindgen_futures::spawn_local(async move {
+                let mut tick: u64 = 0;
                 loop {
                     // Sleep first: `start` already did the eager round above,
                     // so there's no need to discover again immediately.
                     Delay::new(interval).await;
+                    tick = tick.wrapping_add(1);
                     let keep_running = *running.borrow();
                     if !keep_running {
                         break;
                     }
-                    // Don't discover while a foreground fetch is in flight: on the
-                    // browser's single ws+yamux driver, a discovery round resets
-                    // in-flight retrieval substreams and stalls the fetch. If a
-                    // fetch (or burst) is active, defer this round — re-check on a
-                    // short cadence and run only once the connections go quiet, so
-                    // discovery still happens between page loads but never mid-load.
+                    // Don't discover OR warm sessions while a foreground fetch is
+                    // in flight: on the browser's single ws+yamux driver, the
+                    // dial/substream churn of a discovery round or a pool warm-up
+                    // resets in-flight retrieval substreams and stalls the fetch.
+                    // If a fetch (or burst) is active, defer — re-check on a short
+                    // cadence and run only once the connections go quiet, so the
+                    // pool is maintained between page loads but never mid-load.
                     let mut deferrals = 0u32;
                     while inflight.get() > 0 {
                         // Cap the wait so a wedged in-flight counter (shouldn't
@@ -282,7 +382,36 @@ impl HoverflyClient {
                     if !*running.borrow() {
                         break;
                     }
-                    merge_discovered(&transport, &doh, &peers, &bootstrap_ma, wait).await;
+
+                    // Discovery is a ONE-SHOT path: `discover_peers` stands up a
+                    // throwaway libp2p swarm per dialed peer, harvests hive
+                    // gossip, and discards the connection. That's correct for the
+                    // CLI (dial, read, exit) but wasteful in a long-lived browser
+                    // daemon — re-running it every tick spun up a fresh swarm +
+                    // full handshake/pricing dance every `interval`, flooding the
+                    // console and churning the single ws+yamux driver for almost
+                    // no benefit: the eager round at `start()` already filled the
+                    // peer store, and warm retrieval sessions persist separately.
+                    // So re-discover only occasionally (every DISCOVER_EVERY_N
+                    // ticks) just to refresh the store as peers churn; the warm
+                    // pool — the connections retrieval actually reuses — is topped
+                    // up every tick below.
+                    if tick % DISCOVER_EVERY_N == 0 {
+                        merge_discovered(&transport, &doh, &peers, &bootstrap_ma, wait).await;
+                    }
+
+                    // Top the warm session pool back up: sessions die (peer drop,
+                    // idle close) and are evicted by the fetch path, so the pool
+                    // decays between loads. Re-warming here (while connections are
+                    // quiet) keeps the "connected peers" count from sagging to 0 at
+                    // idle — the warm-pool half of daemon mode. Re-check in-flight:
+                    // a discovery round (when it ran) may have let a fetch start.
+                    if inflight.get() == 0 {
+                        let peers_snapshot = peers.borrow().clone();
+                        let n = cache.prewarm(&transport, &peers_snapshot, warm_pool).await;
+                        tracing::debug!(target: "hoverfly::wasm",
+                            "[daemon] pool warm: {} session(s) open ({})", n, warm_pool_label(warm_pool));
+                    }
                 }
             });
         }

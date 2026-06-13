@@ -10,7 +10,24 @@
 
 import { CONTENT_MARKER, DAEMON_FRAME_PATH, GW_VERSION, SW_SCRIPT } from '../shared/config.ts'
 import { DaemonRpc, mintDaemonPort, type DaemonStatus } from '../shared/protocol.ts'
-import { daemonOrigin } from '../shared/parse-request.ts'
+import { daemonOrigin, parseHost } from '../shared/parse-request.ts'
+import { cidToReference } from '../shared/swarm-cid.ts'
+
+/** This shell's OWN Swarm reference (hex), derived from its <cid>.bzz.<host>
+ *  subdomain. The shared daemon broadcasts per-fetch progress phases tagged
+ *  with the requesting CID (`phaseRef`); the shell shows a phase only when it's
+ *  a daemon-lifecycle phase (no ref) or matches THIS reference — otherwise one
+ *  site's loading overlay would display another site's in-flight file progress,
+ *  since the daemon is shared across all content origins. Null if the host isn't
+ *  a content subdomain (shouldn't happen for the boot shell) or the CID is
+ *  unparseable — in which case we fall back to showing all phases. */
+const OWN_REF: string | null = (() => {
+  try {
+    const host = parseHost(location.host)
+    if (host.kind !== 'subdomain' || host.id == null) return null
+    return cidToReference(host.id).refHex
+  } catch { return null }
+})()
 
 async function main (): Promise<void> {
   if (window.top !== window) return // only the top shell bootstraps
@@ -378,20 +395,30 @@ function renderShell (): ShellUi {
     }
   }
 
-  // Stylesheet gate. The overlay must NEVER lift over parsed-but-unstyled
-  // HTML: unlike a normal origin server, this gateway serves CSS over the same
-  // slow Swarm-via-daemon path as everything else, so at DOMContentLoaded the
-  // stylesheets are typically still in flight — and a Swarm CSS fetch can
-  // legitimately take minutes on a cold node. So we wait for EVERY
-  // <link rel="stylesheet"> to actually load (non-null `.sheet`) before
-  // revealing, for as long as the SW could still deliver it (STYLE_BUDGET).
-  // A sheet whose fetch errors (e.g. the SW's 504 after a wedged retrieval)
-  // gets ONE transparent retry — transient chunk-retrieval failures are common
-  // on the thin browser peer pool — and if it errors again the shell shows the
-  // error overlay instead of unstyled content. We deliberately do NOT wait for
-  // the full `load` event as the primary signal: images and other late
-  // subresources can lag badly or never arrive, and they don't blank the page
-  // the way missing CSS does.
+  // Full-load gate. We want the overlay to lift only once the WHOLE site is
+  // ready — HTML, CSS, fonts, AND images — so the page never appears
+  // half-painted (text reflowing as fonts swap in, images popping in late).
+  // The iframe `load` event is exactly that signal: the browser fires it only
+  // after every subresource it knows about (stylesheets, scripts, images,
+  // iframes) has settled. We additionally await `document.fonts.ready` so
+  // web-font swaps have happened before the reveal. The only resources that do
+  // NOT block this — by design — are background route prefetches (rel=prefetch
+  // / speculative SPA fetches), which browsers run at idle and which never gate
+  // `load`; those keep streaming behind the revealed page.
+  //
+  // Two safety rails on top of "wait for everything":
+  //   * Stylesheet failures still fail the shell (never reveal unstyled HTML).
+  //     Unlike a normal origin server this gateway serves CSS over the same
+  //     slow Swarm path as everything else, so a missing sheet is a real,
+  //     visible breakage — not a late nicety like an image. A sheet whose
+  //     fetch errors gets ONE transparent retry (transient chunk-retrieval
+  //     failures are common on the thin browser peer pool); a second failure
+  //     surfaces the error overlay.
+  //   * A FULL_LOAD_BUDGET cap: a single image that's slow or unretrievable
+  //     from Swarm must not pin the spinner forever. Once the document has
+  //     committed and its stylesheets are ready, if `load` still hasn't fired
+  //     after the budget we reveal anyway (the late image will pop in over the
+  //     shown page) rather than hang.
   type LinkEl = HTMLLinkElement & { __gwState?: 'loaded' | 'failed' }
   const sheetState = (doc: Document): 'ready' | 'pending' | 'failed' => {
     let failed = false
@@ -404,24 +431,49 @@ function renderShell (): ShellUi {
     return failed ? 'failed' : 'ready'
   }
 
-  // Time budgets. STYLE_BUDGET: once the document has committed, how long we
-  // keep waiting for its stylesheets. This must cover the SW's whole per-request
-  // budget (~290s: daemon worst case 3 candidates × 90s, see sw.ts) — if it
-  // expires we show a clear failure, NEVER the unstyled page. DOC_CAP: how long
-  // we wait for ANY real document to commit before giving up. This must
-  // comfortably exceed the daemon's per-fetch ceiling (90s) since on a cold
-  // node the first HTML fetch can legitimately take that long; revealing
-  // earlier would just dismiss the overlay over a blank iframe (the observed
-  // "blank page" symptom).
+  // Has the document finished loading EVERYTHING it gates on — i.e. the iframe
+  // `load` event has fired (all stylesheets, scripts, images and sub-iframes
+  // settled) and all web fonts have resolved? `document.readyState === 'complete'`
+  // is the same condition that fires `load`, and `document.fonts.status` is
+  // 'loaded' once font faces stop loading. Background route prefetches are not
+  // part of either signal, so they don't hold this back.
+  const fullyLoaded = (doc: Document): boolean => {
+    if (doc.readyState !== 'complete') return false
+    try { if (doc.fonts != null && doc.fonts.status !== 'loaded') return false } catch { /* no FontFaceSet: ignore */ }
+    return true
+  }
+
+  // Time budgets.
+  //   FULL_LOAD_BUDGET: once the document has committed AND its stylesheets are
+  //     ready, how long we additionally wait for the FULL load (images, fonts,
+  //     remaining subresources). If a late/slow/dead image from Swarm hasn't
+  //     settled by then we reveal anyway rather than pin the spinner forever.
+  //   STYLE_BUDGET: how long, after the document commits, we keep waiting for
+  //     its stylesheets. Must cover the SW's whole per-request budget (~290s:
+  //     daemon worst case 3 candidates × 90s, see sw.ts) — if it expires we show
+  //     a clear failure, NEVER the unstyled page.
+  //   DOC_CAP: how long we wait for ANY real document to commit before giving
+  //     up. Must comfortably exceed the daemon's per-fetch ceiling (90s) since
+  //     on a cold node the first HTML fetch can legitimately take that long;
+  //     revealing earlier would just dismiss the overlay over a blank iframe.
+  const FULL_LOAD_BUDGET_MS = 60_000
   const STYLE_BUDGET_MS = 300_000
   const DOC_CAP_MS = 100_000
+  // How many times to re-attempt a stylesheet whose fetch errored before
+  // declaring it permanently failed (and failing the shell). Swarm retrieval on
+  // the thin browser pool routinely needs a few attempts for a given chunk, so a
+  // single retry was too eager. The overall STYLE_BUDGET_MS still caps total
+  // wait, so more retries can't hang forever — they just avoid a premature fail.
+  const STYLE_RETRIES = 5
   const watchContentReady = (): void => {
     const started = Date.now()
     let docCommittedAt: number | null = null
+    let sheetsReadyAt: number | null = null
     const tracked = new WeakSet<HTMLLinkElement>()
     const poll = setInterval(() => {
       let state: 'ready' | 'pending' | 'failed' = 'pending'
       let docCommitted = false
+      let loadedAll = false
       try {
         const doc = frame.contentDocument
         const rs = doc?.readyState
@@ -432,37 +484,63 @@ function renderShell (): ShellUi {
           docCommitted = true
           // Attach one-shot load/error listeners to any stylesheet links we
           // haven't seen yet. `load` marks the link loaded; `error` retries the
-          // fetch ONCE by swapping in a fresh clone (re-setting the same href is
-          // not a reliable refetch), then marks it failed for good.
+          // fetch by swapping in a fresh clone (re-setting the same href is not
+          // a reliable refetch). Swarm retrieval is slow and flaky on the thin
+          // browser /ws pool — a single stylesheet chunk commonly hits a couple
+          // of transient `storage: not found` / dial failures before a live
+          // forwarder serves it — so we retry SEVERAL times with a short backoff
+          // before declaring the sheet permanently failed. A premature single-
+          // retry budget surfaced "Failed to load site" on sites whose CSS was
+          // in fact retrievable, just slow.
           for (const link of doc.querySelectorAll<LinkEl>('link[rel~="stylesheet"]')) {
             if (tracked.has(link)) continue
             tracked.add(link)
             link.addEventListener('load', () => { link.__gwState = 'loaded' }, { once: true })
             link.addEventListener('error', () => {
-              if (link.dataset.gwRetried !== '1') {
-                console.warn('[boot] stylesheet failed, retrying once:', link.href)
-                const clone = link.cloneNode() as LinkEl
-                clone.dataset.gwRetried = '1'
-                link.replaceWith(clone) // the next poll tick tracks the clone
+              const tries = Number(link.dataset.gwRetries ?? '0')
+              if (tries < STYLE_RETRIES) {
+                const next = tries + 1
+                console.warn(`[boot] stylesheet failed, retry ${next}/${STYLE_RETRIES}:`, link.href)
+                // Brief backoff before re-inserting so a transiently-unreachable
+                // chunk has a moment for a fresh forwarder to come online, rather
+                // than burning all retries against the same dead candidates in a
+                // tight loop.
+                const delay = 1000 * next
+                setTimeout(() => {
+                  const clone = link.cloneNode() as LinkEl
+                  clone.dataset.gwRetries = String(next)
+                  link.replaceWith(clone) // the next poll tick tracks the clone
+                }, delay)
               } else {
-                console.error('[boot] stylesheet failed after retry:', link.href)
+                console.error(`[boot] stylesheet failed after ${STYLE_RETRIES} retries:`, link.href)
                 link.__gwState = 'failed'
               }
             }, { once: true })
           }
           state = sheetState(doc)
+          loadedAll = fullyLoaded(doc)
         }
       } catch { state = 'pending' } // transiently inaccessible while navigating
       if (docCommitted && docCommittedAt == null) docCommittedAt = Date.now()
+      if (docCommitted && state === 'ready' && sheetsReadyAt == null) sheetsReadyAt = Date.now()
       const now = Date.now()
-      if (docCommitted && state === 'ready') {
-        clearInterval(poll)
-        setTimeout(reveal, 400) // brief grace for first paint / hydration
-      } else if (docCommitted && state === 'failed') {
+      if (docCommitted && state === 'failed') {
         // A stylesheet is permanently unretrievable (failed twice). Showing the
         // page would mean blank/unstyled HTML — surface a failure instead.
         clearInterval(poll)
         failShell('The site\u2019s HTML arrived but a stylesheet could not be retrieved from Swarm, so the page would render unstyled. Reload to retry.')
+      } else if (docCommitted && state === 'ready' && loadedAll) {
+        // Everything the page gates on (CSS, fonts, images, scripts) is in.
+        clearInterval(poll)
+        setTimeout(reveal, 200) // brief grace for first paint / hydration
+      } else if (sheetsReadyAt != null && now - sheetsReadyAt > FULL_LOAD_BUDGET_MS) {
+        // Stylesheets are in and the page is styled, but the full `load` is
+        // still pending — typically a slow or unretrievable image. We've waited
+        // the full-load budget; reveal the (styled) page rather than hang. The
+        // straggler will pop in over the shown page if it ever arrives.
+        console.warn('[boot] full-load budget elapsed with subresources pending; revealing styled page')
+        clearInterval(poll)
+        reveal()
       } else if (docCommittedAt != null && now - docCommittedAt > STYLE_BUDGET_MS) {
         // Stylesheets still in flight after the SW's whole request budget —
         // they're not coming. Never reveal unstyled HTML; fail clearly.
@@ -478,24 +556,29 @@ function renderShell (): ShellUi {
     }, 150)
   }
 
-  // The full `load` event is the happy path: by then stylesheets are normally
-  // loaded too. Two guards: (1) the intermediate about:blank document, whose
-  // `load` fires before the real navigation commits — revealing then would
-  // dismiss the overlay over a blank frame; (2) `load` also fires when a
-  // stylesheet ERRORED (an errored subresource doesn't block the event), so
-  // only reveal here if every sheet really loaded — otherwise leave it to the
-  // poll above, which retries the sheet and otherwise fails the shell rather
-  // than ever revealing unstyled HTML.
+  // The iframe `load` event is the happy path: the browser fires it only once
+  // every subresource (stylesheets, scripts, images, sub-iframes) has settled,
+  // so by here the full page is loaded. Guards: (1) the intermediate
+  // about:blank document, whose `load` fires before the real navigation commits
+  // — revealing then would dismiss the overlay over a blank frame; (2) `load`
+  // also fires when a stylesheet ERRORED (an errored subresource doesn't block
+  // the event), so only reveal here if every sheet really loaded — otherwise
+  // leave it to the poll above, which retries the sheet and otherwise fails the
+  // shell rather than ever revealing unstyled HTML. We still wait on
+  // `document.fonts.ready` so a font swap doesn't reflow text right after the
+  // reveal; if fonts never settle the poll's full-load budget reveals anyway.
   frame.addEventListener('load', () => {
     if (!contentRequested) return
-    let ok = false
+    let doc: Document | null = null
     try {
-      const doc = frame.contentDocument
+      doc = frame.contentDocument
       if (doc == null) return
       if ((doc.URL ?? 'about:').startsWith('about:')) return
-      ok = sheetState(doc) === 'ready'
-    } catch { ok = true } // cross-origin/unreadable: can't inspect, reveal as before
-    if (ok) { reveal(); syncHead() }
+      if (sheetState(doc) !== 'ready') return // unstyled: let the poll handle it
+    } catch { reveal(); syncHead(); return } // cross-origin/unreadable: reveal as before
+    const fonts = doc.fonts
+    if (fonts == null) { reveal(); syncHead(); return }
+    fonts.ready.then(() => { reveal(); syncHead() }).catch(() => { reveal(); syncHead() })
   })
 
   return {
@@ -511,25 +594,42 @@ function renderShell (): ShellUi {
       if (sub != null) loadingSub.textContent = sub
     },
     status (s) {
+      // Show the count of peers we hold a live retrieval session to (the warm
+      // forwarder set), not the `dialable` count (peers that merely advertise a
+      // /ws[s] underlay we may never have connected to) — matching the landing
+      // page and the documented "connected peers" semantics (see protocol.ts).
+      // This count legitimately ramps 0 → PREWARM_SESSIONS as prewarm() opens
+      // sessions in the background after readiness. Readiness/colour, though,
+      // keys off `dialable`: having reachable peers means the node is healthy
+      // even before any session is warm.
       let msg: string
       if (s.lastError != null) {
         dot.style.background = '#f85149'
-        msg = `daemon error · ${s.dialable} peers`
+        msg = `daemon error · ${s.connected} peers`
       } else if (s.warming || !s.ready) {
         dot.style.background = '#d29922'
-        msg = s.ready ? `discovering · ${s.dialable} peers` : 'starting daemon…'
+        msg = s.ready ? `discovering · ${s.connected} peers` : 'starting daemon…'
       } else {
         dot.style.background = s.dialable > 0 ? '#3fb950' : '#d29922'
-        msg = `${s.dialable} peers`
+        msg = `${s.connected} peers`
       }
       text.textContent = msg
       // Mirror live daemon status into the overlay while the site is loading.
-      // Prefer the daemon's PHASE (e.g. "fetching index.html… from 152 peers",
+      // Prefer the daemon's PHASE (e.g. "fetching index.html · 24/209 nodes…",
       // "got index.html (40000 bytes, …)") over the bare peer count: on mobile
       // the slow path otherwise looks frozen at "152 peers" with no signal that
       // retrieval is actually progressing (or where it's stuck). Fall back to
       // the peer count before any fetch phase exists.
-      if (!loaded) loadingSub.textContent = (s.phase != null && s.phase !== '') ? s.phase : msg
+      //
+      // The daemon is SHARED across every content origin, so its `phase` is
+      // global. Only show a phase that's either a daemon-lifecycle phase (no
+      // `phaseRef` — warming/ready/discovery, relevant to everyone) or one
+      // tagged with THIS shell's own reference; otherwise we'd display another
+      // site's in-flight file progress. If we couldn't determine our own ref,
+      // fall back to showing all phases (degrades to the old behaviour).
+      const phaseForUs = s.phase != null && s.phase !== '' &&
+        (s.phaseRef == null || OWN_REF == null || s.phaseRef === OWN_REF)
+      if (!loaded) loadingSub.textContent = phaseForUs ? (s.phase as string) : msg
       if (loaded) setTimeout(() => pill.classList.add('gw-min'), 1500)
     },
     fail (msg) { failShell(msg) }

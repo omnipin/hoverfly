@@ -34,7 +34,7 @@ app.innerHTML = `
         <span id="state" class="muted">connecting…</span>
       </div>
       <dl class="stats">
-        <div><dt>Dialable peers</dt><dd id="peers">–</dd></div>
+        <div><dt>Connected peers</dt><dd id="peers">–</dd></div>
         <div><dt>Cached chunks</dt><dd id="chunks">–</dd></div>
         <div><dt>Network</dt><dd id="net">–</dd></div>
       </dl>
@@ -99,10 +99,12 @@ const worker = new SharedWorker(DAEMON_WORKER_SCRIPT, { type: 'module', name: DA
 const rpc = new DaemonRpc(worker.port)
 
 function render (s: DaemonStatus): void {
-  // Only browser-dialable (/ws, /wss) peers can actually be used from the
-  // browser, so that's the single count worth surfacing — the raw PeerStore
-  // total mostly counts TCP-only peers we can never connect to.
-  $('peers').textContent = String(s.dialable)
+  // Surface the count of peers we actually hold an open retrieval session to
+  // (the warm forwarder set), not the raw PeerStore total (mostly TCP-only
+  // peers we can never reach) nor the "dialable" count (peers that merely
+  // advertise a /ws[s] underlay but we may never have connected to). This is
+  // the number that reflects real, usable connectivity.
+  $('peers').textContent = String(s.connected)
   $('net').textContent = s.network === 1 ? 'mainnet' : s.network === 10 ? 'testnet' : String(s.network)
   const dot = $('dot')
   const state = $('state')

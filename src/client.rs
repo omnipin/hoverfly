@@ -277,6 +277,116 @@ impl RetrievalCache {
         self.feed_index.lock().unwrap().clone()
     }
 
+    /// Number of live (cached) per-peer retrieval sessions — i.e. forwarders we
+    /// currently hold an open connection to. Unlike a peer-store count (peers we
+    /// *know about*) or a dialable count (peers that *advertise* a /ws[s]
+    /// underlay), this reflects connections actually established and reused for
+    /// retrieval. Sessions are inserted on first connect and evicted on failure,
+    /// so this tracks the warm forwarder set. Used by the browser daemon to show
+    /// "connected peers" on the gateway status UI.
+    ///
+    /// Async because the session map is behind a `tokio::sync::Mutex`; awaiting
+    /// the lock (rather than `try_lock`) avoids reporting a spurious 0 when a
+    /// fetch momentarily holds it, which would flicker the polled status UI. The
+    /// borrow is released immediately (no work held across the count).
+    pub async fn connected_count(&self) -> usize {
+        self.sessions.lock().await.len()
+    }
+
+    /// Proactively open retrieval sessions to dialable (ws/wss) peers so the
+    /// warm forwarder set — and the `connected_count` the gateway surfaces — is
+    /// non-zero *before* the first fetch. Without this, sessions only open
+    /// lazily inside a fetch (see [`NetworkedStore::get_or_open_session`]), so a
+    /// freshly-warmed daemon sits at "0 connected peers" until a site is loaded.
+    ///
+    /// Dials up to `target` peers that aren't already cached, capped at
+    /// `target`, with a bounded in-flight window so a peerlist full of
+    /// unreachable peers doesn't serialise on dial timeouts. Each successful
+    /// session is inserted into the SAME shared `sessions` map a fetch reuses,
+    /// so this both lights up the UI count AND pre-warms retrieval (the first
+    /// fetch skips the connect for these peers). Best-effort: dial failures are
+    /// logged to the reachability log and otherwise ignored. Returns the number
+    /// of sessions now cached.
+    ///
+    /// `target` is the desired TOTAL session count; if the cache already holds
+    /// that many we open none. Sessions that later die are evicted by the
+    /// fetch path (`ConnectionClosed`), so re-calling this on the daemon's
+    /// maintenance tick tops the pool back up.
+    pub async fn prewarm(&self, transport: &Transport, peers: &PeerStore, target: usize) -> usize {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        // Already at/above target — nothing to open.
+        let already: std::collections::HashSet<String> = {
+            let guard = self.sessions.lock().await;
+            if guard.len() >= target {
+                return guard.len();
+            }
+            guard.keys().cloned().collect()
+        };
+        let want = target.saturating_sub(already.len());
+        if want == 0 {
+            return already.len();
+        }
+
+        // Candidate underlays: dialable peers we don't already hold a session
+        // to. `first_dialable_underlay` is ws-only on wasm, so this naturally
+        // restricts to browser-dialable peers.
+        let mut candidates: Vec<Multiaddr> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for peer in peers.iter() {
+            if let Some(ua) = peer.first_dialable_underlay() {
+                let key = ua.to_string();
+                if already.contains(&key) || !seen.insert(key) {
+                    continue;
+                }
+                candidates.push(ua);
+            }
+        }
+        if candidates.is_empty() {
+            return already.len();
+        }
+
+        // Dial with a bounded in-flight window. We try more candidates than
+        // `want` because mainnet ws peers are flaky; stop once we reach the
+        // target session count or the candidate list is exhausted.
+        let parallelism = SESSION_DIAL_PARALLELISM.min(candidates.len());
+        let mut iter = candidates.into_iter();
+        let mut inflight = FuturesUnordered::new();
+        let dial = |underlay: Multiaddr| async move {
+            let res = PeerSession::connect(transport, &underlay).await;
+            (underlay, res)
+        };
+        for _ in 0..parallelism {
+            match iter.next() {
+                Some(u) => inflight.push(dial(u)),
+                None => break,
+            }
+        }
+
+        while let Some((underlay, res)) = inflight.next().await {
+            if let Ok(session) = res {
+                let session_arc = std::sync::Arc::new(session);
+                let sem_arc =
+                    std::sync::Arc::new(tokio::sync::Semaphore::new(MAX_INFLIGHT_PER_SESSION));
+                let mut guard = self.sessions.lock().await;
+                if guard.len() < target {
+                    guard
+                        .entry(underlay.to_string())
+                        .or_insert_with(|| (session_arc, sem_arc));
+                }
+            }
+            // Stop once we've reached the target; otherwise refill the window.
+            let have = self.sessions.lock().await.len();
+            if have >= target {
+                break;
+            }
+            if let Some(u) = iter.next() {
+                inflight.push(dial(u));
+            }
+        }
+        self.sessions.lock().await.len()
+    }
+
     /// Merge persisted feed hints back in (monotonic — never lowers a hint).
     pub fn import_feed_hints(&self, hints: HashMap<String, u64>) {
         let mut m = self.feed_index.lock().unwrap();
