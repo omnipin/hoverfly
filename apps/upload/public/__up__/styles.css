@@ -6,7 +6,8 @@
   --border: #30363d;
   --fg: #e6edf3;
   --muted: #8b949e;
-  --accent: #ff7a45; /* swarm-ish amber */
+  --accent: #ff7a45; /* swarm-ish amber — brand accent, used sparingly */
+  --link: #58a6ff;   /* links / focus / progress — calmer than the accent */
   --green: #3fb950;
   --red: #f85149;
 }
@@ -24,7 +25,7 @@ body {
 h1 { font-size: clamp(1.7rem, 5vw, 2.4rem); line-height: 1.1; margin: 0 0 0.5rem; }
 .accent { color: var(--accent); }
 .lede { color: var(--muted); margin: 0 0 2rem; }
-.lede a { color: var(--accent); }
+a { color: var(--link); }
 
 .muted { color: var(--muted); }
 .small { font-size: 0.85rem; }
@@ -64,7 +65,7 @@ input[type="text"], input[type="number"], select {
   font: inherit;
   font-size: 0.95rem;
 }
-input:focus, select:focus { outline: none; border-color: var(--accent); }
+input:focus, select:focus { outline: none; border-color: var(--link); }
 
 .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
 
@@ -102,12 +103,12 @@ button.ghost {
   cursor: pointer;
   transition: border-color 0.15s, background 0.15s;
 }
-.drop.hover { border-color: var(--accent); background: var(--panel2); }
+.drop.hover { border-color: var(--link); background: var(--panel2); }
 .drop strong { color: var(--fg); }
 
 /* ---- progress / log ---- */
 .bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin-top: 0.9rem; }
-.bar > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
+.bar > span { display: block; height: 100%; width: 0; background: var(--link); transition: width 0.25s; }
 
 .log {
   margin-top: 0.9rem; padding: 0.75rem 0.85rem;
@@ -130,6 +131,5 @@ button.ghost {
 .err { color: var(--red); margin: 0.6rem 0 0; }
 .ok { color: var(--green); }
 
-.result a { color: var(--accent); }
 .note { font-size: 0.82rem; color: var(--muted); margin-top: 0.6rem; }
-.note code { color: var(--green); }
+.note code { color: var(--fg); }
