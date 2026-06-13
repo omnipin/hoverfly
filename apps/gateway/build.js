@@ -36,7 +36,12 @@ function copyStatic () {
     cpSync(pkg, resolve(assets, 'hoverfly'), { recursive: true })
   } else {
     console.warn(`\n  ⚠  ${pkg} not found — build the wasm first:\n` +
-      '     RUSTUP_TOOLCHAIN=nightly cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --lib\n' +
+      // --features wasm-threads is REQUIRED for the gateway: it pulls
+      // wasm-bindgen-rayon (threaded BMT hashing over shared memory). It's
+      // default-OFF now so the upload dApp can build a no-shared-memory wasm; the
+      // gateway must opt back in. Needs the atomics/shared-memory rustflags from
+      // the repo's .cargo/config.toml (applied automatically).
+      '     RUSTUP_TOOLCHAIN=nightly cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --features wasm-threads --lib\n' +
       '     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/hoverfly.wasm\n')
   }
 }
