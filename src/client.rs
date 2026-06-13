@@ -8,8 +8,6 @@
 use core::time::Duration;
 use libp2p::Multiaddr;
 use nectar_postage::{Batch, BatchId};
-#[cfg(target_arch = "wasm32")]
-use nectar_postage_issuer::Stamper;
 use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk, SingleOwnerChunk};
@@ -1948,23 +1946,18 @@ fn build_stamper(
     BatchStamper::new(issuer, signer.alloy_signer().clone())
 }
 
+/// Current Unix time in **nanoseconds** for stamping, on wasm.
+///
+/// nectar's `current_timestamp()` (and `BatchStamper::stamp`, which calls it
+/// internally) use `std::time::SystemTime::now()`, which **panics on wasm32**
+/// ("time not implemented on this platform"). So on wasm we must source the
+/// timestamp ourselves and feed it explicitly via `prepare_stamp` —
+/// `js_sys::Date::now()` returns milliseconds since the epoch as `f64`; nectar
+/// records the stamp timestamp in nanoseconds (`current_timestamp` returns
+/// `duration.as_nanos()`), so scale by 1e6 to match.
 #[cfg(target_arch = "wasm32")]
-fn stamp_chunk(
-    stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
-    addr: &ChunkAddress,
-    wire: Vec<u8>,
-) -> Result<StampedChunk, ClientError> {
-    let stamp = stamper
-        .stamp(addr)
-        .map_err(|e| ClientError::Stamp(e.to_string()))?;
-    let stamp_bytes = stamp.to_bytes().to_vec();
-    let mut addr32 = [0u8; 32];
-    addr32.copy_from_slice(addr.as_bytes());
-    Ok(StampedChunk {
-        addr: addr32,
-        wire,
-        stamp: stamp_bytes,
-    })
+fn wasm_timestamp_nanos() -> u64 {
+    (js_sys::Date::now() as u64).saturating_mul(1_000_000)
 }
 
 /// Stamp a batch of (address, wire) pairs, signing in parallel via rayon.
@@ -2019,14 +2012,37 @@ fn stamp_chunks_parallel(
     stamped
 }
 
+/// wasm stamping: serial (single-threaded), and — crucially — uses an
+/// explicit timestamp via `prepare_stamp` + `stamp_from_signature` rather than
+/// `BatchStamper::stamp`, because the latter calls `SystemTime::now()` which
+/// panics on wasm. Mirrors the native parallel path's two-phase shape (prepare
+/// digest, then sign) minus rayon.
 #[cfg(target_arch = "wasm32")]
 fn stamp_chunks_parallel(
     stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
     work: Vec<(ChunkAddress, Vec<u8>)>,
 ) -> Result<Vec<StampedChunk>, ClientError> {
-    work.into_iter()
-        .map(|(addr, wire)| stamp_chunk(stamper, &addr, wire))
-        .collect()
+    use alloy_signer::SignerSync;
+    use nectar_postage_issuer::StampIssuer;
+
+    let timestamp = wasm_timestamp_nanos();
+    let mut out = Vec::with_capacity(work.len());
+    for (addr, wire) in work {
+        let digest = stamper
+            .issuer_mut()
+            .prepare_stamp(&addr, timestamp)
+            .map_err(|e| ClientError::Stamp(e.to_string()))?;
+        let prehash = digest.to_prehash();
+        let sig = stamper
+            .signer()
+            .sign_message_sync(prehash.as_slice())
+            .map_err(|e| ClientError::Stamp(e.to_string()))?;
+        let stamp = BatchStamper::<MemoryIssuer, alloy_signer_local::PrivateKeySigner>::stamp_from_signature(&digest, sig);
+        let mut addr32 = [0u8; 32];
+        addr32.copy_from_slice(addr.as_bytes());
+        out.push(StampedChunk { addr: addr32, wire, stamp: stamp.to_bytes().to_vec() });
+    }
+    Ok(out)
 }
 
 /// Upload arbitrary-size content. Splits via nectar, stamps each chunk with
@@ -2878,7 +2894,10 @@ pub async fn push_chunks_with_pool(
         let progress = progress.cloned();
         let chunk_for_result = chunk.clone();
         async move {
-            let t_chunk_start = std::time::Instant::now();
+            // web_time::Instant (not std::time::Instant) — std's panics on
+            // wasm ("time not implemented"); this push path runs on the wasm
+            // upload path too.
+            let t_chunk_start = web_time::Instant::now();
             // Inner result; the outer arm returns the chunk + retry
             // count alongside so the dispatch driver can re-queue
             // failed chunks for another round (bee's pusher does the

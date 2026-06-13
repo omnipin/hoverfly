@@ -3450,9 +3450,8 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nectar-mantaray"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "539b22aba1f4d7bcf7e1214385dc2544f2672ac50d0e29aaa646f7bf4b424703"
+version = "0.2.0"
+source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
 dependencies = [
  "alloy-primitives",
  "bitflags",
@@ -3465,9 +3464,8 @@ dependencies = [
 
 [[package]]
 name = "nectar-postage"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "957b50668a77ad87ded8154fe1cee243d1e71187be5d9f1441f71f3e534d9402"
+version = "0.2.0"
+source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3476,13 +3474,13 @@ dependencies = [
  "nectar-primitives",
  "serde",
  "thiserror 2.0.18",
+ "web-time",
 ]
 
 [[package]]
 name = "nectar-postage-issuer"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1d6dec297127898a588be7ff5443f7bbc3dc13f1790c52b8d87c5545aa652044"
+version = "0.2.0"
+source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3494,9 +3492,8 @@ dependencies = [
 
 [[package]]
 name = "nectar-primitives"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c8a521110aa8a1f47b307ce6a000212e9efa626db027e3ca276adaef3b630e8f"
+version = "0.2.0"
+source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3517,6 +3514,7 @@ dependencies = [
  "thiserror 2.0.18",
  "wasm-bindgen",
  "wasm-bindgen-rayon",
+ "web-time",
  "zeroize",
 ]
 
