@@ -1,0 +1,135 @@
+:root {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel2: #1c232c;
+  --border: #30363d;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #ff7a45; /* swarm-ish amber */
+  --green: #3fb950;
+  --red: #f85149;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; }
+body {
+  font: 16px/1.6 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  background: var(--bg);
+  color: var(--fg);
+}
+
+.wrap { max-width: 46rem; margin: 0 auto; padding: clamp(2rem, 6vw, 4rem) 1.25rem 5rem; }
+
+h1 { font-size: clamp(1.7rem, 5vw, 2.4rem); line-height: 1.1; margin: 0 0 0.5rem; }
+.accent { color: var(--accent); }
+.lede { color: var(--muted); margin: 0 0 2rem; }
+.lede a { color: var(--accent); }
+
+.muted { color: var(--muted); }
+.small { font-size: 0.85rem; }
+.mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+/* ---- step cards ---- */
+.step {
+  margin-top: 1.25rem;
+  padding: 1.25rem;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  transition: opacity 0.2s;
+}
+.step[aria-disabled="true"] { opacity: 0.45; pointer-events: none; }
+.step h2 {
+  font-size: 0.78rem; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--muted); margin: 0 0 0.85rem; display: flex; align-items: center; gap: 0.5rem;
+}
+.step h2 .num {
+  display: inline-grid; place-items: center;
+  width: 1.4rem; height: 1.4rem; border-radius: 50%;
+  background: var(--panel2); border: 1px solid var(--border);
+  font-size: 0.8rem; color: var(--fg);
+}
+.step.done h2 .num { background: var(--green); color: #06210f; border-color: var(--green); }
+
+/* ---- inputs / buttons ---- */
+label { display: block; font-size: 0.8rem; color: var(--muted); margin: 0 0 0.3rem; }
+input[type="text"], input[type="number"], select {
+  width: 100%;
+  padding: 0.65rem 0.8rem;
+  background: var(--panel2);
+  border: 1px solid var(--border);
+  border-radius: 9px;
+  color: var(--fg);
+  font: inherit;
+  font-size: 0.95rem;
+}
+input:focus, select:focus { outline: none; border-color: var(--accent); }
+
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0.85rem; }
+
+button {
+  padding: 0.65rem 1.3rem;
+  background: var(--accent);
+  border: none;
+  border-radius: 9px;
+  color: #1a1100;
+  font: inherit;
+  font-weight: 600;
+  cursor: pointer;
+}
+button:hover:not(:disabled) { filter: brightness(1.08); }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.ghost {
+  background: transparent; color: var(--fg);
+  border: 1px solid var(--border); font-weight: 500;
+}
+
+.actions { display: flex; gap: 0.6rem; align-items: center; margin-top: 1rem; flex-wrap: wrap; }
+
+/* ---- key/value rows ---- */
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 0.35rem 1rem; margin: 0.4rem 0 0; }
+.kv dt { color: var(--muted); font-size: 0.85rem; }
+.kv dd { margin: 0; font-size: 0.9rem; word-break: break-all; }
+
+/* ---- file drop ---- */
+.drop {
+  border: 1.5px dashed var(--border);
+  border-radius: 10px;
+  padding: 1.6rem 1rem;
+  text-align: center;
+  color: var(--muted);
+  cursor: pointer;
+  transition: border-color 0.15s, background 0.15s;
+}
+.drop.hover { border-color: var(--accent); background: var(--panel2); }
+.drop strong { color: var(--fg); }
+
+/* ---- progress / log ---- */
+.bar { height: 8px; background: var(--panel2); border-radius: 6px; overflow: hidden; margin-top: 0.9rem; }
+.bar > span { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.25s; }
+
+.log {
+  margin-top: 0.9rem; padding: 0.75rem 0.85rem;
+  background: #0b0e13; border: 1px solid var(--border); border-radius: 9px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem; color: var(--muted);
+  max-height: 12rem; overflow: auto; white-space: pre-wrap;
+}
+
+.pill {
+  display: inline-flex; align-items: center; gap: 0.4rem;
+  padding: 0.2rem 0.6rem; border-radius: 999px;
+  background: var(--panel2); border: 1px solid var(--border);
+  font-size: 0.8rem;
+}
+.dot { width: 0.55rem; height: 0.55rem; border-radius: 50%; background: var(--muted); }
+.dot.ok { background: var(--green); }
+.dot.warn { background: var(--accent); }
+
+.err { color: var(--red); margin: 0.6rem 0 0; }
+.ok { color: var(--green); }
+
+.result a { color: var(--accent); }
+.note { font-size: 0.82rem; color: var(--muted); margin-top: 0.6rem; }
+.note code { color: var(--green); }
