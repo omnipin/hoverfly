@@ -1,0 +1,44 @@
+# Maintainer: omnipin <https://github.com/omnipin/hoverfly>
+#
+# Prebuilt ("-bin") AUR package: installs the official release binary from
+# GitHub Releases, verified by sha256. No compilation — instant install.
+# For a from-source build see the `hoverfly` AUR package.
+#
+# This file is a TEMPLATE: the release workflow (.github/workflows/release.yml,
+# job `publish-aur`) substitutes @PKGVER@ for each tagged release; the AUR
+# deploy action then runs `updpkgsums` to fill the real sha256 checksums from
+# the release tarballs, regenerates .SRCINFO, and pushes to the AUR. The
+# `SKIP`/@PKGVER@ values are placeholders resolved at publish time.
+pkgname=hoverfly-bin
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Experimental Swarm light client (prebuilt binary)"
+arch=('x86_64' 'aarch64')
+url="https://github.com/omnipin/hoverfly"
+license=('MIT')
+provides=('hoverfly')
+conflicts=('hoverfly')
+# Each arch pulls the matching release tarball. _t<arch> is the Rust target
+# triple embedded in the asset name (see release.yml's packaging step).
+_t_x86_64="x86_64-unknown-linux-gnu"
+_t_aarch64="aarch64-unknown-linux-gnu"
+source_x86_64=("hoverfly-v${pkgver}-${_t_x86_64}.tar.gz::${url}/releases/download/v${pkgver}/hoverfly-v${pkgver}-${_t_x86_64}.tar.gz")
+source_aarch64=("hoverfly-v${pkgver}-${_t_aarch64}.tar.gz::${url}/releases/download/v${pkgver}/hoverfly-v${pkgver}-${_t_aarch64}.tar.gz")
+sha256sums_x86_64=('SKIP')
+sha256sums_aarch64=('SKIP')
+
+package() {
+  # The tarball unpacks to hoverfly-v<ver>-<target>/ containing the binary,
+  # peers.seed.json, README.md and LICENSE.
+  case "$CARCH" in
+    x86_64)  _dir="hoverfly-v${pkgver}-${_t_x86_64}" ;;
+    aarch64) _dir="hoverfly-v${pkgver}-${_t_aarch64}" ;;
+  esac
+
+  install -Dm755 "${srcdir}/${_dir}/hoverfly" "${pkgdir}/usr/bin/hoverfly"
+  install -Dm644 "${srcdir}/${_dir}/LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "${srcdir}/${_dir}/README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  # Curated cold-start peer list shipped alongside the CLI (hoverfly looks for
+  # it next to the binary or via an explicit flag; ship it as docs/data).
+  install -Dm644 "${srcdir}/${_dir}/peers.seed.json" "${pkgdir}/usr/share/${pkgname}/peers.seed.json"
+}
