@@ -2253,7 +2253,7 @@ async fn prep_connection(
                     endpoint,
                     ..
                 } if pid == peer_id => {
-                    info!(target: "hoverfly::transport", "connected to {}", pid);
+                    debug!(target: "hoverfly::transport", "connected to {}", pid);
                     peer_underlay = Some(endpoint.get_remote_address().clone());
                 }
                 SwarmEvent::OutgoingConnectionError {
@@ -2271,7 +2271,7 @@ async fn prep_connection(
                         peer_id: pid, info, ..
                     } if pid == peer_id && !identify_received => {
                         identify_received = true;
-                        info!(target: "hoverfly::transport", "identify received; observed_addr={}", info.observed_addr);
+                        debug!(target: "hoverfly::transport", "identify received; observed_addr={}", info.observed_addr);
                         swarm.add_external_address(info.observed_addr.clone());
                         swarm.behaviour_mut().identify.push([peer_id]);
                         push_in_flight = true;
@@ -2279,7 +2279,7 @@ async fn prep_connection(
                     libp2p::identify::Event::Pushed { peer_id: pid, .. }
                         if pid == peer_id && push_in_flight =>
                     {
-                        info!(target: "hoverfly::transport", "identify push acknowledged");
+                        debug!(target: "hoverfly::transport", "identify push acknowledged");
                         return Ok(peer_underlay.unwrap_or_else(Multiaddr::empty));
                     }
                     _ => {}
@@ -2301,7 +2301,7 @@ async fn do_handshake(
     advertised: Option<&Multiaddr>,
 ) -> Result<handshake::HandshakeResult, TransportError> {
     let local_peer_id = *swarm.local_peer_id();
-    info!(target: "hoverfly::transport", "opening outbound handshake");
+    debug!(target: "hoverfly::transport", "opening outbound handshake");
 
     // Try v15 first (bee 2.8.0+). Bee ≤ 2.7.x's libp2p multistream
     // negotiation will reject the v15 protocol id with
@@ -2395,7 +2395,7 @@ async fn do_handshake(
         }
     };
     close_stream_polled(swarm, &mut stream).await;
-    info!(target: "hoverfly::transport",
+    debug!(target: "hoverfly::transport",
         "outbound handshake complete (version={:?} peer_full_node={})",
         hs_result.version, hs_result.peer_full_node);
     Ok(hs_result)
@@ -2444,14 +2444,14 @@ async fn do_pricing(
             _ = swarm.select_next_some() => {}
         }
     }
-    info!(target: "hoverfly::transport", "opening outbound pricing");
+    debug!(target: "hoverfly::transport", "opening outbound pricing");
     let mut stream = poll_until(swarm, control.open_stream(peer_id, PRICING_PROTO))
         .await
         .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
     poll_until(swarm, write_then_read_empty_headers(&mut stream)).await?;
     poll_until(swarm, pricing::announce(&mut stream)).await?;
     close_stream_polled(swarm, &mut stream).await;
-    info!(target: "hoverfly::transport",
+    debug!(target: "hoverfly::transport",
         "outbound pricing complete (peer threshold {} PLUR)", peer_threshold);
     Ok(peer_threshold)
 }
