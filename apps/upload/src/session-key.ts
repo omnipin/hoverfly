@@ -83,6 +83,13 @@ function cacheKey (wallet: Address): string {
   return `${LS_SESSION_KEY}:${wallet.toLowerCase()}`
 }
 
+/** Return the cached session key for `account` if one exists, else null. Never
+ *  prompts — used by eager connect to wire up silently when possible. */
+export function cachedSessionKey (account: Address): SessionKey | null {
+  const cached = localStorage.getItem(cacheKey(account))
+  return cached != null && /^0x[0-9a-fA-F]{64}$/.test(cached) ? fromHex(cached as Hex) : null
+}
+
 /**
  * Derive (or load the cached) session key for `account`. On first use this
  * prompts the wallet to `personal_sign` the derivation message; subsequent

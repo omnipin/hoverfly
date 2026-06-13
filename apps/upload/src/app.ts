@@ -14,9 +14,9 @@
 
 import type { Hex } from 'viem'
 import { PUBLIC_GATEWAY } from './config.ts'
-import { deriveSessionKey, rotateSessionKey, type SessionKey } from './session-key.ts'
+import { deriveSessionKey, cachedSessionKey, rotateSessionKey, type SessionKey } from './session-key.ts'
 import {
-  connectWallet, quoteBatch, createBatch, formatBzz,
+  connectWallet, eagerConnectWallet, quoteBatch, createBatch, formatBzz,
   type WalletConn, type BatchQuote, type CreatedBatch
 } from './wallet.ts'
 import { saveBatch, verifyBatches, importBatch, type VerifiedBatch } from './batches.ts'
@@ -42,10 +42,10 @@ const app = document.getElementById('app') as HTMLElement
 app.innerHTML = `
   <main class="wrap">
     <h1>Hoverfly <span class="accent">Swarm upload</span></h1>
-    <p class="lede">Buy a postage batch with your wallet, then upload files to
-      <a href="https://www.ethswarm.org/" target="_blank" rel="noopener">Ethereum Swarm</a>
-      through an embedded <a href="https://github.com/omnipin/hoverfly" target="_blank" rel="noopener">hoverfly</a>
-      node running in your browser — no per-chunk wallet prompts.</p>
+    <p class="lede">Serverless, decentralized file upload to
+      <a href="https://www.ethswarm.org/" target="_blank" rel="noopener">Ethereum Swarm</a>,
+      powered by a <a href="https://github.com/omnipin/hoverfly" target="_blank" rel="noopener">hoverfly</a>
+      node running in your browser.</p>
 
     <!-- 1. wallet -->
     <section class="step" id="s-wallet">
@@ -57,41 +57,46 @@ app.innerHTML = `
       </div>
     </section>
 
-    <!-- 2. file + quote -->
+    <!-- 2. file -->
     <section class="step" id="s-file" aria-disabled="true">
       <h2><span class="num">2</span> Choose a file</h2>
       <div class="drop" id="drop">
         <strong>Click to choose</strong> or drop a file here
-        <div class="small">A <code>.tar</code> / <code>.tar.gz</code> uploads as a Swarm collection; anything else as a single file.</div>
         <div class="small" id="file-info"></div>
       </div>
       <input type="file" id="file" hidden />
-      <div class="grid2" style="margin-top:1rem">
-        <div>
-          <label for="ttl">Keep for</label>
-          <select id="ttl">${TTL_OPTIONS.map(([l, s], i) => `<option value="${s}"${i === 1 ? ' selected' : ''}>${l}</option>`).join('')}</select>
-        </div>
-        <div>
-          <label for="immutable">Type</label>
-          <select id="immutable">
-            <option value="false" selected>Mutable (can top up / dilute)</option>
-            <option value="true">Immutable</option>
-          </select>
-        </div>
-      </div>
-      <dl class="kv" id="quote"></dl>
     </section>
 
     <!-- 3. buy -->
     <section class="step" id="s-buy" aria-disabled="true">
-      <h2><span class="num">3</span> Buy postage batch</h2>
+      <h2><span class="num">3</span> Postage batch</h2>
+      <p class="note">Storing on Swarm needs a postage batch — reuse one you already own, or buy a new one below.</p>
       <div id="reuse"></div>
-      <div class="actions">
-        <button id="buy">Buy batch</button>
+      <!-- buy-new controls: hidden whenever an existing batch is selected -->
+      <div id="buy-pane">
+        <div class="grid2">
+          <div>
+            <label for="ttl">Keep for</label>
+            <select id="ttl">${TTL_OPTIONS.map(([l, s], i) => `<option value="${s}"${i === 1 ? ' selected' : ''}>${l}</option>`).join('')}</select>
+          </div>
+          <div>
+            <label for="immutable">Type</label>
+            <select id="immutable">
+              <option value="false" selected>Mutable (can top up / dilute)</option>
+              <option value="true">Immutable</option>
+            </select>
+          </div>
+        </div>
+        <dl class="kv" id="quote"></dl>
+        <div class="actions">
+          <button id="buy">Buy batch</button>
+        </div>
+        <p class="err" id="buy-err" hidden></p>
+      </div>
+      <div class="actions" style="margin-top:0.5rem">
         <span class="pill"><span class="dot" id="batch-dot"></span><span id="batch-state">no batch yet</span></span>
       </div>
       <dl class="kv" id="batch-info"></dl>
-      <p class="err" id="buy-err" hidden></p>
       <details class="adv">
         <summary class="muted small">Import a batch by ID</summary>
         <p class="note">Batches owned by this session key (<span class="mono" id="import-owner"></span>) are
@@ -125,8 +130,7 @@ app.innerHTML = `
         <code>createBatch</code>; it stamps every chunk locally. The key is <strong>derived from a
         one-time wallet signature</strong>, so the same wallet reproduces the same key (and owns the
         same batches) on any device — no funds at risk; its only power is stamping chunks for
-        batches it owns. (Zero-infra version of an EIP-7702/7579 session-key module; see
-        <code>session-key.ts</code>.)</p>
+        batches it owns.</p>
       <dl class="kv">
         <dt>Session key</dt><dd class="mono" id="sk-addr">—</dd>
       </dl>
@@ -137,6 +141,13 @@ app.innerHTML = `
 const $ = <T extends HTMLElement>(id: string): T => document.getElementById(id) as T
 const enable = (id: string, on: boolean): void => { $(id).setAttribute('aria-disabled', String(!on)) }
 const done = (id: string, on: boolean): void => { $(id).classList.toggle('done', on) }
+/** Step 4 (Upload) needs BOTH a chosen file AND a ready batch. Either can be
+ *  satisfied first (e.g. a batch auto-selects on connect before a file is
+ *  picked), so gate on both rather than on whichever happened last. */
+const refreshUploadGate = (): void => { enable('s-upload', file != null && batch != null) }
+/** Show/hide the "buy a new batch" controls. Hidden when an existing batch is
+ *  selected (reused/bought) — buying is then irrelevant. */
+const showBuyPane = (on: boolean): void => { $('buy-pane').hidden = !on }
 const logEl = $('log')
 function log (m: string): void {
   logEl.hidden = false
@@ -146,35 +157,55 @@ function log (m: string): void {
 }
 
 // ---- 1. connect ----
+/** Render the connected state and unlock the next steps. */
+function wireConnection (c: WalletConn, sk: SessionKey): void {
+  conn = c
+  session = sk
+  $('wallet-body').innerHTML = `
+    <dl class="kv">
+      <dt>Account</dt><dd class="mono">${c.account}</dd>
+      <dt>Session key</dt><dd class="mono">${sk.address}</dd>
+    </dl>`
+  const skCell = document.getElementById('sk-addr'); if (skCell != null) skCell.textContent = sk.address
+  done('s-wallet', true)
+  enable('s-file', true)
+  void refreshReuse()
+}
+
 $('connect').addEventListener('click', async () => {
   const btn = $<HTMLButtonElement>('connect')
   btn.disabled = true
   try {
-    conn = await connectWallet()
+    const c = await connectWallet()
     $('wallet-body').innerHTML = `
       <dl class="kv">
-        <dt>Account</dt><dd class="mono">${conn.account}</dd>
-        <dt>Chain</dt><dd>Gnosis (${conn.chainId})</dd>
-        <dt>Session key</dt><dd class="mono" id="wallet-sk">deriving…</dd>
+        <dt>Account</dt><dd class="mono">${c.account}</dd>
+        <dt>Session key</dt><dd class="mono" id="wallet-sk">sign in your wallet to derive…</dd>
       </dl>`
     // Derive the stamping session key from a one-time wallet signature (cached
     // per wallet thereafter). Deterministic → same wallet owns the same batches
     // on any device.
-    session = await deriveSessionKey(conn.wallet, conn.account, () => {
-      const sk = document.getElementById('wallet-sk'); if (sk != null) sk.textContent = 'sign in your wallet to derive…'
-    })
-    const skCells = [document.getElementById('wallet-sk'), document.getElementById('sk-addr')]
-    for (const c of skCells) if (c != null) c.textContent = session.address
-    done('s-wallet', true)
-    enable('s-file', true)
-    void refreshReuse()
+    const sk = await deriveSessionKey(c.wallet, c.account)
+    wireConnection(c, sk)
   } catch (e) {
     btn.disabled = false
     alert(errMsg(e))
   }
 })
 
-// ---- 2. file + quote ----
+// Eager connect on mount: if the wallet has already authorized this site AND we
+// have a cached session key for it, wire up silently — no prompts. (If the
+// wallet is authorized but the key isn't cached, we leave the manual Connect
+// button, which will derive it with one signature.)
+void (async () => {
+  const c = await eagerConnectWallet()
+  if (c == null) return
+  const sk = cachedSessionKey(c.account)
+  if (sk == null) return // would need a signature; let the user click Connect
+  wireConnection(c, sk)
+})()
+
+// ---- 2. file ----
 const drop = $('drop')
 const fileInput = $<HTMLInputElement>('file')
 drop.addEventListener('click', () => fileInput.click())
@@ -192,20 +223,22 @@ $('immutable').addEventListener('change', () => void refreshQuote())
 function setFile (f: File): void {
   file = f
   $('file-info').innerHTML = `<strong>${escapeHtml(f.name)}</strong> · ${fmtBytes(f.size)} · ${f.type || 'application/octet-stream'}`
-  void refreshQuote()
+  done('s-file', true)
+  enable('s-buy', true)
+  refreshUploadGate() // a batch may already be selected; unlock upload now that a file exists
+  void refreshQuote() // size + TTL → batch cost (shown in step 3)
 }
 
+/** Quote the batch cost for the chosen file + TTL. The quote lives in step 3
+ *  (it's a postage-batch property), and re-runs when TTL changes. */
 async function refreshQuote (): Promise<void> {
   if (conn == null || file == null) return
   const ttl = Number($<HTMLSelectElement>('ttl').value)
   try {
     quote = await quoteBatch(conn, file.size, ttl)
     $('quote').innerHTML = `
-      <dt>Suggested depth</dt><dd>${quote.depth} (≈ ${(quote.amountPerChunk).toString()} PLUR/chunk · 2^${quote.depth} chunks)</dd>
       <dt>Estimated cost</dt><dd>${formatBzz(quote.totalPlur)} xBZZ</dd>
       <dt>Your balance</dt><dd class="${quote.enoughBalance ? 'ok' : 'err'}">${formatBzz(quote.balancePlur)} xBZZ${quote.enoughBalance ? '' : ' — insufficient'}</dd>`
-    done('s-file', true)
-    enable('s-buy', true)
   } catch (e) {
     $('quote').innerHTML = `<dt class="err">Quote failed</dt><dd class="err">${escapeHtml(errMsg(e))}</dd>`
   }
@@ -220,18 +253,16 @@ async function refreshReuse (): Promise<void> {
   if (conn == null || session == null) { $('reuse').innerHTML = ''; return }
   const sk = session // non-null capture for the closures below
   const importOwner = $('import-owner'); if (importOwner != null) importOwner.textContent = sk.address
-  // Make it explicit WHOSE batches we look for: the session key (the batch
-  // owner), NOT the connected wallet. This is the usual point of confusion.
-  const owner = `<p class="note">Looking for batches owned by your session key
-    <span class="mono">${sk.address}</span> (not your wallet) — auto-discovered via Swarmscan + verified on-chain.</p>`
-  $('reuse').innerHTML = owner + '<p class="note">Checking on-chain…</p>'
+  $('reuse').innerHTML = '<p class="note">Checking for existing batches…</p>'
   try {
     verified = await verifyBatches(conn, sk.address)
   } catch {
     verified = []
   }
   if (verified.length === 0) {
-    $('reuse').innerHTML = owner + '<p class="note muted">No existing batches found for this session key. Buy one below, or import by ID.</p>'
+    // Nothing to reuse → buy-new is the only path.
+    $('reuse').innerHTML = ''
+    showBuyPane(true)
     return
   }
 
@@ -239,23 +270,48 @@ async function refreshReuse (): Promise<void> {
     const label = `${b.batchId.slice(0, 14)}… · depth ${b.onChain.depth}${b.usable ? '' : ' · expired'}`
     return `<option value="${b.batchId}"${b.usable ? '' : ' disabled'}>${label}</option>`
   }
-  $('reuse').innerHTML = owner + `
-    <label for="existing">Reuse an existing batch (${verified.length} found, verified on-chain)</label>
+  $('reuse').innerHTML = `
+    <label for="existing">Use an existing batch</label>
     <select id="existing">
-      <option value="">— buy a new batch —</option>
       ${verified.map(opt).join('')}
+      <option value="">— buy a new batch instead —</option>
     </select>`
+
+  const selectBatch = (v: VerifiedBatch): void => {
+    batch = { batchId: v.batchId, depth: v.onChain.depth, owner: sk.address, createTx: '0x' as Hex }
+    setBatchState('batch ready', true)
+    $('batch-info').innerHTML = `
+      <dt>Batch ID</dt><dd class="mono">${v.batchId}</dd>
+      <dt>Owner</dt><dd class="mono">${sk.address} <span class="muted">(session key)</span></dd>`
+    showBuyPane(false)
+    done('s-buy', true)
+    refreshUploadGate()
+  }
+
   $('existing').addEventListener('change', (e) => {
     const sel = e.target as HTMLSelectElement
-    if (sel.value === '') { batch = null; setBatchState('no batch yet', false); enable('s-upload', false); return }
+    if (sel.value === '') {
+      // "buy a new batch instead" → reveal buy controls, clear any selection.
+      batch = null
+      $('batch-info').innerHTML = ''
+      setBatchState('no batch yet', false)
+      showBuyPane(true)
+      refreshUploadGate()
+      return
+    }
     const v = verified.find(b => b.batchId.toLowerCase() === sel.value.toLowerCase())
-    if (v == null || !v.usable) return
-    batch = { batchId: v.batchId, depth: v.onChain.depth, owner: sk.address, createTx: '0x' as Hex }
-    setBatchState('reusing ' + v.batchId.slice(0, 12) + '…', true)
-    $('batch-info').innerHTML = ''
-    done('s-buy', true)
-    enable('s-upload', true)
+    if (v != null && v.usable) selectBatch(v)
   })
+
+  // Default to reusing the first usable batch (hides the buy UI). If none are
+  // usable (all expired), fall back to buy-new.
+  const firstUsable = verified.find(b => b.usable)
+  if (firstUsable != null) {
+    ;($('existing') as HTMLSelectElement).value = firstUsable.batchId
+    selectBatch(firstUsable)
+  } else {
+    showBuyPane(true)
+  }
 }
 
 // import-by-id
@@ -297,12 +353,14 @@ $('buy').addEventListener('click', async () => {
     $('batch-info').innerHTML = `
       <dt>Batch ID</dt><dd class="mono">${batch.batchId}</dd>
       <dt>Owner</dt><dd class="mono">${batch.owner} <span class="muted">(session key)</span></dd>
-      <dt>Depth</dt><dd>${batch.depth}</dd>
       ${batch.approveTx ? `<dt>Approve tx</dt><dd class="mono">${batch.approveTx}</dd>` : ''}
       <dt>Create tx</dt><dd class="mono">${batch.createTx}</dd>`
     setBatchState('batch ready', true)
+    // The new batch now exists → fold the buy UI away and let it appear in the
+    // reuse list (selected), so "have a batch" looks the same however you got it.
+    showBuyPane(false)
     done('s-buy', true)
-    enable('s-upload', true)
+    refreshUploadGate()
   } catch (e) {
     err.textContent = errMsg(e); err.hidden = false
     setBatchState('failed', false)
@@ -367,10 +425,7 @@ $('go').addEventListener('click', async () => {
       <dl class="kv" style="margin-top:1rem">
         <dt>Swarm reference</dt><dd class="mono ok">${ref}</dd>
         <dt>Open</dt><dd><a href="${url}" target="_blank" rel="noopener">${escapeHtml(url)}</a></dd>
-      </dl>
-      <p class="note">Public gateways are flaky/rate-limited and only see a chunk once it has
-        propagated to its neighbourhood — a 404/500 right after upload usually means
-        "not yet retrievable from that gateway", not a failed upload.</p>`
+      </dl>`
     done('s-upload', true)
   } catch (e) {
     setNet('failed', 'warn')
@@ -393,7 +448,7 @@ $('rotate').addEventListener('click', () => {
   $('sk-addr').textContent = session.address
   batch = null; upload = null
   setBatchState('no batch yet', false)
-  enable('s-upload', false)
+  refreshUploadGate()
   void refreshReuse()
 })
 
