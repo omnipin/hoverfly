@@ -86,10 +86,35 @@ function injected (): Eip1193 {
 export async function connectWallet (): Promise<WalletConn> {
   const eth = injected()
   const wallet = createWalletClient({ chain: gnosis, transport: custom(eth) })
-  const [account] = await wallet.requestAddresses()
+  const [account] = await wallet.requestAddresses() // prompts if not authorized
   if (account == null) throw new Error('Wallet returned no account')
+  return finishConnect(eth, wallet, account)
+}
 
-  // Ensure Gnosis. If the wallet doesn't know it, add it.
+/**
+ * Eager (silent) connect: if the wallet has ALREADY authorized this site, wire
+ * it up without any prompt and return the connection; otherwise return null.
+ *
+ * Uses `getAddresses` (eth_accounts) which never prompts — unlike
+ * `requestAddresses` (eth_requestAccounts). Called on mount so a returning,
+ * already-authorized user skips the manual "Connect" click. Any error (no
+ * injected wallet, etc.) resolves to null — eager connect must never throw or
+ * pop a dialog on load.
+ */
+export async function eagerConnectWallet (): Promise<WalletConn | null> {
+  let eth: Eip1193
+  try { eth = injected() } catch { return null }
+  try {
+    const wallet = createWalletClient({ chain: gnosis, transport: custom(eth) })
+    const [account] = await wallet.getAddresses() // silent; [] if not authorized
+    if (account == null) return null
+    return await finishConnect(eth, wallet, account)
+  } catch { return null }
+}
+
+/** Ensure Gnosis (switch/add if needed) and build the read client. Shared by
+ *  the prompting and eager connect paths. */
+async function finishConnect (eth: Eip1193, wallet: WalletClient, account: Address): Promise<WalletConn> {
   let chainId = await wallet.getChainId()
   if (chainId !== GNOSIS_CHAIN_ID) {
     try {
