@@ -1,0 +1,28 @@
+{
+  "name": "@hoverfly/upload",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "In-browser Swarm upload dApp: buy a postage batch with your wallet, then upload files via an embedded hoverfly (wasm) node — no per-chunk wallet prompts (session-key stamping).",
+  "scripts": {
+    "build:wasm": "bash build-wasm.sh",
+    "build": "node build.js",
+    "watch": "node build.js --watch",
+    "serve": "python3 -m http.server 3100 --directory dist",
+    "start": "node build.js && python3 -m http.server 3100 --directory dist",
+    "typecheck": "tsc -p tsconfig.json"
+  },
+  "dependencies": {
+    "nanotar": "^0.3.0",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "esbuild": "^0.24.2",
+    "typescript": "^5.7.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "esbuild"
+    ]
+  }
+}
