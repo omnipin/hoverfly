@@ -312,12 +312,7 @@ impl RetrievalCache {
     /// that many we open none. Sessions that later die are evicted by the
     /// fetch path (`ConnectionClosed`), so re-calling this on the daemon's
     /// maintenance tick tops the pool back up.
-    pub async fn prewarm(
-        &self,
-        transport: &Transport,
-        peers: &PeerStore,
-        target: usize,
-    ) -> usize {
+    pub async fn prewarm(&self, transport: &Transport, peers: &PeerStore, target: usize) -> usize {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // Already at/above target — nothing to open.
