@@ -1,0 +1,49 @@
+# Maintainer: omnipin <https://github.com/omnipin/hoverfly>
+#
+# From-source AUR package: builds the hoverfly CLI with cargo at install time.
+# For a no-compile install of the official prebuilt binary, see `hoverfly-bin`.
+#
+# This file is a TEMPLATE: the release workflow (.github/workflows/release.yml,
+# job `publish-aur`) substitutes @PKGVER@ for each tagged release; the AUR
+# deploy action then runs `updpkgsums` to fill the real source-tarball sha256,
+# regenerates .SRCINFO, and pushes to the AUR. The `SKIP`/@PKGVER@ values are
+# placeholders resolved at publish time.
+pkgname=hoverfly
+pkgver=@PKGVER@
+pkgrel=1
+pkgdesc="Experimental Swarm light client"
+arch=('x86_64' 'aarch64')
+url="https://github.com/omnipin/hoverfly"
+license=('MIT')
+depends=('gcc-libs')
+# Build needs Rust + cargo. The native CLI builds on stable (nightly is only
+# required for the wasm target, which this package does not build).
+makedepends=('rust' 'cargo')
+provides=('hoverfly')
+conflicts=('hoverfly-bin')
+source=("${pkgname}-${pkgver}.tar.gz::${url}/archive/refs/tags/v${pkgver}.tar.gz")
+sha256sums=('SKIP')
+
+prepare() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  # Vendor-free, reproducible build against the committed lockfile.
+  export RUSTUP_TOOLCHAIN=stable
+  cargo fetch --locked --target "$(rustc -vV | sed -n 's/host: //p')"
+}
+
+build() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  export RUSTUP_TOOLCHAIN=stable
+  export CARGO_TARGET_DIR=target
+  # Default features (cli + bridge) — the full native CLI. --frozen keeps the
+  # build offline and pinned to Cargo.lock.
+  cargo build --release --frozen --bin hoverfly
+}
+
+package() {
+  cd "${srcdir}/${pkgname}-${pkgver}"
+  install -Dm755 "target/release/hoverfly" "${pkgdir}/usr/bin/hoverfly"
+  install -Dm644 "LICENSE" "${pkgdir}/usr/share/licenses/${pkgname}/LICENSE"
+  install -Dm644 "README.md" "${pkgdir}/usr/share/doc/${pkgname}/README.md"
+  install -Dm644 "peers.seed.json" "${pkgdir}/usr/share/${pkgname}/peers.seed.json"
+}
