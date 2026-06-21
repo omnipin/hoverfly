@@ -56,8 +56,7 @@ random nonce works, but most random overlays land in bee's already-full
 low kademlia bins and get dropped right after the handshake. `hoverfly
 vanity-overlay` searches for a nonce that puts you in deeper,
 undersaturated bins instead. Anchoring against a few stable peers
-(`--target-overlay`) roughly **doubled** upload throughput in testing —
-see `PERFORMANCE.md` for the method and numbers.
+(`--target-overlay`) roughly **doubles** upload throughput.
 
 ```bash
 hoverfly vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
