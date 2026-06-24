@@ -2055,7 +2055,11 @@ fn stamp_chunks_parallel(
         let stamp = BatchStamper::<MemoryIssuer, alloy_signer_local::PrivateKeySigner>::stamp_from_signature(&digest, sig);
         let mut addr32 = [0u8; 32];
         addr32.copy_from_slice(addr.as_bytes());
-        out.push(StampedChunk { addr: addr32, wire, stamp: stamp.to_bytes().to_vec() });
+        out.push(StampedChunk {
+            addr: addr32,
+            wire,
+            stamp: stamp.to_bytes().to_vec(),
+        });
     }
     Ok(out)
 }
