@@ -13,7 +13,7 @@
 // 7579/4337 account abstraction if we want a revocable, user-owned variant.
 
 import type { Hex } from 'viem'
-import { PUBLIC_GATEWAY } from './config.ts'
+import { BATCH_INDEX_WAIT_SECS, PUBLIC_GATEWAY } from './config.ts'
 import { deriveSessionKey, cachedSessionKey, rotateSessionKey, type SessionKey } from './session-key.ts'
 import {
   connectWallet, eagerConnectWallet, quoteBatch, createBatch, formatBzz,
@@ -37,6 +37,15 @@ let file: File | null = null
 let quote: BatchQuote | null = null
 let batch: CreatedBatch | null = null
 let upload: UploadSession | null = null
+/**
+ * Epoch ms before which the selected batch is NOT yet safe to upload to,
+ * because its on-chain `BatchCreated` event hasn't propagated to bee nodes'
+ * batchstore (see BATCH_INDEX_WAIT_SECS). 0 = ready now (reused/imported
+ * batches, already long-indexed). Set in the future only after buying a NEW
+ * batch; a countdown ticks it down and re-evaluates the upload gate.
+ */
+let batchReadyAt = 0
+let batchWaitTimer: ReturnType<typeof setInterval> | null = null
 
 const app = document.getElementById('app') as HTMLElement
 app.innerHTML = `
@@ -143,8 +152,51 @@ const enable = (id: string, on: boolean): void => { $(id).setAttribute('aria-dis
 const done = (id: string, on: boolean): void => { $(id).classList.toggle('done', on) }
 /** Step 4 (Upload) needs BOTH a chosen file AND a ready batch. Either can be
  *  satisfied first (e.g. a batch auto-selects on connect before a file is
- *  picked), so gate on both rather than on whichever happened last. */
-const refreshUploadGate = (): void => { enable('s-upload', file != null && batch != null) }
+ *  picked), so gate on both rather than on whichever happened last.
+ *
+ *  A freshly-BOUGHT batch additionally must wait out BATCH_INDEX_WAIT_SECS so
+ *  bee nodes have indexed its on-chain event (otherwise every push is rejected
+ *  `batchstore … storage: not found`). While that window is open the step is
+ *  enabled (so the user sees it) but the Upload button is disabled and shows a
+ *  countdown. */
+const refreshUploadGate = (): void => {
+  const have = file != null && batch != null
+  enable('s-upload', have)
+  const go = document.getElementById('go') as HTMLButtonElement | null
+  if (go == null) return
+  if (!have) { go.disabled = true; go.textContent = 'Upload to Swarm'; return }
+  const remainingMs = batchReadyAt - Date.now()
+  if (remainingMs > 0) {
+    go.disabled = true
+    go.textContent = `Waiting for batch to be indexed… ${Math.ceil(remainingMs / 1000)}s`
+  } else {
+    go.disabled = false
+    go.textContent = 'Upload to Swarm'
+  }
+}
+
+/** Begin (or restart) the post-purchase indexing wait for a NEW batch: arm
+ *  `batchReadyAt` and tick a 1s countdown that re-evaluates the upload gate
+ *  until the window elapses. Reused/imported batches must NOT call this. */
+function startBatchIndexWait (): void {
+  batchReadyAt = Date.now() + BATCH_INDEX_WAIT_SECS * 1000
+  if (batchWaitTimer != null) clearInterval(batchWaitTimer)
+  batchWaitTimer = setInterval(() => {
+    refreshUploadGate()
+    if (Date.now() >= batchReadyAt && batchWaitTimer != null) {
+      clearInterval(batchWaitTimer); batchWaitTimer = null
+    }
+  }, 1000)
+  refreshUploadGate()
+}
+
+/** A batch that's already on-chain long enough to be indexed (reused/imported):
+ *  clear any pending wait so uploads are immediately allowed. */
+function clearBatchIndexWait (): void {
+  batchReadyAt = 0
+  if (batchWaitTimer != null) { clearInterval(batchWaitTimer); batchWaitTimer = null }
+  refreshUploadGate()
+}
 /** Show/hide the "buy a new batch" controls. Hidden when an existing batch is
  *  selected (reused/bought) — buying is then irrelevant. */
 const showBuyPane = (on: boolean): void => { $('buy-pane').hidden = !on }
@@ -285,7 +337,8 @@ async function refreshReuse (): Promise<void> {
       <dt>Owner</dt><dd class="mono">${sk.address} <span class="muted">(session key)</span></dd>`
     showBuyPane(false)
     done('s-buy', true)
-    refreshUploadGate()
+    // Reused/imported batch — already indexed by the network, upload immediately.
+    clearBatchIndexWait()
   }
 
   $('existing').addEventListener('change', (e) => {
@@ -296,7 +349,7 @@ async function refreshReuse (): Promise<void> {
       $('batch-info').innerHTML = ''
       setBatchState('no batch yet', false)
       showBuyPane(true)
-      refreshUploadGate()
+      clearBatchIndexWait()
       return
     }
     const v = verified.find(b => b.batchId.toLowerCase() === sel.value.toLowerCase())
@@ -360,7 +413,11 @@ $('buy').addEventListener('click', async () => {
     // reuse list (selected), so "have a batch" looks the same however you got it.
     showBuyPane(false)
     done('s-buy', true)
-    refreshUploadGate()
+    // A NEW batch isn't stampable until bees ingest its on-chain event — gate
+    // the upload behind the indexing countdown so the first push doesn't get
+    // rejected `batchstore … storage: not found`.
+    startBatchIndexWait()
+    log(`Batch created. Waiting ~${BATCH_INDEX_WAIT_SECS}s for the network to index it before uploading…`)
   } catch (e) {
     err.textContent = errMsg(e); err.hidden = false
     setBatchState('failed', false)
@@ -448,7 +505,7 @@ $('rotate').addEventListener('click', () => {
   $('sk-addr').textContent = session.address
   batch = null; upload = null
   setBatchState('no batch yet', false)
-  refreshUploadGate()
+  clearBatchIndexWait()
   void refreshReuse()
 })
 

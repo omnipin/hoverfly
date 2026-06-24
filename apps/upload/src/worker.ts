@@ -21,6 +21,7 @@ declare const self: DedicatedWorkerGlobalScope
 interface HoverflyClient {
   start: (bootstrap: string, intervalSecs: number, waitSecs: number, warmPool?: number) => Promise<number>
   loadPeers: (json: string) => void
+  mergePeers: (json: string) => number
   exportPeers: () => string
   peerCount: () => number
   connectedPeerCount?: () => Promise<number>
@@ -120,14 +121,28 @@ async function start (sessionKeyHex: string): Promise<void> {
     const c = new mod.HoverflyClient(sessionKeyHex, BigInt(NETWORK_ID), undefined, 30, undefined)
     client = c
 
+    // Load the IndexedDB cache first (peers we actually reached last session),
+    // then MERGE the freshly-fetched CDN seed on top. The cache alone goes
+    // stale fast: mainnet /ws[s] underlays are AutoTLS SNI hostnames that
+    // rotate within ~2-3h, so a cache from a previous session is mostly dead
+    // underlays — dialing them spams the browser console with `can't establish
+    // a connection` and finds nothing. The CDN seed is re-derived hourly
+    // precisely to beat that rotation. `mergePeers` (NOT loadPeers, which
+    // REPLACES the store) upserts the seed into the cache: underlays are
+    // unioned and the newer reachability wins, so we keep last session's live
+    // peers AND gain the fresh underlays. On a true cold start the cache is
+    // absent and the seed is the only source.
     const saved = await idbGet(IDB_PEERS_KEY)
     if (saved != null) {
       try { c.loadPeers(saved); log(`Loaded ${c.peerCount()} peers from cache`) } catch (e) { console.warn(e) }
-    } else {
-      const seed = await loadSeed()
-      if (seed != null) {
-        try { c.loadPeers(seed); log(`Seeded ${c.peerCount()} peers`) } catch (e) { console.warn(e) }
-      }
+    }
+    const seed = await loadSeed()
+    if (seed != null) {
+      try {
+        const before = c.peerCount()
+        const total = saved != null ? c.mergePeers(seed) : (c.loadPeers(seed), c.peerCount())
+        log(`Merged fresh seed (+${total - before} new, ${total} total)`)
+      } catch (e) { console.warn(e) }
     }
 
     log('Discovering browser-dialable peers…')

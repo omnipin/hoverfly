@@ -36,6 +36,18 @@ export const POSTAGE_STAMP = '0x45a1502382541Cd610CC9068e88727426b696293' as con
 export const BZZ_TOKEN = '0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da' as const
 /** Bee hard-codes bucketDepth = 16; the contract rejects anything else. */
 export const BUCKET_DEPTH = 16
+/**
+ * Seconds to wait after creating a NEW batch before allowing an upload.
+ *
+ * A batch only becomes stampable once bee nodes have ingested its on-chain
+ * `BatchCreated` event into their replicated batchstore. That lags the
+ * confirming transaction by a few blocks PLUS each node's event-poll interval,
+ * so a push fired immediately after `createBatch` is rejected network-wide with
+ * `invalid stamp: batchstore get: … storage: not found`. Empirically ~60–90s
+ * covers the propagation; we use 90s to be safe. Reused/imported batches (long
+ * since indexed) skip this wait entirely.
+ */
+export const BATCH_INDEX_WAIT_SECS = 90
 /** Gnosis block time (seconds), stable since launch — used for duration math. */
 export const GNOSIS_BLOCK_TIME_SECS = 5
 /** A public Gnosis RPC, used only for read calls if the wallet chain differs. */
