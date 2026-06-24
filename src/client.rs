@@ -69,6 +69,21 @@ pub enum ClientError {
     Manifest(String),
     #[error("feed: {0}")]
     Feed(String),
+    /// A chunk dispatch found only *shallow* pushsync receipts — every
+    /// peer that answered forwarded the chunk but none inside the chunk's
+    /// neighborhood-of-responsibility stored it (`proximity(storer, chunk)
+    /// < storer.storage_radius`). A shallow receipt does NOT prove durable
+    /// storage, so a chunk that only ever lands shallow is silently
+    /// unretrievable later (the manifest resolves but the data 404/500s).
+    ///
+    /// This is a *retryable* error: the outer per-chunk retry loop
+    /// re-dispatches the chunk across more peers / after pool churn (the
+    /// neighborhood peer may be reachable on a later attempt). Only after
+    /// the full `MAX_CHUNK_RETRIES` budget is exhausted does the dispatcher
+    /// accept the deepest shallow as a last resort (mirroring bee's
+    /// `maxPushErrors` give-up) rather than aborting the whole upload.
+    #[error("shallow-only receipt (no neighborhood storer reached)")]
+    ShallowOnly,
 }
 
 impl From<nectar_primitives::error::PrimitivesError> for ClientError {
@@ -3396,26 +3411,24 @@ pub async fn push_chunks_with_pool(
                 }
             }
 
-            // If we've seen at least one shallow receipt and we've
-            // walked the full candidate list, accept the deepest
-            // shallow rather than failing the whole upload. The chunk
-            // *did* get forwarded into the network — every peer that
-            // signed a shallow receipt acked the push at some hop, the
-            // receipt just doesn't prove durable AOR storage. Bee's
-            // pushsync takes the same way out via `maxPushErrors` once
-            // errSkip has burned through the candidate list. We accept
-            // even when intermixed timeouts happened: missing the
-            // "strictly best" peer for one of 3 000 random chunks is
-            // not worth aborting the whole upload.
+            // If we've seen at least one shallow receipt but no full
+            // (neighborhood) receipt, do NOT accept it here. A shallow
+            // receipt only proves the chunk was forwarded to some hop —
+            // not that a peer inside its neighborhood-of-responsibility
+            // stored it — so a chunk that lands only shallow is silently
+            // unretrievable later (manifest resolves, data 404/500s).
+            // Surface a *retryable* `ShallowOnly` error so the outer
+            // per-chunk loop re-dispatches across more peers / after pool
+            // churn (the neighborhood peer may be reachable next time).
+            // Only after the full `MAX_CHUNK_RETRIES` budget is spent does
+            // that loop accept the deepest shallow as a last resort
+            // (mirroring bee's `maxPushErrors` give-up) instead of aborting
+            // the whole upload.
             if let Some((po, _r)) = best_shallow {
-                let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
-                if let Some(p) = &progress {
-                    p(done, total);
-                }
-                info!(target: "hoverfly::upload",
-                    "accepting shallow receipt for chunk {} after {} attempts (deepest po={}, {} shallow / {} overdraft / {} err)",
+                debug!(target: "hoverfly::upload",
+                    "chunk {} got only shallow receipts after {} attempts (deepest po={}, {} shallow / {} overdraft / {} err); will retry",
                     hex::encode(chunk.addr), attempt_no, po, shallows, overdrafts, errors);
-                return Ok::<_, ClientError>(());
+                return Err(ClientError::ShallowOnly);
             }
 
             // Fast-fail when every peer rejects the batch. Bee peers
@@ -3683,6 +3696,28 @@ pub async fn push_chunks_with_pool(
                             tokio::time::sleep(backoff).await;
                             dispatch(chunk, next).await
                         }));
+                    }
+                    // Retry budget exhausted. A chunk that only ever got
+                    // shallow receipts (no neighborhood storer reachable
+                    // across all MAX_CHUNK_RETRIES attempts) is accepted as
+                    // a last resort here rather than aborting the whole
+                    // upload — it WAS forwarded into the network, and after
+                    // 60 retries the neighborhood peer is genuinely
+                    // unreachable from our pool. Mirrors bee's
+                    // `maxPushErrors` give-up. Any other error is fatal.
+                    Err(ClientError::ShallowOnly) => {
+                        let done = pushed.fetch_add(1, Ordering::Relaxed) + 1;
+                        if let Some(p) = &progress {
+                            p(done, total);
+                        }
+                        warn!(target: "hoverfly::upload",
+                            "accepting shallow-only chunk {} as last resort after {} retries ({}/{} pushed) — may be slow/unretrievable",
+                            hex::encode(chunk.addr), attempts, done, total);
+                        if let Some(c) = iter.next() {
+                            inflight.push(Box::pin(dispatch(c, 0)));
+                        } else {
+                            more_chunks = false;
+                        }
                     }
                     Err(e) => {
                         first_err = Some(e);

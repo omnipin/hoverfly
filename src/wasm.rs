@@ -209,6 +209,26 @@ impl HoverflyClient {
         Ok(())
     }
 
+    /// Merge a peers.json string INTO the existing in-memory store (rather than
+    /// replacing it like [`Self::load_peers`]). Each peer is `upsert`ed, so
+    /// underlays are unioned and reachability fields keep the newer observation.
+    ///
+    /// This is what the upload dApp uses to combine its persisted IndexedDB
+    /// cache with the hourly-refreshed CDN seed: the cache carries peers we
+    /// actually reached last session, the seed carries fresh AutoTLS /ws[s]
+    /// underlays (which rotate every ~2-3h), and merging gets both — instead of
+    /// the seed clobbering the cache or a stale cache shadowing the seed.
+    /// Returns the store size after the merge.
+    #[wasm_bindgen(js_name = "mergePeers")]
+    pub fn merge_peers(&self, peers_json: &str) -> Result<usize, JsError> {
+        let incoming: PeerStore = serde_json::from_str(peers_json).map_err(into_js_err)?;
+        let mut store = self.peers.borrow_mut();
+        for peer in incoming.iter() {
+            store.upsert(peer.clone());
+        }
+        Ok(store.len())
+    }
+
     /// Export the current peer store as a JSON string.
     #[wasm_bindgen(js_name = "exportPeers")]
     pub fn export_peers(&self) -> Result<String, JsError> {
