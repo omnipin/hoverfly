@@ -11,11 +11,9 @@ use nectar_postage::{Batch, BatchId};
 use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk, SingleOwnerChunk};
-use nectar_primitives::file::{GenericJoiner, sync_split};
-use nectar_primitives::store::{ChunkGet, ChunkStoreError, SyncChunkGet, SyncChunkPut};
+use nectar_primitives::file::{GenericJoiner, split};
+use nectar_primitives::store::{ChunkGet, ChunkStoreError};
 use std::collections::HashMap;
-#[cfg(not(target_arch = "wasm32"))]
-use std::sync::Mutex;
 use thiserror::Error;
 use tracing::{debug, info, warn};
 
@@ -606,7 +604,9 @@ impl<'a> NetworkedStore<'a> {
         // proximity is the right *secondary* signal.
         let mut candidates: Vec<&Peer> = self.peers.closest(&address, usize::MAX);
         if candidates.is_empty() {
-            return Err(ChunkStoreError::Other("no peers in peerlist".into()));
+            return Err(ChunkStoreError::Other(
+                "no peers in peerlist".to_string().into(),
+            ));
         }
         let dialable = candidates
             .iter()
@@ -970,9 +970,12 @@ impl<'a> NetworkedStore<'a> {
             initial_deque_len,
             last_err,
         );
-        Err(ChunkStoreError::Other(format!(
-            "all peers failed ({failed_attempts}/{initial_deque_len} attempted): {last_err}"
-        )))
+        Err(ChunkStoreError::Other(
+            format!(
+                "all peers failed ({failed_attempts}/{initial_deque_len} attempted): {last_err}"
+            )
+            .into(),
+        ))
     }
 }
 
@@ -988,83 +991,15 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
     }
 }
 
-// On wasm32 the inner future isn't `Send` (libp2p swarm + tokio_with_wasm
-// timers aren't Send), but the nectar trait requires `+ Send`. Wrap in
-// `SendWrapper`, which is safe because wasm32 is single-threaded — the
-// future will always be polled on the same thread it was created on.
 #[cfg(target_arch = "wasm32")]
 impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
     type Error = ChunkStoreError;
 
-    fn get(
+    async fn get(
         &self,
         address: &ChunkAddress,
-    ) -> impl core::future::Future<Output = Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error>> + Send
-    {
-        let address = *address;
-        send_wrapper::SendWrapper::new(self.fetch_chunk_inner(address))
-    }
-}
-
-/// A `SyncChunkGet` adapter that wraps an async network fetch by blocking
-/// the current thread (via `tokio::task::block_in_place`). Used by mantaray
-/// manifest decoding which expects a synchronous chunk store.
-///
-/// Native-only: wasm32 has no multi-thread runtime to block on.
-#[cfg(not(target_arch = "wasm32"))]
-pub struct BlockingNetworkedStore<'a> {
-    transport: &'a Transport,
-    peers: &'a PeerStore,
-    max_retries: usize,
-    concurrency: usize,
-    cache: Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>,
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<'a> BlockingNetworkedStore<'a> {
-    pub fn new(transport: &'a Transport, peers: &'a PeerStore, max_retries: usize) -> Self {
-        Self::with_concurrency(transport, peers, max_retries, 1)
-    }
-
-    pub fn with_concurrency(
-        transport: &'a Transport,
-        peers: &'a PeerStore,
-        max_retries: usize,
-        concurrency: usize,
-    ) -> Self {
-        Self {
-            transport,
-            peers,
-            max_retries,
-            concurrency,
-            cache: Mutex::new(HashMap::new()),
-        }
-    }
-}
-
-#[cfg(not(target_arch = "wasm32"))]
-impl<'a> SyncChunkGet<DEFAULT_BODY_SIZE> for BlockingNetworkedStore<'a> {
-    type Error = ChunkStoreError;
-
-    fn get(&self, address: &ChunkAddress) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
-        if let Some(c) = self.cache.lock().unwrap().get(address).cloned() {
-            return Ok(c);
-        }
-        info!(target: "hoverfly::manifest", "blocking fetch for {}", address);
-        let handle = tokio::runtime::Handle::current();
-        let store = NetworkedStore::with_concurrency(
-            self.transport,
-            self.peers,
-            self.max_retries,
-            self.concurrency,
-        );
-        let address_copy = *address;
-        let chunk = handle.block_on(async move {
-            ChunkGet::<DEFAULT_BODY_SIZE>::get(&store, &address_copy).await
-        })?;
-        info!(target: "hoverfly::manifest", "got chunk: data.len()={}", chunk.data().len());
-        self.cache.lock().unwrap().insert(*address, chunk.clone());
-        Ok(chunk)
+    ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+        self.fetch_chunk_inner(*address).await
     }
 }
 
@@ -1624,11 +1559,10 @@ fn walk_manifest<'a>(
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
 ) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + Send + 'a>,
+    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + 'a>,
 > {
     Box::pin(async move {
         use crate::manifest::decode_node;
-        use futures::stream::{FuturesUnordered, StreamExt};
 
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
             .await
@@ -1645,20 +1579,11 @@ fn walk_manifest<'a>(
             });
         }
 
-        // Descend into each fork in parallel; each subtree's entries are
-        // appended in arrival order.
-        let mut children: FuturesUnordered<_> = node
-            .forks
-            .values()
-            .map(|fork| {
-                let mut next_path = path_so_far.clone();
-                next_path.extend_from_slice(&fork.prefix);
-                let r = fork.reference;
-                walk_manifest(store, r, next_path)
-            })
-            .collect();
-        while let Some(res) = children.next().await {
-            out.extend(res?);
+        for fork in node.forks.values() {
+            let mut next_path = path_so_far.clone();
+            next_path.extend_from_slice(&fork.prefix);
+            let r = fork.reference;
+            out.extend(walk_manifest(store, r, next_path).await?);
         }
         Ok(out)
     })
@@ -1756,7 +1681,7 @@ pub async fn upload_collection(
     let mut total_bytes: usize = 0;
     let mut raw_chunks = 0usize;
     for f in &files {
-        let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
         debug!(
             target: "hoverfly::upload",
             "collection: {} ({} bytes) -> {} chunks (root {})",
@@ -1883,7 +1808,7 @@ pub fn prepare_upload_file_with_manifest(
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
-    let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(data)?;
     info!(target: "hoverfly::upload", "file: {} bytes -> {} chunks (root {})",
         data.len(), file_store.len(), file_root);
 
@@ -1957,7 +1882,7 @@ fn build_stamper(
         BUCKET_DEPTH,
         false,
     );
-    let issuer = MemoryIssuer::from_batch(&batch);
+    let issuer = MemoryIssuer::from_batch(&batch).expect("valid batch");
     BatchStamper::new(issuer, signer.alloy_signer().clone())
 }
 
@@ -2183,7 +2108,7 @@ fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
 /// [`prepare_upload_file_with_manifest`] (or just split + manifest) to
 /// derive that manifest root.
 pub fn bmt_root(data: &[u8]) -> Result<(ChunkAddress, usize), ClientError> {
-    let (root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
     Ok((root, store.len()))
 }
 
@@ -2213,7 +2138,7 @@ pub fn collection_root(
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
     for f in files {
-        let (file_root, file_store) = sync_split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
         for (addr, _chunk) in file_store.into_chunks() {
             let mut addr_bytes = [0u8; 32];
             addr_bytes.copy_from_slice(addr.as_bytes());
@@ -2246,7 +2171,7 @@ pub fn prepare_upload_bytes(
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
-    let (root, store) = sync_split::<DEFAULT_BODY_SIZE>(data)?;
+    let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
     info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {})",
         data.len(), store.len(), root);
 
@@ -4491,12 +4416,4 @@ fn parse_batch_id(hex_str: &str) -> Result<BatchId, ClientError> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(BatchId::from(arr))
-}
-
-// Unused trait imports kept here to ensure the bridge between sync/async
-// store traits is available (nectar wires them via blanket impls).
-#[allow(dead_code)]
-fn _store_traits_in_scope<S: SyncChunkGet<DEFAULT_BODY_SIZE> + SyncChunkPut<DEFAULT_BODY_SIZE>>(
-    _: S,
-) {
 }

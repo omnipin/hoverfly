@@ -41,26 +41,14 @@ bridge = []
 # Redirect futures-bounded to a vendored copy whose `Delay::tokio` falls back to
 # futures-timer on wasm32 (real tokio's timer panics in the browser). Fixes the
 # libp2p-identify (and any other) `futures_bounded::Delay::tokio` usage on wasm.
-#
-# Nectar crates point at the omnipin fork, which gates wasm-bindgen-rayon behind
-# a default-off `wasm-threads` feature so the default wasm build needs no shared
-# memory / cross-origin isolation (lets the upload dApp run on the eth.limo ENS
-# gateway). The gateway opts back into threads with `--features wasm-threads`.
-# Pinned to a rev for reproducibility (branch wasm-threads-optional).
 [patch.crates-io]
 futures-bounded = { path = "vendor/futures-bounded" }
-nectar-primitives = { git = "https://github.com/omnipin/nectar", rev = "5b4748a39fcb8119edd28d70a6399ad2af1da7a8" }
-nectar-mantaray = { git = "https://github.com/omnipin/nectar", rev = "5b4748a39fcb8119edd28d70a6399ad2af1da7a8" }
-nectar-postage = { git = "https://github.com/omnipin/nectar", rev = "5b4748a39fcb8119edd28d70a6399ad2af1da7a8" }
-nectar-postage-issuer = { git = "https://github.com/omnipin/nectar", rev = "5b4748a39fcb8119edd28d70a6399ad2af1da7a8" }
 
 [dependencies]
-# Nectar primitives (BMT, chunks, file split/join, mantaray, postage). Versions
-# track the omnipin fork (0.2.0); see [patch.crates-io] above.
-nectar-primitives = "0.2.0"
-nectar-mantaray   = "0.2.0"
-nectar-postage    = { version = "0.2.0", features = ["std"] }
-nectar-postage-issuer = { version = "0.2.0", features = ["std", "local-signer"] }
+nectar-primitives = "0.3.0"
+nectar-mantaray   = "0.3.0"
+nectar-postage    = { version = "0.3.0", features = ["std"] }
+nectar-postage-issuer = { version = "0.3.0", features = ["std", "local-signer"] }
 
 # alloy crypto (matches nectar's signer: nectar 0.1.0 is on the alloy 2.0
 # signer line, so hoverfly must track it too or the BatchStamper signer types
@@ -173,11 +161,7 @@ futures-timer = { version = "3.0.3", features = ["wasm-bindgen"] }
 reqwest = { version = "0.12", default-features = false, features = ["json"] }
 console_error_panic_hook = "0.1"
 tracing-wasm = "0.2"
-# Marker wrapper used to satisfy `+ Send` bounds on futures whose inner
-# state (libp2p swarm + tokio_with_wasm timers) isn't `Send`. Safe on
-# wasm32 because the platform is single-threaded; SendWrapper panics if
-# accessed from a different thread, which can't happen in the browser.
-send_wrapper = { version = "0.6", features = ["futures"] }
+send_wrapper = "0.6"
 
 [dev-dependencies]
 tokio-test = "0.4"
