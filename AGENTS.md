@@ -36,6 +36,27 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
   RUSTUP_TOOLCHAIN=nightly cargo check --target wasm32-unknown-unknown --no-default-features
   ```
 
+  **Threaded vs. threadless wasm (`wasm-threads` feature).** `wasm-threads`
+  (default-OFF) forwards to `nectar-primitives/wasm-threads`, the only thing
+  that pulls `wasm-bindgen-rayon` — whose presence forces wasm-bindgen's threads
+  transform and a *shared* (`SharedArrayBuffer`) memory, requiring COOP/COEP
+  cross-origin isolation on the hosting page. Two intended builds:
+  - **Gateway (threaded):** `--no-default-features --features wasm-threads`,
+    with the atomics/`--shared-memory` rustflags from `.cargo/config.toml`.
+    Faster BMT hashing; must be served cross-origin-isolated. This is what
+    `apps/gateway` builds.
+  - **Upload dApp (threadless, no shared memory):** `--no-default-features`
+    (omit `wasm-threads`) **and** override the rustflags with empty `RUSTFLAGS`
+    so `--shared-memory`/`+atomics` aren't applied → a plain non-shared linear
+    memory, no `SharedArrayBuffer`, no COOP/COEP. Runs on hosts that can't set
+    those headers (e.g. the eth.limo ENS gateway). See `apps/upload/build-wasm.sh`.
+    Single-threaded (nectar's `sync_split` rayon paths run inline with no pool).
+
+  Nectar crates are pulled from the **omnipin fork** (`../omnipin/nectar`, via
+  `[patch.crates-io]`), which is upstream 0.2.0 plus the `wasm-threads` gate
+  (API-identical to 0.1.0; the only behavioral delta is `web_time` for
+  wall-clock, which also fixes `current_timestamp()` panicking on wasm).
+
   First-time setup:
   ```
   rustup target add wasm32-unknown-unknown --toolchain nightly

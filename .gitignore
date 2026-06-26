@@ -3,6 +3,9 @@
 /pkg
 *.tmp
 peers.json
+# Overlay identity nonce written to CWD by CLI runs (default `--nonce-file`).
+# A runtime artifact, like peers.json — never commit it.
+overlay-nonce
 # `peers.seed.json` is checked in: an IP-diverse cold-start seed
 # harvested from a long-running daemon (~800 peers across ~800 unique
 # /32 IPs as of the last refresh; regenerate via
