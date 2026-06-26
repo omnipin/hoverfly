@@ -311,46 +311,49 @@ pub fn build_collection_manifest(
     let store = DefaultMemoryStore::new();
     let mut manifest: PlainManifest<_, DEFAULT_BODY_SIZE> = PlainManifest::new(store);
 
-    for entry in entries {
-        let mut metadata: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(ct) = &entry.content_type {
-            metadata.insert(ENTRY_METADATA_CONTENT_TYPE_KEY.to_string(), ct.clone());
+    let root = futures::executor::block_on(async {
+        for entry in entries {
+            let mut metadata: BTreeMap<String, String> = BTreeMap::new();
+            if let Some(ct) = &entry.content_type {
+                metadata.insert(ENTRY_METADATA_CONTENT_TYPE_KEY.to_string(), ct.clone());
+            }
+            let filename = entry
+                .path
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(entry.path.as_str())
+                .to_string();
+            metadata.insert(ENTRY_METADATA_FILENAME_KEY.to_string(), filename);
+
+            manifest
+                .add_with_metadata(&entry.path, entry.reference, metadata)
+                .await
+                .map_err(|e| ManifestError::Metadata(e.to_string()))?;
         }
-        // Filename is the basename of the path (matching bee's behaviour).
-        let filename = entry
-            .path
-            .rsplit('/')
-            .next()
-            .filter(|s| !s.is_empty())
-            .unwrap_or(entry.path.as_str())
-            .to_string();
-        metadata.insert(ENTRY_METADATA_FILENAME_KEY.to_string(), filename);
+
+        if index_document.is_some() || error_document.is_some() {
+            let mut root_meta: BTreeMap<String, String> = BTreeMap::new();
+            if let Some(idx) = index_document {
+                root_meta.insert(
+                    WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY.to_string(),
+                    idx.to_string(),
+                );
+            }
+            if let Some(err) = error_document {
+                root_meta.insert(WEBSITE_ERROR_DOCUMENT_PATH_KEY.to_string(), err.to_string());
+            }
+            manifest
+                .add_with_metadata(ROOT_PATH, ChunkAddress::new([0u8; 32]), root_meta)
+                .await
+                .map_err(|e| ManifestError::Metadata(e.to_string()))?;
+        }
 
         manifest
-            .add_with_metadata(&entry.path, entry.reference, metadata)
-            .map_err(|e| ManifestError::Metadata(e.to_string()))?;
-    }
-
-    if index_document.is_some() || error_document.is_some() {
-        let mut root_meta: BTreeMap<String, String> = BTreeMap::new();
-        if let Some(idx) = index_document {
-            root_meta.insert(
-                WEBSITE_INDEX_DOCUMENT_SUFFIX_KEY.to_string(),
-                idx.to_string(),
-            );
-        }
-        if let Some(err) = error_document {
-            root_meta.insert(WEBSITE_ERROR_DOCUMENT_PATH_KEY.to_string(), err.to_string());
-        }
-        // bee uses swarm.ZeroAddress for the root entry's reference.
-        manifest
-            .add_with_metadata(ROOT_PATH, ChunkAddress::new([0u8; 32]), root_meta)
-            .map_err(|e| ManifestError::Metadata(e.to_string()))?;
-    }
-
-    let root = manifest
-        .save()
-        .map_err(|e| ManifestError::Metadata(e.to_string()))?;
+            .save()
+            .await
+            .map_err(|e| ManifestError::Metadata(e.to_string()))
+    })?;
 
     let (_node, store) = manifest.into_parts();
     let chunks: Vec<(ChunkAddress, bytes::Bytes)> = store
