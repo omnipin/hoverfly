@@ -13,7 +13,7 @@
 // 7579/4337 account abstraction if we want a revocable, user-owned variant.
 
 import type { Hex } from 'viem'
-import { BATCH_INDEX_WAIT_SECS, PUBLIC_GATEWAY } from './config.ts'
+import { BATCH_INDEX_POLL_MS, BATCH_INDEX_MAX_POLLS, PUBLIC_GATEWAY, SWARMSCAN_BATCH_URL } from './config.ts'
 import { deriveSessionKey, cachedSessionKey, rotateSessionKey, type SessionKey } from './session-key.ts'
 import {
   connectWallet, eagerConnectWallet, quoteBatch, createBatch, formatBzz,
@@ -40,7 +40,7 @@ let upload: UploadSession | null = null
 /**
  * Epoch ms before which the selected batch is NOT yet safe to upload to,
  * because its on-chain `BatchCreated` event hasn't propagated to bee nodes'
- * batchstore (see BATCH_INDEX_WAIT_SECS). 0 = ready now (reused/imported
+ * batchstore (see pollSwarmscanForBatch). 0 = ready now (reused/imported
  * batches, already long-indexed). Set in the future only after buying a NEW
  * batch; a countdown ticks it down and re-evaluates the upload gate.
  */
@@ -154,7 +154,7 @@ const done = (id: string, on: boolean): void => { $(id).classList.toggle('done',
  *  satisfied first (e.g. a batch auto-selects on connect before a file is
  *  picked), so gate on both rather than on whichever happened last.
  *
- *  A freshly-BOUGHT batch additionally must wait out BATCH_INDEX_WAIT_SECS so
+ *  A freshly-BOUGHT batch additionally must wait for a swarmscan poll so
  *  bee nodes have indexed its on-chain event (otherwise every push is rejected
  *  `batchstore … storage: not found`). While that window is open the step is
  *  enabled (so the user sees it) but the Upload button is disabled and shows a
@@ -175,11 +175,32 @@ const refreshUploadGate = (): void => {
   }
 }
 
-/** Begin (or restart) the post-purchase indexing wait for a NEW batch: arm
- *  `batchReadyAt` and tick a 1s countdown that re-evaluates the upload gate
- *  until the window elapses. Reused/imported batches must NOT call this. */
-function startBatchIndexWait (): void {
-  batchReadyAt = Date.now() + BATCH_INDEX_WAIT_SECS * 1000
+/** Poll swarmscan until the batch is indexed (or the ceiling expires).
+ *  Mirrors the README pattern: `curl -s .../v1/postage/batches/<ID>`.
+ *  Returns true once indexed, false if the ceiling expired. */
+async function pollSwarmscanForBatch (batchId: string): Promise<boolean> {
+  const base = SWARMSCAN_BATCH_URL.replace(/\/$/, '')
+  log(`Polling swarmscan for batch ${batchId.slice(0, 12)}… (up to ${BATCH_INDEX_MAX_POLLS} attempts)`)
+  for (let i = 1; i <= BATCH_INDEX_MAX_POLLS; i++) {
+    try {
+      const r = await fetch(`${base}/${batchId}`, { cache: 'no-store' })
+      if (r.ok) {
+        log(`Batch indexed by bee network (swarmscan 200)`)
+        return true
+      }
+    } catch { /* transient network error — keep polling */ }
+    log(`  …swarmscan poll ${i}/${BATCH_INDEX_MAX_POLLS}`)
+    await new Promise(resolve => setTimeout(resolve, BATCH_INDEX_POLL_MS))
+  }
+  log(`WARNING: swarmscan did not return the batch after ${BATCH_INDEX_MAX_POLLS * BATCH_INDEX_POLL_MS / 1000}s. Proceeding anyway — upload may fail.`)
+  return false
+}
+
+/** Begin (or restart) the post-purchase indexing wait for a NEW batch: poll
+ *  swarmscan (bee network) until the batch is indexed, then clear the gate.
+ *  Reused/imported batches must NOT call this. */
+function startBatchIndexWait (batchId: string): void {
+  batchReadyAt = Date.now() + BATCH_INDEX_MAX_POLLS * BATCH_INDEX_POLL_MS
   if (batchWaitTimer != null) clearInterval(batchWaitTimer)
   batchWaitTimer = setInterval(() => {
     refreshUploadGate()
@@ -188,6 +209,11 @@ function startBatchIndexWait (): void {
     }
   }, 1000)
   refreshUploadGate()
+  // Fire-and-forget the swarmscan poll; the interval above handles the UI.
+  pollSwarmscanForBatch(batchId).then(ok => {
+    if (ok) batchReadyAt = 0
+    refreshUploadGate()
+  }).catch(() => { /* best-effort */ })
 }
 
 /** A batch that's already on-chain long enough to be indexed (reused/imported):
@@ -414,10 +440,10 @@ $('buy').addEventListener('click', async () => {
     showBuyPane(false)
     done('s-buy', true)
     // A NEW batch isn't stampable until bees ingest its on-chain event — gate
-    // the upload behind the indexing countdown so the first push doesn't get
+    // the upload behind an active swarmscan poll so the first push doesn't get
     // rejected `batchstore … storage: not found`.
-    startBatchIndexWait()
-    log(`Batch created. Waiting ~${BATCH_INDEX_WAIT_SECS}s for the network to index it before uploading…`)
+    startBatchIndexWait(batch.batchId)
+    log(`Polling swarmscan for batch ${batch.batchId.slice(0, 12)}… until the bee network has indexed it`)
   } catch (e) {
     err.textContent = errMsg(e); err.hidden = false
     setBatchState('failed', false)

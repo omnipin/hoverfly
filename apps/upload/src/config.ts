@@ -37,17 +37,18 @@ export const BZZ_TOKEN = '0xdBF3Ea6F5beE45c02255B2c26a16F300502F68da' as const
 /** Bee hard-codes bucketDepth = 16; the contract rejects anything else. */
 export const BUCKET_DEPTH = 16
 /**
- * Seconds to wait after creating a NEW batch before allowing an upload.
+ * How often (ms) to poll swarmscan for a freshly-created batch while waiting
+ * for it to be indexed by the bee network.
  *
  * A batch only becomes stampable once bee nodes have ingested its on-chain
- * `BatchCreated` event into their replicated batchstore. That lags the
- * confirming transaction by a few blocks PLUS each node's event-poll interval,
- * so a push fired immediately after `createBatch` is rejected network-wide with
- * `invalid stamp: batchstore get: … storage: not found`. Empirically ~60–90s
- * covers the propagation; we use 90s to be safe. Reused/imported batches (long
- * since indexed) skip this wait entirely.
+ * `BatchCreated` event into their replicated batchstore. Instead of a fixed
+ * timeout, we poll [swarmscan](https://swarmscan.io/) until it returns the
+ * batch (matching the pattern shown in the README:
+ * `curl -s https://api.swarmscan.io/v1/postage/batches/<ID>`).
+ * Reused/imported batches (long since indexed) skip this wait entirely.
  */
-export const BATCH_INDEX_WAIT_SECS = 90
+export const BATCH_INDEX_POLL_MS = 5_000
+export const BATCH_INDEX_MAX_POLLS = 120 // 120 × 5s = 10 min ceiling
 /** Gnosis block time (seconds), stable since launch — used for duration math. */
 export const GNOSIS_BLOCK_TIME_SECS = 5
 /** A public Gnosis RPC, used only for read calls if the wallet chain differs. */
@@ -97,3 +98,4 @@ export const PUBLIC_GATEWAY = 'https://bzz.limo/bzz/'
  */
 export const SWARMSCAN_BATCH_CREATED =
   'https://api.swarmscan.io/v1/events/postage-stamp/batch-created'
+export const SWARMSCAN_BATCH_URL = 'https://api.swarmscan.io/v1/postage/batches'
