@@ -12,14 +12,15 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use futures_timer::Delay;
-use js_sys::Uint8Array;
+use js_sys::{Array, Reflect, Uint8Array};
 use libp2p::Multiaddr;
 use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    RetrievalCache, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
-    list_manifest_ex, upload_bytes,
+    DEFAULT_UPLOAD_CONCURRENCY, RetrievalCache, UploadFile, discover, fetch_bytes_cached_ex,
+    fetch_manifest_path_cached_meta, list_manifest_ex, upload_bytes, upload_collection,
+    upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
 use crate::peers::PeerStore;
@@ -206,6 +207,26 @@ impl HoverflyClient {
         let store: PeerStore = serde_json::from_str(peers_json).map_err(into_js_err)?;
         *self.peers.borrow_mut() = store;
         Ok(())
+    }
+
+    /// Merge a peers.json string INTO the existing in-memory store (rather than
+    /// replacing it like [`Self::load_peers`]). Each peer is `upsert`ed, so
+    /// underlays are unioned and reachability fields keep the newer observation.
+    ///
+    /// This is what the upload dApp uses to combine its persisted IndexedDB
+    /// cache with the hourly-refreshed CDN seed: the cache carries peers we
+    /// actually reached last session, the seed carries fresh AutoTLS /ws[s]
+    /// underlays (which rotate every ~2-3h), and merging gets both — instead of
+    /// the seed clobbering the cache or a stale cache shadowing the seed.
+    /// Returns the store size after the merge.
+    #[wasm_bindgen(js_name = "mergePeers")]
+    pub fn merge_peers(&self, peers_json: &str) -> Result<usize, JsError> {
+        let incoming: PeerStore = serde_json::from_str(peers_json).map_err(into_js_err)?;
+        let mut store = self.peers.borrow_mut();
+        for peer in incoming.iter() {
+            store.upsert(peer.clone());
+        }
+        Ok(store.len())
     }
 
     /// Export the current peer store as a JSON string.
@@ -554,7 +575,11 @@ impl HoverflyClient {
         serde_json::to_string(&json).map_err(into_js_err)
     }
 
-    /// Upload bytes with an existing postage batch. Returns the root hash hex.
+    /// Upload raw bytes with an existing postage batch. Returns the BMT root
+    /// hash hex. This is the lowest-level upload: no manifest, so the reference
+    /// carries no filename or content-type. Prefer [`Self::upload_file`] (which
+    /// wraps the bytes in a single-entry mantaray manifest) for anything a
+    /// gateway should serve with a sensible `Content-Type`.
     pub async fn upload(
         &self,
         data: Uint8Array,
@@ -562,11 +587,7 @@ impl HoverflyClient {
         depth: u8,
         max_retries: usize,
     ) -> Result<String, JsError> {
-        let key = self
-            .signer_key
-            .as_deref()
-            .ok_or_else(|| JsError::new("client constructed without a private key"))?;
-        let signer = SwarmSigner::from_hex(key, self.network_id).map_err(into_js_err)?;
+        let signer = self.upload_signer()?;
         let buf = data.to_vec();
         let peers = self.peers.borrow().clone();
         let root = upload_bytes(
@@ -582,6 +603,134 @@ impl HoverflyClient {
         .map_err(into_js_err)?;
         Ok(hex::encode(root.as_bytes()))
     }
+
+    /// Upload a single file wrapped in a one-entry mantaray manifest: `path`
+    /// (the filename) maps to the file's content, with optional `content_type`
+    /// metadata. Returns the *manifest* root — a gateway resolves
+    /// `<root>/<path>` to the bytes and serves them with the recorded
+    /// `Content-Type`, and a bare `<root>/` resolves to the single entry too
+    /// (the single-file fallback gateways use). This is the upload a dApp wants
+    /// for "upload this file and give me a usable bzz link".
+    #[wasm_bindgen(js_name = "uploadFile")]
+    pub async fn upload_file(
+        &self,
+        data: Uint8Array,
+        path: String,
+        content_type: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        max_retries: usize,
+    ) -> Result<String, JsError> {
+        let signer = self.upload_signer()?;
+        let buf = data.to_vec();
+        let peers = self.peers.borrow().clone();
+        let root = upload_file_with_manifest_ex(
+            &self.transport,
+            &peers,
+            &signer,
+            &batch_id_hex,
+            depth,
+            &buf,
+            &path,
+            content_type.as_deref(),
+            max_retries,
+            DEFAULT_UPLOAD_CONCURRENCY,
+            None,
+        )
+        .await
+        .map_err(into_js_err)?;
+        Ok(hex::encode(root.as_bytes()))
+    }
+
+    /// Upload a collection of files as a multi-entry mantaray manifest — the
+    /// in-browser equivalent of bee's tar / multipart `POST /bzz` directory
+    /// upload. Each file is BMT-split independently and gets one manifest entry
+    /// keyed by its in-archive `path`; duplicate chunks across files are
+    /// stamped once. Returns the manifest root.
+    ///
+    /// `files` is a JS array of objects `{ path: string, data: Uint8Array,
+    /// contentType?: string }`. `index_document` / `error_document` (e.g.
+    /// `"index.html"` / `"error.html"`) are written as website metadata on the
+    /// root so a gateway serves `<root>/` as the index and unknown paths as the
+    /// error page — turning the collection into a browsable website.
+    ///
+    /// Tar parsing stays in JS (the `tar` crate is `cli`-feature-gated and not
+    /// in the wasm build); the caller unpacks the archive and passes the entry
+    /// list here.
+    #[wasm_bindgen(js_name = "uploadCollection")]
+    pub async fn upload_collection(
+        &self,
+        files: Array,
+        index_document: Option<String>,
+        error_document: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        max_retries: usize,
+    ) -> Result<String, JsError> {
+        let signer = self.upload_signer()?;
+        let upload_files = parse_upload_files(&files)?;
+        if upload_files.is_empty() {
+            return Err(JsError::new("collection is empty (no files)"));
+        }
+        let peers = self.peers.borrow().clone();
+        let root = upload_collection(
+            &self.transport,
+            &peers,
+            &signer,
+            &batch_id_hex,
+            depth,
+            upload_files,
+            index_document.as_deref(),
+            error_document.as_deref(),
+            max_retries,
+            DEFAULT_UPLOAD_CONCURRENCY,
+            None,
+        )
+        .await
+        .map_err(into_js_err)?;
+        Ok(hex::encode(root.as_bytes()))
+    }
+
+    /// Build the stamp signer from the private key the client was constructed
+    /// with. Errors if the client is fetch-only (no key).
+    fn upload_signer(&self) -> Result<SwarmSigner, JsError> {
+        let key = self
+            .signer_key
+            .as_deref()
+            .ok_or_else(|| JsError::new("client constructed without a private key"))?;
+        SwarmSigner::from_hex(key, self.network_id).map_err(into_js_err)
+    }
+}
+
+/// Decode a JS array of `{ path, data, contentType? }` into `UploadFile`s.
+/// `path` and `data` (a `Uint8Array`) are required per entry; `contentType`
+/// is optional. Reading the `Uint8Array` copies its bytes out of wasm-shared
+/// memory into an owned `Vec<u8>`.
+fn parse_upload_files(files: &Array) -> Result<Vec<UploadFile>, JsError> {
+    let mut out = Vec::with_capacity(files.length() as usize);
+    for (i, entry) in files.iter().enumerate() {
+        let path = Reflect::get(&entry, &JsValue::from_str("path"))
+            .ok()
+            .and_then(|v| v.as_string())
+            .ok_or_else(|| JsError::new(&format!("files[{i}]: missing string `path`")))?;
+        let data_val = Reflect::get(&entry, &JsValue::from_str("data"))
+            .map_err(|_| JsError::new(&format!("files[{i}]: missing `data`")))?;
+        if !data_val.is_instance_of::<Uint8Array>() {
+            return Err(JsError::new(&format!(
+                "files[{i}]: `data` must be a Uint8Array"
+            )));
+        }
+        let data = Uint8Array::from(data_val).to_vec();
+        let content_type = Reflect::get(&entry, &JsValue::from_str("contentType"))
+            .ok()
+            .and_then(|v| v.as_string());
+        out.push(UploadFile {
+            path,
+            content_type,
+            data,
+        });
+    }
+    Ok(out)
 }
 
 /// Result of a manifest path fetch: file bytes plus the optional
