@@ -893,17 +893,30 @@ fn make_progress_bar() -> Option<ProgressFn> {
     }
     pb.set_style(
         ProgressStyle::with_template(
-            "  pushing {bar:40.cyan/blue} {pos}/{len} chunks  ({percent}%, eta {eta})",
+            "  pushing {bar:40.cyan/blue} {pos}/{len} chunks  ({percent}%, eta {eta}) {msg}",
         )
         .ok()?
         .progress_chars("##-"),
     );
     pb.enable_steady_tick(Duration::from_millis(250));
+    let start = std::time::Instant::now();
     let cb: ProgressFn = Arc::new(move |done: usize, total: usize| {
         if pb.length() != Some(total as u64) {
             pb.set_length(total as u64);
         }
         pb.set_position(done as u64);
+        // Throughput: each chunk holds ~4 KiB of data (Swarm leaf chunk).
+        let elapsed = start.elapsed().as_secs_f64();
+        if elapsed > 0.5 && done > 0 {
+            let bytes = done as f64 * 4096.0;
+            let bps = bytes / elapsed;
+            let (rate, unit) = if bps >= 1024.0 * 1024.0 {
+                (bps / (1024.0 * 1024.0), "MB/s")
+            } else {
+                (bps / 1024.0, "KB/s")
+            };
+            pb.set_message(format!("{rate:.1} {unit}"));
+        }
         if done >= total {
             pb.finish_and_clear();
         }
