@@ -469,11 +469,13 @@ where
     let addr = ChunkAddress::new(feed.update_address(i));
     match tokio::time::timeout(deadline, store.get(&addr)).await {
         Ok(Ok(c)) => Ok(Probe::Present(c)),
-        Ok(Err(ChunkStoreError::NotFound { .. })) => Ok(Probe::Absent),
+        Ok(Err(ChunkStoreError::NotFound(_))) => Ok(Probe::Absent),
         // "no peer found" / "all peers failed" => nobody is serving this SOC
         // right now. For the search this means "advance", but it is NOT a
         // definitive not-found, so mark it Unresolved (retryable at the anchor).
-        Ok(Err(ChunkStoreError::Other(msg))) if is_absent_retrieval(&msg) => Ok(Probe::Unresolved),
+        Ok(Err(ChunkStoreError::Other(msg))) if is_absent_retrieval(&msg.to_string()) => {
+            Ok(Probe::Unresolved)
+        }
         Ok(Err(e)) => Err(ResolveError::Fetch(e.to_string())),
         // Timed out — inconclusive, retryable at the anchor.
         Err(_) => Ok(Probe::Unresolved),
@@ -734,9 +736,9 @@ mod tests {
                     return match o {
                         Outcome::Present(c) => Ok(c),
                         Outcome::NotFound => Err(ChunkStoreError::not_found(address)),
-                        Outcome::Transient => {
-                            Err(ChunkStoreError::Other("all peers failed".into()))
-                        }
+                        Outcome::Transient => Err(ChunkStoreError::Other(
+                            "all peers failed".to_string().into(),
+                        )),
                     };
                 }
             }
