@@ -50,12 +50,16 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
     so `--shared-memory`/`+atomics` aren't applied → a plain non-shared linear
     memory, no `SharedArrayBuffer`, no COOP/COEP. Runs on hosts that can't set
     those headers (e.g. the eth.limo ENS gateway). See `apps/upload/build-wasm.sh`.
-    Single-threaded (nectar's `sync_split` rayon paths run inline with no pool).
+    Single-threaded (nectar's `split` rayon paths run inline with no pool).
 
-  Nectar crates are pulled from the **omnipin fork** (`../omnipin/nectar`, via
-  `[patch.crates-io]`), which is upstream 0.2.0 plus the `wasm-threads` gate
-  (API-identical to 0.1.0; the only behavioral delta is `web_time` for
-  wall-clock, which also fixes `current_timestamp()` panicking on wasm).
+  Nectar crates are pulled from **upstream 0.3.0** (crates.io). The old
+  `[patch.crates-io]` omnipin fork and its `wasm-threads` gate are gone —
+  upstream v0.3.0 has `MaybeSend`/`MaybeSync` (Send/Sync relaxed on wasm)
+  and `web_time` natively. API changes from 0.2.0:
+  - `sync_split` → `split` (free function, same signature)
+  - `SyncChunkGet`/`SyncChunkPut` → removed (use async `ChunkGet`/`ChunkPut`)
+  - `ChunkStoreError::Other(String)` → `ChunkStoreError::Other(Box<dyn Error + Send + Sync>)`
+  - `MemoryIssuer::from_batch` returns `Result<_, IssuerError>`
 
   First-time setup:
   ```
@@ -98,18 +102,18 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 ## WASM constraints (will bite you)
 
 - `tokio_with_wasm::time::{Sleep, Timeout, Interval}` are **not `Send`**.
-  Several `nectar-primitives` traits require `+ Send` on returned futures.
-  Workarounds in this repo:
-  - `send_wrapper::SendWrapper::new(future)` to satisfy `+ Send` on wasm
-    (single-threaded, safe). See `ChunkGet for NetworkedStore` in
-    `src/client.rs`.
-  - Per-target `impl` blocks gated by
-    `#[cfg(target_arch = "wasm32")]` / `#[cfg(not(target_arch = "wasm32"))]`.
-  - `futures::future::BoxFuture<'_>` (Send) vs `LocalBoxFuture<'_>`
-    (not Send) cfg-gated when storing futures in `FuturesUnordered`.
+  Upstream nectar v0.3.0 uses `MaybeSend`/`MaybeSync` on wasm, relaxing the
+  `+ Send` bound on ChunkGet. The old `send_wrapper` workaround for the
+  `ChunkGet` impl is therefore removed. However, `send_wrapper` is still
+  used by `src/wsws/mod.rs` to make the WebSocket `Connection` struct `Send`
+  (libp2p's transport trait requires it).
+- Per-target `impl` blocks gated by
+  `#[cfg(target_arch = "wasm32")]` / `#[cfg(not(target_arch = "wasm32"))]`.
+- `walk_manifest` in client.rs switched from `FuturesUnordered` (Send-bound)
+  to sequential iteration on wasm because the ChunkGet future is no longer
+  wrapped to be Send.
 - `tokio_with_wasm` is missing: `runtime::Handle`, `time::Instant`,
-  `time::interval_at`, `Sleep::reset`. `BlockingNetworkedStore` is therefore
-  gated to non-wasm. For sleep-resets, re-pin a fresh
+  `time::interval_at`, `Sleep::reset`. For sleep-resets, re-pin a fresh
   `Box::pin(tokio::time::sleep(d))`.
 - `Cargo.toml` deliberately pulls three `getrandom` package versions
   (0.2, 0.3, 0.4) on wasm — alloy-primitives 1.5.x pulls 0.4 transitively.
@@ -345,7 +349,8 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
 
 - After any `transport.rs`, `client.rs`, or trait-bound change, run both
   the native build and the wasm check. `Send`-bound regressions on wasm
-  are by far the most common breakage.
+  are by far the most common breakage (nectar v0.3.0 `MaybeSend` relaxes
+  this for ChunkGet, but other paths like tokio::spawn still require Send).
 - Network behaviour is empirical. If you change defaults or the constants
   above, measure against mainnet with a freshly randomised file (bee
   dedupes by chunk address: identical bytes re-upload in O(stamp) and tell

@@ -3450,12 +3450,14 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nectar-mantaray"
-version = "0.2.0"
-source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75c174d7ac3b6d10553ddec6b76d3d27ebbeeb51b1584218c5e50ce0debd3751"
 dependencies = [
  "alloy-primitives",
  "bitflags",
  "bytes",
+ "futures",
  "nectar-primitives",
  "rand 0.10.1",
  "serde_json",
@@ -3464,8 +3466,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-postage"
-version = "0.2.0"
-source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af24f6d250c971698fec2b653460f0a6ec07a8a8c0091905392937240f73b5d7"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3479,8 +3482,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-postage-issuer"
-version = "0.2.0"
-source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a55ff4403c4def299ea8a6f45ed1ea2bff5ebfad4a1cfa42c52c97ccda3e4302"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3492,8 +3496,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-primitives"
-version = "0.2.0"
-source = "git+https://github.com/omnipin/nectar?rev=5b4748a39fcb8119edd28d70a6399ad2af1da7a8#5b4748a39fcb8119edd28d70a6399ad2af1da7a8"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0669be4db188635ff0a773886c6b4d4f935c1b57de01c2fddb2f31f5054c36a7"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -4798,9 +4803,6 @@ name = "send_wrapper"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cd0b0ec5f1c1ca621c432a25813d8d60c88abe6d3e08a3eb9cf37d97a0fe3d73"
-dependencies = [
- "futures-core",
-]
 
 [[package]]
 name = "serde"
