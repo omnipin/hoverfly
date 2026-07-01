@@ -270,7 +270,7 @@ pub const MAX_PUSHES_PER_SESSION: u32 = 10_000;
 pub const GHOST_BALANCE_LIMIT_PLUR: u64 = 12_000_000;
 
 /// Pre-warm watermark as a fraction of [`GHOST_BALANCE_LIMIT_PLUR`].
-/// We start dialing a replacement session once ghost balance reaches 2/3
+/// We start dialing a replacement session once ghost balance reaches 1/2
 /// of the retirement limit so the dial usually completes before the
 /// active session has to be rotated.
 pub const GHOST_BALANCE_PREWARM_NUMERATOR: u64 = 1;
@@ -660,7 +660,7 @@ pub struct Transport {
     #[cfg(not(target_arch = "wasm32"))]
     swap: Option<SwapConfig>,
     /// Optional status-snapshot responder. When `Some`, every
-    /// outbound session accepts `/swarm/status/1.1.0/status` and
+    /// outbound session accepts `/swarm/status/1.1.3/status` and
     /// returns this snapshot in response to bee's salud probes.
     /// When `None`, the protocol is still accepted at the
     /// multistream-select level (so bee doesn't log "protocol not
@@ -1699,7 +1699,7 @@ impl SessionState {
 
     /// One outbound salud-style status probe. Mirrors what bee's
     /// `pkg/salud::probe` does periodically against every connected
-    /// peer: open a `/swarm/status/1.1.0/status` substream, send Get,
+    /// peer: open a `/swarm/status/1.1.3/status` substream, send Get,
     /// read Snapshot, measure wall-clock round-trip. Caller uses the
     /// elapsed time as a per-peer responsiveness signal; the response
     /// payload is discarded.
@@ -1969,7 +1969,7 @@ struct SessionDriver {
     _pr_in: crate::protocols::stream_pool::IncomingStreams,
     _hive_in_v2: crate::protocols::stream_pool::IncomingStreams,
     _hive_in_v1: crate::protocols::stream_pool::IncomingStreams,
-    /// Inbound `/swarm/status/1.1.0/status` streams. Bee's `pkg/salud`
+    /// Inbound `/swarm/status/1.1.3/status` streams. Bee's `pkg/salud`
     /// opens this stream periodically (10s..5min backoff) over any
     /// connection it has to us — including the outbound connections
     /// our session pool maintains. NOT responding leaves us marked
@@ -2621,8 +2621,10 @@ where
         .expect("synthetic peer observed multiaddr is valid")
         .to_vec();
 
-    // Light client: no chequebook on chain. Bee skips the chequebook
-    // gate when full_node=false anyway.
+    // No chequebook on chain, so advertise the zero address. We send
+    // full_node=true here (all callers do), but bee's chequebook gate
+    // only fires when the peer runs --chequebook-verification, which no
+    // mainnet peer enables by default — so the zero chequebook is fine.
     let our_chequebook = [0u8; 20];
 
     let our_addr = match version {

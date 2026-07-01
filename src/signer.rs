@@ -211,11 +211,11 @@ impl SwarmSigner {
     /// should advance it.
     ///
     /// `chequebook_address` is the 20-byte address of our chequebook
-    /// contract. Zero address `[0; 20]` is acceptable when we're a
-    /// light-node (no chequebook); bee only enforces non-zero when
-    /// the peer has `--chequebook-verification` enabled and we
-    /// advertise `full_node = true`. With `full_node = false` bee
-    /// skips the chequebook gate regardless.
+    /// contract. We run no chequebook, so this is always the zero
+    /// address `[0; 20]`. Bee only enforces a non-zero chequebook when
+    /// the peer has `--chequebook-verification` enabled AND we advertise
+    /// `full_node = true` (which we do). No mainnet peer enables that
+    /// flag by default, so the zero address is accepted in practice.
     pub fn sign_handshake_v15(
         &self,
         underlay: &[u8],

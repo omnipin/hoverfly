@@ -177,7 +177,7 @@ pub struct NetworkedStore<'a> {
     /// would open a fresh libp2p connection to the same peer — for a
     /// 1407-chunk file fanned out by the joiner that's ~1407 concurrent
     /// dials to one Bee, which trips its connection / handshake limits
-    /// and produces cascading timeouts. The comment at `transport.rs:780`
+    /// and produces cascading timeouts. `Transport::fetch_chunk`'s doc
     /// explicitly says: "For multi-chunk workloads use `PeerSession`."
     /// Keyed by underlay multiaddr (stringified) so peers reachable via
     /// multiple underlays still get one session per actual connection.
@@ -746,8 +746,8 @@ impl<'a> NetworkedStore<'a> {
                 };
                 let started = web_time::Instant::now();
                 // Reuse a cached PeerSession for this peer across all of the
-                // joiner's chunk requests (transport.rs:780 — "For multi-chunk
-                // workloads use `PeerSession`"). Falls back to `Deferred` /
+                // joiner's chunk requests (`Transport::fetch_chunk` doc — "For
+                // multi-chunk workloads use `PeerSession`"). Falls back to `Deferred` /
                 // `Failed` for the connect-time errors the original
                 // `Transport::fetch_chunk` would have surfaced.
                 let mut peer_full_node: Option<bool> = None;
@@ -2468,7 +2468,7 @@ impl SessionEntry {
     /// p95 is ~5s. Anything above 1s is firmly in the tail.
     ///
     /// Currently unused — bee's per-entry skiplist (`record_failure`
-    /// + DEAD_SKIP_SECS=300) is the primary mechanism for shifting
+    /// + DEAD_SKIP_SECS=15) is the primary mechanism for shifting
     /// load away from slow peers. Kept as a building block for a
     /// future "demote without parking" path that might be useful
     /// when the pool is too small to afford parking peers entirely.
@@ -3699,15 +3699,16 @@ pub async fn push_chunks_with_pool(
                         // entries will have expired their skip windows
                         // by the time we retry.
                         let next = attempts + 1;
-                        // Linear backoff capped at 10 s. Total wait
-                        // across MAX_CHUNK_RETRIES retries is
-                        // ~1+2+3+...+10+10 ≈ 55 s, which outlasts both
-                        // DEAD_SKIP_SECS (60 s, close enough — entries
-                        // start reviving in the last retry slot) and
-                        // bee's typical ghost-overdraw blocklist
-                        // window. 500 ms × 6 = 10.5 s used to abort
-                        // the upload inside the blocklist window
-                        // every time at higher --concurrency.
+                        // Flat 500 ms backoff. Total wait across
+                        // MAX_CHUNK_RETRIES (=60) retries is ≈30 s in
+                        // the common case, which outlasts both
+                        // DEAD_SKIP_SECS (=15 s — a parked entry revives
+                        // well within the budget) and bee's typical
+                        // ghost-overdraw blocklist window. The earlier
+                        // linear-backoff-to-10 s scheme aborted uploads
+                        // inside the blocklist window at higher
+                        // --concurrency; a longer flat budget is simpler
+                        // and empirically more robust.
                         let backoff = Duration::from_millis(500);
                         info!(target: "hoverfly::upload",
                             "chunk {} dispatch failed ({}); retry {}/{} in {}ms",
@@ -3770,7 +3771,7 @@ pub async fn push_chunks_with_pool(
                         // Reuse the strike + dead-skip machinery used by
                         // the synchronous rotation path: after
                         // DEAD_STRIKES (=3) consecutive prewarm failures
-                        // the entry is parked for DEAD_SKIP_SECS (=60 s),
+                        // the entry is parked for DEAD_SKIP_SECS (=15 s),
                         // the dispatcher skips it during proximity
                         // ordering, and we stop hammering bee with
                         // doomed dials. Once the skip window expires

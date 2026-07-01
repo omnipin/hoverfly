@@ -19,9 +19,15 @@
 //!   2. Receive `SynAck { syn, ack }`.
 //!   3. Send `Ack { address: BzzAddress, network_id, full_node, ... }`.
 //!
-//! We act as a light client (`full_node = false`) so bee never enforces
-//! the chequebook verification gate on us, and we send the zero
-//! `chequebook_address` in v15 to signal "no chequebook".
+//! `full_node` is a parameter of [`run`]; the value hoverfly actually
+//! advertises is chosen by the caller (`transport.rs` passes
+//! `full_node = true` — a deliberate throughput/accounting tactic, see
+//! that call site's comment). We run no on-chain chequebook, so we
+//! always send the zero `chequebook_address` in v15 to signal "no
+//! chequebook"; that's safe under either `full_node` value because bee's
+//! chequebook-verification gate only fires when the *peer* runs
+//! `--chequebook-verification` AND we advertise `full_node = true` — and
+//! no mainnet peer enables that flag by default.
 
 use crate::proto::handshake as pb;
 use crate::protocols::framing::{FrameError, read_message, write_message};
@@ -167,11 +173,12 @@ where
         None => client_loopback_underlay(our_peer_id),
     };
 
-    // Light-node light-chequebook: we don't run a chequebook contract
-    // on chain, so we advertise the zero address. Bee's chequebook
-    // verifier only fires when our peer enables --chequebook-verification
-    // AND we set full_node=true. With full_node=false (we're a client)
-    // bee skips the gate regardless of what we advertise here.
+    // We don't run a chequebook contract on chain, so we advertise the
+    // zero address. Bee's chequebook verifier only fires when our peer
+    // enables --chequebook-verification AND we advertise full_node=true.
+    // We DO advertise full_node=true (see transport.rs call site), but no
+    // mainnet peer enables --chequebook-verification by default, so the
+    // gate stays dormant and the zero chequebook is accepted.
     let our_chequebook = [0u8; 20];
 
     let (our_signature, our_timestamp, our_addr) = match version {
