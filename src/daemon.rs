@@ -61,11 +61,22 @@ pub struct UploadRequest {
     pub file: PathBuf,
     pub batch: String,
     pub depth: u8,
+    /// Whether the batch is immutable (fill-only stamping) vs mutable
+    /// (overwrite-aware ring stamping). Defaults to `false` so a client
+    /// that predates this field still deserializes as mutable.
+    #[serde(default)]
+    pub immutable: bool,
     pub key: String,
     pub max_retries: usize,
     pub concurrency: usize,
     pub raw: bool,
     pub collection: bool,
+    /// When true, the daemon streams `Response::Progress { done, total }`
+    /// frames over the connection as chunks are pushed, before the
+    /// terminal `Uploaded`/`Err`. Defaults to false so a client that
+    /// predates this field never receives frames it can't deserialize.
+    #[serde(default)]
+    pub progress: bool,
     pub manifest_path: Option<String>,
     pub content_type: Option<String>,
     pub index_document: Option<String>,
@@ -85,6 +96,16 @@ pub struct FetchRequest {
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum Response {
     Pong,
+    /// Streamed during an upload: `done`/`total` chunks pushed so far.
+    /// Zero or more `Progress` frames precede the terminal `Uploaded`
+    /// or `Err` frame on the same connection. Clients that predate this
+    /// variant will fail to deserialize it — but only newer clients ask
+    /// for progress (see `UploadRequest.progress`), so old clients never
+    /// receive one.
+    Progress {
+        done: usize,
+        total: usize,
+    },
     Uploaded {
         root: String,
         bytes: usize,
@@ -439,9 +460,16 @@ async fn handle_conn(
         Some(r) => r,
         None => return Ok(()),
     };
+    // Upload optionally streams `Progress` frames before its terminal
+    // frame, so it owns the stream directly and returns once the final
+    // frame is written. Every other op produces a single response we
+    // write below.
+    if let Request::Upload(r) = req {
+        return handle_upload_streaming(&state, r, &mut stream).await;
+    }
     let response = match req {
         Request::Ping => Response::Pong,
-        Request::Upload(r) => handle_upload(&state, r).await,
+        Request::Upload(_) => unreachable!("handled above"),
         Request::Fetch(r) => handle_fetch(&state, r).await,
         Request::ReloadPeers => {
             let new_peers = PeerStore::load_or_create(&state.peerlist_path);
@@ -470,111 +498,184 @@ async fn handle_conn(
     Ok(())
 }
 
-async fn handle_upload(state: &Arc<State>, r: UploadRequest) -> Response {
-    let result: Result<(String, usize), ClientError> = (async {
-        let signer = crate::SwarmSigner::from_hex(&r.key, state.signer_network_id)
-            .map_err(|e| ClientError::Stamp(e.to_string()))?;
-        let data = std::fs::read(&r.file).map_err(|e| ClientError::File(e.to_string()))?;
-        let bytes = data.len();
+/// Run an upload and, if `r.progress` is set, stream `Response::Progress`
+/// frames to `stream` as chunks are pushed, followed by the terminal
+/// `Uploaded`/`Err` frame. Owns the connection so it can interleave
+/// progress with the final result on one socket.
+async fn handle_upload_streaming(
+    state: &Arc<State>,
+    r: UploadRequest,
+    stream: &mut UnixStream,
+) -> std::io::Result<()> {
+    // Progress plumbing: the push loop invokes a sync `Fn(done, total)`
+    // callback from worker tasks. Bridge it to async socket writes via an
+    // unbounded channel — the callback only does a non-blocking `send`, and
+    // the drain loop below writes each update as a `Progress` frame. Only
+    // wired when the client opted in (`r.progress`), so old clients (which
+    // send `progress: false`) never receive frames they can't parse.
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+    let progress: Option<crate::client::ProgressFn> = if r.progress {
+        let tx = tx.clone();
+        Some(Arc::new(move |done: usize, total: usize| {
+            let _ = tx.send((done, total));
+        }))
+    } else {
+        None
+    };
+    // Drop our extra sender so the drain loop's `recv()` returns `None`
+    // once the upload future (holding the last clone via the callback)
+    // finishes and its callback is dropped.
+    drop(tx);
 
-        // Collections / single-entry manifests still build their own
-        // pool via the existing helpers (they handle dedup + multiple
-        // pre-stamp passes). Only the raw / single-file path benefits
-        // from the persistent pool — that's where most repeat upload
-        // throughput goes anyway.
-        let is_tar = r
-            .file
-            .extension()
-            .and_then(|s| s.to_str())
-            .map(|s| s.eq_ignore_ascii_case("tar"))
-            .unwrap_or(false);
+    // The upload future borrows `state`/`r`/`progress`; run it in place and
+    // interleave progress drains via `tokio::select!`. `run_upload` yields
+    // exactly once with the terminal result.
+    let upload = run_upload(state, &r, progress.as_ref());
+    tokio::pin!(upload);
 
-        let root = if (r.collection || (is_tar && !r.raw)) && !r.raw {
-            // Collections still use the one-shot path: the dedup + multi-
-            // stamp logic in upload_collection is complex enough that
-            // refactoring it for an external pool is a follow-up.
-            let files = read_tar_files(&data).map_err(|e| ClientError::File(e.to_string()))?;
-            if files.is_empty() {
-                return Err(ClientError::File(
-                    "tar archive contains no regular files".into(),
-                ));
+    let result: Result<(String, usize), ClientError> = loop {
+        tokio::select! {
+            // Bias toward draining progress so the bar stays current even
+            // when the upload future is also ready.
+            biased;
+            maybe = rx.recv() => {
+                if let Some((done, total)) = maybe {
+                    // Best-effort: if the client hung up, stop streaming but
+                    // let the upload finish (its receipts are still worth
+                    // completing / caching).
+                    let _ = write_frame(stream, &Response::Progress { done, total }).await;
+                }
+                // `None` (all senders dropped) only happens once the upload
+                // future has resolved and been dropped, which the other arm
+                // catches first; nothing to do here.
             }
-            // Default the website index to `index.html` for tar
-            // collections — that's what a static site build expects.
-            // An explicit empty string opts out.
-            let index_doc = r
-                .index_document
-                .as_deref()
-                .map(|s| if s.is_empty() { None } else { Some(s) })
-                .unwrap_or(Some("index.html"));
-            let peers = state.peers.read().await;
-            upload_collection(
-                &state.transport,
-                &*peers,
-                &signer,
-                &r.batch,
-                r.depth,
-                files,
-                index_doc,
-                r.error_document.as_deref(),
-                r.max_retries,
-                r.concurrency,
-                None,
-            )
-            .await?
-        } else {
-            // Raw and single-file-with-manifest uploads go through the
-            // persistent pool. First request lazily fills it; subsequent
-            // ones reuse it with zero dial-fill cost.
-            let pool = ensure_pool(state).await?;
-            let peers = state.peers.read().await;
-            if r.raw {
-                upload_bytes_with_pool(
-                    &state.transport,
-                    &*pool,
-                    &*peers,
-                    &signer,
-                    &r.batch,
-                    r.depth,
-                    &data,
-                    r.max_retries,
-                    Some(&state.cache),
-                )
-                .await?
-            } else {
-                let path = r.manifest_path.clone().unwrap_or_else(|| {
-                    r.file
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .map(str::to_string)
-                        .unwrap_or_else(|| "file".to_string())
-                });
-                let ct = r.content_type.clone();
-                upload_file_with_manifest_with_pool(
-                    &state.transport,
-                    &*pool,
-                    &*peers,
-                    &signer,
-                    &r.batch,
-                    r.depth,
-                    &data,
-                    &path,
-                    ct.as_deref(),
-                    r.max_retries,
-                    Some(&state.cache),
-                )
-                .await?
-            }
-        };
-        Ok((hex::encode(root.as_bytes()), bytes))
-    })
-    .await;
-    match result {
+            res = &mut upload => break res,
+        }
+    };
+
+    // Drain any progress updates emitted between the final push and the
+    // upload future resolving, so the bar reaches 100% before the terminal
+    // frame. Non-blocking.
+    while let Ok((done, total)) = rx.try_recv() {
+        let _ = write_frame(stream, &Response::Progress { done, total }).await;
+    }
+
+    let response = match result {
         Ok((root, bytes)) => Response::Uploaded { root, bytes },
         Err(e) => Response::Err {
             message: e.to_string(),
         },
-    }
+    };
+    write_frame(stream, &response).await
+}
+
+/// Core upload logic shared by streaming and (potential) non-streaming
+/// callers. Returns `(root_hex, input_bytes)`.
+async fn run_upload(
+    state: &Arc<State>,
+    r: &UploadRequest,
+    progress: Option<&crate::client::ProgressFn>,
+) -> Result<(String, usize), ClientError> {
+    let signer = crate::SwarmSigner::from_hex(&r.key, state.signer_network_id)
+        .map_err(|e| ClientError::Stamp(e.to_string()))?;
+    let data = std::fs::read(&r.file).map_err(|e| ClientError::File(e.to_string()))?;
+    let bytes = data.len();
+
+    // Collections / single-entry manifests still build their own
+    // pool via the existing helpers (they handle dedup + multiple
+    // pre-stamp passes). Only the raw / single-file path benefits
+    // from the persistent pool — that's where most repeat upload
+    // throughput goes anyway.
+    let is_tar = r
+        .file
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.eq_ignore_ascii_case("tar"))
+        .unwrap_or(false);
+
+    let root = if (r.collection || (is_tar && !r.raw)) && !r.raw {
+        // Collections still use the one-shot path: the dedup + multi-
+        // stamp logic in upload_collection is complex enough that
+        // refactoring it for an external pool is a follow-up.
+        let files = read_tar_files(&data).map_err(|e| ClientError::File(e.to_string()))?;
+        if files.is_empty() {
+            return Err(ClientError::File(
+                "tar archive contains no regular files".into(),
+            ));
+        }
+        // Default the website index to `index.html` for tar
+        // collections — that's what a static site build expects.
+        // An explicit empty string opts out.
+        let index_doc = r
+            .index_document
+            .as_deref()
+            .map(|s| if s.is_empty() { None } else { Some(s) })
+            .unwrap_or(Some("index.html"));
+        let peers = state.peers.read().await;
+        upload_collection(
+            &state.transport,
+            &*peers,
+            &signer,
+            &r.batch,
+            r.depth,
+            r.immutable,
+            files,
+            index_doc,
+            r.error_document.as_deref(),
+            r.max_retries,
+            r.concurrency,
+            progress,
+        )
+        .await?
+    } else {
+        // Raw and single-file-with-manifest uploads go through the
+        // persistent pool. First request lazily fills it; subsequent
+        // ones reuse it with zero dial-fill cost.
+        let pool = ensure_pool(state).await?;
+        let peers = state.peers.read().await;
+        if r.raw {
+            upload_bytes_with_pool(
+                &state.transport,
+                &*pool,
+                &*peers,
+                &signer,
+                &r.batch,
+                r.depth,
+                r.immutable,
+                &data,
+                r.max_retries,
+                Some(&state.cache),
+                progress,
+            )
+            .await?
+        } else {
+            let path = r.manifest_path.clone().unwrap_or_else(|| {
+                r.file
+                    .file_name()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| "file".to_string())
+            });
+            let ct = r.content_type.clone();
+            upload_file_with_manifest_with_pool(
+                &state.transport,
+                &*pool,
+                &*peers,
+                &signer,
+                &r.batch,
+                r.depth,
+                r.immutable,
+                &data,
+                &path,
+                ct.as_deref(),
+                r.max_retries,
+                Some(&state.cache),
+                progress,
+            )
+            .await?
+        }
+    };
+    Ok((hex::encode(root.as_bytes()), bytes))
 }
 
 /// Ensure the daemon's persistent pool exists and has at least one
@@ -1026,6 +1127,37 @@ pub async fn call(socket_path: &std::path::Path, request: &Request) -> std::io::
         .await?
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "daemon hung up"))?;
     Ok(resp)
+}
+
+/// Upload-specific client call that consumes the daemon's progress stream.
+///
+/// Sends the request, then reads frames in a loop: each `Progress { done,
+/// total }` invokes `progress` (if any); the first non-progress frame
+/// (`Uploaded` / `Err`) is the terminal result and is returned. Use this
+/// instead of [`call`] for `Request::Upload` so the client can render a
+/// progress bar in its own terminal — the daemon has no terminal the user
+/// is watching. When `request` has `progress: false`, the daemon simply
+/// never sends `Progress` frames and this behaves exactly like [`call`].
+pub async fn call_upload(
+    socket_path: &std::path::Path,
+    request: &Request,
+    progress: Option<&crate::client::ProgressFn>,
+) -> std::io::Result<Response> {
+    let mut stream = UnixStream::connect(socket_path).await?;
+    write_frame(&mut stream, request).await?;
+    loop {
+        let frame = read_frame::<Response>(&mut stream).await?.ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "daemon hung up")
+        })?;
+        match frame {
+            Response::Progress { done, total } => {
+                if let Some(p) = progress {
+                    p(done, total);
+                }
+            }
+            terminal => return Ok(terminal),
+        }
+    }
 }
 
 // ---- wire protocol ----

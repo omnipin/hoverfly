@@ -8,7 +8,15 @@
 use core::time::Duration;
 use libp2p::Multiaddr;
 use nectar_postage::{Batch, BatchId};
-use nectar_postage_issuer::{BatchStamper, MemoryIssuer};
+use nectar_postage_issuer::{BatchStamper, MemoryIssuer, RingIssuer, StampIssuer};
+
+/// Boxed issuer so a single `BatchStamper` type covers both batch kinds:
+/// immutable batches use the fill-only `MemoryIssuer`, mutable batches use
+/// the overwrite-aware `RingIssuer` (nectar 0.3 split these; each rejects the
+/// other's batch kind). Both are `dyn StampIssuer`, and the only issuer method
+/// the stamping paths call is `prepare_stamp` via `issuer_mut()`.
+type HoverflyStamper =
+    BatchStamper<Box<dyn StampIssuer + Send>, alloy_signer_local::PrivateKeySigner>;
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk, SingleOwnerChunk};
 use nectar_primitives::file::{GenericJoiner, split};
@@ -1609,6 +1617,7 @@ pub async fn upload_file_with_manifest(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
@@ -1620,6 +1629,7 @@ pub async fn upload_file_with_manifest(
         signer,
         batch_id_hex,
         depth,
+        immutable,
         data,
         path,
         content_type,
@@ -1653,6 +1663,7 @@ pub async fn upload_collection(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     files: Vec<UploadFile>,
     index_document: Option<&str>,
     error_document: Option<&str>,
@@ -1667,7 +1678,7 @@ pub async fn upload_collection(
     }
 
     let batch_id = parse_batch_id(batch_id_hex)?;
-    let mut stamper = build_stamper(signer, batch_id, depth);
+    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
 
     // Bee enforces `index < 2^(depth - bucketDepth)` per (batch, bucket).
     // Stamping the same chunk address twice burns two indices in the same
@@ -1747,6 +1758,7 @@ pub async fn upload_file_with_manifest_ex(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
@@ -1754,8 +1766,15 @@ pub async fn upload_file_with_manifest_ex(
     concurrency: usize,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (manifest_root, work) =
-        prepare_upload_file_with_manifest(signer, batch_id_hex, depth, data, path, content_type)?;
+    let (manifest_root, work) = prepare_upload_file_with_manifest(
+        signer,
+        batch_id_hex,
+        depth,
+        immutable,
+        data,
+        path,
+        content_type,
+    )?;
     push_chunks_concurrent(
         transport,
         peers,
@@ -1777,18 +1796,35 @@ pub async fn upload_file_with_manifest_with_pool(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
     max_retries_per_chunk: usize,
     cache: Option<&crate::cache::ChunkCache>,
+    progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (manifest_root, work) =
-        prepare_upload_file_with_manifest(signer, batch_id_hex, depth, data, path, content_type)?;
+    let (manifest_root, work) = prepare_upload_file_with_manifest(
+        signer,
+        batch_id_hex,
+        depth,
+        immutable,
+        data,
+        path,
+        content_type,
+    )?;
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, peers, work, max_retries_per_chunk, None).await?;
+    push_chunks_with_pool(
+        transport,
+        pool,
+        peers,
+        work,
+        max_retries_per_chunk,
+        progress,
+    )
+    .await?;
     Ok(manifest_root)
 }
 
@@ -1802,6 +1838,7 @@ pub fn prepare_upload_file_with_manifest(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
@@ -1817,7 +1854,7 @@ pub fn prepare_upload_file_with_manifest(
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
     info!(target: "hoverfly::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
 
-    let mut stamper = build_stamper(signer, batch_id, depth);
+    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
     let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
         Vec::with_capacity(file_store.len() + manifest_chunks.len());
     for (addr, chunk) in file_store.into_chunks() {
@@ -1872,7 +1909,8 @@ fn build_stamper(
     signer: &SwarmSigner,
     batch_id: BatchId,
     depth: u8,
-) -> BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner> {
+    immutable: bool,
+) -> Result<HoverflyStamper, ClientError> {
     let batch = Batch::new(
         batch_id,
         0u128,
@@ -1880,10 +1918,16 @@ fn build_stamper(
         alloy_primitives::Address::from(*signer.eth_address()),
         depth,
         BUCKET_DEPTH,
-        false,
+        immutable,
     );
-    let issuer = MemoryIssuer::from_batch(&batch).expect("valid batch");
-    BatchStamper::new(issuer, signer.alloy_signer().clone())
+    // Immutable → fill-only `MemoryIssuer`; mutable → externally-tracked
+    // `RingIssuer`. Each errors on the wrong batch kind, so gate on `immutable`.
+    let issuer: Box<dyn StampIssuer + Send> = if immutable {
+        Box::new(MemoryIssuer::from_batch(&batch).map_err(|e| ClientError::Stamp(e.to_string()))?)
+    } else {
+        Box::new(RingIssuer::external(&batch).map_err(|e| ClientError::Stamp(e.to_string()))?)
+    };
+    Ok(BatchStamper::new(issuer, signer.alloy_signer().clone()))
 }
 
 /// Current Unix time in **nanoseconds** for stamping, on wasm.
@@ -1912,11 +1956,10 @@ fn wasm_timestamp_nanos() -> u64 {
 /// to spread work over; the serial path is just as fast there.
 #[cfg(not(target_arch = "wasm32"))]
 fn stamp_chunks_parallel(
-    stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
+    stamper: &mut HoverflyStamper,
     work: Vec<(ChunkAddress, Vec<u8>)>,
 ) -> Result<Vec<StampedChunk>, ClientError> {
     use nectar_postage::current_timestamp;
-    use nectar_postage_issuer::StampIssuer;
     use rayon::prelude::*;
 
     // Phase 1 (serial): allocate batch indices & build digests.
@@ -1942,11 +1985,15 @@ fn stamp_chunks_parallel(
             let sig = signer
                 .sign_message_sync(prehash.as_slice())
                 .map_err(|e| ClientError::Stamp(e.to_string()))?;
-            let stamp = BatchStamper::<MemoryIssuer, alloy_signer_local::PrivateKeySigner>::stamp_from_signature(&digest, sig);
+            let stamp = HoverflyStamper::stamp_from_signature(&digest, sig);
             let stamp_bytes = stamp.to_bytes().to_vec();
             let mut addr32 = [0u8; 32];
             addr32.copy_from_slice(addr.as_bytes());
-            Ok(StampedChunk { addr: addr32, wire, stamp: stamp_bytes })
+            Ok(StampedChunk {
+                addr: addr32,
+                wire,
+                stamp: stamp_bytes,
+            })
         })
         .collect();
     stamped
@@ -1959,11 +2006,10 @@ fn stamp_chunks_parallel(
 /// digest, then sign) minus rayon.
 #[cfg(target_arch = "wasm32")]
 fn stamp_chunks_parallel(
-    stamper: &mut BatchStamper<MemoryIssuer, alloy_signer_local::PrivateKeySigner>,
+    stamper: &mut HoverflyStamper,
     work: Vec<(ChunkAddress, Vec<u8>)>,
 ) -> Result<Vec<StampedChunk>, ClientError> {
     use alloy_signer::SignerSync;
-    use nectar_postage_issuer::StampIssuer;
 
     let timestamp = wasm_timestamp_nanos();
     let mut out = Vec::with_capacity(work.len());
@@ -1977,7 +2023,7 @@ fn stamp_chunks_parallel(
             .signer()
             .sign_message_sync(prehash.as_slice())
             .map_err(|e| ClientError::Stamp(e.to_string()))?;
-        let stamp = BatchStamper::<MemoryIssuer, alloy_signer_local::PrivateKeySigner>::stamp_from_signature(&digest, sig);
+        let stamp = HoverflyStamper::stamp_from_signature(&digest, sig);
         let mut addr32 = [0u8; 32];
         addr32.copy_from_slice(addr.as_bytes());
         out.push(StampedChunk {
@@ -1998,6 +2044,7 @@ pub async fn upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     max_retries_per_chunk: usize,
 ) -> Result<ChunkAddress, ClientError> {
@@ -2007,6 +2054,7 @@ pub async fn upload_bytes(
         signer,
         batch_id_hex,
         depth,
+        immutable,
         data,
         max_retries_per_chunk,
         DEFAULT_UPLOAD_CONCURRENCY,
@@ -2022,12 +2070,13 @@ pub async fn upload_bytes_ex(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     max_retries_per_chunk: usize,
     concurrency: usize,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
+    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data)?;
     push_chunks_concurrent(
         transport,
         peers,
@@ -2050,15 +2099,25 @@ pub async fn upload_bytes_with_pool(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
     max_retries_per_chunk: usize,
     cache: Option<&crate::cache::ChunkCache>,
+    progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, data)?;
+    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data)?;
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
-    push_chunks_with_pool(transport, pool, peers, work, max_retries_per_chunk, None).await?;
+    push_chunks_with_pool(
+        transport,
+        pool,
+        peers,
+        work,
+        max_retries_per_chunk,
+        progress,
+    )
+    .await?;
     Ok(root)
 }
 
@@ -2167,6 +2226,7 @@ pub fn prepare_upload_bytes(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
+    immutable: bool,
     data: &[u8],
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
@@ -2175,7 +2235,7 @@ pub fn prepare_upload_bytes(
     info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {})",
         data.len(), store.len(), root);
 
-    let mut stamper = build_stamper(signer, batch_id, depth);
+    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
 
     let snapshot = store.into_chunks();
     let stamp_in: Vec<(ChunkAddress, Vec<u8>)> = snapshot
