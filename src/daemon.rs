@@ -87,9 +87,18 @@ pub struct UploadRequest {
 pub struct FetchRequest {
     pub hash: String,
     pub path: Option<String>,
-    pub output: PathBuf,
+    /// Where to write fetched bytes. `None` is only valid together with
+    /// `list: true` (listing writes nothing). Kept optional so a list
+    /// request needn't supply a dummy path.
+    #[serde(default)]
+    pub output: Option<PathBuf>,
     pub max_retries: usize,
     pub concurrency: usize,
+    /// When true, enumerate the manifest's entries instead of fetching
+    /// bytes; the daemon replies with `Response::Listed`. `#[serde(default)]`
+    /// so older clients (which always fetch) deserialize as `false`.
+    #[serde(default)]
+    pub list: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -113,6 +122,10 @@ pub enum Response {
     Fetched {
         bytes_written: usize,
         content_type: Option<String>,
+    },
+    /// Reply to a `Fetch` request with `list: true`: the manifest's entries.
+    Listed {
+        entries: Vec<crate::client::ManifestEntry>,
     },
     Ok,
     Err {
@@ -1048,7 +1061,28 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
 }
 
 async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
+    // List mode: enumerate manifest entries, write nothing, reply Listed.
+    if r.list {
+        let peers = state.peers.read().await;
+        return match crate::client::list_manifest_ex(
+            &state.transport,
+            &*peers,
+            &r.hash,
+            r.max_retries,
+            r.concurrency,
+        )
+        .await
+        {
+            Ok(entries) => Response::Listed { entries },
+            Err(e) => Response::Err {
+                message: e.to_string(),
+            },
+        };
+    }
     let result: Result<(usize, Option<String>), ClientError> = (async {
+        let output = r.output.as_ref().ok_or_else(|| {
+            ClientError::File("internal: fetch without --list requires an output path".into())
+        })?;
         let peers = state.peers.read().await;
         let (bytes, ct) = if let Some(p) = r.path.as_deref() {
             let (b, c) = fetch_manifest_path_cached_ex(
@@ -1074,7 +1108,7 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
             .await?;
             (b, None)
         };
-        std::fs::write(&r.output, &bytes).map_err(|e| ClientError::File(e.to_string()))?;
+        std::fs::write(output, &bytes).map_err(|e| ClientError::File(e.to_string()))?;
         Ok((bytes.len(), ct))
     })
     .await;

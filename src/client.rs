@@ -1562,13 +1562,27 @@ async fn lookup_manifest_path(
 /// parallel. Each level's forks are independent chunk fetches; serial
 /// descent was the dominant cost on deep manifests (every level adds an
 /// RTT). The store's internal cache makes repeat visits free.
+// The manifest-walk future must be `Send` on native so the daemon can run
+// a list request inside `tokio::spawn` (a multi-thread-runtime task). On
+// wasm the store is IndexedDB-backed (`Rc<Database>`, not `Send`), and there's
+// no cross-thread spawn, so the bound is dropped. `MaybeSendWalk` gates the
+// trait-object bound by target; the async body is identical either way (its
+// actual Send-ness follows from the store type, which is Send on native and
+// non-Send on wasm).
+#[cfg(not(target_arch = "wasm32"))]
+type MaybeSendWalk<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + Send + 'a>,
+>;
+#[cfg(target_arch = "wasm32")]
+type MaybeSendWalk<'a> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + 'a>,
+>;
+
 fn walk_manifest<'a>(
     store: &'a NetworkedStore<'a>,
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
-) -> std::pin::Pin<
-    Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + 'a>,
-> {
+) -> MaybeSendWalk<'a> {
     Box::pin(async move {
         use crate::manifest::decode_node;
 
@@ -1597,7 +1611,7 @@ fn walk_manifest<'a>(
     })
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ManifestEntry {
     pub path: String,
     pub reference: String,
