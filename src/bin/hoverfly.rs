@@ -1327,26 +1327,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             #[cfg(unix)]
             if let Some(sock) = daemon {
-                let output = output.ok_or("--output is required when using --daemon")?;
+                // `--output` is only needed when actually writing bytes.
+                // `--list` enumerates the manifest and writes nothing, so
+                // don't demand it in that mode.
+                if !list && output.is_none() {
+                    return Err("--output is required when using --daemon (unless --list)".into());
+                }
                 let req = hoverfly::daemon::Request::Fetch(hoverfly::daemon::FetchRequest {
                     hash,
                     path,
                     output: output.clone(),
                     max_retries,
                     concurrency,
+                    list,
                 });
                 let resp = hoverfly::daemon::call(&sock, &req).await?;
                 match resp {
+                    hoverfly::daemon::Response::Listed { entries } => {
+                        println!("{} entries:", entries.len());
+                        for e in entries {
+                            let ct = e.content_type.as_deref().unwrap_or("-");
+                            println!("  {}  {}  [{}]", e.reference, e.path, ct);
+                        }
+                        return Ok(());
+                    }
                     hoverfly::daemon::Response::Fetched {
                         bytes_written,
                         content_type,
                     } => {
                         let ct = content_type.as_deref().unwrap_or("-");
+                        // Safe: non-list mode required `output` above.
+                        let out_display = output
+                            .as_deref()
+                            .map(|p| p.display().to_string())
+                            .unwrap_or_default();
                         println!(
                             "fetched {} bytes ({}) -> {} (via daemon)",
-                            bytes_written,
-                            ct,
-                            output.display()
+                            bytes_written, ct, out_display,
                         );
                         return Ok(());
                     }
