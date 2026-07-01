@@ -18,9 +18,8 @@ use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    DEFAULT_UPLOAD_CONCURRENCY, RetrievalCache, UploadFile, discover, fetch_bytes_cached_ex,
-    fetch_manifest_path_cached_meta, list_manifest_ex, upload_bytes, upload_collection,
-    upload_file_with_manifest_ex,
+    RetrievalCache, UploadFile, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
+    list_manifest_ex, upload_bytes_ex, upload_collection, upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
 use crate::peers::PeerStore;
@@ -53,6 +52,22 @@ const FETCH_CONCURRENCY: usize = 4;
 /// sessions instead.
 const DEFAULT_WARM_POOL: usize = 0;
 
+/// Upload session-pool target for the browser pusher.
+///
+/// The native CLI defaults to 8 (`DEFAULT_UPLOAD_CONCURRENCY`) and the VPS
+/// daemon runs 256+, but the browser is different in BOTH directions:
+///
+/// - `push_chunks_with_pool` opens this many pushsync sessions ONCE and does
+///   not top up mid-upload. In the browser, `/wss` AutoTLS underlays rotate and
+///   sessions die fast, so a small pool (8) decays to `eligible=0` partway
+///   through a multi-thousand-chunk upload and the tail spins on retries. A
+///   larger initial pool gives enough live sessions to survive the whole push.
+/// - But everything multiplexes over the single browser ws+yamux driver, and
+///   browsers cap concurrent WS connections per host, so we can't go to 256
+///   like the VPS. 48 is the empirical sweet spot: enough live forwarders to
+///   keep `eligible > 0` for the whole upload without saturating the driver.
+const UPLOAD_POOL: usize = 48;
+
 /// How many maintenance ticks between background re-discovery rounds in the
 /// browser daemon. Discovery is a one-shot path (throwaway swarm per peer — see
 /// the loop in [`HoverflyClient::start`]), so running it every tick churns the
@@ -74,17 +89,40 @@ fn warm_pool_label(target: usize) -> String {
 
 #[wasm_bindgen(start)]
 pub fn _wasm_init() {
+    use tracing_subscriber::layer::SubscriberExt;
+    use tracing_subscriber::util::SubscriberInitExt;
+
     console_error_panic_hook::set_once();
-    // Route `tracing` events to the browser console. The default config maps
-    // some levels to `console.debug` (hidden by Chrome's default log level),
-    // and disables span timing noise. Pin a config that:
+    // Route `tracing` events to the browser console. The `tracing_wasm` layer
     //   - emits each event at its own console level (warn -> console.warn etc.)
     //     so retrieval `warn!`/`info!` are visible without enabling Verbose, and
     //   - keeps the `target` (e.g. `hoverfly::fetch`) so events are filterable.
+    //
+    // Compose it with a per-target `Targets` filter: libp2p is *very* chatty at
+    // INFO — its swarm logs `local_peer_id = …` once per constructed swarm, and
+    // we stand up a throwaway swarm PER DIAL, so a browser pool fill (dozens of
+    // dials through the mostly-dead `/wss` candidate set) floods the console
+    // with hundreds of identical INFO lines that bury hoverfly's own logs and
+    // cost real console/serialization time. Pin libp2p (and other noisy
+    // low-level crates) to WARN while keeping hoverfly + everything else at INFO.
     let mut builder = tracing_wasm::WASMLayerConfigBuilder::new();
-    builder.set_max_level(tracing::Level::INFO);
     builder.set_report_logs_in_timings(false);
-    tracing_wasm::set_as_global_default_with_config(builder.build());
+    let wasm_layer = tracing_wasm::WASMLayer::new(builder.build());
+    // Apply the per-target filter at the registry level (a `Filtered`
+    // subscriber layer), not on the WASMLayer directly — `tracing_wasm`'s
+    // layer doesn't expose the per-layer `with_filter` combinator against this
+    // tracing-subscriber version.
+    let filter = tracing_subscriber::filter::Targets::new()
+        .with_default(tracing::Level::INFO)
+        .with_target("libp2p_swarm", tracing::Level::WARN)
+        .with_target("libp2p", tracing::Level::WARN)
+        .with_target("libp2p_gossipsub", tracing::Level::WARN)
+        .with_target("multistream_select", tracing::Level::WARN)
+        .with_target("yamux", tracing::Level::WARN);
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(wasm_layer)
+        .init();
 }
 
 #[wasm_bindgen]
@@ -120,6 +158,14 @@ pub struct HoverflyClient {
     /// retrieval; discovery resumes once the burst drains. `Rc<Cell>` is sound
     /// on single-threaded wasm.
     inflight_fetches: Rc<Cell<usize>>,
+    /// Live upload progress `(pushed, total)` chunk counts, updated by the
+    /// push loop's progress callback. `Send + Sync` atomics (not `Rc<Cell>`)
+    /// because the callback the pusher invokes is a `ProgressFn`
+    /// (`Fn + Send + Sync`). The worker polls [`Self::upload_progress`] on a
+    /// timer during an upload and forwards it to the UI — turning the fake
+    /// staged bar into a real per-chunk one. Reset at the start of each upload.
+    upload_done: Arc<std::sync::atomic::AtomicUsize>,
+    upload_total: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 /// RAII guard: increments the shared in-flight fetch counter on creation and
@@ -198,6 +244,8 @@ impl HoverflyClient {
             cache: RetrievalCache::new(),
             running: Rc::new(RefCell::new(false)),
             inflight_fetches: Rc::new(Cell::new(0)),
+            upload_done: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            upload_total: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         })
     }
 
@@ -313,13 +361,24 @@ impl HoverflyClient {
     ///
     /// Idempotent: a second call refreshes peers but does not spawn a second
     /// loop. Returns the peer count after the initial round.
+    ///
+    /// `skip_prewarm` (default `false`): when `true`, discover peers and run the
+    /// maintenance loop's periodic re-discovery, but do NOT open or maintain the
+    /// warm *retrieval* session pool. The upload dApp sets this — it never
+    /// fetches, and the pushsync pool the upload path opens is entirely separate
+    /// from the retrieval sessions this would warm. Warming retrieval sessions
+    /// there just doubled cold-start dialing (retrieval pool + then the upload's
+    /// own pushsync pool) and made bring-up far slower than the native pusher for
+    /// no benefit. Gateway callers omit it to keep the fetch-warming behavior.
     pub async fn start(
         &self,
         bootstrap: String,
         interval_secs: u32,
         wait_secs: u32,
         warm_pool: Option<u32>,
+        skip_prewarm: Option<bool>,
     ) -> Result<usize, JsError> {
+        let skip_prewarm = skip_prewarm.unwrap_or(false);
         // 0 (or omitted -> default 0) => unlimited: dial every reachable peer.
         // `prewarm` treats usize::MAX as "no cap" (it never reaches the target,
         // so it drains the whole candidate list).
@@ -347,7 +406,7 @@ impl HoverflyClient {
         // of dialing cold. Best effort — unreachable peers are skipped. Runs only
         // on the first `start()` (when the loop is about to be spawned); a repeat
         // `start()` just refreshes peers and lets the loop keep the pool topped.
-        if !*self.running.borrow() {
+        if !skip_prewarm && !*self.running.borrow() {
             let peers_snapshot = self.peers.borrow().clone();
             let n = self
                 .cache
@@ -427,7 +486,10 @@ impl HoverflyClient {
                     // quiet) keeps the "connected peers" count from sagging to 0 at
                     // idle — the warm-pool half of daemon mode. Re-check in-flight:
                     // a discovery round (when it ran) may have let a fetch start.
-                    if inflight.get() == 0 {
+                    // `skip_prewarm` (upload dApp) leaves the retrieval pool
+                    // alone entirely — it only wants peer discovery, not warm
+                    // fetch sessions it never uses.
+                    if !skip_prewarm && inflight.get() == 0 {
                         let peers_snapshot = peers.borrow().clone();
                         let n = cache.prewarm(&transport, &peers_snapshot, warm_pool).await;
                         tracing::debug!(target: "hoverfly::wasm",
@@ -591,7 +653,8 @@ impl HoverflyClient {
         let signer = self.upload_signer()?;
         let buf = data.to_vec();
         let peers = self.peers.borrow().clone();
-        let root = upload_bytes(
+        let progress = self.make_progress();
+        let root = upload_bytes_ex(
             &self.transport,
             &peers,
             &signer,
@@ -600,6 +663,8 @@ impl HoverflyClient {
             immutable,
             &buf,
             max_retries,
+            UPLOAD_POOL,
+            Some(&progress),
         )
         .await
         .map_err(into_js_err)?;
@@ -627,6 +692,7 @@ impl HoverflyClient {
         let signer = self.upload_signer()?;
         let buf = data.to_vec();
         let peers = self.peers.borrow().clone();
+        let progress = self.make_progress();
         let root = upload_file_with_manifest_ex(
             &self.transport,
             &peers,
@@ -638,8 +704,8 @@ impl HoverflyClient {
             &path,
             content_type.as_deref(),
             max_retries,
-            DEFAULT_UPLOAD_CONCURRENCY,
-            None,
+            UPLOAD_POOL,
+            Some(&progress),
         )
         .await
         .map_err(into_js_err)?;
@@ -678,6 +744,7 @@ impl HoverflyClient {
             return Err(JsError::new("collection is empty (no files)"));
         }
         let peers = self.peers.borrow().clone();
+        let progress = self.make_progress();
         let root = upload_collection(
             &self.transport,
             &peers,
@@ -689,12 +756,50 @@ impl HoverflyClient {
             index_document.as_deref(),
             error_document.as_deref(),
             max_retries,
-            DEFAULT_UPLOAD_CONCURRENCY,
-            None,
+            UPLOAD_POOL,
+            Some(&progress),
         )
         .await
         .map_err(into_js_err)?;
         Ok(hex::encode(root.as_bytes()))
+    }
+
+    /// Live upload progress as `[pushed, total]` chunk counts. The worker
+    /// polls this on a timer while an upload is in flight and forwards it to
+    /// the UI, so the progress bar tracks real chunk pushes instead of a fake
+    /// staged animation. `total` is 0 before the first upload and between
+    /// uploads; during an upload it's the chunk count and `pushed` climbs to it.
+    #[wasm_bindgen(js_name = "uploadProgress")]
+    pub fn upload_progress(&self) -> Vec<usize> {
+        use std::sync::atomic::Ordering;
+        vec![
+            self.upload_done.load(Ordering::Relaxed),
+            self.upload_total.load(Ordering::Relaxed),
+        ]
+    }
+
+    /// One-line dump of the transport diagnostic counters (push outcomes +
+    /// latency histograms + retirement causes). The worker logs this at the
+    /// end of an upload so browser throughput can be debugged from real data
+    /// (where did the time go?) instead of guesswork.
+    #[wasm_bindgen(js_name = "uploadDiagnostics")]
+    pub fn upload_diagnostics(&self) -> String {
+        crate::transport::diag::summary()
+    }
+
+    /// Reset the progress counters and build a [`ProgressFn`] that records
+    /// `(done, total)` into this client's atomics on every chunk. Called at the
+    /// start of each upload; the returned closure is handed to the pusher.
+    fn make_progress(&self) -> crate::client::ProgressFn {
+        use std::sync::atomic::Ordering;
+        self.upload_done.store(0, Ordering::Relaxed);
+        self.upload_total.store(0, Ordering::Relaxed);
+        let done = self.upload_done.clone();
+        let total = self.upload_total.clone();
+        Arc::new(move |d: usize, t: usize| {
+            total.store(t, Ordering::Relaxed);
+            done.store(d, Ordering::Relaxed);
+        })
     }
 
     /// Build the stamp signer from the private key the client was constructed

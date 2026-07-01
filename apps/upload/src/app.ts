@@ -36,6 +36,11 @@ let conn: WalletConn | null = null
 let file: File | null = null
 let quote: BatchQuote | null = null
 let batch: CreatedBatch | null = null
+/** Mutability of the selected batch, needed by the stamping issuer (mutable →
+ *  ring issuer, immutable → fill-only). Set wherever `batch` is assigned:
+ *  from the buy form's Type select, or from the reused/imported batch's
+ *  on-chain `immutableFlag`. */
+let batchImmutable = false
 let upload: UploadSession | null = null
 /**
  * Epoch ms before which the selected batch is NOT yet safe to upload to,
@@ -357,6 +362,7 @@ async function refreshReuse (): Promise<void> {
 
   const selectBatch = (v: VerifiedBatch): void => {
     batch = { batchId: v.batchId, depth: v.onChain.depth, owner: sk.address, createTx: '0x' as Hex }
+    batchImmutable = v.onChain.immutable
     setBatchState('batch ready', true)
     $('batch-info').innerHTML = `
       <dt>Batch ID</dt><dd class="mono">${v.batchId}</dd>
@@ -372,6 +378,7 @@ async function refreshReuse (): Promise<void> {
     if (sel.value === '') {
       // "buy a new batch instead" → reveal buy controls, clear any selection.
       batch = null
+      batchImmutable = false
       $('batch-info').innerHTML = ''
       setBatchState('no batch yet', false)
       showBuyPane(true)
@@ -428,6 +435,7 @@ $('buy').addEventListener('click', async () => {
     const immutable = $<HTMLSelectElement>('immutable').value === 'true'
     setBatchState('buying…', false)
     batch = await createBatch(conn, session.address, quote, immutable, (m) => setBatchState(m, false))
+    batchImmutable = immutable
     saveBatch({ batchId: batch.batchId, depth: batch.depth, owner: batch.owner, createdAt: Date.now(), sizeBytes: file?.size })
     $('batch-info').innerHTML = `
       <dt>Batch ID</dt><dd class="mono">${batch.batchId}</dd>
@@ -459,21 +467,32 @@ $('go').addEventListener('click', async () => {
   btn.disabled = true
   $('result').innerHTML = ''
   const bar = $('bar')
-  bar.style.width = '8%'
+  // Progress is driven by real chunk-push events from the worker
+  // (`onProgress`) once pushing starts. Until then, show indeterminate-ish
+  // low fill for the fixed-cost prelude (node start, read, split/stamp).
+  setBar(0)
+  let pushing = false
   try {
     setNet('starting node…', 'warn')
     if (upload == null) {
-      upload = await startUploadSession(session.bareKeyHex, log, (n) => {
-        setNet(`${n} peers connected`, n > 0 ? 'ok' : 'warn')
-      })
+      upload = await startUploadSession(session.bareKeyHex, log,
+        (n) => { setNet(`${n} peers connected`, n > 0 ? 'ok' : 'warn') },
+        (done, total) => {
+          // Real per-chunk progress. Reserve the first 10% of the bar for the
+          // prelude (start/read/stamp) and map chunk pushes onto 10–100%.
+          pushing = true
+          const frac = total > 0 ? done / total : 0
+          setBar(0.1 + 0.9 * frac)
+          setNet(`pushing ${done}/${total} chunks`, 'warn')
+        })
     }
     const connected = await upload.connected()
     setNet(`${connected} peers connected`, connected > 0 ? 'ok' : 'warn')
-    bar.style.width = '30%'
+    if (!pushing) setBar(0.04)
 
     log(`Reading ${file.name} (${fmtBytes(file.size)})…`)
     const bytes = new Uint8Array(await file.arrayBuffer())
-    bar.style.width = '45%'
+    if (!pushing) setBar(0.07)
 
     const kind = classifyArchive(file.name, file.type)
     setNet('uploading…', 'warn')
@@ -488,18 +507,18 @@ $('go').addEventListener('click', async () => {
       const indexDoc = pickIndexDocument(entries)
       log(`Collection: ${entries.length} files${indexDoc != null ? `, index = ${indexDoc}` : ''}`)
       log(`Stamping + pushing chunks (batch ${batch.batchId.slice(0, 12)}…, depth ${batch.depth})…`)
-      ref = await upload.uploadCollection(entries, indexDoc, undefined, batch.batchId, batch.depth)
+      ref = await upload.uploadCollection(entries, indexDoc, undefined, batch.batchId, batch.depth, batchImmutable)
     } else {
       // Single file → one-entry manifest with filename + content-type, so the
       // gateway serves it with a sensible Content-Type.
       const contentType = file.type || guessContentType(file.name)
       log(`Single file: ${file.name} (${contentType ?? 'application/octet-stream'})`)
       log(`Stamping + pushing chunks (batch ${batch.batchId.slice(0, 12)}…, depth ${batch.depth})…`)
-      ref = await upload.uploadFile(bytes, file.name, contentType, batch.batchId, batch.depth)
+      ref = await upload.uploadFile(bytes, file.name, contentType, batch.batchId, batch.depth, batchImmutable)
       suffix = encodeURIComponent(file.name)
     }
 
-    bar.style.width = '100%'
+    setBar(1)
     setNet('done', 'ok')
     log('Upload complete: ' + ref)
 
@@ -511,6 +530,7 @@ $('go').addEventListener('click', async () => {
       </dl>`
     done('s-upload', true)
   } catch (e) {
+    setBar(0)
     setNet('failed', 'warn')
     log('ERROR: ' + errMsg(e))
     $('result').innerHTML = `<p class="err">${escapeHtml(errMsg(e))}</p>`
@@ -522,6 +542,11 @@ function setNet (msg: string, kind: 'ok' | 'warn' | ''): void {
   $('net-state').textContent = msg
   $('net-dot').className = 'dot' + (kind ? ' ' + kind : '')
 }
+/** Set the progress bar fill from a 0..1 fraction (clamped). */
+function setBar (frac: number): void {
+  const pct = Math.max(0, Math.min(1, frac)) * 100
+  $('bar').style.width = pct.toFixed(1) + '%'
+}
 
 // ---- session key rotate ----
 $('rotate').addEventListener('click', () => {
@@ -529,7 +554,7 @@ $('rotate').addEventListener('click', () => {
   if (!confirm('Rotate to a fresh RANDOM session key for this wallet? It overrides the wallet-derived key, so it won\'t reproduce on other devices, and existing batches owned by the current key can no longer receive new uploads.')) return
   session = rotateSessionKey(conn.account)
   $('sk-addr').textContent = session.address
-  batch = null; upload = null
+  batch = null; batchImmutable = false; upload = null
   setBatchState('no batch yet', false)
   clearBatchIndexWait()
   void refreshReuse()
