@@ -192,7 +192,7 @@ pub struct ListenConfig {
     /// listener and as the bee handshake signer (overlay derived from
     /// its eth address + a random nonce).
     pub identity: SwarmSigner,
-    /// Snapshot served on every inbound `/swarm/status/1.1.0/status`
+    /// Snapshot served on every inbound `/swarm/status/1.1.3/status`
     /// probe. Required for bee's `salud` to mark us Healthy and
     /// therefore stop preferentially selecting us for kademlia
     /// bin-prune disconnection. See `crate::protocols::status::StatusSnapshot`.

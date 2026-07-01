@@ -1593,7 +1593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // the swap substream; you'll see this in the
             // `cheque_failed` diag counter.
             // Always attach a default status snapshot. Bee opens
-            // `/swarm/status/1.1.0/status` over our outbound
+            // `/swarm/status/1.1.3/status` over our outbound
             // connections via its `pkg/salud` worker; if we don't
             // respond, bee marks us Unhealthy and we get
             // preferentially disconnected via the kademlia bin-prune

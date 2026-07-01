@@ -67,7 +67,7 @@ pub struct InboundConfig {
     /// Shared chunk cache the retrieval responder reads from. Cloning
     /// is cheap (`Arc`).
     pub cache: ChunkCache,
-    /// Snapshot served for every inbound `/swarm/status/1.1.0/status`
+    /// Snapshot served for every inbound `/swarm/status/1.1.3/status`
     /// probe. Bee's `pkg/salud` package probes connected peers
     /// periodically (10s..5min backoff) and marks Unhealthy any peer
     /// whose response is missing or whose values fall below the
