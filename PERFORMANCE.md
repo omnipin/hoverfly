@@ -20,7 +20,8 @@ passes `true`). This is a measured throughput decision, not an accident:
   - **Attempt 1** (full-node-sized accounting): pool filled in ~300 ms
     (bee skips the kademlia bin-saturation gate for lights) but collapsed
     within ~30 s — our outstanding per-peer balance overshot bee's **light
-    disconnect limit (~1.125M PLUR)** and peers blocklisted us for over-debt.
+    disconnect limit (~1.6875M PLUR = 125% × the light payment threshold
+    13.5M/10)** and peers blocklisted us for over-debt.
   - **Attempt 2** (matched light refresh `REFRESH_RATE_PLUR = 450K`,
     `SAFE_PEER_THRESHOLD_PLUR = 900K`): pool fills < 1 s, but throughput
     regressed 5-6× (30-40 KiB/s vs the ~194 KiB/s full-node baseline). The
@@ -527,14 +528,17 @@ Interleaved A/B (May 2026 mainnet, VPS, 771-peer pool, c=64, 5 MiB, 4 trials):
 
 Distributions overlap completely (~3× trial variance). **Verdict: not
 confirmed at this workload.** Cheques are correct (`cheques_emitted` > 0,
-`cheques_failed` ≈ 0). Reading bee's accounting, payment has effect via
-`notifyPaymentThresholdUpgrade` — cumulative `100 × refreshRate = 450M PLUR`
-per peer triggers a threshold upgrade — but our per-peer cumulative reaches
-only a few million before the session dies (external causes), three orders of
-magnitude short. The 3× claim is consistent with **long-lived daemon
-sessions** accumulating 100s of MiB per peer over hours, not one-shot
-uploads. Code stays: it's correct, and the retrieval path debits us via the
-same accounting, so a long-running fetch worker would benefit identically.
+`cheques_failed` ≈ 0). Reading bee's accounting (`notifyPaymentThresholdUpgrade`),
+paying a peer only raises its threshold once cumulative settled debt crosses a
+**checkpoint**, and the first checkpoint is `refreshRate × linearCheckpointNumber
+= 4.5M × 1800 ≈ 8.1B PLUR` per peer (then linear `+refreshRate` per
+`refreshRate × 100` step, going exponential past the linear limit). Our per-peer
+cumulative reaches only a few million before the session dies (external causes)
+— roughly **three orders of magnitude short of even the first checkpoint**. The
+3× claim is consistent with **long-lived daemon sessions** accumulating 100s of
+MiB per peer over hours, not one-shot uploads. Code stays: it's correct, and the
+retrieval path debits us via the same accounting, so a long-running fetch worker
+would benefit identically.
 Re-measure in the daemon + public-reachability + multi-GB regime.
 
 ## Session-death cause (RST analysis)
