@@ -2778,12 +2778,31 @@ async fn push_chunks_concurrent(
     if work.is_empty() {
         return Ok(());
     }
-    // Adaptive sizing: never open more sessions than we have chunks to
-    // push. A 1888-byte file is 2 chunks; opening 32 sessions for that
-    // wastes ~30 s on dial timeouts when the user picked a high
-    // --concurrency for the upload-machine defaults. Floor at 4 so very
-    // small uploads still get the multi-peer race for resilience.
-    let target_sessions = concurrency.max(1).min(work.len().max(4));
+    // Adaptive sizing. Two competing pressures:
+    //
+    //  - Don't open *far* more sessions than there are chunks: a 2-chunk
+    //    file doesn't need 256 sessions, and every extra dial costs a
+    //    (browser: 20 s) timeout budget when the peer is stale.
+    //  - But the pool must be big enough to survive per-peer failure. Each
+    //    chunk races `CHUNK_PEER_PARALLELISM` (=3) peers, chosen by proximity
+    //    to *that chunk's* address, and browser `/wss` sessions die
+    //    constantly (AutoTLS SNI rotation, low keepalive). With a pool of 4,
+    //    a single upload where 3 peers drop into dial-cooldown leaves ONE
+    //    eligible session and the tail chunk blocks on its full 30 s
+    //    per-op timeout — exactly the "tiny file took 30 s" stall.
+    //
+    // So floor the pool at `MIN_UPLOAD_POOL` (enough live spread + churn
+    // headroom for the 3-way race across distinct chunk addresses),
+    // independent of chunk count, then cap by the requested concurrency and
+    // by a small multiple of the chunk count so we still don't massively
+    // over-dial a big-concurrency caller uploading a 2-chunk file.
+    const MIN_UPLOAD_POOL: usize = 16;
+    // Room to grow with the upload (4 sessions per chunk covers the 3-way
+    // race plus a spare), floored at MIN_UPLOAD_POOL, then capped by the
+    // caller's `concurrency`. README (3 chunks): min(48, max(16, 12)) = 16.
+    // Large upload: min(48, max(16, huge)) = 48.
+    let want = (work.len() * 4).max(MIN_UPLOAD_POOL);
+    let target_sessions = concurrency.max(1).min(want);
     let pool = SessionPool::open(transport, peers, target_sessions).await?;
     info!(
         target: "hoverfly::upload",
@@ -4341,7 +4360,19 @@ async fn open_session_pool_filtered(
         candidates
     };
 
-    let dial_parallelism = SESSION_DIAL_PARALLELISM.min(max_sessions);
+    // Dial-search width is deliberately DECOUPLED from `max_sessions`. We keep
+    // only the first `max_sessions` successful dials, but we must *search* far
+    // wider than that to find them: on mainnet ~50%+ of candidates are stale,
+    // and in the browser the candidate set is only the `/wss` minority (no raw
+    // TCP), whose AutoTLS SNI hostnames rotate every few hours — so a large
+    // fraction of even the fresh seed is already dead. Clamping the in-flight
+    // dial window to `max_sessions` (e.g. 4 for a tiny upload) meant crawling
+    // through that dead list 4 at a time, each dial burning the full
+    // dial-timeout before the next candidate is tried — the dominant cause of
+    // slow browser uploads. Search up to `SESSION_DIAL_PARALLELISM` wide
+    // regardless of how many sessions we ultimately keep, bounded only by the
+    // candidate count.
+    let dial_parallelism = SESSION_DIAL_PARALLELISM.min(candidates.len().max(1));
     let mut iter = candidates.into_iter();
     let mut dialing = FuturesUnordered::new();
     let dial = |overlay: SwarmAddress, overlay_hex: String, underlay: Multiaddr| async move {

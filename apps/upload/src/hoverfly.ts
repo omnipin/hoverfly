@@ -18,9 +18,9 @@ export interface UploadSession {
   /** Number of peers we hold a live push session to (best effort). */
   connected: () => Promise<number>
   /** Upload a single file as a one-entry manifest. Returns the manifest root (hex). */
-  uploadFile: (bytes: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number) => Promise<string>
+  uploadFile: (bytes: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean) => Promise<string>
   /** Upload a collection (tar/dir) as a multi-entry manifest. Returns the manifest root (hex). */
-  uploadCollection: (files: CollectionFile[], indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number) => Promise<string>
+  uploadCollection: (files: CollectionFile[], indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean) => Promise<string>
 }
 
 const WORKER_URL = new URL(WORKER_JS, self.location.href).href
@@ -33,7 +33,8 @@ const WORKER_URL = new URL(WORKER_JS, self.location.href).href
 export async function startUploadSession (
   sessionKeyHex: string,
   log: (m: string) => void,
-  onStatus?: (connected: number) => void
+  onStatus?: (connected: number) => void,
+  onProgress?: (done: number, total: number) => void
 ): Promise<UploadSession> {
   const worker = new Worker(WORKER_URL, { type: 'module' })
 
@@ -44,6 +45,7 @@ export async function startUploadSession (
     const msg = e.data
     if (msg.kind === 'log') { log(msg.message); return }
     if (msg.kind === 'status') { onStatus?.(msg.connected); return }
+    if (msg.kind === 'progress') { onProgress?.(msg.done, msg.total); return }
     if (msg.kind === 'result') {
       const p = pending.get(msg.id)
       if (p == null) return
@@ -70,17 +72,17 @@ export async function startUploadSession (
 
   return {
     connected: async () => (await call({ kind: 'connected' })) as number,
-    uploadFile: async (bytes, path, contentType, batchIdHex, depth) => {
+    uploadFile: async (bytes, path, contentType, batchIdHex, depth, immutable) => {
       const buf = bytes.slice().buffer // detachable copy → transfer (zero-copy)
       return (await call(
-        { kind: 'uploadFile', data: buf, path, contentType, batchIdHex, depth },
+        { kind: 'uploadFile', data: buf, path, contentType, batchIdHex, depth, immutable },
         [buf]
       )) as string
     },
-    uploadCollection: async (files, indexDocument, errorDocument, batchIdHex, depth) => {
+    uploadCollection: async (files, indexDocument, errorDocument, batchIdHex, depth, immutable) => {
       const { files: tf, transfer } = toTransferFiles(files)
       return (await call(
-        { kind: 'uploadCollection', files: tf, indexDocument, errorDocument, batchIdHex, depth },
+        { kind: 'uploadCollection', files: tf, indexDocument, errorDocument, batchIdHex, depth, immutable },
         transfer
       )) as string
     }
