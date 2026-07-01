@@ -1,10 +1,22 @@
 # AGENTS.md
 
-hoverfly is a Rust crate: a minimal, WASM-portable Swarm (Ethereum Swarm)
-micro-client. Three user-facing operations: `discover`, `fetch`, `upload`.
-`README.md`, `index.ts`, `package.json`, `bun.lock`, and `node_modules/` are
-vestigial `bun init` artifacts and should be ignored (don't touch them, don't
-rely on them).
+hoverfly is a Rust crate: a minimal, WASM-portable **Swarm (Ethereum Swarm)
+light client**. It speaks the real Bee wire protocols (handshake, hive,
+pricing, pseudosettle, pushsync, retrieval, swap, status) directly over
+libp2p, so it participates in the mainnet network as a first-class light
+peer — it dials bees, gets dialled back, accounts/settles, uploads and
+retrieves chunks — without running a full Bee node or storing the network's
+chunks. It is *not* a thin HTTP wrapper around a gateway and not a full node.
+
+User-facing operations: `discover`, `fetch` (incl. mantaray manifest path
+resolution and mutable **feed**/ENS resolution), `upload`, plus on-chain
+helpers (`batch`, `bridge`) and a long-running `daemon`.
+
+`README.md`, `index.ts`, `package.json`, `bun.lock`, and `node_modules/` at
+the repo root are vestigial `bun init` artifacts — ignore them (don't touch,
+don't rely on them). `README.npm.md` is the real published-package readme.
+The `apps/` dir holds two browser front-ends that embed the wasm build
+(see "Apps").
 
 ## Transport
 
@@ -14,20 +26,38 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
   `or_transport` in `src/transport.rs::build_swarm_from`. libp2p picks the
   right inner transport from the multiaddr's protocol stack. Mainnet bees
   publish plain `/ip4/.../tcp/.../p2p/...` underlays (no `/ws`), so on a
-  native CLI run almost every dial is raw TCP — the "WS-only" framing in
-  earlier docs and a few stale comments is wrong; only WASM is WS-only
+  native CLI run almost every dial is raw TCP; only WASM is WS-only
   (browsers can't open raw TCP sockets, so `src/transport.rs::build_swarm`
-  uses `libp2p::websocket_websys` only).
+  uses `libp2p::websocket_websys` only, via the vendored `src/wsws/`).
 - Dialability is gated at peerlist-ingestion time by
   `src/dnsaddr.rs::is_dialable_multiaddr`: requires `/ip4/` (no DNS resolver,
   no v6) and either `/ws[s]` or plain `/tcp/` on native, `/ws[s]` only on
   wasm. The peers.json store reuses the same predicate via
   `peers.rs::is_dialable_str` in `PeerStore::upsert`.
+- DNS is **DoH-only** (`src/doh.rs`, `src/dnsaddr.rs`) — no system resolver.
+  `/dnsaddr/mainnet.ethswarm.org` is resolved over HTTPS the same way in CLI,
+  daemon and browser.
+
+### Concurrent substream opens (vendored `stream_pool`)
+
+`src/protocols/stream_pool/` is a **vendored, patched copy of
+`libp2p_stream`** (upstream `protocols/stream`). The one change: upstream
+serialises outbound substream upgrades behind a singular `pending_upgrade:
+Option<…>`, so every pushsync chunk's substream open blocks on the previous
+one — this dominated per-chunk wall time. Our `Handler` replaces that slot
+with a `HashMap<UpgradeId, …>` keyed by a monotonic `u64`, so many upgrades
+are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
+`OpenStreamError`, `AlreadyRegistered`) is identical to upstream. Cap is
+`DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64`
+(`stream_pool/handler.rs`), tunable via the CLI `--substream-upgrade-cap` /
+`TransportConfig::max_concurrent_substream_upgrades`. There is **no external
+`libp2p-stream` dependency** anymore.
 
 ## Build
 
 - Native: `cargo build` / `cargo build --release`. Release is ~2-5× faster on
   crypto paths but only ~10-15% end-to-end (network dominates).
+- Edition **2024**; crate version tracked in `Cargo.toml` (`0.1.x`).
 - WASM: **nightly + `build-std` + `--no-default-features`** (the `cli`
   feature pulls non-wasm deps). `.cargo/config.toml` already sets the
   atomics/bulk-memory rustflags. After any lib change:
@@ -44,22 +74,33 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
   - **Gateway (threaded):** `--no-default-features --features wasm-threads`,
     with the atomics/`--shared-memory` rustflags from `.cargo/config.toml`.
     Faster BMT hashing; must be served cross-origin-isolated. This is what
-    `apps/gateway` builds.
+    `apps/gateway` builds. It calls `initThreadPool` and polls retrieval
+    futures across Web Worker threads (see `idb_chunk_store` threading note).
   - **Upload dApp (threadless, no shared memory):** `--no-default-features`
     (omit `wasm-threads`) **and** override the rustflags with empty `RUSTFLAGS`
     so `--shared-memory`/`+atomics` aren't applied → a plain non-shared linear
     memory, no `SharedArrayBuffer`, no COOP/COEP. Runs on hosts that can't set
     those headers (e.g. the eth.limo ENS gateway). See `apps/upload/build-wasm.sh`.
-    Single-threaded (nectar's `split` rayon paths run inline with no pool).
+    Single-threaded: **do not** call `initThreadPool` on this build, and nectar's
+    `split` rayon paths run inline with no pool. (The upload path also must never
+    hit `std::time::{SystemTime,Instant}::now()` — use `web_time`/`js_sys::Date`
+    — and must avoid rayon contention on `parking_lot` locks, which can't park
+    a thread on wasm.)
 
   Nectar crates are pulled from **upstream 0.3.0** (crates.io). The old
-  `[patch.crates-io]` omnipin fork and its `wasm-threads` gate are gone —
-  upstream v0.3.0 has `MaybeSend`/`MaybeSync` (Send/Sync relaxed on wasm)
-  and `web_time` natively. API changes from 0.2.0:
+  `[patch.crates-io]` omnipin fork and its bespoke `wasm-threads` gate are
+  gone — upstream v0.3.0 has `MaybeSend`/`MaybeSync` (Send/Sync relaxed on
+  wasm) and `web_time` natively. API notes vs 0.2.0:
   - `sync_split` → `split` (free function, same signature)
   - `SyncChunkGet`/`SyncChunkPut` → removed (use async `ChunkGet`/`ChunkPut`)
   - `ChunkStoreError::Other(String)` → `ChunkStoreError::Other(Box<dyn Error + Send + Sync>)`
   - `MemoryIssuer::from_batch` returns `Result<_, IssuerError>`
+
+  There **is** one active `[patch.crates-io]`: `futures-bounded` →
+  `vendor/futures-bounded`, whose `Delay::tokio` falls back to
+  `futures-timer` on wasm32 (real tokio's timer panics in the browser). This
+  fixes libp2p-identify's (and any other) `futures_bounded::Delay::tokio`
+  usage on wasm.
 
   First-time setup:
   ```
@@ -68,22 +109,47 @@ Native (`cfg(not(target_arch = "wasm32"))`) and WASM differ:
   ```
 
 - `build.rs` runs `prost-build` over every file in `proto/`. New wire types
-  go in `proto/` and are re-exported under `src/lib.rs::proto`.
+  go in `proto/` and are re-exported under `src/lib.rs::proto`. Regenerate the
+  committed `src/proto/*.rs` with `scripts/regen-protos.sh` (uses the
+  `regen-protos` example + `prost-build` dev-dep; not part of a normal build).
 
 ## Binaries
 
-- `hoverfly` (`src/bin/hoverfly.rs`) — the CLI.
+- `hoverfly` (`src/bin/hoverfly.rs`) — the CLI. Subcommands: `discover`,
+  `fetch`, `upload`, `bmt` (compute a BMT/collection root offline), `daemon`,
+  `save-peers`, `vanity-overlay`, `batch create` (on-chain postage batch),
+  `bridge`.
 - `sigcheck` (`src/bin/sigcheck.rs`) — signer/handshake reference comparison
   tool, not user-facing.
 
 Both require `--features cli` (default). The `cli` feature gates `clap`,
 `tracing-subscriber`, `tar`, and `indicatif`.
 
-The `bridge` feature (default-on) gates the optional `hoverfly bridge`
-subcommand and `src/bridge.rs`. Compile it out with `--no-default-features
---features cli`. It adds no new dependencies (reuses the reqwest + alloy
-signing stack already pulled in for `batch.rs`) and is native-only
+The `bridge` feature (default-on) gates the `hoverfly bridge` subcommand and
+`src/bridge.rs`. Compile it out with `--no-default-features --features cli`.
+It adds no new dependencies (reuses the reqwest + alloy signing stack already
+pulled in for `batch.rs`) and is native-only
 (`#[cfg(all(not(target_arch = "wasm32"), feature = "bridge"))]`).
+
+## Apps (browser front-ends embedding the wasm)
+
+- `apps/gateway/` — browser-only Swarm **subdomain gateway** (like the IPFS
+  service-worker-gateway). One `SharedWorker` runs a single hoverfly node for
+  the whole gateway (warm peers + warm session cache); a broker iframe bridges
+  the daemon MessagePort to each `<cid>.bzz.*` content origin; a service
+  worker resolves paths against the mantaray manifest and returns `Response`s.
+  Uses the **threaded** wasm build → requires COOP/COEP (its `serve.js`
+  sets them). esbuild + pnpm.
+- `apps/upload/` — prototype in-browser **upload dApp**. Connect an EIP-1193
+  wallet (Gnosis/chain 100) → buy a postage batch → upload a file via an
+  embedded hoverfly wasm node running in a Worker. Foreground-only (no
+  SharedWorker). Uses the **threadless** wasm build (`build-wasm.sh`) → no
+  `SharedArrayBuffer`, no COOP/COEP, so it can be hosted on the eth.limo /
+  eth.link ENS gateway (which only send `Cross-Origin-Resource-Policy`).
+  Key design: to avoid ~thousands of per-chunk wallet popups it mints an
+  ephemeral in-browser secp256k1 **session key**, sets it as the `createBatch`
+  owner, and signs all stamps locally (session-key.ts / wallet.ts isolate the
+  signer so AA/7702/7579 can drop in later).
 
 ## Tests / verification
 
@@ -114,28 +180,40 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   wrapped to be Send.
 - `tokio_with_wasm` is missing: `runtime::Handle`, `time::Instant`,
   `time::interval_at`, `Sleep::reset`. For sleep-resets, re-pin a fresh
-  `Box::pin(tokio::time::sleep(d))`.
+  `Box::pin(tokio::time::sleep(d))`. On the upload/wasm path never call
+  `std::time::{SystemTime,Instant}::now()` — use `web_time::Instant` or
+  `js_sys::Date`.
 - `Cargo.toml` deliberately pulls three `getrandom` package versions
-  (0.2, 0.3, 0.4) on wasm — alloy-primitives 1.5.x pulls 0.4 transitively.
+  (0.2, 0.3, 0.4) on wasm — alloy-primitives 1.6.x pulls 0.4 transitively.
   Do not "clean up" these duplicates without checking the transitive graph.
+- `futures-timer` is pulled with the `wasm-bindgen` (gloo-timers) feature so
+  libp2p-swarm/ping's `Delay` doesn't panic in-browser.
 
 ## Architecture map
 
 - `src/transport.rs` — libp2p transport (dual TCP + WS on native, WS-only on
   wasm), per-peer `PeerSession` with a single swarm-driver task + concurrent
-  pushes via `Arc<SessionState>` + cloned `libp2p_stream::Control`.
+  pushes via `Arc<SessionState>` + cloned stream-pool `Control`.
   Accounting (`reserve_plur`, `balance_plur`, pseudosettle) lives here,
   guarded by `tokio::sync::Mutex`. Client-side ghost-balance mirror retires
   the session at `GHOST_BALANCE_LIMIT_PLUR`; `MAX_PUSHES_PER_SESSION` is the
-  defence-in-depth ceiling.
+  defence-in-depth ceiling. Hosts `TransportConfig`
+  (incl. `max_concurrent_substream_upgrades`).
 - `src/client.rs` — high-level `discover`/`fetch`/`upload`. `NetworkedStore`
-  implements nectar's `ChunkGet`; cache is shared via `Clone`. Upload uses
-  an adaptive session pool with pre-warmed rotation, proximity-sorted
-  per-chunk peer ordering, and an in-flight buffer capped at 128. Public
-  `SessionPool` lets the daemon reuse a warm pool across requests;
-  `*_with_pool` variants of `upload_bytes` / `upload_file_with_manifest`
-  call `push_chunks_with_pool` directly. Collections still go through the
-  one-shot `upload_collection`.
+  implements nectar's `ChunkGet`; cache is shared via `Clone`. Fetch resolves
+  mantaray manifest paths and mutable **feeds** (`resolve_feed_root`,
+  delegating to `src/feed.rs`). Upload uses an adaptive session pool with
+  pre-warmed rotation, proximity-sorted per-chunk peer ordering, and an
+  in-flight buffer capped at 128. Public `SessionPool` lets the daemon reuse a
+  warm pool across requests; `*_with_pool` variants of `upload_bytes` /
+  `upload_file_with_manifest` call `push_chunks_with_pool` directly.
+  Collections still go through the one-shot `upload_collection`.
+- `src/feed.rs` — Swarm **feed retrieval** (read-only). Resolves the latest
+  update of a sequence-indexed feed (single-owner chunks) via a concurrent
+  exponential-probe + k-ary search, then extracts the content reference. Feed
+  params come from a feed manifest's root-entry metadata (`swarm-feed-owner`
+  / `-topic` / `-type`); this is how feed-backed ENS sites stay updatable.
+  Publishing feeds is out of scope. Mirrors bee `pkg/feeds`.
 - `src/daemon.rs` — `#[cfg(unix)]` only. Long-running daemon that owns a
   `Transport` + in-memory `PeerStore` + lazy `Arc<SessionPool>` reused across
   requests. Unix-socket IPC, `u32-LE length` + JSON wire protocol. File
@@ -143,19 +221,18 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   anyone with socket access can read/write the daemon's filesystem and sign
   uploads with whatever key they send.
 - `src/inbound.rs` — `#[cfg(not(target_arch = "wasm32"))]` only. Optional
-  daemon listener for serving retrieval requests from the local upload
-  cache.
-- `src/protocols/` — bee wire protocols: `handshake`, `pricing`,
-  `retrieval`, `pushsync`, `pseudosettle`, `hive`, `framing`,
-  `swap`, `status`. `handshake` and `hive` each support two on-wire
-  versions concurrently (bee 2.8.0 raised handshake `14.0.0`→`15.0.0`
-  and hive `1.1.0`→`2.0.0` as a network-wide upgrade in May 2026):
-  outbound tries v15 first and falls back to v14 on
-  `UnsupportedProtocol`; inbound accepts both ids in parallel. The
-  `Version` enum on each module disambiguates downstream. The
-  `status` responder is inbound-only; bee's `pkg/salud` probes us
-  via `/swarm/status/1.1.0/status` to decide whether to mark us
-  Healthy in its kademlia metrics collector.
+  daemon listener for serving retrieval requests from the local upload cache.
+- `src/protocols/` — bee wire protocols. Current on-wire ids:
+  `handshake` `15.0.0` (+ `14.0.0` fallback), `hive` `2.0.0` (+ `1.1.0`),
+  `pricing` `1.0.0`, `pseudosettle` `1.0.0`, `pushsync` `1.3.1`,
+  `retrieval` `1.4.0`, `swap` `1.0.0`, `status` `1.1.3`; plus `framing`
+  and the vendored `stream_pool`. `handshake` and `hive` support two
+  versions concurrently (bee 2.8.0 raised handshake `14→15` and hive
+  `1.1→2.0` as a network-wide upgrade, May 2026): outbound tries v15/v2
+  first and falls back on `UnsupportedProtocol`; inbound accepts both ids in
+  parallel. The `Version` enum on each module disambiguates downstream. The
+  `status` responder is inbound-only; bee's `pkg/salud` probes us to decide
+  whether to mark us Healthy in its kademlia metrics collector.
 - `src/bridge.rs` — `#[cfg(all(not(target_arch = "wasm32"), feature =
   "bridge"))]`. The *second* RPC-touching module (alongside `batch.rs`),
   feature-gated and native-only. Funds the signer's Gnosis address with
@@ -172,6 +249,11 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   `/chains` token list (`resolve_token`); a raw `0x` address is used
   verbatim with `--from-decimals`; omitted = native gas token. Verified
   end-to-end on Base→Gnosis mainnet (both address and symbol forms).
+- `src/batch.rs` — `#[cfg(not(target_arch = "wasm32"))]`. On-chain postage
+  batch creation on Gnosis (mirrors bee `postagecontract.CreateBatch`):
+  approve BZZ → `createBatch(...)` (legacy EIP-155 type-0 tx via `alloy-rlp`)
+  → parse the `BatchCreated` event. Depth/amount math is mirrored by
+  `apps/upload`.
 - `src/cheques.rs` — `#[cfg(not(target_arch = "wasm32"))]`. JSON-backed
   per-peer cumulative-payout sidecar (`cheques.json`). Required to
   persist across CLI runs because bee rejects non-strictly-increasing
@@ -184,10 +266,31 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   defines the deprioritization window. `upsert` filters underlays via
   `is_dialable_str` (same predicate as the transport), so non-`/ip4/` and
   non-dialable entries are silently dropped on ingestion.
+- `src/stamp.rs` — postage-stamp wire validator (113-byte shape + owner
+  recovery). Does NOT verify on-chain batch ownership (no RPC). Currently
+  unused for ingestion; ready for a future chunk-ingestion path.
 - `src/manifest.rs` — mantaray encode/decode helpers.
-- `src/wasm.rs` — `wasm-bindgen` façade. WASM-only module.
-- `src/cache.rs`, `src/cid.rs`, `src/doh.rs`, `src/dnsaddr.rs`, `src/mime.rs`,
-  `src/signer.rs` — support modules.
+- `src/signer.rs` — `SwarmSigner`: overlay derivation, handshake signing
+  (v14 + cached v15), eth-address recovery. See "Bee 2.8.0 protocol support".
+- `src/wasm.rs` — `wasm-bindgen` façade (`HoverflyClient`): `start`/`stop`,
+  peer load/merge/export, `prewarmSessions`, `enableChunkStore`,
+  `discover`/`fetch`/`fetchManifestPath`/`listManifest`,
+  `upload`/`uploadFile`/`uploadCollection`, upload progress/diagnostics, and
+  feed-hint import/export. WASM-only.
+- `src/idb_chunk_store.rs` — persistent IndexedDB-backed L2 chunk cache
+  (browser only). Immutable content-addressed chunks survive reloads on top
+  of the per-fetch in-memory cache in `client::NetworkedStore`. **Threading
+  gotcha:** the threaded (gateway) build polls futures across rayon Web
+  Worker threads, and the `indexed-db` handle (`Rc<Database>`) is `!Send` /
+  thread-affine — so only the database *name* is process-global; each thread
+  lazily opens + caches its own `Database` handle via `thread_local`. Uses
+  the `indexed-db` crate specifically because it's the only binding that
+  works under wasm-bindgen's multi-threaded futures executor.
+- `src/wsws/` — vendored libp2p-websocket-websys, patched so
+  `WebSocket.send()` gets a non-shared buffer (the wasm memory is a
+  `SharedArrayBuffer` in the atomics build and Chrome rejects shared views).
+- `src/cache.rs`, `src/cid.rs`, `src/doh.rs`, `src/dnsaddr.rs`, `src/mime.rs`
+  — support modules.
 - `src/lib.rs` — public re-exports; canonical view of what's stable API.
 
 ## Repo conventions
@@ -197,170 +300,116 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   `iris.radicle.xyz`), `vps` → SSH push to the VPS that runs the
   long-lived daemon. Push targets are explicit; there's no shared
   default — pick the remote you mean.
-- `peers.json` is gitignored. The CLI writes reachability observations back
-  into it on every operation; respect existing fields on read (see
-  `apply_log` / `record_dial_{success,failure}`).
-- Hard constants worth knowing before tuning (file:line):
-  - `transport.rs:120  MAX_PUSHES_PER_SESSION = 10_000` — defence-in-depth
+- `peers.json` is gitignored (runtime artifact). The CLI writes reachability
+  observations back into it on every operation; respect existing fields on
+  read (see `apply_log` / `record_dial_{success,failure}`).
+- **`peers.seed.json`** (committed, ~800 IPs) and **`peers.ws.json`**
+  (committed, WS-dialable subset for the browser builds) are IP-diverse
+  cold-start seeds harvested from a long-running daemon. CI copies a seed to
+  `peers.json` before starting the daemon so a fresh runner doesn't discover
+  from scratch. Regenerate via `hoverfly save-peers --socket <sock>` against a
+  daemon that's been running a few hours.
+- Hard constants worth knowing before tuning (file:line — verify current
+  values, they drift):
+  - `transport.rs  MAX_PUSHES_PER_SESSION = 10_000` — defence-in-depth
     safety net; normal rotation is driven by ghost balance, not this.
-  - `transport.rs:131  GHOST_BALANCE_LIMIT_PLUR = 12_000_000` — client-side
+  - `transport.rs  GHOST_BALANCE_LIMIT_PLUR = 12_000_000` — client-side
     mirror of bee's `ghostBalance` disconnect threshold (~16.875M PLUR on
     bee, with headroom for in-flight pushes). Session retires when crossed.
-  - `transport.rs:137-138  GHOST_BALANCE_PREWARM_{NUMERATOR,DENOMINATOR} = 2/3`
+  - `transport.rs  GHOST_BALANCE_PREWARM_{NUMERATOR,DENOMINATOR} = 1/2`
     — fraction of the limit at which a replacement session is pre-dialed.
-  - `transport.rs:41,47  REFRESH_RATE_PLUR = 4_500_000`,
+  - `transport.rs  REFRESH_RATE_PLUR = 4_500_000`,
     `SAFE_PEER_THRESHOLD_PLUR = REFRESH_RATE_PLUR * 2` — pseudosettle math,
     mirrors bee's `pkg/node/node.go::refreshRate`.
-  - `client.rs:79,84,678  DEFAULT_FETCH_CONCURRENCY = 5`,
-    `DEFAULT_DISCOVER_CONCURRENCY = 16`,
-    `DEFAULT_UPLOAD_CONCURRENCY = 8`.
-  - `client.rs:1329  PREEMPT_INTERVAL = 30s` — only fires when no in-flight
-    push has returned. With `CHUNK_PEER_PARALLELISM = 1` (intentional, no
-    per-chunk racing) it's effectively a hung-session detector, not a
-    racing timer.
-  - `client.rs:1206,1213  DEAD_SKIP_SECS = 60`, `DEAD_STRIKES = 3` — how
-    long to park a session entry, and how many rotation-dial failures
-    trigger parking. Sized to outlast bee's ghost-overdraw blocklist
-    and a rotation-dial cluster at high `--concurrency`.
-  - `client.rs  MAX_CHUNK_RETRIES = 60` with 500ms flat backoff
-    (≈30 s total in the common case, longer if peers genuinely
-    take time) — outer pusher-layer retry budget per chunk. Was
-    `10` with linear backoff in older docs; bumped after observing
-    that bee mainnet bin-saturation and ghost-overdraw blocklist
-    windows occasionally need more retry runway. Independent of
-    `--max-retries`.
-  - `transport.rs:118  is_connection_dead` deliberately excludes
-    `Timeout` — a single slow op shouldn't retire the whole session
-    on which dozens of other pushes might still be in flight.
-  - `client.rs  SESSION_DIAL_PARALLELISM = 128` — in-flight window
-    while filling the session pool. Was `32`; bumped to absorb the
-    ~97% dial rejection rate against the post-bee-2.8 mainnet
-    where most peers either run 2.8 or have entries in our seed
-    that are now-stale.
+  - `stream_pool/handler.rs  DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64`
+    — per-connection concurrent substream-upgrade cap (`--substream-upgrade-cap`).
+  - `client.rs  DEFAULT_FETCH_CONCURRENCY = 5`,
+    `DEFAULT_DISCOVER_CONCURRENCY = 16`, `DEFAULT_UPLOAD_CONCURRENCY = 8`.
+  - `client.rs  CHUNK_PEER_PARALLELISM = 3` — each chunk races up to 3
+    proximity-ordered peers (≈2-3× throughput for ≈3× bandwidth).
+    `PREEMPT_INTERVAL = 1s` extends/tops-up that race window when the initial
+    seed used fewer peers or after an early shallow/error reply — short enough
+    to race on per-chunk RTT timescales.
+  - `client.rs  DEAD_SKIP_SECS = 15`, `DEAD_STRIKES = 3` — how long to park a
+    session entry, and how many rotation-dial failures trigger parking.
+  - `client.rs  MAX_CHUNK_RETRIES = 60` with 500ms retry penalty per failed
+    dispatch — outer pusher-layer retry budget per chunk (mirrors bee's
+    `pusher.DefaultRetryCount` philosophy). Independent of `--max-retries`.
+  - `transport.rs  is_connection_dead` deliberately excludes `Timeout` — a
+    single slow op shouldn't retire a whole session with many in-flight pushes.
+  - `client.rs  SESSION_DIAL_PARALLELISM = 128` — in-flight window while
+    filling the session pool (absorbs the high mainnet dial-rejection rate).
 - Network IDs: `1` = mainnet (default), `10` = testnet/sepolia. Bootnode:
   `/dnsaddr/mainnet.ethswarm.org`. **EVM chain id** is separate from
   network id (it's the `chainID` in the cheque's EIP-712 domain): 100
   for Gnosis / Swarm mainnet, 11155111 for Sepolia. Set via
   `--chequebook-chain-id`.
-- **Bee-citizenship features** (May 2026) for long-term kademlia
-  presence growth: stable overlay across runs (persist nonce via
-  `--nonce-file`, default `overlay-nonce` in CWD; see
-  `signer::from_bytes_with_nonce`), outbound hive self-announce on
-  every session connect (`protocols::hive::announce_self`,
-  invoked from `transport::do_hive_announce` after the bee
-  handshake), inbound status responder (`protocols::status`).
-  Hive announces fire at ~160 per 5 MiB upload at c=64.
-  Single-upload throughput unchanged in benchmarks; the design is
-  a slow-burn lever — bees that learn about us via gossip add us
-  to their `knownPeers` and may dial us back hours later,
-  growing our kademlia presence beyond what any single session
-  could. We previously also exposed an inbound pullsync responder
-  (empty cursors / empty offers) but dropped it: it was the only
-  piece bee actually probed, but each empty response immediately
-  triggered another probe, creating constant noise with no
-  reciprocal benefit — we don't store chunks, so non-empty offers
-  aren't possible. See PERFORMANCE.md "Bee-citizenship".
-- **Bee 2.8.0 protocol support** (also May 2026, day-of-release).
-  Handshake v15 (`signer::sign_handshake_v15`) and hive v2 carry
-  signed `timestamp` + `chequebook_address` fields in the
-  `BzzAddress`. `SwarmSigner::sign_handshake_v15_cached` caches
-  the `(timestamp, signature)` pair per `(underlay, chequebook)`
-  so reconnects to the same peer replay an identical record —
-  bee 2.8's gossip path rejects updates within
-  `MinimumUpdateInterval = 300 s` of the existing record, so
-  re-issuing a fresh signature every minute-scale reconnect
-  ages our addressbook entry out across the network. Also added
-  `libp2p::ping::Behaviour` because bee 2.8's reacher uses
-  `/ipfs/ping/1.0.0` to verify peer reachability; failed pings
-  mark us `ReachabilityStatusPrivate` and the kademlia 5-min
-  prune loop kicks us. See PERFORMANCE.md "Bee 2.8.0 protocol
-  migration" for the full story.
-- **`peers.seed.json`** (committed, ~700 IPs as of mid-2026). An
-  IP-diverse cold-start seed harvested from a long-running daemon.
-  CI workflows copy it to `peers.json` before starting the daemon
-  so a fresh runner doesn't have to discover from scratch (which,
-  on AWS/Azure egress to a EU-Hetzner-heavy network, is slow).
-  Local installs that want fast cold-start can do the same.
-  Regenerate via the `hoverfly save-peers --socket <sock>` CLI
-  on a daemon that's been running a few hours.
-- **Postage stamp signature validator** (`src/stamp.rs`). Validates
-  the 113-byte wire-format stamp shape and recovers the batch
-  owner's Ethereum address from the signature. Does NOT verify
-  on-chain that the recovered address actually owns the claimed
-  batch — that would require an RPC call we deliberately don't
-  make. Currently unused (we only emit stamps via
-  `nectar-postage`, never ingest them); ready for the future
-  chunk-ingestion path (pullsync delivery, retrieval-forwarding).
-- **SWAP / chequebook** is implemented but scoped to *issuance only*:
-  no contract deploy, no cashout, no on-chain RPC. Caller supplies an
-  already-deployed chequebook via `--chequebook` whose `issuer()`
-  matches `--key`'s Ethereum address. `transport::SwapConfig` carries
-  the cheque store and per-peer cap. Sessions advertise the
-  beneficiary in a one-shot `/swarm/swap/1.0.0/swap` handshake at
-  connect time; `SessionState::try_settle_once` then emits a cheque
-  for the PLUR remainder after pseudosettle clears what it can.
-  Exchange-rate fallback is `abort and fall through to
-  pseudosettle-only` (no hardcoded rate; we trust bee's per-stream
-  `exchange`+`deduction` headers, which it derives from its on-chain
-  priceoracle poll). Bee's `chequestore.go::ReceiveCheque` does an
-  on-chain `chequebook.issuer()` + `balance()` + `paidOut()` triplet
-  per accepted cheque, so the SWAP path's marginal cost on the
-  receiving side is hundreds of ms — that's why emission is gated to
-  the existing settle path, not run on every push.
-  **Status (May 2026):** code is correct (`cheques_emitted` > 0,
-  `cheques_failed` ≈ 0 on real uploads), but no measurable throughput
-  benefit at one-shot upload workloads. The mechanism that *would*
-  pay off — bee's `notifyPaymentThresholdUpgrade` at
-  `100 × refreshRate` per-peer cumulative — is unreachable when
-  sessions die from kademlia bin pruning long before per-peer debt
-  accumulates that high. See PERFORMANCE.md "SWAP / chequebook".
-- **Connection-close cause diagnostic** (`diag::CONN_CLOSED_IO_DETAIL`,
-  added May 2026). Captures `SwarmEvent::ConnectionClosed.cause`
-  on every session death and buckets the underlying `io::Error`.
-  Empirically on mainnet 100% are `errno 104 (ECONNRESET)`, attributable
-  to bee's kademlia bin-prune path
-  (`pkg/topology/kademlia/kademlia.go:719`) preferentially disconnecting
-  peers with `ReachabilityStatusPublic != Public`. Mitigation:
-  run via `daemon + --listen + --advertise` (see PERFORMANCE.md
-  "Public reachability"). Default config is Private, gets pruned.
-- **Per-stream + per-chunk latency histograms** (May 2026):
-  `diag::PUSH_LATENCY_*` (do_pushsync wall-time buckets),
-  `diag::OPEN_STREAM_*` (multistream-select + yamux open buckets),
-  `diag::PUSH_OUTCOME_*` (ok / shallow / overdraft / error counts),
-  `diag::CHUNK_LATENCY_*` (per-chunk total wall-time including
-  retries and racing). All printed at upload end. Shape matches
-  bee's `bee_pusher_sync_time` / `bee_pushsync_push_peer_time` /
-  etc. Prometheus metrics so direct A/B comparisons are possible
-  against a co-located bee node. See PERFORMANCE.md
-  "Bee-vs-hoverfly end-to-end comparison" for the numbers.
+- **Bee-citizenship features** (May 2026) for long-term kademlia presence
+  growth: stable overlay across runs (persist nonce via `--nonce-file`,
+  default `overlay-nonce` in CWD; see `signer::from_bytes_with_nonce`),
+  outbound hive self-announce on every session connect
+  (`protocols::hive::announce_self`, invoked from `transport::do_hive_announce`
+  after the bee handshake), inbound status responder (`protocols::status`).
+  Slow-burn lever: bees that learn about us via gossip add us to `knownPeers`
+  and may dial us back later, growing our kademlia presence beyond a single
+  session. A pullsync inbound responder was tried and dropped (constant probe
+  noise, no reciprocal benefit — we store no chunks). See PERFORMANCE.md
+  "Bee-citizenship".
+- **Bee 2.8.0 protocol support** (May 2026). Handshake v15 + hive v2 carry a
+  signed `timestamp` + `chequebook_address` in the `BzzAddress`.
+  `SwarmSigner::sign_handshake_v15_cached` caches the `(timestamp, signature)`
+  pair per `(underlay, chequebook)` so reconnects to the same peer replay an
+  **identical** record. Bee 2.8's gossip path rejects updates within
+  `MinimumUpdateInterval = 300 s` of the existing record, so re-issuing a
+  fresh signature every reconnect would age our addressbook entry out across
+  the network. (Bee itself later adopted the same "sign once, reuse until the
+  advertised data changes" approach in v2.8.1 — hoverfly already did this by
+  construction; nothing to change.) Also added `libp2p::ping::Behaviour`
+  because bee 2.8's reacher uses `/ipfs/ping/1.0.0` to verify reachability;
+  failed pings mark us private and the kademlia prune loop kicks us. See
+  PERFORMANCE.md "Bee 2.8.0 protocol migration".
+- **SWAP / chequebook** is implemented but scoped to *issuance only*: no
+  contract deploy, no cashout, no on-chain RPC. Caller supplies an
+  already-deployed chequebook via `--chequebook` whose `issuer()` matches
+  `--key`'s eth address. Sessions advertise the beneficiary in a one-shot
+  `/swarm/swap/1.0.0/swap` handshake at connect; `try_settle_once` then emits
+  a cheque for the PLUR remainder after pseudosettle. Exchange-rate fallback
+  is abort→pseudosettle-only (no hardcoded rate; trust bee's per-stream
+  `exchange`+`deduction` headers). Correct but no measured throughput benefit
+  at one-shot upload workloads. See PERFORMANCE.md "SWAP / chequebook".
+- **Diagnostics** (May 2026): `diag::CONN_CLOSED_IO_DETAIL` buckets
+  `ConnectionClosed.cause` (empirically ~100% ECONNRESET from bee's kademlia
+  bin-prune of non-public peers — mitigate with `daemon + --listen +
+  --advertise`); per-stream/per-chunk latency histograms
+  (`diag::PUSH_LATENCY_*`, `OPEN_STREAM_*`, `PUSH_OUTCOME_*`,
+  `CHUNK_LATENCY_*`) printed at upload end, shaped to match bee's Prometheus
+  metrics for direct A/B. See PERFORMANCE.md.
 - CLI has split timeouts: `--timeout` (per-operation, default 10 s, applies
   to pushsync / retrieval / pseudosettle substreams) ≠ `--dial-timeout`
   (session open: dial + identify + handshake + pricing, default 3 s). Don't
   conflate them. Bee's internal `pushsync.defaultTTL` is 30 s; setting
   `--timeout` below ~10-15 s on slow links causes spurious timeouts that
   bee then logs as ghost-balance overdraw on our overlay.
-- CLI `--max-retries` per chunk: see `client.rs:1372`
-  `cap = max_retries.max(1).min(order.len())`. `0` is silently promoted
-  to `1` (one attempt); the value is also capped by the live pool size,
-  so on a small or attrited pool the user-supplied number is the upper
-  bound, not the guarantee.
+- CLI `--max-retries` per chunk: see `client.rs`
+  `cap = max_retries.max(1).min(order.len())`. `0` is silently promoted to
+  `1`; the value is also capped by the live pool size, so on a small/attrited
+  pool the user-supplied number is the upper bound, not the guarantee.
 
 ## When changing this code
 
 - After any `transport.rs`, `client.rs`, or trait-bound change, run both
   the native build and the wasm check. `Send`-bound regressions on wasm
   are by far the most common breakage (nectar v0.3.0 `MaybeSend` relaxes
-  this for ChunkGet, but other paths like tokio::spawn still require Send).
+  this for ChunkGet, but other paths like `tokio::spawn` still require Send).
 - Network behaviour is empirical. If you change defaults or the constants
   above, measure against mainnet with a freshly randomised file (bee
   dedupes by chunk address: identical bytes re-upload in O(stamp) and tell
   you nothing about real throughput).
 - The reference Bee implementation lives at
-  `~/Coding/forks/bee/pkg/{pushsync,pusher,accounting,node,p2p,bzz,hive,topology}`.
-  When in doubt about protocol semantics — pushsync receipts,
-  accounting, pseudosettle wall-second rule, ghostBalance/blocklist
-  windows, the v15 handshake / v2 hive wire format, kademlia
-  saturation/prune behavior — read Bee directly; the upstream
-  docs lag behind the code. Check out a specific tag
-  (`git -C ~/Coding/forks/bee checkout v2.8.0`) when you need
-  the actual code that's running on mainnet right now.
+  `~/Coding/forks/bee/pkg/{pushsync,pusher,accounting,node,p2p,bzz,hive,topology,feeds,salud}`.
+  When in doubt about protocol semantics — pushsync receipts, accounting,
+  pseudosettle wall-second rule, ghostBalance/blocklist windows, the v15
+  handshake / v2 hive wire format, feed derivation, kademlia
+  saturation/prune behavior — read Bee directly; the upstream docs lag the
+  code. Check out the tag running on mainnet
+  (`git -C ~/Coding/forks/bee checkout v2.8.1`) when you need exact code.
