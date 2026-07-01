@@ -10,9 +10,9 @@ import type { CollectionFile } from './hoverfly.ts'
 export type ReqBody =
   | { kind: 'start', sessionKeyHex: string }
   | { kind: 'connected' }
-  | { kind: 'uploadFile', data: ArrayBuffer, path: string, contentType: string | undefined, batchIdHex: string, depth: number }
+  | { kind: 'uploadFile', data: ArrayBuffer, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean }
   | {
-      kind: 'uploadCollection', batchIdHex: string, depth: number,
+      kind: 'uploadCollection', batchIdHex: string, depth: number, immutable: boolean,
       indexDocument: string | undefined, errorDocument: string | undefined,
       // file bytes travel as ArrayBuffers (transferable) keyed alongside paths
       files: Array<{ path: string, data: ArrayBuffer, contentType?: string }>
@@ -25,6 +25,10 @@ export type Res =
   | { kind: 'result', id: number, ok: false, error: string }
   | { kind: 'log', message: string }
   | { kind: 'status', connected: number }
+  // Live upload progress: `done`/`total` chunks pushed. Emitted by the worker
+  // on a timer while an upload is in flight (polling the wasm client's
+  // `uploadProgress()`), so the UI bar tracks real chunk pushes.
+  | { kind: 'progress', done: number, total: number }
 
 /** Convert main-thread CollectionFile[] (Uint8Array) to transferable form. */
 export function toTransferFiles (files: CollectionFile[]): {

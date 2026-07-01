@@ -285,7 +285,7 @@ pub const GHOST_BALANCE_PREWARM_DENOMINATOR: u64 = 2;
 /// where bee likely didn't blocklist us and a reconnect to the same
 /// peer would succeed.
 pub mod diag {
-    use std::sync::atomic::AtomicU64;
+    use std::sync::atomic::{AtomicU64, Ordering};
     /// Sessions that ended because a push task surfaced an `is_connection_dead`
     /// error AND the session's ghost balance at the moment of retirement was
     /// below [`super::GHOST_BALANCE_LIMIT_PLUR`] × [`super::GHOST_BALANCE_PREWARM_NUMERATOR`] /
@@ -444,6 +444,53 @@ pub mod diag {
     pub static CHUNK_LATENCY_2_5S: AtomicU64 = AtomicU64::new(0);
     pub static CHUNK_LATENCY_5_15S: AtomicU64 = AtomicU64::new(0);
     pub static CHUNK_LATENCY_GT_15S: AtomicU64 = AtomicU64::new(0);
+
+    /// One-line human-readable dump of every diagnostic counter. Used by the
+    /// wasm client (`HoverflyClient::uploadDiagnostics`) to surface where an
+    /// upload actually spent its time in the browser console — push RTT vs
+    /// open-stream negotiation vs retirement/re-dial churn vs overdrafts — so
+    /// throughput debugging is data-driven rather than guesswork.
+    pub fn summary() -> String {
+        let g = |c: &AtomicU64| c.load(Ordering::Relaxed);
+        format!(
+            "outcomes[ok={} shallow={} overdraft={} err={}] \
+             push_ms[<100={} 100-500={} 500-2k={} 2-5k={} 5-10k={} >10k={}] \
+             open_ms[<10={} 10-100={} 100-500={} >500={}] \
+             chunk_ms[<500={} 500-2k={} 2-5k={} 5-15k={} >15k={}] \
+             retire[dead_low={} dead_prewarm={} dead_high={} ghost={} maxpush={}] \
+             prewarm[on_dead={} on_ghost={}] \
+             conn_closed[io={} keepalive={} clean={}]",
+            g(&PUSH_OUTCOME_OK),
+            g(&PUSH_OUTCOME_SHALLOW),
+            g(&PUSH_OUTCOME_OVERDRAFT),
+            g(&PUSH_OUTCOME_ERROR),
+            g(&PUSH_LATENCY_LT_100MS),
+            g(&PUSH_LATENCY_100_500MS),
+            g(&PUSH_LATENCY_500MS_2S),
+            g(&PUSH_LATENCY_2_5S),
+            g(&PUSH_LATENCY_5_10S),
+            g(&PUSH_LATENCY_GT_10S),
+            g(&OPEN_STREAM_LT_10MS),
+            g(&OPEN_STREAM_10_100MS),
+            g(&OPEN_STREAM_100_500MS),
+            g(&OPEN_STREAM_GT_500MS),
+            g(&CHUNK_LATENCY_LT_500MS),
+            g(&CHUNK_LATENCY_500MS_2S),
+            g(&CHUNK_LATENCY_2_5S),
+            g(&CHUNK_LATENCY_5_15S),
+            g(&CHUNK_LATENCY_GT_15S),
+            g(&DEAD_RETIRE_LOW_GHOST),
+            g(&DEAD_RETIRE_PREWARM_GHOST),
+            g(&DEAD_RETIRE_HIGH_GHOST),
+            g(&GHOST_RETIRE),
+            g(&MAX_PUSHES_RETIRE),
+            g(&PREWARM_ON_DEAD),
+            g(&PREWARM_ON_GHOST),
+            g(&CONN_CLOSED_IO),
+            g(&CONN_CLOSED_KEEPALIVE),
+            g(&CONN_CLOSED_CLEAN),
+        )
+    }
 }
 
 #[derive(Debug, Error)]

@@ -19,14 +19,16 @@ import type { Req, Res } from './worker-protocol.ts'
 declare const self: DedicatedWorkerGlobalScope
 
 interface HoverflyClient {
-  start: (bootstrap: string, intervalSecs: number, waitSecs: number, warmPool?: number) => Promise<number>
+  start: (bootstrap: string, intervalSecs: number, waitSecs: number, warmPool?: number, skipPrewarm?: boolean) => Promise<number>
   loadPeers: (json: string) => void
   mergePeers: (json: string) => number
   exportPeers: () => string
   peerCount: () => number
   connectedPeerCount?: () => Promise<number>
-  uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, maxRetries: number) => Promise<string>
-  uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, maxRetries: number) => Promise<string>
+  uploadProgress?: () => number[]
+  uploadDiagnostics?: () => string
+  uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
+  uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
 }
 interface HoverflyModule {
   default: (input?: unknown) => Promise<unknown>
@@ -146,7 +148,12 @@ async function start (sessionKeyHex: string): Promise<void> {
     }
 
     log('Discovering browser-dialable peers…')
-    const n = await c.start(DEFAULT_BOOTSTRAP, MAINTENANCE_SECS, DISCOVER_WAIT_SECS, WARM_POOL)
+    // skipPrewarm=true: this dApp only uploads. The retrieval warm pool `start`
+    // would otherwise open is never used by the pushsync upload path, and
+    // warming it just doubled cold-start dialing (retrieval sessions + the
+    // upload's own pushsync pool), making bring-up far slower than native for
+    // no benefit. Discover peers, skip the retrieval warm-up.
+    const n = await c.start(DEFAULT_BOOTSTRAP, MAINTENANCE_SECS, DISCOVER_WAIT_SECS, WARM_POOL, true)
     log(`Discovery done: ${n} peers known`)
     await pushStatus()
     try { void idbSet(IDB_PEERS_KEY, c.exportPeers()) } catch { /* ignore */ }
@@ -175,6 +182,42 @@ function requireClient (): HoverflyClient {
   return client
 }
 
+/**
+ * Run an upload while polling the wasm client's `uploadProgress()` and posting
+ * `progress` events, so the UI can render a real per-chunk bar. Emits a final
+ * `done === total` frame on completion so the bar reaches 100%. The poll timer
+ * is always cleared, even if the upload throws.
+ */
+async function withProgress<T> (c: HoverflyClient, run: () => Promise<T>): Promise<T> {
+  let timer: ReturnType<typeof setInterval> | null = null
+  if (c.uploadProgress != null) {
+    const poll = (): void => {
+      try {
+        const [done, total] = c.uploadProgress!()
+        if (total > 0) post({ kind: 'progress', done, total })
+      } catch { /* ignore */ }
+    }
+    timer = setInterval(poll, 200)
+  }
+  try {
+    return await run()
+  } finally {
+    if (timer != null) clearInterval(timer)
+    // Dump the transport diagnostic counters so browser throughput can be
+    // debugged from real data (push RTT vs open-stream vs retirement churn).
+    try {
+      const diag = c.uploadDiagnostics?.()
+      if (diag != null && diag.length > 0) log(`diag: ${diag}`)
+    } catch { /* ignore */ }
+    // Final snapshot so the bar snaps to 100% rather than stopping at the last
+    // poll (which may lag a few hundred chunks behind completion).
+    try {
+      const [done, total] = c.uploadProgress?.() ?? [0, 0]
+      if (total > 0) post({ kind: 'progress', done: Math.max(done, total), total })
+    } catch { /* ignore */ }
+  }
+}
+
 self.onmessage = async (e: MessageEvent<Req>) => {
   const msg = e.data
   try {
@@ -190,18 +233,20 @@ self.onmessage = async (e: MessageEvent<Req>) => {
         break
       }
       case 'uploadFile': {
-        const root = await requireClient().uploadFile(
-          new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, UPLOAD_RETRIES
-        )
+        const c = requireClient()
+        const root = await withProgress(c, async () => await c.uploadFile(
+          new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+        ))
         await pushStatus()
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
       case 'uploadCollection': {
+        const c = requireClient()
         const files = msg.files.map(f => ({ path: f.path, data: new Uint8Array(f.data), contentType: f.contentType }))
-        const root = await requireClient().uploadCollection(
-          files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, UPLOAD_RETRIES
-        )
+        const root = await withProgress(c, async () => await c.uploadCollection(
+          files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+        ))
         await pushStatus()
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
