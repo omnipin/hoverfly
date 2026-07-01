@@ -321,6 +321,14 @@ enum Commands {
         #[arg(long)]
         no_owner_check: bool,
 
+        /// Treat the batch as immutable (fill-only stamping). When `--depth`
+        /// is omitted the batch's mutability is read from chain and this flag
+        /// is ignored; it only takes effect when `--depth` is supplied (which
+        /// skips the on-chain read). Mutable batches use overwrite-aware ring
+        /// stamping; immutable batches use fill-only stamping.
+        #[arg(long)]
+        immutable: bool,
+
         /// Private key (hex, 32 bytes — batch owner's signer)
         #[arg(long, value_name = "KEY")]
         key: String,
@@ -1415,6 +1423,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             depth,
             rpc_url,
             no_owner_check,
+            immutable,
             key,
             peerlist,
             max_retries,
@@ -1435,8 +1444,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // silent-failure modes (wrong depth → bad bucket index math;
             // wrong key → stamps bee rejects → endless "could not push
             // chunk" retries).
-            let depth: u8 = match depth {
-                Some(d) => d,
+            // Resolve depth AND mutability together. When `--depth` is
+            // supplied we skip the on-chain read, so mutability comes from
+            // the `--immutable` flag. Otherwise both come from chain (the
+            // authoritative source) and the flag is ignored.
+            let (depth, immutable): (u8, bool) = match depth {
+                Some(d) => (d, immutable),
                 None => {
                     let stamp_addr: alloy_primitives::Address =
                         hoverfly::batch::MAINNET_POSTAGE_STAMP
@@ -1486,16 +1499,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         info.owner,
                         if info.immutable { ", immutable" } else { "" },
                     );
-                    info.depth
+                    (info.depth, info.immutable)
                 }
             };
 
             #[cfg(unix)]
             if let Some(sock) = daemon {
+                // Render the upload progress bar on THIS (client) terminal.
+                // The daemon streams `Progress { done, total }` frames back
+                // over the socket; `call_upload` invokes the callback on each.
+                // When the terminal is not a TTY (`make_progress_bar` returns
+                // None) we ask for no progress stream to avoid useless frames.
+                let progress_cb = make_progress_bar();
                 let req = hoverfly::daemon::Request::Upload(hoverfly::daemon::UploadRequest {
                     file: file.clone(),
                     batch: batch.clone(),
                     depth,
+                    immutable,
                     key: key.clone(),
                     max_retries,
                     concurrency,
@@ -1505,6 +1525,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     content_type: content_type.clone(),
                     index_document: index_document.clone(),
                     error_document: error_document.clone(),
+                    progress: progress_cb.is_some(),
                 });
                 // Time the daemon round-trip end-to-end on the client
                 // side. Includes IPC and any daemon-side work; mirrors
@@ -1513,7 +1534,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // get a throughput number for daemon-mode runs (used
                 // in PERFORMANCE.md A/B comparisons).
                 let upload_started = std::time::Instant::now();
-                let resp = hoverfly::daemon::call(&sock, &req).await?;
+                let resp = hoverfly::daemon::call_upload(&sock, &req, progress_cb.as_ref()).await?;
                 let elapsed = upload_started.elapsed();
                 match resp {
                     hoverfly::daemon::Response::Uploaded { root, bytes } => {
@@ -1602,6 +1623,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &signer,
                     &batch,
                     depth,
+                    immutable,
                     files,
                     index_doc,
                     error_document.as_deref(),
@@ -1644,6 +1666,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &signer,
                     &batch,
                     depth,
+                    immutable,
                     &data,
                     max_retries,
                     concurrency,
@@ -1673,6 +1696,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &signer,
                     &batch,
                     depth,
+                    immutable,
                     &data,
                     &path,
                     ct.as_deref(),

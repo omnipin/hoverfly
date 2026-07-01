@@ -585,6 +585,7 @@ impl HoverflyClient {
         data: Uint8Array,
         batch_id_hex: String,
         depth: u8,
+        immutable: bool,
         max_retries: usize,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
@@ -596,6 +597,7 @@ impl HoverflyClient {
             &signer,
             &batch_id_hex,
             depth,
+            immutable,
             &buf,
             max_retries,
         )
@@ -619,6 +621,7 @@ impl HoverflyClient {
         content_type: Option<String>,
         batch_id_hex: String,
         depth: u8,
+        immutable: bool,
         max_retries: usize,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
@@ -630,6 +633,7 @@ impl HoverflyClient {
             &signer,
             &batch_id_hex,
             depth,
+            immutable,
             &buf,
             &path,
             content_type.as_deref(),
@@ -665,6 +669,7 @@ impl HoverflyClient {
         error_document: Option<String>,
         batch_id_hex: String,
         depth: u8,
+        immutable: bool,
         max_retries: usize,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
@@ -679,6 +684,7 @@ impl HoverflyClient {
             &signer,
             &batch_id_hex,
             depth,
+            immutable,
             upload_files,
             index_document.as_deref(),
             error_document.as_deref(),
