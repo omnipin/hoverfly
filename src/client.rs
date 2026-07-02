@@ -2357,8 +2357,8 @@ impl SessionEntry {
     /// True if a pre-warmed session is already waiting in the slot.
     /// Used by the dispatcher's cooldown pre-filter to keep entries
     /// whose live session is dead but whose rotation path can swap in
-    /// the pre-warm without paying a fresh dial (so DIAL_COOLDOWN
-    /// doesn't apply).
+    /// the pre-warm without paying a fresh dial (so the per-peer dial
+    /// rate limit doesn't apply).
     fn has_pending(&self) -> bool {
         self.pending
             .lock()
@@ -2966,13 +2966,14 @@ pub async fn push_chunks_with_pool(
             // - Cooldown pre-filter: the entry's current session is
             //   dead (driver task exited, cmd_tx closed) AND there's
             //   no pre-warmed replacement waiting AND the transport's
-            //   per-peer DIAL_COOLDOWN is still active. Without this,
-            //   we burn a full chunk-dispatch attempt only for
-            //   `try_push_with_rotation` to discover the session is
-            //   dead, attempt the rotation dial, and get DialTooSoon
-            //   back from `Transport::open_session`. Each one of
-            //   those wastes one of the `cap` attempts and adds a
-            //   500ms retry penalty downstream. Trace data on a stalled
+            //   per-peer dial rate limit would still park the redial
+            //   (peek > 0). Without this, we burn a full chunk-dispatch
+            //   attempt only for `try_push_with_rotation` to discover the
+            //   session is dead, attempt the rotation dial, and stall on
+            //   a park (or over `MAX_DIAL_PARK`, get `DialTooSoon`) back
+            //   from `Transport::open_session`. Each one of those wastes
+            //   one of the `cap` attempts and adds a retry penalty
+            //   downstream. Trace data on a stalled
             //   upload showed all 8 chunk-fan-out attempts hitting
             //   this exact pattern simultaneously (every peer in the
             //   pool went into cooldown together after a maintenance
@@ -3778,12 +3779,12 @@ pub async fn push_chunks_with_pool(
                         // the entry rejoins the rotation.
                         //
                         // `DialTooSoon` excluded: that's our own per-peer
-                        // cooldown talking (`DIAL_COOLDOWN` in
-                        // `transport.rs`), not a peer fault. Prewarm is
-                        // opportunistic, so dropping the dial without
+                        // dial rate limit (`ratelimit::DialRateLimiter`,
+                        // over `MAX_DIAL_PARK`), not a peer fault. Prewarm
+                        // is opportunistic, so dropping the dial without
                         // striking is fine — the next chunk that wants
-                        // this peer will trigger a fresh prewarm
-                        // attempt after the cooldown burns off.
+                        // this peer will trigger a fresh prewarm attempt
+                        // once its bucket drains.
                         debug!(target: "hoverfly::upload",
                             "pre-warm dial for {} failed: {}", entry.overlay_hex, e);
                         if !matches!(&e, TransportError::DialTooSoon { .. })
