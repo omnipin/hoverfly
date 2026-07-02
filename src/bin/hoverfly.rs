@@ -1472,7 +1472,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         hoverfly::batch::MAINNET_POSTAGE_STAMP
                             .parse()
                             .expect("hardcoded valid");
-                    eprintln!("depth: not provided, reading batch on-chain via {rpc_url} ...");
                     let info = hoverfly::batch::read_batch(&rpc_url, stamp_addr, &batch)
                         .await
                         .map_err(|e| {
@@ -1510,12 +1509,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .into());
                         }
                     }
-                    eprintln!(
-                        "depth: {} (read on-chain; owner={}{})",
-                        info.depth,
-                        info.owner,
-                        if info.immutable { ", immutable" } else { "" },
-                    );
                     (info.depth, info.immutable)
                 }
             };
