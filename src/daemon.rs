@@ -53,6 +53,9 @@ pub enum Request {
     /// Save the current in-memory peerlist (with reachability
     /// observations) back to its file.
     SavePeers,
+    /// Query the daemon's current pool + peerlist stats. Replies with
+    /// [`Response::Status`].
+    Status,
     Shutdown,
 }
 
@@ -126,6 +129,25 @@ pub enum Response {
     /// Reply to a `Fetch` request with `list: true`: the manifest's entries.
     Listed {
         entries: Vec<crate::client::ManifestEntry>,
+    },
+    /// Reply to a `Status` request: current pool + peerlist stats.
+    Status {
+        /// Configured target pool size (`--pool-size`).
+        pool_target: usize,
+        /// Total entries currently in the pool (includes tombstoned /
+        /// dead-skip entries not yet pruned).
+        pool_len: usize,
+        /// Entries whose underlying libp2p session is alive right now
+        /// (driver task open AND not in the dead-skip window). This is
+        /// the real "connected peers" number.
+        live_count: usize,
+        /// Total peers in the daemon's in-memory peerlist.
+        peerlist_total: usize,
+        /// Peers with a dialable underlay in the peerlist (dial candidates).
+        peerlist_dialable: usize,
+        /// Whether the lazy pool has been built yet (false before the
+        /// eager fill / first request completes).
+        pool_initialized: bool,
     },
     Ok,
     Err {
@@ -500,6 +522,30 @@ async fn handle_conn(
                 Err(e) => Response::Err {
                     message: format!("save: {e}"),
                 },
+            }
+        }
+        Request::Status => {
+            let (pool_len, live_count, pool_initialized) = {
+                match state.pool.read().await.as_ref() {
+                    Some(p) => (p.len(), p.live_count(), true),
+                    None => (0, 0, false),
+                }
+            };
+            let (peerlist_total, peerlist_dialable) = {
+                let peers = state.peers.read().await;
+                let dialable = peers
+                    .iter()
+                    .filter(|p| p.first_dialable_underlay().is_some())
+                    .count();
+                (peers.len(), dialable)
+            };
+            Response::Status {
+                pool_target: state.pool_target,
+                pool_len,
+                live_count,
+                peerlist_total,
+                peerlist_dialable,
+                pool_initialized,
             }
         }
         Request::Shutdown => {
