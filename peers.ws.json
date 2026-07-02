@@ -1,17 +1,5 @@
 {
   "peers": {
-    "c09285d56fd7d62a7824d15f84c8459ad1b496e8befdcc90d19a99328728b350": {
-      "overlay": "c09285d56fd7d62a7824d15f84c8459ad1b496e8befdcc90d19a99328728b350",
-      "underlays": [
-        "/ip4/5.78.94.214/tcp/1635/tls/sni/5-78-94-214.k2k4r8pobzefjwtmnob5hb4aw8idrmzh8epsvcjo007e79s2hf8073z3.libp2p.direct/ws/p2p/QmfEugihe2Pm78YomGupdxSt46Uxgg4DLpjkzgzzeouiKg"
-      ],
-      "eth_address": null,
-      "nonce": null,
-      "last_dial_success_unix": 1782947366,
-      "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 478,
-      "consecutive_failures": 0
-    },
     "61675c04553772e0f796cce0f9014c8a39531d0449549f6e54a5767b92213723": {
       "overlay": "61675c04553772e0f796cce0f9014c8a39531d0449549f6e54a5767b92213723",
       "underlays": [
@@ -19,69 +7,57 @@
       ],
       "eth_address": null,
       "nonce": null,
-      "last_dial_success_unix": 1782947366,
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 990,
+      "last_dial_rtt_ms": 316,
       "consecutive_failures": 0
     },
-    "02ee51dfdb898cf15450b302662fa7a16644a36976dfe3feb81e4b811a5eea41": {
-      "overlay": "02ee51dfdb898cf15450b302662fa7a16644a36976dfe3feb81e4b811a5eea41",
+    "c09285d56fd7d62a7824d15f84c8459ad1b496e8befdcc90d19a99328728b350": {
+      "overlay": "c09285d56fd7d62a7824d15f84c8459ad1b496e8befdcc90d19a99328728b350",
       "underlays": [
-        "/ip4/126.108.216.112/tcp/1635/tls/sni/126-108-216-112.k2k4r8novlzzfbrx3cub8u6iyuccliun26jfu4rd9jxbp3osil4fyak8.libp2p.direct/ws/p2p/QmZt3Migk2xknRxt3T2KdG53LiL518qELobxsZXEYh5nuV"
+        "/ip4/5.78.94.214/tcp/1635/tls/sni/5-78-94-214.k2k4r8pobzefjwtmnob5hb4aw8idrmzh8epsvcjo007e79s2hf8073z3.libp2p.direct/ws/p2p/QmfEugihe2Pm78YomGupdxSt46Uxgg4DLpjkzgzzeouiKg"
       ],
       "eth_address": null,
-      "nonce": "440c000000000000000000000000000000000000000000000000000000000000",
-      "last_dial_success_unix": 1782947366,
+      "nonce": null,
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2014,
+      "last_dial_rtt_ms": 1174,
       "consecutive_failures": 0
     },
-    "00fe18660210d9adb2823b687b32f0cd119858347bc5a6e87b52991cc9b68c94": {
-      "overlay": "00fe18660210d9adb2823b687b32f0cd119858347bc5a6e87b52991cc9b68c94",
+    "8095aec9ed7d1689b88c36bbc7afa3ffd527e5df51363c23ea492a7e6c2ff068": {
+      "overlay": "8095aec9ed7d1689b88c36bbc7afa3ffd527e5df51363c23ea492a7e6c2ff068",
       "underlays": [
-        "/ip4/116.202.192.234/tcp/31704/tls/sni/116-202-192-234.k2k4r8mp1ep79ucmxf7yvt7iub4tlfbyt5w7m52bn69gocqh2i3gx759.libp2p.direct/ws/p2p/QmXC83KNSgLoZyCbMashMBStUs9gQEzXhUf7ZxNjotdoQp"
+        "/ip4/116.202.192.234/tcp/31610/tls/sni/116-202-192-234.k2k4r8lso5lnzwcpg2ahg4s0r9tp8a8k9iqwt6tvwskecf4b0u4u3rr0.libp2p.direct/ws/p2p/QmUmJXThPhZCPbXqitGxHYxwy1zGKs4yymWmX2VUduELmH"
       ],
       "eth_address": null,
-      "nonce": "0605000000000000000000000000000000000000000000000000000000000000",
-      "last_dial_success_unix": 1782947366,
+      "nonce": "c60a000000000000000000000000000000000000000000000000000000000000",
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2264,
+      "last_dial_rtt_ms": 1537,
       "consecutive_failures": 0
     },
-    "4c4ff703f9f3c47a5963c2213447a1bd94d02528ce7ae100b9f7139a85d78151": {
-      "overlay": "4c4ff703f9f3c47a5963c2213447a1bd94d02528ce7ae100b9f7139a85d78151",
+    "2b0ad5cab63f72819e44ce3199a681f55f56828d5583a6e42380a99f91302df2": {
+      "overlay": "2b0ad5cab63f72819e44ce3199a681f55f56828d5583a6e42380a99f91302df2",
       "underlays": [
-        "/ip4/116.202.168.171/tcp/31702/tls/sni/116-202-168-171.k2k4r8o1am2qz843cmvcs5lew4tu8e9baw3m2lal22wb33ihbkg8h11b.libp2p.direct/ws/p2p/Qmap4VfpRqaf6PfmzQEwvSzyc4mQW8ps5xNALM4VhbQbRG"
+        "/ip4/116.202.168.171/tcp/31730/tls/sni/116-202-168-171.k2k4r8o9jkbb632kbb8qfnnv415yp24rrp2rk75zgavbyvhpgsy92wsy.libp2p.direct/ws/p2p/QmbRwtd9jRnnvoNDHVpZFfjzSxN3ZvcaHdbemGDuJM2Lyo"
       ],
       "eth_address": null,
-      "nonce": "b201000000000000000000000000000000000000000000000000000000000000",
-      "last_dial_success_unix": 1782947366,
+      "nonce": "870b000000000000000000000000000000000000000000000000000000000000",
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2277,
+      "last_dial_rtt_ms": 1551,
       "consecutive_failures": 0
     },
-    "01da7835afedfe4ee5c5d9e5c4b3e9cdb3a0eae0cf77a5a0b00f89c014ba942f": {
-      "overlay": "01da7835afedfe4ee5c5d9e5c4b3e9cdb3a0eae0cf77a5a0b00f89c014ba942f",
+    "1438eedd2f1c0dfec2fd2f812eee3e4b8f78bbf2c84259a37ad935e213b8bb17": {
+      "overlay": "1438eedd2f1c0dfec2fd2f812eee3e4b8f78bbf2c84259a37ad935e213b8bb17",
       "underlays": [
-        "/ip4/116.202.193.61/tcp/31613/tls/sni/116-202-193-61.k2k4r8opc0u8dz9ki3uyygswlc0v51k090j6b04rorr5hps5ipwk6v4w.libp2p.direct/ws/p2p/QmcceM3UEYRYYpkCYJFQ4o41duqeVP4M7fdcw2E8WiMf4B"
+        "/ip4/116.202.193.61/tcp/31725/tls/sni/116-202-193-61.k2k4r8jr7myvxlwcbfciedr1n59y7utecbrjnl2pawbn4ldofhce8w17.libp2p.direct/ws/p2p/QmPFiWsesxkSv4ZWuQX4UJC2kLeR9j18nUoNgaxirhEnJN"
       ],
       "eth_address": null,
-      "nonce": "3300000000000000000000000000000000000000000000000000000000000000",
-      "last_dial_success_unix": 1782947366,
+      "nonce": "9101000000000000000000000000000000000000000000000000000000000000",
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2283,
-      "consecutive_failures": 0
-    },
-    "7c075d8ad7ae4750dce5b20911a1c9a58e936d6bec3420a15fdf43cc86f54510": {
-      "overlay": "7c075d8ad7ae4750dce5b20911a1c9a58e936d6bec3420a15fdf43cc86f54510",
-      "underlays": [
-        "/ip4/109.205.181.149/tcp/31633/tls/sni/109-205-181-149.k2k4r8o0v7s6i5ed6vdjh657kvm9261w4pf54rci6wjz1mee5cra8i6t.libp2p.direct/ws/p2p/QmanCaEatd9WLRjLCLKWLxtKU5h5gryfdCXQadQeEpF3kG"
-      ],
-      "eth_address": null,
-      "nonce": "a102000000000000000000000000000000000000000000000000000000000000",
-      "last_dial_success_unix": 1782947366,
-      "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2287,
+      "last_dial_rtt_ms": 1552,
       "consecutive_failures": 0
     },
     "155bbf20c52d6c7f62fed0503ce4352441dd9b444538cb2058f8161e9fb5c79e": {
@@ -91,9 +67,21 @@
       ],
       "eth_address": null,
       "nonce": null,
-      "last_dial_success_unix": 1782947366,
+      "last_dial_success_unix": 1782959815,
       "last_dial_failure_unix": null,
-      "last_dial_rtt_ms": 2448,
+      "last_dial_rtt_ms": 1822,
+      "consecutive_failures": 0
+    },
+    "02ee51dfdb898cf15450b302662fa7a16644a36976dfe3feb81e4b811a5eea41": {
+      "overlay": "02ee51dfdb898cf15450b302662fa7a16644a36976dfe3feb81e4b811a5eea41",
+      "underlays": [
+        "/ip4/126.108.216.112/tcp/1635/tls/sni/126-108-216-112.k2k4r8novlzzfbrx3cub8u6iyuccliun26jfu4rd9jxbp3osil4fyak8.libp2p.direct/ws/p2p/QmZt3Migk2xknRxt3T2KdG53LiL518qELobxsZXEYh5nuV"
+      ],
+      "eth_address": null,
+      "nonce": "440c000000000000000000000000000000000000000000000000000000000000",
+      "last_dial_success_unix": 1782959815,
+      "last_dial_failure_unix": null,
+      "last_dial_rtt_ms": 2865,
       "consecutive_failures": 0
     }
   }
