@@ -543,6 +543,17 @@ enum Commands {
         socket: PathBuf,
     },
 
+    /// Query a running daemon's pool + peerlist stats: how many peer
+    /// sessions are live right now vs the configured `--pool-size`
+    /// target, and how many dial candidates the peerlist holds. Use
+    /// this to see whether the pool is filling toward target or capped.
+    #[cfg(unix)]
+    Status {
+        /// Unix socket path of the running daemon.
+        #[arg(long, value_name = "PATH")]
+        socket: PathBuf,
+    },
+
     /// Search for a vanity overlay nonce that targets bee mainnet's
     /// kademlia bin structure.
     ///
@@ -1953,6 +1964,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 hoverfly::daemon::Response::Err { message } => {
                     return Err(format!("daemon refused save: {message}").into());
+                }
+                other => {
+                    return Err(format!("unexpected daemon response: {other:?}").into());
+                }
+            }
+        }
+
+        Commands::Status { socket } => {
+            let resp = hoverfly::daemon::call(&socket, &hoverfly::daemon::Request::Status)
+                .await
+                .map_err(|e| format!("daemon call failed: {e}"))?;
+            match resp {
+                hoverfly::daemon::Response::Status {
+                    pool_target,
+                    pool_len,
+                    live_count,
+                    peerlist_total,
+                    peerlist_dialable,
+                    pool_initialized,
+                } => {
+                    if !pool_initialized {
+                        println!("pool: not yet initialized (eager fill still running or no request served)");
+                    } else {
+                        println!(
+                            "pool: {live_count} live / {pool_len} entries / {pool_target} target"
+                        );
+                        if live_count < pool_target {
+                            println!(
+                                "  note: {live_count} < {pool_target} target — pool is under target \
+                                 (peers being pruned faster than refilled, or peerlist too thin)"
+                            );
+                        }
+                    }
+                    println!("peerlist: {peerlist_dialable} dialable / {peerlist_total} total");
+                }
+                hoverfly::daemon::Response::Err { message } => {
+                    return Err(format!("daemon error: {message}").into());
                 }
                 other => {
                     return Err(format!("unexpected daemon response: {other:?}").into());
