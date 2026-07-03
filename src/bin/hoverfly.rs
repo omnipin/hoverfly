@@ -1985,7 +1985,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     pool_initialized,
                 } => {
                     if !pool_initialized {
-                        println!("pool: not yet initialized (eager fill still running or no request served)");
+                        println!(
+                            "pool: not yet initialized (eager fill still running or no request served)"
+                        );
                     } else {
                         println!(
                             "pool: {live_count} live / {pool_len} entries / {pool_target} target"

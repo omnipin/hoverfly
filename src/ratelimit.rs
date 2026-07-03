@@ -245,7 +245,10 @@ mod tests {
         let p = peer();
         // Peeking an untouched bucket is zero and leaves it untouched.
         assert_eq!(l.peek(&p), Duration::ZERO);
-        assert_eq!(l.reserve_bounded(p, Duration::from_secs(1)), Ok(Duration::ZERO));
+        assert_eq!(
+            l.reserve_bounded(p, Duration::from_secs(1)),
+            Ok(Duration::ZERO)
+        );
     }
 
     #[test]
