@@ -275,6 +275,12 @@ pub async fn run(
     // kademlia tables for retrieval routing.
     let cfg = crate::TransportConfig {
         timeout: op_timeout,
+        // Decoupled from op_timeout: keep warm-pool connections that carry no
+        // substreams between pushes from being self-closed by the swarm after
+        // ~op_timeout. Long so hoverfly never ends an otherwise-live
+        // connection; bee's RST remains the only closer. See PERFORMANCE.md
+        // warm-pool notes.
+        idle_timeout: std::time::Duration::from_secs(600),
         dial_timeout,
         network_id,
         advertise: listen.as_ref().and_then(|lc| lc.advertise.clone()),
@@ -392,23 +398,37 @@ pub async fn run(
             }
             // Maintenance tick. Bee RSTs most random-overlay
             // connections within seconds (see PERFORMANCE.md "Session-
-            // death cause" + "Vanity overlay"), so naïve top-up-to-
-            // target dials more pruned peers than the deep-bin
-            // anchors can ever offset, saturating dial parallelism
-            // and competing with chunk pushsync streams for the
-            // per-IP libp2p rate limit (bee 10 RPS / burst 40 per
-            // /32). Two countermeasures:
+            // death cause"), so the pool bleeds out continuously. The
+            // fix is bee's own model (`pkg/topology/kademlia` manage
+            // loop): re-dial FAST so we out-pace the churn, rather than
+            // slowly and losing ground. A light bee holds ~137 outbound
+            // connections this way by refilling its bins every 15 s +
+            // on every disconnect.
             //
-            // - **Long interval** (5 min, not 30 s): give bee's
-            //   per-IP rate limiter time to refill between bursts,
-            //   and don't run maintenance while an upload is in
-            //   flight (5 min > most upload durations).
-            // - **Bounded refill** (`maintain_pool` only adds up to
-            //   `pool_target / 8` new dials per tick): a 256-target
-            //   pool can lose 32 entries per tick and recover within
-            //   one tick, but never schedules 200+ simultaneous
-            //   dials that would starve uploads.
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(300));
+            // The old 5-min interval was chosen to avoid bee's per-IP
+            // rate limiter, but that concern is now handled elsewhere:
+            // the per-peer parking limiter (`ratelimit::DialRateLimiter`)
+            // paces re-dials to the SAME peer, and maintenance dials
+            // FRESH peers (`top_up` excludes overlays already in the
+            // pool) which hit DIFFERENT bee nodes — each of which
+            // rate-limits our /32 independently, so a burst of N dials
+            // to N distinct nodes isn't throttled. `top_up`'s downstream
+            // `SESSION_DIAL_PARALLELISM` cap bounds the in-flight dials.
+            //
+            // Interval is `HOVERFLY_MAINTENANCE_SECS` (default 3 s). Fast +
+            // capped-per-tick (see `maintain_pool`) so refills are SPREAD
+            // over time: dialing the whole deficit in one burst makes the
+            // cohort connect together and get RST together, producing a
+            // 137<->0 sawtooth. A steady trickle desynchronises deaths into
+            // a stable floor. A 1 s tick over-dials the redial treadmill (bee
+            // RSTs non-participants in ~15 s) and steals push CPU from active
+            // uploads on small hosts; 3 s keeps the floor without the tax.
+            let maint_secs: u64 = std::env::var("HOVERFLY_MAINTENANCE_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .filter(|n: &u64| *n > 0)
+                .unwrap_or(3);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(maint_secs));
             tick.tick().await; // skip the immediate-tick semantics
             loop {
                 tick.tick().await;
@@ -1086,21 +1106,22 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
             "pool maintenance: {} live, no top-up needed", after_prune);
         return Ok(());
     }
-    // Cap per-tick refill at `target / 8` (e.g. 32 new dials for a
-    // 256-target pool). A 5-minute tick interval at 32 dials per
-    // tick gives ~6 dials/min sustained, well under bee's per-IP
-    // burst limit (40 / 4 s). The pool converges to steady-state
-    // over a handful of ticks rather than spamming bee's rate
-    // limiter into temporary blocklisting.
+    // Spread the refill: add at most `target/8` fresh sessions per tick.
+    // With the fast (1 s) tick this trickles the pool back up to target
+    // over a handful of ticks rather than dialing the whole deficit at
+    // once — the burst is what synchronises the cohort's lifetimes and
+    // produces the sawtooth. `target/8` at 1 s (e.g. 17/s for target 137)
+    // comfortably out-paces the observed death rate while keeping in-flight
+    // dials bounded (also capped downstream by `SESSION_DIAL_PARALLELISM`).
     let max_per_tick = (target / 8).max(8);
     let refill_target = (after_prune + max_per_tick).min(target);
-    info!(target: "hoverfly::daemon",
-        "pool maintenance: pruned {} dead, {} live, topping up to {} (cap {} per tick)",
+    debug!(target: "hoverfly::daemon",
+        "pool maintenance: pruned {} dead, {} live, topping up to {} (+{}/tick)",
         pruned, after_prune, refill_target, max_per_tick);
     // Step 2: dial fresh peers to refill.
     let peers = state.peers.read().await;
     let added = pool.top_up(&state.transport, &*peers, refill_target).await;
-    info!(target: "hoverfly::daemon",
+    debug!(target: "hoverfly::daemon",
         "pool maintenance: added {} session(s), pool now {}",
         added, pool.len());
     Ok(())

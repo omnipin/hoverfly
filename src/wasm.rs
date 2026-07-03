@@ -221,6 +221,7 @@ impl HoverflyClient {
         };
         let cfg = TransportConfig {
             timeout,
+            idle_timeout: Duration::from_secs(600),
             // Browsers need a far larger dial budget than native: a single dial
             // covers DNS + the browser's own TLS + WS upgrade to the AutoTLS
             // `wss://<sni>.libp2p.direct` endpoint, then Noise + Yamux + identify
