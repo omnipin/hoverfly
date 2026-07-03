@@ -459,10 +459,18 @@ enum Commands {
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
         peerlist: PathBuf,
 
-        /// Target size of the warm session pool. The daemon dials this
-        /// many sessions on the first upload and keeps them open
-        /// (auto-rotated via pre-warm) for all subsequent requests.
-        #[arg(long, default_value_t = 16)]
+        /// Target size of the warm session pool. The daemon eagerly dials
+        /// this many sessions on startup and a fast maintenance loop keeps
+        /// the pool topped up for all subsequent requests.
+        ///
+        /// Default 256 = the documented throughput operating point (pool
+        /// 128 ≈ 665 KiB/s, 256 ≈ 1055 on a VPS; see PERFORMANCE.md). The
+        /// maintenance loop now holds a big pool near target, so a large
+        /// default is worthwhile rather than the old minimal 16 that churned
+        /// down to a handful of live sessions. Lower it (e.g. 64) on a
+        /// resource-constrained box: 256 outbound connections ≈ 256 fds plus
+        /// a steady ~target/8 dials/sec of maintenance traffic.
+        #[arg(long, default_value_t = 256)]
         pool_size: usize,
 
         /// (Experimental) libp2p multiaddr to bind an inbound

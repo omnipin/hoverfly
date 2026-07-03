@@ -117,8 +117,8 @@ graceful failure handling.
   `DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64` (`--substream-upgrade-cap`).
   This alone moved a 222-peer residential run from ~75 → ~133 KiB/s.
 - **Session pool** (`client.rs::SessionPool`). `--concurrency`
-  (`DEFAULT_UPLOAD_CONCURRENCY = 8` one-shot; daemon `--pool-size` default 16,
-  recommended 256) controls target pool size. The per-chunk dispatcher picks
+  (`DEFAULT_UPLOAD_CONCURRENCY = 8` one-shot; daemon `--pool-size` default 256,
+  the throughput operating point) controls target pool size. The per-chunk dispatcher picks
   the closest-by-proximity session for routing.
 - **Address-space spread** (`client.rs::spread_across_address_space`). Pool
   candidates are bucketed by leading overlay byte (256 bins) and
@@ -156,11 +156,15 @@ graceful failure handling.
   daemon owns a warm `SessionPool`, reused across uploads. It does an **eager
   pool fill on startup** (background task, not lazy on first upload), so the
   pool-fill cost is paid once and the first request is fast too. A background
-  **maintenance loop** (5-min tick) prunes dead entries and refills up to
-  `pool_target / 8` new dials per tick — bounded so maintenance never
-  schedules hundreds of simultaneous dials that would starve uploads or trip
-  bee's per-IP rate limit. `--pool-size` default is a minimal 16; the
-  documented operating point is 256 (see "Recommended config").
+  **maintenance loop** (fast 1-s tick, `HOVERFLY_MAINTENANCE_SECS`) prunes
+  dead entries and trickles up to `pool_target / 8` fresh dials per tick. The
+  fast+spread cadence out-paces bee's continuous RSTs and *desynchronises*
+  connection deaths, holding a big pool near target (measured: ~95-105 live at
+  target 137 vs 2-6 under the old 5-min tick); the per-peer parking limiter +
+  fresh-peer (distinct-node) selection keep it under bee's per-node dial limit.
+  Connections stay via a decoupled long `idle_timeout` (600 s) so the swarm
+  doesn't self-close warm, substream-idle connections. `--pool-size` default
+  is 256 (the throughput operating point).
 
 ### Per-chunk dispatch
 
