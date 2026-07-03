@@ -27,6 +27,7 @@ pub mod client;
 pub mod feed;
 pub mod manifest;
 pub mod protocols;
+pub mod ratelimit;
 pub mod transport;
 
 #[cfg(target_arch = "wasm32")]
