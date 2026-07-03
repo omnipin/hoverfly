@@ -415,17 +415,19 @@ pub async fn run(
             // to N distinct nodes isn't throttled. `top_up`'s downstream
             // `SESSION_DIAL_PARALLELISM` cap bounds the in-flight dials.
             //
-            // Interval is `HOVERFLY_MAINTENANCE_SECS` (default 1 s). Fast +
+            // Interval is `HOVERFLY_MAINTENANCE_SECS` (default 3 s). Fast +
             // capped-per-tick (see `maintain_pool`) so refills are SPREAD
             // over time: dialing the whole deficit in one burst makes the
             // cohort connect together and get RST together, producing a
             // 137<->0 sawtooth. A steady trickle desynchronises deaths into
-            // a stable floor.
+            // a stable floor. A 1 s tick over-dials the redial treadmill (bee
+            // RSTs non-participants in ~15 s) and steals push CPU from active
+            // uploads on small hosts; 3 s keeps the floor without the tax.
             let maint_secs: u64 = std::env::var("HOVERFLY_MAINTENANCE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|n: &u64| *n > 0)
-                .unwrap_or(1);
+                .unwrap_or(3);
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(maint_secs));
             tick.tick().await; // skip the immediate-tick semantics
             loop {

@@ -156,12 +156,18 @@ graceful failure handling.
   daemon owns a warm `SessionPool`, reused across uploads. It does an **eager
   pool fill on startup** (background task, not lazy on first upload), so the
   pool-fill cost is paid once and the first request is fast too. A background
-  **maintenance loop** (fast 1-s tick, `HOVERFLY_MAINTENANCE_SECS`) prunes
+  **maintenance loop** (3-s tick, `HOVERFLY_MAINTENANCE_SECS`) prunes
   dead entries and trickles up to `pool_target / 8` fresh dials per tick. The
-  fast+spread cadence out-paces bee's continuous RSTs and *desynchronises*
+  spread cadence out-paces bee's continuous RSTs and *desynchronises*
   connection deaths, holding a big pool near target (measured: ~95-105 live at
   target 137 vs 2-6 under the old 5-min tick); the per-peer parking limiter +
   fresh-peer (distinct-node) selection keep it under bee's per-node dial limit.
+  The tick is deliberately not sub-second: at 1 s the redial treadmill (bee
+  RSTs non-participants in ~15 s) pins the daemon's CPU and *starves concurrent
+  uploads* on small hosts — on a 2-core VPS a 10 MB upload dropped from
+  ~1.06 MiB/s (pool 137) toward ~450 KiB/s (pool 300, 1-s tick). The warm pool
+  does not itself speed uploads (pushes dial the chunk neighbourhood on demand);
+  its cost must stay low enough not to compete with them.
   Connections stay via a decoupled long `idle_timeout` (600 s) so the swarm
   doesn't self-close warm, substream-idle connections. `--pool-size` default
   is 256 (the throughput operating point).
