@@ -551,6 +551,16 @@ pub struct TransportConfig {
     /// substream, one pseudosettle round-trip). Sized for round-trip
     /// latency + bee handler processing, not for connection setup.
     pub timeout: Duration,
+    /// libp2p connection idle timeout — how long a connection with no
+    /// active substreams is kept before the swarm closes it. **Decoupled
+    /// from `timeout`**: a warm pool connection carries no substreams
+    /// between pushes, so tying idle-close to the (short) op timeout made
+    /// the swarm close its own warm connections after ~30 s. A daemon
+    /// maintaining a warm pool wants this long (minutes) so hoverfly never
+    /// closes an otherwise-live connection; bee's own RST is then the only
+    /// thing that ends it. Kept short only matters for ephemeral one-shots
+    /// that don't hold a pool.
+    pub idle_timeout: Duration,
     /// Wall-clock budget for the entire `PeerSession::connect()` —
     /// libp2p dial + identify + handshake + pricing. Healthy peers
     /// finish in ≪ 1 s; dead/NAT'd ones eat the full budget. Kept
@@ -584,6 +594,7 @@ impl Default for TransportConfig {
     fn default() -> Self {
         Self {
             timeout: Duration::from_secs(30),
+            idle_timeout: Duration::from_secs(600),
             dial_timeout: Duration::from_secs(3),
             network_id: 1,
             advertise: None,
@@ -2708,7 +2719,7 @@ where
 async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> {
     let mut swarm = build_swarm_from(
         &t.keypair,
-        t.config.timeout,
+        t.config.idle_timeout,
         t.config.max_concurrent_substream_upgrades,
     )
     .await?;
@@ -2731,7 +2742,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) async fn build_swarm_from(
     keypair: &Keypair,
-    timeout: Duration,
+    idle_timeout: Duration,
     max_concurrent_substream_upgrades: usize,
 ) -> Result<Swarm<Behaviour>, TransportError> {
     use libp2p_core::{Transport as _, upgrade};
@@ -2781,7 +2792,7 @@ pub(crate) async fn build_swarm_from(
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
         .with_behaviour(|key| behaviour(key, max_concurrent_substream_upgrades))
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(timeout))
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(idle_timeout))
         .build();
     Ok(swarm)
 }
@@ -2794,7 +2805,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
     use libp2p_core::{Transport as _, upgrade};
 
     let keypair = t.keypair.clone();
-    let timeout = t.config.timeout;
+    let idle_timeout = t.config.idle_timeout;
     let max_concurrent_substream_upgrades = t.config.max_concurrent_substream_upgrades;
 
     let swarm = SwarmBuilder::with_existing_identity(keypair.clone())
@@ -2814,7 +2825,7 @@ async fn build_swarm(t: &Transport) -> Result<Swarm<Behaviour>, TransportError> 
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
         .with_behaviour(|key| behaviour(key, max_concurrent_substream_upgrades))
         .map_err(|e| TransportError::DialFailed(e.to_string()))?
-        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(timeout))
+        .with_swarm_config(|cfg| cfg.with_idle_connection_timeout(idle_timeout))
         .build();
     Ok(swarm)
 }
