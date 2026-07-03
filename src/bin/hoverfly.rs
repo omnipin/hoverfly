@@ -1193,6 +1193,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cfg = TransportConfig {
         timeout: Duration::from_secs(cli.timeout),
+        // Long idle timeout so warm connections aren't self-closed between
+        // ops; harmless for one-shots (connections are busy during upload).
+        idle_timeout: Duration::from_secs(600),
         dial_timeout: Duration::from_secs(cli.dial_timeout),
         network_id: cli.network_id,
         advertise: None,
