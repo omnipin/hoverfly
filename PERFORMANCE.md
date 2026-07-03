@@ -511,6 +511,51 @@ unaffected (it keeps live sessions). Open follow-ups: shorten
 lockout for peers that only ever failed once; probe-on-fill retry of
 recently-failed peers.
 
+## Single-swarm collapse (built, measured, regressed ~100%, removed)
+
+Hypothesis (from `nxm-rs/vertex`, which runs one swarm): collapse the
+per-peer `Swarm` (`PeerSession` = one whole swarm + one `SessionDriver` each,
+N swarms at pool 256-512) into **one shared swarm** owned by a single driver
+task, with `PeerConn` handles opening substreams to any peer via the vendored
+`stream_pool::Control`. Motivation: FD count ≈ `connections + 1` instead of
+per-swarm overhead ×N, one identify/ping/transport stack, one task.
+
+Built it end-to-end (`SwarmDriver` owns the swarm; does dial + the identify
+"magic" + close detection + inbound-stream routing by `PeerId`; work runs in
+caller tasks via a cloned `Control`). Connect + pool-fill work great: **64/64
+sessions fill in <1 s**. Fixed a chain of real bugs found along the way —
+dial-cancellation on the shared swarm (`PeerCondition::Always` + per-peer
+dedup), a 131%-CPU driver busy-loop (removing `biased` from the `select!`),
+phantom-redial hangs (disabling `stream_pool`'s internal auto-dial), and stale
+liveness (`is_alive` reading the swarm's real connection set instead of a
+driver-set flag that lags under mass churn).
+
+**It still regresses to zero throughput.** Back-to-back A/B on the *same*
+peers / overlay / churn, non-daemon `upload peers.seed.json` (357 chunks,
+`--concurrency 64`):
+
+| Path | Result |
+|---|---|
+| Per-session (old) | **357/357 ok, upload completes** (1.4 MB, ok=357 error=0) |
+| Single-swarm (new) | **0/357** — pool collapses to ~2 live TCP; every `open_stream` fails `Canceled` / `Disconnected` |
+
+**Root cause (architectural, not a bug):** one shared swarm + one driver +
+the `stream_pool::Control` indirection cannot service ~64 connections ×
+hundreds of concurrent substream opens (buffer 128 × race 3 ≈ 384 in flight).
+Each `open_stream` hops a channel to the behaviour and only advances when the
+single driver next polls the swarm; under load, opens get cancelled and
+connections tear down. The per-session model gives every connection a
+**dedicated poller** — that turns out to be essential parallelism for this
+high-concurrency push workload, not just overhead. The FD/memory win is real
+but nets a throughput loss to zero.
+
+**Lesson:** don't bolt one swarm under the rotation pool. If single-swarm is
+ever revisited, it needs vertex's hand-rolled multiplexing `ClientHandler`
+(the behaviour *is* the poll loop, no `Control` channel indirection), which is
+a much larger rewrite — not the assumed "`stream_pool` already gets the win".
+The parking dial limiter developed alongside this (`src/ratelimit.rs`,
+`DialRateLimiter`) is independent and stays.
+
 ## SWAP / chequebook (built, tested, no measured benefit)
 
 Hypothesis (from Swarm infra): uploads 3× faster when paying peers in BZZ via

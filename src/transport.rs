@@ -49,24 +49,29 @@ pub(crate) const SWAP_PROTO: StreamProtocol = StreamProtocol::new("/swarm/swap/1
 /// — not just the daemon's inbound listener — has to accept it.
 /// See `protocols::status` docs for the rationale.
 pub(crate) const STATUS_PROTO: StreamProtocol = StreamProtocol::new("/swarm/status/1.1.3/status");
-/// Minimum interval between successive dials to the same peer-id.
-/// Bee's libp2p connection rate limiter
-/// (`pkg/p2p/libp2p/libp2p.go::connLimiter`) allows 10 RPS / burst 40
-/// per /32 source IP per bee node. Once the burst is exhausted the
-/// limiter drops further dial attempts silently, which manifests as
-/// the bee node closing the next connection mid-push.
+/// Upper bound on how long [`PeerSession::connect`] will *park* a dial
+/// under the per-peer rate limit before giving up and surfacing
+/// [`TransportError::DialTooSoon`].
 ///
-/// The dispatcher's session-rotation pattern (popular high-PO peers
-/// are rotated on essentially every connection-dead event) can hit
-/// each top-tier peer 100+ times per upload otherwise — sustained
-/// well above bee's 10 RPS limit even spread across many bees, and
+/// Bee's libp2p connection rate limiter
+/// (`pkg/p2p/libp2p/libp2p.go::connLimiter`) allows ~10 RPS / burst 40
+/// per /32 source IP per bee node. Once the burst is exhausted the
+/// limiter drops further dial attempts silently, which manifests as the
+/// bee node closing the next connection mid-push. The dispatcher's
+/// session-rotation pattern (popular high-PO peers rotated on essentially
+/// every connection-dead event) can hit each top-tier peer 100+ times
+/// per upload otherwise — sustained well above bee's limit and
 /// concentrated on the few we keep wanting back.
 ///
-/// 1 second is comfortably under any of bee's per-IP /32 limits
-/// while still leaving the rotation responsive enough that a freshly
-/// retired session's chunk can be pushed via that peer again within
-/// a chunk's typical wall-clock window.
-pub const DIAL_COOLDOWN: Duration = Duration::from_secs(1);
+/// [`crate::ratelimit::DialRateLimiter`] paces us to bee's ceiling by
+/// *parking* early redials (awaiting the minimum GCRA delay) instead of
+/// refusing them — the old flat 1 s cooldown refused, and a trace found
+/// 3065/3163 upload errors were exactly that refusal (`PERFORMANCE.md`,
+/// "Vanity overlay"). Parking is bounded here so a chunk waiting on
+/// rotation falls through to another peer rather than stalling behind a
+/// deeply-in-debt bucket; ~all real redials park for << 1 s, so this cap
+/// is only hit for a peer we have hammered far past its burst.
+pub const MAX_DIAL_PARK: Duration = Duration::from_secs(1);
 
 /// Bee's per-second refresh rate granted by pseudosettle.
 /// See `pkg/node/node.go::refreshRate`.
@@ -529,12 +534,13 @@ pub enum TransportError {
     Swap(String),
     #[error("status: {0}")]
     Status(String),
-    /// The caller asked to dial a peer that we dialed too recently.
-    /// Surfaced by [`PeerSession::connect`] when the per-peer cooldown
-    /// hasn't elapsed yet (see [`Transport::dial_cooldown_remaining`]).
-    /// The dispatcher catches this and tries a different peer for the
-    /// chunk that triggered the rotation, so the upload doesn't stall
-    /// waiting on a single peer's rate-limit window.
+    /// The per-peer dial rate limit would park this dial longer than
+    /// [`MAX_DIAL_PARK`]. Surfaced by [`PeerSession::connect`] only when a
+    /// peer's GCRA bucket is deeply in debt (hammered far past its burst);
+    /// shorter waits are parked transparently rather than refused. The
+    /// dispatcher catches this and tries a different peer for the chunk
+    /// that triggered the rotation, so the upload doesn't stall waiting on
+    /// a single peer's rate-limit window. See [`crate::ratelimit`].
     #[error("dial too soon (try again in {wait:?})")]
     DialTooSoon { wait: Duration },
 }
@@ -674,16 +680,15 @@ pub struct Transport {
     /// back to `peers.json`, so future runs skip recently-failed peers
     /// up-front. Always present so callers don't need to check.
     reachability_log: crate::peers::ReachabilityLog,
-    /// Per-peer-id last-dial timestamp. Used to enforce a minimum
-    /// interval between successive dials to the same peer so we stay
-    /// under bee's per-IP libp2p connection rate limiter
-    /// (`pkg/p2p/libp2p/libp2p.go::connLimiter` — 10 RPS, burst 40
-    /// per /32). Without this, the pool rotation pattern (popular
-    /// high-PO peers re-dialed every time their session retires)
-    /// produces 100+ dials/peer per upload and bee starts silently
-    /// dropping our connections mid-push.
-    dial_cooldown:
-        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<PeerId, web_time::Instant>>>,
+    /// Per-peer GCRA dial rate limiter. Keeps us under bee's per-IP
+    /// libp2p connection rate limiter (`pkg/p2p/libp2p/libp2p.go::connLimiter`
+    /// — ~10 RPS, burst 40 per /32) by *parking* early redials (awaiting
+    /// the minimum delay) instead of refusing them. Without this pacing,
+    /// the pool rotation pattern (popular high-PO peers re-dialed every
+    /// time their session retires) produces 100+ dials/peer per upload
+    /// and bee starts silently dropping our connections mid-push. See
+    /// [`crate::ratelimit::DialRateLimiter`] and [`MAX_DIAL_PARK`].
+    dial_limiter: std::sync::Arc<crate::ratelimit::DialRateLimiter>,
 }
 
 impl Transport {
@@ -697,9 +702,7 @@ impl Transport {
             swap: None,
             status_snapshot: None,
             reachability_log: crate::peers::new_log(),
-            dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            dial_limiter: std::sync::Arc::new(crate::ratelimit::DialRateLimiter::default()),
         }
     }
 
@@ -749,9 +752,7 @@ impl Transport {
             swap: None,
             status_snapshot: None,
             reachability_log: crate::peers::new_log(),
-            dial_cooldown: std::sync::Arc::new(std::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
+            dial_limiter: std::sync::Arc::new(crate::ratelimit::DialRateLimiter::default()),
         }
     }
 
@@ -773,18 +774,14 @@ impl Transport {
         &self.reachability_log
     }
 
-    /// How long the caller must wait before the next dial to `peer_id`
-    /// to stay under bee's per-IP connection rate limit (10 RPS / burst
-    /// 40 per /32, see `pkg/p2p/libp2p/libp2p.go`). `None` if we're
-    /// clear to dial now.
+    /// The delay a dial to `peer_id` would incur right now under the
+    /// per-peer rate limit (see [`crate::ratelimit::DialRateLimiter`]).
+    /// `None` if we're clear to dial immediately. Peek only — does **not**
+    /// reserve a slot, so the dispatcher can use it as an eligibility
+    /// pre-filter without perturbing the bucket.
     pub(crate) fn dial_cooldown_remaining(&self, peer_id: &PeerId) -> Option<Duration> {
-        let last = self.dial_cooldown.lock().ok()?.get(peer_id).copied()?;
-        let since = web_time::Instant::now().saturating_duration_since(last);
-        if since >= DIAL_COOLDOWN {
-            None
-        } else {
-            Some(DIAL_COOLDOWN - since)
-        }
+        let wait = self.dial_limiter.peek(peer_id);
+        (wait > Duration::ZERO).then_some(wait)
     }
 
     /// Same as `dial_cooldown_remaining` but takes a multiaddr.
@@ -797,13 +794,18 @@ impl Transport {
         self.dial_cooldown_remaining(&peer_id)
     }
 
-    /// Record that we are about to dial `peer_id`. Called from
-    /// [`PeerSession::connect`] after the cooldown check passes so
-    /// concurrent callers can't race past it.
-    fn note_dial(&self, peer_id: &PeerId) {
-        if let Ok(mut map) = self.dial_cooldown.lock() {
-            map.insert(*peer_id, web_time::Instant::now());
-        }
+    /// Reserve a dial slot for `peer_id`, parking (up to `max_wait`) under
+    /// the per-peer rate limit. `Ok(wait)` means the caller should
+    /// `sleep(wait)` then dial; `Err(wait)` means the required park
+    /// exceeds `max_wait` and no slot was charged (surface `DialTooSoon`).
+    /// Called from [`PeerSession::connect`]; concurrent callers serialise
+    /// on the limiter's lock so they can't race past the burst.
+    pub(crate) fn reserve_dial(
+        &self,
+        peer_id: PeerId,
+        max_wait: Duration,
+    ) -> Result<Duration, Duration> {
+        self.dial_limiter.reserve_bounded(peer_id, max_wait)
     }
 
     /// Fetch a single chunk by address. Convenience for single-shot fetches —
@@ -1041,24 +1043,30 @@ impl PeerSession {
         transport: &Transport,
         peer_addr: &Multiaddr,
     ) -> Result<Self, TransportError> {
-        // Enforce a per-peer-id minimum gap between dials. Bee
-        // libp2p (pkg/p2p/libp2p/libp2p.go::connLimiter) rate-limits
-        // inbound connections from a single /32 IP to 10 RPS / burst
-        // 40. Without this gate, the dispatcher's session-rotation
-        // pattern (popular high-PO peers retired + re-dialed on
-        // every chunk push) typically triggers 100+ dials per peer
-        // per upload — well past the bee rate limit, after which bee
-        // silently drops our connections mid-push and we cascade
-        // into more retries.
+        // Pace dials to this peer under bee's per-IP libp2p connection
+        // rate limiter (pkg/p2p/libp2p/libp2p.go::connLimiter — ~10 RPS /
+        // burst 40 per /32). The dispatcher's session-rotation pattern
+        // (popular high-PO peers retired + re-dialed on every chunk push)
+        // otherwise triggers 100+ dials per peer per upload — past bee's
+        // limit, after which bee silently drops our connections mid-push
+        // and we cascade into retries.
         //
-        // Caller surfaces this as `DialTooSoon` so the dispatcher
-        // can pick a different peer for the chunk that triggered
-        // the rotation, instead of stalling on a sleep.
+        // We *park* an early redial (await the minimum GCRA delay) rather
+        // than refuse it: the old flat-cooldown refusal made the
+        // dispatcher abandon peers bee would accept a moment later
+        // (3065/3163 upload errors were exactly that — see
+        // `ratelimit` module docs). Parking is bounded by `MAX_DIAL_PARK`:
+        // a wait beyond that still surfaces `DialTooSoon` so a chunk
+        // waiting on rotation falls through to another peer instead of
+        // stalling behind a deeply-in-debt bucket. The reservation happens
+        // OUTSIDE the `dial_timeout` budget below, so the park never eats
+        // into the connect deadline.
         let peer_id = ensure_ws(peer_addr)?;
-        if let Some(wait) = transport.dial_cooldown_remaining(&peer_id) {
-            return Err(TransportError::DialTooSoon { wait });
+        match transport.reserve_dial(peer_id, MAX_DIAL_PARK) {
+            Ok(wait) if wait > Duration::ZERO => tokio::time::sleep(wait).await,
+            Ok(_) => {}
+            Err(wait) => return Err(TransportError::DialTooSoon { wait }),
         }
-        transport.note_dial(&peer_id);
 
         // The dial phase (connect + identify + handshake + pricing) is
         // bounded by `dial_timeout`. Healthy peers finish well under 1 s;
