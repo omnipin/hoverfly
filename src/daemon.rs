@@ -1235,10 +1235,34 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
     // ensure_pool: snapshot + drop the guard before dialing — top_up's
     // dial wave can spend tens of seconds in timeouts, and holding the
     // read guard across it starves the shutdown persist (Ctrl-C hang).
+    //
+    // TIME-BOXED: top_up chases its success quota through the candidate
+    // list and, on a residential network with the good peers still in
+    // dial cooldown, a single call can grind the stale tail for 30-40 s.
+    // maintain_pool is sequential, so that freezes pruning and fresh
+    // cohorts for the whole grind — observed as entries pinned at ~90
+    // while live collapsed to single digits, then one giant prune.
+    // Cancelling at a deadline is free since the incremental sink keeps
+    // every session already opened; the next tick (≤1 s later) prunes
+    // and resumes with whatever candidates have left cooldown.
+    const TOP_UP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
     let peers_snapshot = { state.peers.read().await.clone() };
-    let added = pool
-        .top_up(&state.transport, &peers_snapshot, refill_target)
-        .await;
+    let before = pool.len();
+    let added = match tokio::time::timeout(
+        TOP_UP_DEADLINE,
+        pool.top_up(&state.transport, &peers_snapshot, refill_target),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(_elapsed) => {
+            let partial = pool.len().saturating_sub(before);
+            debug!(target: "hoverfly::daemon",
+                "pool maintenance: top_up hit {}s deadline with +{} partial",
+                TOP_UP_DEADLINE.as_secs(), partial);
+            partial
+        }
+    };
     debug!(target: "hoverfly::daemon",
         "pool maintenance: added {} session(s), pool now {}",
         added, pool.len());
