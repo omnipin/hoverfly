@@ -415,10 +415,21 @@ bin-pruned, lifting connection lifetime toward bee's ~533 s. Measured (VPS
 with open inbound port, fresh identity, advertise carried in every outbound
 handshake; A/B on the same box/binary/peerlist): listen mean ~145 live vs
 plain-daemon control ~162 over 3-4 min windows — no benefit, slight noise in
-the control's favour. Consistent with the earlier vanity-overlay result:
-bin retention appears to require actual participation (salud health +
-pullsync), not just reachability + a routable advertise. The `--listen`
-flag's "marginal help in practice" doc note stands.
+the control's favour. Consistent with the earlier vanity-overlay result.
+The `--listen` flag's "marginal help in practice" doc note stands.
+
+What retention actually keys on (evidenced, not guessed): a bee running
+`full-node: false` on the same residential laptop holds ~137 connections at
+~533 s lifetimes — no pullsync, no reserve. Honest **light registration**
+puts a peer in bee's lightnode container, exempt from bin-pruning; our
+fake-full advertisement gets bin-managed and pruned as a useless occupant in
+~10-15 s regardless of reachability. The dial economics follow: bee sustains
+137 connections on ~0.26 dials/s; our churn regime needs ~20 attempts/s for
+the same count (~80×), which datacenter networks can supply continuously
+(VPS: steady ~160) and residential networks supply in cooldown-synchronized
+bursts (laptop: sawtooth). The durable fix for laptop-class deployments, if
+ever needed, is a light-registered connection plane (stable topology) with
+full-mode sessions dialed on demand for pushes — not a smarter treadmill.
 
 ## Known limits (not bugs)
 
