@@ -402,6 +402,24 @@ loop tops the pool back up each tick. For contrast, a bee node maintains ~131
 kademlia neighbours as a structural obligation of full participation — a
 different quantity from our upload fan-out working set.
 
+The sustained live count is arithmetic — `live ≈ refill_rate × lifetime ×
+dial_success` with lifetime pinned at ~10-15 s by bee's bin-prune of
+non-participants — so the refill tick is the operative lever: at target 256,
+the 3-s tick equilibrates around ~55-70 live and the 1-s (idle-adaptive) tick
+around ~130-190 (measured on a Hetzner-adjacent VPS: mean ~160).
+
+**Negative result — `--listen`/`--identity`/`--advertise` does NOT improve
+outbound retention.** Hypothesis: a publicly-reachable, advertised,
+stable-identity daemon might be retained in bee kademlia bins instead of
+bin-pruned, lifting connection lifetime toward bee's ~533 s. Measured (VPS
+with open inbound port, fresh identity, advertise carried in every outbound
+handshake; A/B on the same box/binary/peerlist): listen mean ~145 live vs
+plain-daemon control ~162 over 3-4 min windows — no benefit, slight noise in
+the control's favour. Consistent with the earlier vanity-overlay result:
+bin retention appears to require actual participation (salud health +
+pullsync), not just reachability + a routable advertise. The `--listen`
+flag's "marginal help in practice" doc note stands.
+
 ## Known limits (not bugs)
 
 - **Bee mainnet forwarding RTT** is the per-chunk floor (~200-800 ms/hop,
