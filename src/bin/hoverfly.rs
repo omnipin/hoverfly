@@ -1860,12 +1860,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         } => {
             // Install a Ctrl-C handler that sends a shutdown request to
             // ourselves via the socket, triggering graceful peerlist save.
+            //
+            // A SECOND Ctrl-C force-exits. tokio's handler replaces the
+            // default SIGINT disposition for the process lifetime, so
+            // without this a wedged graceful path (e.g. the peerlist
+            // persist waiting on a lock) made the daemon unkillable from
+            // the terminal — every further ^C was silently swallowed.
             let sock_path = socket.clone();
             tokio::spawn(async move {
                 if tokio::signal::ctrl_c().await.is_ok() {
-                    let _ =
-                        hoverfly::daemon::call(&sock_path, &hoverfly::daemon::Request::Shutdown)
-                            .await;
+                    eprintln!("shutting down (Ctrl-C again to force-quit)…");
+                    if hoverfly::daemon::call(&sock_path, &hoverfly::daemon::Request::Shutdown)
+                        .await
+                        .is_err()
+                    {
+                        // Socket not bound yet / already gone — nothing to
+                        // shut down gracefully; don't leave an unkillable
+                        // process behind.
+                        std::process::exit(130);
+                    }
+                    if tokio::signal::ctrl_c().await.is_ok() {
+                        eprintln!("force quit");
+                        std::process::exit(130);
+                    }
                 }
             });
 

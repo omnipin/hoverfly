@@ -894,10 +894,15 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
         }
     }
 
-    let pool = {
-        let peers = state.peers.read().await;
-        Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?)
-    };
+    // Snapshot the peerlist and DROP the read guard before the dial
+    // marathon: SessionPool::open runs for minutes on a big list, and
+    // holding peers.read() across it blocks peers.write() — which the
+    // Ctrl-C shutdown path (peerlist persist) and SetPeers take. tokio's
+    // RwLock is write-preferring, so the queued writer would then stall
+    // every later reader too. Cloning ~3k peers is microseconds.
+    let peers_snapshot = { state.peers.read().await.clone() };
+    let pool =
+        Arc::new(SessionPool::open(&state.transport, &peers_snapshot, state.pool_target).await?);
     info!(target: "hoverfly::daemon",
         "warm pool: {} session(s) open", pool.len());
     // Install with an instantaneous write — the only place `pool`'s
@@ -1147,9 +1152,14 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
     debug!(target: "hoverfly::daemon",
         "pool maintenance: pruned {} dead, {} live, topping up to {} (+{}/tick)",
         pruned, after_prune, refill_target, max_per_tick);
-    // Step 2: dial fresh peers to refill.
-    let peers = state.peers.read().await;
-    let added = pool.top_up(&state.transport, &*peers, refill_target).await;
+    // Step 2: dial fresh peers to refill. Same lock rule as
+    // ensure_pool: snapshot + drop the guard before dialing — top_up's
+    // dial wave can spend tens of seconds in timeouts, and holding the
+    // read guard across it starves the shutdown persist (Ctrl-C hang).
+    let peers_snapshot = { state.peers.read().await.clone() };
+    let added = pool
+        .top_up(&state.transport, &peers_snapshot, refill_target)
+        .await;
     debug!(target: "hoverfly::daemon",
         "pool maintenance: added {} session(s), pool now {}",
         added, pool.len());
