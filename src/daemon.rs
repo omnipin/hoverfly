@@ -145,8 +145,11 @@ pub enum Response {
         peerlist_total: usize,
         /// Peers with a dialable underlay in the peerlist (dial candidates).
         peerlist_dialable: usize,
-        /// Whether the lazy pool has been built yet (false before the
-        /// eager fill / first request completes).
+        /// Whether the pool object exists yet. The eager fill installs
+        /// an (initially empty, incrementally growing) pool within the
+        /// first moments of startup, so this is `false` only for that
+        /// brief window — watch `live_count` climb toward `pool_target`
+        /// for fill progress.
         pool_initialized: bool,
     },
     Ok,
@@ -165,7 +168,25 @@ struct State {
     /// uploads. Wrapped in `RwLock<Option<Arc<SessionPool>>>` so an
     /// upload can either reuse the existing pool or (if `None`) take
     /// a write lock and build one.
+    ///
+    /// LOCKING RULE: this lock is only ever held for *instantaneous*
+    /// reads/installs — never across discover or dial awaits. The
+    /// long fill itself is serialized by [`Self::fill_lock`] instead,
+    /// so `Status` (and anything else that reads the pool) answers
+    /// immediately during the minutes-long eager fill rather than
+    /// queueing behind a writer.
     pool: RwLock<Option<Arc<SessionPool>>>,
+    /// Serializes pool *builders* (eager fill task vs first upload
+    /// racing in before the fill finishes). Holding this across the
+    /// discover+dial marathon is fine — nothing else ever waits on it
+    /// except a competing fill.
+    fill_lock: tokio::sync::Mutex<()>,
+    /// Number of client operations (uploads/fetches) currently in
+    /// flight. The maintenance loop reads this to pick its tick: fast
+    /// (1 s) while idle so the pool tracks target closely, slow (3 s+)
+    /// while an op runs so refill dials don't steal push/fetch CPU —
+    /// the reason the slow tick exists at all.
+    active_ops: std::sync::atomic::AtomicUsize,
     /// Target pool size — daemon owner picks this once at startup.
     pool_target: usize,
     /// Shared chunk cache populated by every upload (and optionally
@@ -337,6 +358,8 @@ pub async fn run(
         peers: RwLock::new(peers),
         peerlist_path: peerlist_path.clone(),
         pool: RwLock::new(None),
+        fill_lock: tokio::sync::Mutex::new(()),
+        active_ops: std::sync::atomic::AtomicUsize::new(0),
         pool_target,
         cache: cache.clone(),
         doh,
@@ -415,23 +438,31 @@ pub async fn run(
             // to N distinct nodes isn't throttled. `top_up`'s downstream
             // `SESSION_DIAL_PARALLELISM` cap bounds the in-flight dials.
             //
-            // Interval is `HOVERFLY_MAINTENANCE_SECS` (default 3 s). Fast +
-            // capped-per-tick (see `maintain_pool`) so refills are SPREAD
-            // over time: dialing the whole deficit in one burst makes the
-            // cohort connect together and get RST together, producing a
-            // 137<->0 sawtooth. A steady trickle desynchronises deaths into
-            // a stable floor. A 1 s tick over-dials the redial treadmill (bee
-            // RSTs non-participants in ~15 s) and steals push CPU from active
-            // uploads on small hosts; 3 s keeps the floor without the tax.
-            let maint_secs: u64 = std::env::var("HOVERFLY_MAINTENANCE_SECS")
+            // ADAPTIVE interval. The sustained live count is pure
+            // arithmetic: live ≈ (refill/tick ÷ tick_secs) × lifetime ×
+            // dial-success — and bee RSTs non-participant connections in
+            // ~10-15 s, so at target 256 with 32/tick the 3 s tick
+            // equilibrates around ~60-70 live while the 1 s tick reaches
+            // ~150-200. The ONLY reason a slow tick exists is that refill
+            // dials steal push/fetch CPU from active operations on small
+            // hosts (measured: daemon at 139% CPU starved a concurrent
+            // upload to ~0). So: tick FAST (1 s) while idle — the pool
+            // tracks target closely and topology stays hot off the cache
+            // — and back off to `HOVERFLY_MAINTENANCE_SECS` (default 3 s)
+            // only while a client op is actually in flight.
+            let busy_secs: u64 = std::env::var("HOVERFLY_MAINTENANCE_SECS")
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .filter(|n: &u64| *n > 0)
                 .unwrap_or(3);
-            let mut tick = tokio::time::interval(std::time::Duration::from_secs(maint_secs));
-            tick.tick().await; // skip the immediate-tick semantics
+            let idle_secs = busy_secs.min(1);
             loop {
-                tick.tick().await;
+                let secs = if state.active_ops.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                    busy_secs
+                } else {
+                    idle_secs
+                };
+                tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
                 if let Err(e) = maintain_pool(&state).await {
                     debug!(target: "hoverfly::daemon",
                         "pool maintenance tick failed: {e}");
@@ -515,17 +546,37 @@ async fn handle_conn(
         Some(r) => r,
         None => return Ok(()),
     };
+    // RAII marker for "a client op is running" — the maintenance loop
+    // slows its tick while any are live so refill dials don't compete
+    // with push/fetch work for CPU.
+    struct OpGuard(Arc<State>);
+    impl Drop for OpGuard {
+        fn drop(&mut self) {
+            self.0
+                .active_ops
+                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    fn op_guard(s: &Arc<State>) -> OpGuard {
+        s.active_ops
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        OpGuard(s.clone())
+    }
     // Upload optionally streams `Progress` frames before its terminal
     // frame, so it owns the stream directly and returns once the final
     // frame is written. Every other op produces a single response we
     // write below.
     if let Request::Upload(r) = req {
+        let _op = op_guard(&state);
         return handle_upload_streaming(&state, r, &mut stream).await;
     }
     let response = match req {
         Request::Ping => Response::Pong,
         Request::Upload(_) => unreachable!("handled above"),
-        Request::Fetch(r) => handle_fetch(&state, r).await,
+        Request::Fetch(r) => {
+            let _op = op_guard(&state);
+            handle_fetch(&state, r).await
+        }
         Request::ReloadPeers => {
             let new_peers = PeerStore::load_or_create(&state.peerlist_path);
             *state.peers.write().await = new_peers;
@@ -769,12 +820,36 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
             }
         }
     }
-    let mut guard = state.pool.write().await;
-    if let Some(p) = guard.as_ref() {
-        if !p.is_empty() {
-            return Ok(p.clone());
+    // Serialize BUILDERS on the dedicated fill lock, NOT on
+    // `state.pool`'s write half. The fill below (multi-round discover +
+    // the dial marathon) can take minutes on a cold peerlist; holding
+    // `pool.write()` across it starves every `pool.read()` in the
+    // daemon — most visibly `hoverfly status`, which hung until the
+    // eager fill finished instead of reporting `pool_initialized:
+    // false` immediately (the exact state that field exists for).
+    let _fill = state.fill_lock.lock().await;
+    // Re-check under the fill lock: a competing builder (eager fill vs
+    // first upload) may have installed the pool while we waited.
+    {
+        let guard = state.pool.read().await;
+        if let Some(p) = guard.as_ref() {
+            if !p.is_empty() {
+                return Ok(p.clone());
+            }
         }
     }
+
+    // INCREMENTAL install, before anything slow: put an empty pool in
+    // shared state now and let `top_up` (below) append each session the
+    // moment its dial succeeds. Status then reports live fill progress
+    // ("37 live / 256 target") through the pre-fill discover AND the
+    // dial run — instead of "not yet initialized" until the very last
+    // dial — and an upload arriving mid-fill can start pushing against
+    // the partial pool. Concurrent maintenance ticks are kept out by
+    // `fill_lock` (held here; the tick try-locks and skips while a fill
+    // is running), so nothing double-dials the below-target pool.
+    let pool = Arc::new(SessionPool::new());
+    *state.pool.write().await = Some(pool.clone());
 
     // Multi-round discover before pool fill, so we dial fresh peers
     // instead of stale file entries. The discover happens under the
@@ -869,11 +944,39 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
         }
     }
 
-    let peers = state.peers.read().await;
-    let pool = Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?);
+    // Snapshot the peerlist and DROP the read guard before the dial
+    // marathon: the fill runs for minutes on a big list, and holding
+    // peers.read() across it blocks peers.write() — which the Ctrl-C
+    // shutdown path (peerlist persist) and SetPeers take. tokio's
+    // RwLock is write-preferring, so the queued writer would then stall
+    // every later reader too. Cloning ~3k peers is microseconds.
+    let peers_snapshot = { state.peers.read().await.clone() };
+    // Bootstrap fill only: open the first sessions here (fast — rank-0
+    // cache peers connect in ~1 s) and hand the climb to target over to
+    // the fast-tick maintenance loop. Chasing `pool_target` CUMULATIVE
+    // successes in one shot is counterproductive: the fill holds
+    // fill_lock for its whole run so no pruning happens, early cohorts
+    // die (~10-15 s bee RST of non-participants) while the fill grinds
+    // the stale candidate tail, and the "completed" pool arrives mostly
+    // dead — observed: 256 entries / 3 live, followed by one giant
+    // prune to 1. A 64-session bootstrap is live in seconds; the 1 s
+    // idle maintenance tick then ramps and *sustains* the equilibrium.
+    const EAGER_FILL_BOOTSTRAP: usize = 64;
+    let bootstrap = state.pool_target.min(EAGER_FILL_BOOTSTRAP);
+    let added = pool
+        .top_up(&state.transport, &peers_snapshot, bootstrap)
+        .await;
+    if added == 0 && pool.is_empty() {
+        // Nothing dialable (offline / dead peerlist). Uninstall so the
+        // next ensure_pool attempt rebuilds instead of every caller
+        // finding a permanently-empty "initialized" pool.
+        *state.pool.write().await = None;
+        return Err(ClientError::NoPeers(
+            "pool fill opened 0 sessions (peerlist unreachable?)".into(),
+        ));
+    }
     info!(target: "hoverfly::daemon",
         "warm pool: {} session(s) open", pool.len());
-    *guard = Some(pool.clone());
     Ok(pool)
 }
 
@@ -1093,6 +1196,16 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
             None => return Ok(()),
         }
     };
+    // Skip the tick while a fill is running (the eager fill — or an
+    // upload-triggered ensure_pool — holds fill_lock for its whole
+    // duration). Since fills now install the pool BEFORE filling, the
+    // tick would otherwise see a below-target pool mid-fill and launch
+    // a second dial wave over an overlapping candidate set. Holding the
+    // guard across our own top_up also serializes maintenance against
+    // any fill that starts mid-tick.
+    let Ok(_fill_guard) = state.fill_lock.try_lock() else {
+        return Ok(());
+    };
     // Step 1: garbage-collect dead entries. Bee RSTs the majority of
     // our random-overlay-PO=0 connections within seconds of handshake
     // (see PERFORMANCE.md "Session-death cause"); without pruning,
@@ -1118,9 +1231,38 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
     debug!(target: "hoverfly::daemon",
         "pool maintenance: pruned {} dead, {} live, topping up to {} (+{}/tick)",
         pruned, after_prune, refill_target, max_per_tick);
-    // Step 2: dial fresh peers to refill.
-    let peers = state.peers.read().await;
-    let added = pool.top_up(&state.transport, &*peers, refill_target).await;
+    // Step 2: dial fresh peers to refill. Same lock rule as
+    // ensure_pool: snapshot + drop the guard before dialing — top_up's
+    // dial wave can spend tens of seconds in timeouts, and holding the
+    // read guard across it starves the shutdown persist (Ctrl-C hang).
+    //
+    // TIME-BOXED: top_up chases its success quota through the candidate
+    // list and, on a residential network with the good peers still in
+    // dial cooldown, a single call can grind the stale tail for 30-40 s.
+    // maintain_pool is sequential, so that freezes pruning and fresh
+    // cohorts for the whole grind — observed as entries pinned at ~90
+    // while live collapsed to single digits, then one giant prune.
+    // Cancelling at a deadline is free since the incremental sink keeps
+    // every session already opened; the next tick (≤1 s later) prunes
+    // and resumes with whatever candidates have left cooldown.
+    const TOP_UP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+    let peers_snapshot = { state.peers.read().await.clone() };
+    let before = pool.len();
+    let added = match tokio::time::timeout(
+        TOP_UP_DEADLINE,
+        pool.top_up(&state.transport, &peers_snapshot, refill_target),
+    )
+    .await
+    {
+        Ok(n) => n,
+        Err(_elapsed) => {
+            let partial = pool.len().saturating_sub(before);
+            debug!(target: "hoverfly::daemon",
+                "pool maintenance: top_up hit {}s deadline with +{} partial",
+                TOP_UP_DEADLINE.as_secs(), partial);
+            partial
+        }
+    };
     debug!(target: "hoverfly::daemon",
         "pool maintenance: added {} session(s), pool now {}",
         added, pool.len());

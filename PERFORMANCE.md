@@ -402,6 +402,35 @@ loop tops the pool back up each tick. For contrast, a bee node maintains ~131
 kademlia neighbours as a structural obligation of full participation — a
 different quantity from our upload fan-out working set.
 
+The sustained live count is arithmetic — `live ≈ refill_rate × lifetime ×
+dial_success` with lifetime pinned at ~10-15 s by bee's bin-prune of
+non-participants — so the refill tick is the operative lever: at target 256,
+the 3-s tick equilibrates around ~55-70 live and the 1-s (idle-adaptive) tick
+around ~130-190 (measured on a Hetzner-adjacent VPS: mean ~160).
+
+**Negative result — `--listen`/`--identity`/`--advertise` does NOT improve
+outbound retention.** Hypothesis: a publicly-reachable, advertised,
+stable-identity daemon might be retained in bee kademlia bins instead of
+bin-pruned, lifting connection lifetime toward bee's ~533 s. Measured (VPS
+with open inbound port, fresh identity, advertise carried in every outbound
+handshake; A/B on the same box/binary/peerlist): listen mean ~145 live vs
+plain-daemon control ~162 over 3-4 min windows — no benefit, slight noise in
+the control's favour. Consistent with the earlier vanity-overlay result.
+The `--listen` flag's "marginal help in practice" doc note stands.
+
+What retention actually keys on (evidenced, not guessed): a bee running
+`full-node: false` on the same residential laptop holds ~137 connections at
+~533 s lifetimes — no pullsync, no reserve. Honest **light registration**
+puts a peer in bee's lightnode container, exempt from bin-pruning; our
+fake-full advertisement gets bin-managed and pruned as a useless occupant in
+~10-15 s regardless of reachability. The dial economics follow: bee sustains
+137 connections on ~0.26 dials/s; our churn regime needs ~20 attempts/s for
+the same count (~80×), which datacenter networks can supply continuously
+(VPS: steady ~160) and residential networks supply in cooldown-synchronized
+bursts (laptop: sawtooth). The durable fix for laptop-class deployments, if
+ever needed, is a light-registered connection plane (stable topology) with
+full-mode sessions dialed on demand for pushes — not a smarter treadmill.
+
 ## Known limits (not bugs)
 
 - **Bee mainnet forwarding RTT** is the per-chunk floor (~200-800 ms/hop,
