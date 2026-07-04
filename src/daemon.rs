@@ -165,7 +165,19 @@ struct State {
     /// uploads. Wrapped in `RwLock<Option<Arc<SessionPool>>>` so an
     /// upload can either reuse the existing pool or (if `None`) take
     /// a write lock and build one.
+    ///
+    /// LOCKING RULE: this lock is only ever held for *instantaneous*
+    /// reads/installs — never across discover or dial awaits. The
+    /// long fill itself is serialized by [`Self::fill_lock`] instead,
+    /// so `Status` (and anything else that reads the pool) answers
+    /// immediately during the minutes-long eager fill rather than
+    /// queueing behind a writer.
     pool: RwLock<Option<Arc<SessionPool>>>,
+    /// Serializes pool *builders* (eager fill task vs first upload
+    /// racing in before the fill finishes). Holding this across the
+    /// discover+dial marathon is fine — nothing else ever waits on it
+    /// except a competing fill.
+    fill_lock: tokio::sync::Mutex<()>,
     /// Target pool size — daemon owner picks this once at startup.
     pool_target: usize,
     /// Shared chunk cache populated by every upload (and optionally
@@ -337,6 +349,7 @@ pub async fn run(
         peers: RwLock::new(peers),
         peerlist_path: peerlist_path.clone(),
         pool: RwLock::new(None),
+        fill_lock: tokio::sync::Mutex::new(()),
         pool_target,
         cache: cache.clone(),
         doh,
@@ -769,10 +782,22 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
             }
         }
     }
-    let mut guard = state.pool.write().await;
-    if let Some(p) = guard.as_ref() {
-        if !p.is_empty() {
-            return Ok(p.clone());
+    // Serialize BUILDERS on the dedicated fill lock, NOT on
+    // `state.pool`'s write half. The fill below (multi-round discover +
+    // the dial marathon) can take minutes on a cold peerlist; holding
+    // `pool.write()` across it starves every `pool.read()` in the
+    // daemon — most visibly `hoverfly status`, which hung until the
+    // eager fill finished instead of reporting `pool_initialized:
+    // false` immediately (the exact state that field exists for).
+    let _fill = state.fill_lock.lock().await;
+    // Re-check under the fill lock: a competing builder (eager fill vs
+    // first upload) may have installed the pool while we waited.
+    {
+        let guard = state.pool.read().await;
+        if let Some(p) = guard.as_ref() {
+            if !p.is_empty() {
+                return Ok(p.clone());
+            }
         }
     }
 
@@ -869,11 +894,15 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
         }
     }
 
-    let peers = state.peers.read().await;
-    let pool = Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?);
+    let pool = {
+        let peers = state.peers.read().await;
+        Arc::new(SessionPool::open(&state.transport, &*peers, state.pool_target).await?)
+    };
     info!(target: "hoverfly::daemon",
         "warm pool: {} session(s) open", pool.len());
-    *guard = Some(pool.clone());
+    // Install with an instantaneous write — the only place `pool`'s
+    // write half is taken for the fill path.
+    *state.pool.write().await = Some(pool.clone());
     Ok(pool)
 }
 
