@@ -281,6 +281,22 @@ graceful failure handling.
   aborting the upload. Mirrors bee's `pusher.DefaultRetryCount` philosophy.
   Independent of the `--max-retries` CLI flag (which is the per-attempt peer
   candidate cap, silently promoted from 0→1 and capped by live pool size).
+- **Mid-upload pool top-up** (`push_chunks_with_pool`, `HOVERFLY_PUSH_TOPUP_SECS`,
+  default 2 s). A *frozen* pool decays over a long upload: sessions die (browser
+  `/wss` fast, native TCP slowly), the live set shrinks, and the last chunks race
+  a nearly-empty pool and grind retries — the "stuck at N-1/N" tail. bee never
+  hits this because its pusher selects peers from the continuously-maintained
+  kademlia topology, not a per-upload pool. We mirror that: a loop concurrent
+  with the dispatcher prunes dead entries (`prune_dead`) and re-dials fresh peers
+  (`top_up`) back to the pool's opening size while the push runs. Gated by a
+  `maintain` flag — the one-shot CLI/browser pool passes `true` (no external
+  maintainer); the daemon passes `false`, because its own maintenance loop owns
+  upkeep and a second top-up would double-dial (the CPU-churn that starves
+  uploads on small hosts). Measured (2-core VPS, pool 16, 6 randomized paired
+  6 MB uploads, order-balanced to cancel network drift): **+74% mean throughput,
+  wins 6/6 pairs, 2-5 s slow-chunk bucket −34%**. The effect scales inversely
+  with pool size — negligible at `--concurrency 512`, large at the shipping
+  defaults (CLI/dApp pool 8).
 - **Timeouts do not retire sessions.** `is_connection_dead` deliberately
   excludes `TransportError::Timeout`. A single slow substream errors that
   chunk back to the dispatcher (which advances to the next peer) but leaves
