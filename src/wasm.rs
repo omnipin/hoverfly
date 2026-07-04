@@ -57,11 +57,15 @@ const DEFAULT_WARM_POOL: usize = 0;
 /// The native CLI defaults to 8 (`DEFAULT_UPLOAD_CONCURRENCY`) and the VPS
 /// daemon runs 256+, but the browser is different in BOTH directions:
 ///
-/// - `push_chunks_with_pool` opens this many pushsync sessions ONCE and does
-///   not top up mid-upload. In the browser, `/wss` AutoTLS underlays rotate and
-///   sessions die fast, so a small pool (8) decays to `eligible=0` partway
-///   through a multi-thousand-chunk upload and the tail spins on retries. A
-///   larger initial pool gives enough live sessions to survive the whole push.
+/// - `push_chunks_with_pool` now tops the pool up mid-upload (`maintain=true`
+///   on the one-shot path): every `HOVERFLY_PUSH_TOPUP_SECS` (default 2 s — the
+///   browser has no env, so it uses the default) it prunes dead entries and
+///   re-dials fresh peers back to the opening size. Before that the pool opened
+///   ONCE, and since `/wss` AutoTLS underlays rotate and sessions die fast, a
+///   small pool (8) decayed to `eligible=0` partway through a multi-thousand-
+///   chunk upload and the tail spun on retries. The top-up keeps the live set
+///   near this target; the larger initial size still helps warm-start but no
+///   longer has to survive the whole push on its own.
 /// - But everything multiplexes over the single browser ws+yamux driver, and
 ///   browsers cap concurrent WS connections per host, so we can't go to 256
 ///   like the VPS. 48 is the empirical sweet spot: enough live forwarders to
