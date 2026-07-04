@@ -18,7 +18,7 @@ use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    RetrievalCache, UploadFile, discover, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
+    RetrievalCache, UploadFile, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
     list_manifest_ex, upload_bytes_ex, upload_collection, upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
@@ -895,6 +895,17 @@ fn into_js_err<E: core::fmt::Display>(e: E) -> JsError {
 /// retries; the daemon must stay alive. The peer-store borrow is taken only
 /// after the `discover` await resolves and is never held across an `.await`,
 /// so it can never clash with a concurrent fetch's snapshot borrow.
+/// Discovery depth for the in-browser daemon. Round 1 asks the bootstrap
+/// (or seed peers) for hive announcements; round 2 dials the ws-dialable
+/// peers *found in round 1* for theirs. One round yields ~20-30 known
+/// peers — too few for the upload pool + mid-push top-up, which then
+/// exhausts its candidate list and refills 0 while sessions keep dying
+/// (observed: 533 KB upload grinding at pool=1-3 with 36 conn deaths).
+/// Two rounds roughly triples the ws universe for one extra ~5-15 s of
+/// background dialing; deeper than 2 hits diminishing returns because the
+/// browser can only dial the /ws[s] subset of each hive burst anyway.
+const WASM_DISCOVER_ROUNDS: usize = 2;
+
 async fn merge_discovered(
     transport: &Transport,
     doh: &Doh,
@@ -902,7 +913,9 @@ async fn merge_discovered(
     bootstrap: &Multiaddr,
     wait: Duration,
 ) {
-    match discover(transport, doh, bootstrap, wait).await {
+    match crate::client::discover_recursive(transport, doh, bootstrap, wait, WASM_DISCOVER_ROUNDS)
+        .await
+    {
         Ok(found) => {
             let n = found.len();
             let mut store = peers.borrow_mut();
