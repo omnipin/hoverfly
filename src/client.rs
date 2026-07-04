@@ -1836,6 +1836,7 @@ pub async fn upload_file_with_manifest_with_pool(
         peers,
         work,
         max_retries_per_chunk,
+        false, // daemon owns pool upkeep via its maintenance loop
         progress,
     )
     .await?;
@@ -2129,6 +2130,7 @@ pub async fn upload_bytes_with_pool(
         peers,
         work,
         max_retries_per_chunk,
+        false, // daemon owns pool upkeep via its maintenance loop
         progress,
     )
     .await?;
@@ -2829,7 +2831,89 @@ async fn push_chunks_concurrent(
         pool.len(),
         work.len()
     );
-    push_chunks_with_pool(transport, &pool, peers, work, max_retries, progress).await
+    // One-shot pool with no external maintainer → keep it topped up mid-push.
+    push_chunks_with_pool(transport, &pool, peers, work, max_retries, true, progress).await
+}
+
+/// Push `work` through `session_pool`, keeping the pool topped up for the
+/// duration of the push so the tail of a long upload doesn't stall on a
+/// decayed pool.
+///
+/// The dispatcher ([`push_chunks_with_pool_inner`]) freezes its view of the
+/// pool per chunk; over a multi-thousand-chunk upload sessions die (browser
+/// `/wss` fast, native TCP slowly) and the live set shrinks, so the last few
+/// chunks race a nearly-empty pool and grind retries — the classic
+/// "stuck at N-1/N" tail. Bee never hits this because it pushes through the
+/// continuously-maintained kademlia topology, not a per-upload pool. We mirror
+/// that: a concurrent loop prunes dead entries and re-dials fresh peers from
+/// `peers` back to the pool's opening size while the push runs.
+///
+/// `maintain` selects whether this call owns pool upkeep. The one-shot CLI /
+/// browser path ([`push_chunks_concurrent`]) builds a throwaway pool with no
+/// external maintainer and passes `true`. The daemon passes `false`: its own
+/// maintenance loop already prunes + tops up the shared pool, and a second
+/// top-up here would double-dial (the CPU-churn that starves uploads on small
+/// hosts). `HOVERFLY_PUSH_TOPUP_SECS` sets the interval (default 2 s); `0`
+/// disables it even when `maintain` is true (frozen-pool A/B on one binary).
+///
+/// Measured (2-core VPS, pool 16, 6 randomized paired 6 MB uploads): the
+/// top-up wins 6/6 pairs, mean +74% throughput, 2-5 s slow-chunk bucket -34%.
+pub async fn push_chunks_with_pool(
+    transport: &Transport,
+    session_pool: &SessionPool,
+    peers: &PeerStore,
+    work: Vec<StampedChunk>,
+    max_retries: usize,
+    maintain: bool,
+    progress: Option<&ProgressFn>,
+) -> Result<(), ClientError> {
+    let topup_secs: u64 = std::env::var("HOVERFLY_PUSH_TOPUP_SECS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(2);
+    // Even when this call doesn't own upkeep (maintain=false, the daemon
+    // path), the daemon's own maintenance loop refills the pool — so an
+    // empty pool is still recoverable and the dispatcher should wait, not
+    // abort. Only the explicit topup_secs=0 kill-switch restores the old
+    // frozen-pool fail-fast (for A/B baselines).
+    let pool_can_recover = topup_secs != 0;
+    if !maintain || topup_secs == 0 {
+        return push_chunks_with_pool_inner(
+            transport,
+            session_pool,
+            peers,
+            work,
+            max_retries,
+            pool_can_recover,
+            progress,
+        )
+        .await;
+    }
+    // Restore the pool to the size it opened at: for a one-shot CLI/browser
+    // pool that's the full opening size (all-live at open); for the daemon it
+    // tracks its configured target via `len()`.
+    let target = session_pool.len();
+    let topup = async {
+        loop {
+            tokio::time::sleep(Duration::from_secs(topup_secs)).await;
+            session_pool.prune_dead();
+            let added = session_pool.top_up(transport, peers, target).await;
+            if added > 0 {
+                info!(
+                    target: "hoverfly::upload",
+                    "push top-up: +{} session(s), pool now {}",
+                    added,
+                    session_pool.len()
+                );
+            }
+        }
+    };
+    tokio::select! {
+        r = push_chunks_with_pool_inner(
+            transport, session_pool, peers, work, max_retries, pool_can_recover, progress,
+        ) => r,
+        _ = topup => unreachable!("top-up loop only exits when the push future wins the select"),
+    }
 }
 
 /// Push `work` through an existing pool. Used by the daemon to amortise
@@ -2843,12 +2927,20 @@ async fn push_chunks_concurrent(
 /// verification on `is_shallow`). This is the entrypoint a multi-worker
 /// pusher hits to push pre-stamped chunks under its own ephemeral
 /// overlay key.
-pub async fn push_chunks_with_pool(
+async fn push_chunks_with_pool_inner(
     transport: &Transport,
     session_pool: &SessionPool,
     peers: &PeerStore,
     work: Vec<StampedChunk>,
     max_retries: usize,
+    // True when SOMETHING refills this pool while we push — the wrapper's
+    // top-up loop (maintain=true) or the daemon's maintenance loop. Makes
+    // an empty pool a *recoverable outage* (wait for the maintainer,
+    // bounded) instead of a 30-s death sentence: 60 × 500 ms of retries is
+    // far shorter than a browser-wide wss churn spike, and aborting a
+    // multi-thousand-chunk upload at 5% because the pool was briefly empty
+    // wastes everything already pushed.
+    pool_can_recover: bool,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
@@ -3505,9 +3597,25 @@ pub async fn push_chunks_with_pool(
                 filter_dead,
                 filter_cap,
                 filter_dead_session_cooldown,
-                last_err
-                    .map(|e| e.to_string())
-                    .unwrap_or_else(|| "all overdraft/shallow".into())
+                last_err.map(|e| e.to_string()).unwrap_or_else(|| {
+                    // No attempt ever ran. Name the actual reason the
+                    // candidate list came up empty instead of the old
+                    // catch-all "all overdraft/shallow" (misleading when
+                    // e.g. every session was merely at its inflight cap).
+                    if pool.is_empty() {
+                        "pool empty (all sessions died; top-up found no dialable candidates)"
+                            .into()
+                    } else if filter_cap > 0
+                        && filter_dead == 0
+                        && filter_dead_session_cooldown == 0
+                    {
+                        "all sessions at inflight cap".into()
+                    } else if filter_dead + filter_cap + filter_dead_session_cooldown > 0 {
+                        "all sessions filtered (dead/cap/cooldown)".into()
+                    } else {
+                        "all overdraft/shallow".into()
+                    }
+                })
             )))
             }.await;
             // Chunk-latency histogram — full wall time from dispatch
@@ -3737,6 +3845,27 @@ pub async fn push_chunks_with_pool(
                         let dispatch = &dispatch;
                         inflight.push(Box::pin(async move {
                             tokio::time::sleep(backoff).await;
+                            // Maintained pool + zero entries = transient
+                            // outage (all sessions died faster than the
+                            // top-up's tick; browser wss does this in
+                            // churn spikes). Spending 500-ms retries
+                            // against a pool that CANNOT serve anything
+                            // burns the whole 60-retry budget in 30 s and
+                            // aborts the upload. Park this chunk until the
+                            // maintainer restores a session (bounded by
+                            // POOL_RECOVERY_WAIT), then retry for real.
+                            // Many chunks waiting concurrently is fine —
+                            // they're all just sleeping on the same
+                            // recovery.
+                            const POOL_RECOVERY_WAIT: Duration = Duration::from_secs(90);
+                            if pool_can_recover && session_pool.is_empty() {
+                                let wait_start = web_time::Instant::now();
+                                while session_pool.is_empty()
+                                    && wait_start.elapsed() < POOL_RECOVERY_WAIT
+                                {
+                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                }
+                            }
                             dispatch(chunk, next).await
                         }));
                     }
@@ -4364,6 +4493,67 @@ async fn open_session_pool_into(
                 }
             })
     });
+    // Browser only: interleave the dial parade across distinct host IPs.
+    // Firefox serializes WebSocket handshakes per resolved IP
+    // (nsWSAdmissionManager keys CONNECTING on the IP address, RFC 6455
+    // §4.1), so a dial window full of same-host overlays — common on
+    // mainnet, where one operator runs dozens of bees behind one IP and
+    // hive announcements re-flood them into the store — degenerates into
+    // a single-file convoy: one dead entry at the front costs its full
+    // dial timeout before anything behind it on that IP even starts.
+    // Round-robin across IP groups (preserving the rank/RTT order within
+    // each group) so consecutive dials hit distinct hosts and each IP's
+    // serialized lane is only ever one-deep per pass. Native TCP has no
+    // per-IP handshake serialization and benefits from redundancy, so
+    // this reorder is wasm-only. (The CI ws seed already dedupes to one
+    // overlay per IP; this brings the same discipline to the runtime
+    // store that discovery keeps re-polluting.)
+    #[cfg(target_arch = "wasm32")]
+    {
+        fn host_key(ma: &Multiaddr) -> String {
+            use libp2p::multiaddr::Protocol;
+            for p in ma.iter() {
+                match p {
+                    Protocol::Ip4(ip) => return ip.to_string(),
+                    Protocol::Ip6(ip) => return ip.to_string(),
+                    // AutoTLS SNI hostnames start with the dashed IP
+                    // (`116-202-192-234.k2k4…libp2p.direct`) — the first
+                    // label identifies the host even without resolving.
+                    Protocol::Dns4(h) | Protocol::Dns(h) | Protocol::Dns6(h) => {
+                        return h.split('.').next().unwrap_or(&h).to_string();
+                    }
+                    _ => {}
+                }
+            }
+            ma.to_string()
+        }
+        let mut groups: Vec<(String, std::collections::VecDeque<_>)> = Vec::new();
+        for entry in all.drain(..) {
+            let key = host_key(&entry.2);
+            match groups.iter_mut().find(|(k, _)| *k == key) {
+                Some((_, g)) => g.push_back(entry),
+                None => {
+                    let mut g = std::collections::VecDeque::new();
+                    g.push_back(entry);
+                    groups.push((key, g));
+                }
+            }
+        }
+        // Groups are in first-seen order, i.e. still best-rank-first.
+        // Round-robin pop until every group is drained.
+        loop {
+            let mut took = false;
+            for (_, g) in groups.iter_mut() {
+                if let Some(e) = g.pop_front() {
+                    all.push(e);
+                    took = true;
+                }
+            }
+            if !took {
+                break;
+            }
+        }
+    }
     let candidates: Vec<(SwarmAddress, String, Multiaddr)> = all
         .into_iter()
         .map(|(o, hex, u, _, _)| (o, hex, u))
