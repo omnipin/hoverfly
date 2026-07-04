@@ -2632,6 +2632,25 @@ impl SessionPool {
         })
     }
 
+    /// An empty pool, to be filled incrementally via [`Self::top_up`].
+    /// The daemon installs one of these in shared state *before* its
+    /// eager fill so Status/uploads see the pool grow session-by-session
+    /// instead of a `None` until the last dial completes.
+    pub fn new() -> Self {
+        Self {
+            sessions: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Append one entry (instantaneous write lock). Used by the live
+    /// fill sink ([`PoolSink::Pool`]).
+    fn push_entry(&self, entry: std::sync::Arc<SessionEntry>) {
+        self.sessions
+            .write()
+            .expect("session pool rwlock poisoned")
+            .push(entry);
+    }
+
     pub fn len(&self) -> usize {
         self.sessions
             .read()
@@ -2748,18 +2767,18 @@ impl SessionPool {
         }
         let additional = target_size - current;
         let existing = self.entry_overlays();
-        let new_entries = open_session_pool_filtered(transport, peers, additional, &existing)
-            .await
-            .unwrap_or_default();
-        if new_entries.is_empty() {
-            return 0;
-        }
-        let added = new_entries.len();
-        let wrapped: Vec<std::sync::Arc<SessionEntry>> =
-            new_entries.into_iter().map(std::sync::Arc::new).collect();
-        let mut guard = self.sessions.write().expect("session pool rwlock poisoned");
-        guard.extend(wrapped);
-        added
+        // Live sink: every session lands in the pool the moment its
+        // dial succeeds, so concurrent readers (Status, dispatchers)
+        // see the fill progress instead of an all-at-the-end append.
+        open_session_pool_into(
+            transport,
+            peers,
+            additional,
+            &existing,
+            PoolSink::Pool(self),
+        )
+        .await
+        .unwrap_or(0)
     }
 }
 
@@ -4233,12 +4252,46 @@ async fn open_session_pool(
 /// (lowercase hex) is in `exclude`. Used by [`SessionPool::top_up`]
 /// for the daemon's background maintenance loop — we want to dial
 /// *new* peers, not re-dial the ones already in the pool.
+/// Where a pool fill delivers each successfully-opened session.
+///
+/// `Collect` gathers into a Vec handed over only when the fill
+/// completes — the one-shot upload path wants the full pool before it
+/// starts pushing. `Pool` appends each entry to a live [`SessionPool`]
+/// the moment its dial succeeds, so concurrent readers (the daemon's
+/// Status IPC, an upload racing the eager fill) see the pool grow in
+/// real time instead of a None/empty pool until the last dial lands.
+enum PoolSink<'a> {
+    Collect(&'a mut Vec<SessionEntry>),
+    Pool(&'a SessionPool),
+}
+
 async fn open_session_pool_filtered(
     transport: &Transport,
     peers: &PeerStore,
     max_sessions: usize,
     exclude: &std::collections::HashSet<String>,
 ) -> Result<Vec<SessionEntry>, ClientError> {
+    let mut out = Vec::with_capacity(max_sessions);
+    open_session_pool_into(
+        transport,
+        peers,
+        max_sessions,
+        exclude,
+        PoolSink::Collect(&mut out),
+    )
+    .await?;
+    Ok(out)
+}
+
+/// Core dial-window fill. Returns the number of sessions opened;
+/// entries land wherever `sink` points (see [`PoolSink`]).
+async fn open_session_pool_into(
+    transport: &Transport,
+    peers: &PeerStore,
+    max_sessions: usize,
+    exclude: &std::collections::HashSet<String>,
+    mut sink: PoolSink<'_>,
+) -> Result<usize, ClientError> {
     let log = transport.reachability_log();
     use futures::stream::{FuturesUnordered, StreamExt};
 
@@ -4390,7 +4443,7 @@ async fn open_session_pool_filtered(
         dialing.push(dial(overlay, overlay_hex, underlay));
     }
 
-    let mut sessions = Vec::with_capacity(max_sessions);
+    let mut added = 0usize;
     while let Some((overlay, overlay_hex, underlay, res, rtt_ms)) = dialing.next().await {
         match res {
             Ok(session) => {
@@ -4404,7 +4457,7 @@ async fn open_session_pool_filtered(
                         full_node: Some(session.peer_full_node()),
                     },
                 );
-                sessions.push(SessionEntry {
+                let entry = SessionEntry {
                     overlay,
                     overlay_hex,
                     underlay,
@@ -4417,12 +4470,19 @@ async fn open_session_pool_filtered(
                     push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
                     push_success_count: std::sync::atomic::AtomicU64::new(0),
                     inflight_pushes: std::sync::atomic::AtomicU32::new(0),
-                });
-                if sessions.len() % 8 == 0 || sessions.len() == max_sessions {
-                    info!(target: "hoverfly::upload",
-                        "pool fill: {}/{} sessions open", sessions.len(), max_sessions);
+                };
+                match &mut sink {
+                    PoolSink::Collect(v) => v.push(entry),
+                    // Live-append: the session is usable by concurrent
+                    // pool readers the moment it lands.
+                    PoolSink::Pool(p) => p.push_entry(std::sync::Arc::new(entry)),
                 }
-                if sessions.len() >= max_sessions {
+                added += 1;
+                if added % 8 == 0 || added == max_sessions {
+                    info!(target: "hoverfly::upload",
+                        "pool fill: {}/{} sessions open", added, max_sessions);
+                }
+                if added >= max_sessions {
                     break;
                 }
             }
@@ -4446,8 +4506,8 @@ async fn open_session_pool_filtered(
     }
     info!(target: "hoverfly::upload",
         "pool fill: done with {} session(s) ({} requested)",
-        sessions.len(), max_sessions);
-    Ok(sessions)
+        added, max_sessions);
+    Ok(added)
 }
 
 /// Quick reachability probe: dial each peer in parallel, record success/

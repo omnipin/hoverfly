@@ -145,8 +145,11 @@ pub enum Response {
         peerlist_total: usize,
         /// Peers with a dialable underlay in the peerlist (dial candidates).
         peerlist_dialable: usize,
-        /// Whether the lazy pool has been built yet (false before the
-        /// eager fill / first request completes).
+        /// Whether the pool object exists yet. The eager fill installs
+        /// an (initially empty, incrementally growing) pool within the
+        /// first moments of startup, so this is `false` only for that
+        /// brief window — watch `live_count` climb toward `pool_target`
+        /// for fill progress.
         pool_initialized: bool,
     },
     Ok,
@@ -801,6 +804,18 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
         }
     }
 
+    // INCREMENTAL install, before anything slow: put an empty pool in
+    // shared state now and let `top_up` (below) append each session the
+    // moment its dial succeeds. Status then reports live fill progress
+    // ("37 live / 256 target") through the pre-fill discover AND the
+    // dial run — instead of "not yet initialized" until the very last
+    // dial — and an upload arriving mid-fill can start pushing against
+    // the partial pool. Concurrent maintenance ticks are kept out by
+    // `fill_lock` (held here; the tick try-locks and skips while a fill
+    // is running), so nothing double-dials the below-target pool.
+    let pool = Arc::new(SessionPool::new());
+    *state.pool.write().await = Some(pool.clone());
+
     // Multi-round discover before pool fill, so we dial fresh peers
     // instead of stale file entries. The discover happens under the
     // daemon's stable signer — so when running with `--listen` +
@@ -895,19 +910,26 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
     }
 
     // Snapshot the peerlist and DROP the read guard before the dial
-    // marathon: SessionPool::open runs for minutes on a big list, and
-    // holding peers.read() across it blocks peers.write() — which the
-    // Ctrl-C shutdown path (peerlist persist) and SetPeers take. tokio's
+    // marathon: the fill runs for minutes on a big list, and holding
+    // peers.read() across it blocks peers.write() — which the Ctrl-C
+    // shutdown path (peerlist persist) and SetPeers take. tokio's
     // RwLock is write-preferring, so the queued writer would then stall
     // every later reader too. Cloning ~3k peers is microseconds.
     let peers_snapshot = { state.peers.read().await.clone() };
-    let pool =
-        Arc::new(SessionPool::open(&state.transport, &peers_snapshot, state.pool_target).await?);
+    let added = pool
+        .top_up(&state.transport, &peers_snapshot, state.pool_target)
+        .await;
+    if added == 0 && pool.is_empty() {
+        // Nothing dialable (offline / dead peerlist). Uninstall so the
+        // next ensure_pool attempt rebuilds instead of every caller
+        // finding a permanently-empty "initialized" pool.
+        *state.pool.write().await = None;
+        return Err(ClientError::NoPeers(
+            "pool fill opened 0 sessions (peerlist unreachable?)".into(),
+        ));
+    }
     info!(target: "hoverfly::daemon",
         "warm pool: {} session(s) open", pool.len());
-    // Install with an instantaneous write — the only place `pool`'s
-    // write half is taken for the fill path.
-    *state.pool.write().await = Some(pool.clone());
     Ok(pool)
 }
 
@@ -1126,6 +1148,16 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
             // soon, nothing for maintenance to do.
             None => return Ok(()),
         }
+    };
+    // Skip the tick while a fill is running (the eager fill — or an
+    // upload-triggered ensure_pool — holds fill_lock for its whole
+    // duration). Since fills now install the pool BEFORE filling, the
+    // tick would otherwise see a below-target pool mid-fill and launch
+    // a second dial wave over an overlapping candidate set. Holding the
+    // guard across our own top_up also serializes maintenance against
+    // any fill that starts mid-tick.
+    let Ok(_fill_guard) = state.fill_lock.try_lock() else {
+        return Ok(());
     };
     // Step 1: garbage-collect dead entries. Bee RSTs the majority of
     // our random-overlay-PO=0 connections within seconds of handshake
