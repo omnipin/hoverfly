@@ -21,7 +21,7 @@ path = "src/bin/sigcheck.rs"
 required-features = ["cli"]
 
 [features]
-default = ["cli", "bridge"]
+default = ["cli", "bridge", "pusher"]
 cli = ["dep:clap", "dep:tracing-subscriber", "dep:tar", "dep:indicatif"]
 # WASM thread pool (forwards to nectar-primitives/wasm-threads → wasm-bindgen-
 # rayon). OFF by default so the default wasm build needs no SharedArrayBuffer /
@@ -37,6 +37,12 @@ wasm-threads = ["nectar-primitives/wasm-threads"]
 # the alloy signing stack already pulled in for `batch.rs`); adds no new
 # dependencies.
 bridge = []
+# Pusher relay (`hoverfly pusher`, docs/pusher-design.md): an HTTP push
+# endpoint that accepts pre-signed chunks and pushes them into the swarm
+# over native libp2p. Stage A ships /v1/status + the flag-gated /v1/probe
+# self-push experiment endpoint. Native-only (hyper server); all wasm
+# builds use --no-default-features and never see it.
+pusher = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
 # Redirect futures-bounded to a vendored copy whose `Delay::tokio` falls back to
 # futures-timer on wasm32 (real tokio's timer panics in the browser). Fixes the
@@ -117,6 +123,12 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = tr
 tar = { version = "0.4", optional = true }
 indicatif = { version = "0.17", optional = true }
 getrandom = { version = "0.3", default-features = false }
+# `hoverfly pusher` HTTP server (feature "pusher"). hyper directly — three
+# routes don't justify a framework, and the streamed-NDJSON probe/ack
+# responses map 1:1 onto hyper's Frame/StreamBody model.
+hyper = { version = "1", optional = true, features = ["server", "http1"] }
+hyper-util = { version = "0.1", optional = true, features = ["tokio"] }
+http-body-util = { version = "0.1", optional = true }
 # Parallel postage stamp signing on native targets. Wasm-single-thread
 # doesn't benefit and rayon doesn't compile there anyway.
 rayon = "1"
