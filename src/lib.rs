@@ -66,6 +66,9 @@ pub mod daemon;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inbound;
 
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod pusher;
+
 pub use cache::{CachedChunk, ChunkCache};
 pub use doh::Doh;
 
