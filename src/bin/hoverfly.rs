@@ -1955,6 +1955,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 _ => load_or_create_nonce(&cli.nonce_file)?,
             };
+            let node_identity = std::env::var("HOVERFLY_PUSHER_IDENTITY")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
             hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
                 listen,
                 peerlist,
@@ -1962,6 +1965,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 nonce,
                 network_id: cli.network_id,
                 rpc_url,
+                node_identity,
                 transport: cfg,
             })
             .await?;
