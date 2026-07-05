@@ -2871,6 +2871,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "keccak-batch"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4172542d4f7233006681ac8d6ed65bf689a67e96eaa3d5dc27655d513fccb8cc"
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3450,9 +3456,9 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "nectar-mantaray"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "75c174d7ac3b6d10553ddec6b76d3d27ebbeeb51b1584218c5e50ce0debd3751"
+checksum = "ae51cfb3659e761cb6b2d02fb853eb05c4e1edb9cabd854a0da4aa2bee308864"
 dependencies = [
  "alloy-primitives",
  "bitflags",
@@ -3466,9 +3472,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-postage"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "af24f6d250c971698fec2b653460f0a6ec07a8a8c0091905392937240f73b5d7"
+checksum = "e14774530b8b43845f223bf5de8b24e66dd70eeec76f5c111e9dccd3fccf02c7"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3482,9 +3488,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-postage-issuer"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a55ff4403c4def299ea8a6f45ed1ea2bff5ebfad4a1cfa42c52c97ccda3e4302"
+checksum = "c64ff5c1edbf330c263ebe825ca39825f245686c0207b4370952c7fd98672ac3"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3496,9 +3502,9 @@ dependencies = [
 
 [[package]]
 name = "nectar-primitives"
-version = "0.3.0"
+version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0669be4db188635ff0a773886c6b4d4f935c1b57de01c2fddb2f31f5054c36a7"
+checksum = "e90eb5b7f0d7036f497d671bf781f05eee6165c9148bde9e48ea137574e8354b"
 dependencies = [
  "alloy-primitives",
  "alloy-signer",
@@ -3512,6 +3518,7 @@ dependencies = [
  "getrandom 0.4.2",
  "hybrid-array",
  "js-sys",
+ "keccak-batch",
  "once_cell",
  "parking_lot",
  "rayon",
