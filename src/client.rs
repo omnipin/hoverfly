@@ -71,6 +71,8 @@ pub enum ClientError {
     BatchNotFound(String),
     #[error("stamp: {0}")]
     Stamp(String),
+    #[error("pusher: {0}")]
+    Pusher(String),
     #[error("manifest: {0}")]
     Manifest(String),
     #[error("feed: {0}")]
@@ -2259,6 +2261,116 @@ pub async fn upload_bytes_with_pool(
     )
     .await?;
     Ok(root)
+}
+
+/// Push locally-stamped chunks through a relay (`hoverfly pusher`) over
+/// HTTP instead of dialing bees directly. The signing key never leaves
+/// this process — only pre-signed frames go over the wire
+/// (docs/pusher-design.md §3). Single-lane (stage B): batched POSTs to
+/// one pusher, streamed NDJSON acks, unacked chunks re-POSTed for a few
+/// rounds before giving up. Returns `Ok` only when every chunk is acked.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn push_via_pusher(
+    pusher_url: &str,
+    chunks: Vec<StampedChunk>,
+    progress: Option<&ProgressFn>,
+) -> Result<(), ClientError> {
+    use std::collections::HashSet;
+    /// Frames per POST — must stay ≤ the pusher's advertised batch_max.
+    const BATCH: usize = 256;
+    /// Rounds of re-POSTing unacked chunks before failing.
+    const MAX_ROUNDS: usize = 6;
+
+    let base = pusher_url.trim_end_matches('/');
+    let push_url = format!("{base}/v1/push");
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(300))
+        .build()
+        .map_err(|e| ClientError::Pusher(format!("http client: {e}")))?;
+
+    let total = chunks.len();
+    let mut done = 0usize;
+    let mut pending: Vec<usize> = (0..chunks.len()).collect();
+
+    for round in 0..MAX_ROUNDS {
+        if pending.is_empty() {
+            break;
+        }
+        let mut next: Vec<usize> = Vec::new();
+        for idx_batch in pending.chunks(BATCH) {
+            let batch: Vec<StampedChunk> = idx_batch.iter().map(|&i| chunks[i].clone()).collect();
+            let body = crate::pushframe::encode_batch(&batch);
+            let resp = match http.post(&push_url).body(body).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(target: "hoverfly::upload", "pusher POST failed: {e}; retrying batch");
+                    next.extend_from_slice(idx_batch);
+                    continue;
+                }
+            };
+            if !resp.status().is_success() {
+                let code = resp.status();
+                let txt = resp.text().await.unwrap_or_default();
+                warn!(target: "hoverfly::upload",
+                    "pusher rejected batch ({code}): {}", txt.trim());
+                next.extend_from_slice(idx_batch);
+                continue;
+            }
+            // Parse streamed NDJSON acks; collect the addrs marked "ok".
+            let txt = resp
+                .text()
+                .await
+                .map_err(|e| ClientError::Pusher(format!("read acks: {e}")))?;
+            let mut acked: HashSet<String> = HashSet::new();
+            let mut sample_err: Option<String> = None;
+            for line in txt.lines() {
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                match v.get("s").and_then(|s| s.as_str()) {
+                    Some("ok") => {
+                        if let Some(a) = v.get("a").and_then(|a| a.as_str()) {
+                            acked.insert(a.to_string());
+                        }
+                    }
+                    Some("err") => {
+                        if sample_err.is_none() {
+                            sample_err = v.get("e").and_then(|e| e.as_str()).map(str::to_string);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if let Some(e) = &sample_err {
+                warn!(target: "hoverfly::upload", "pusher rejected chunk(s): {e}");
+            }
+            for &i in idx_batch {
+                if acked.contains(&hex::encode(chunks[i].addr)) {
+                    done += 1;
+                    if let Some(p) = progress {
+                        p(done, total);
+                    }
+                } else {
+                    next.push(i);
+                }
+            }
+        }
+        if !next.is_empty() {
+            warn!(target: "hoverfly::upload",
+                "pusher round {} left {} chunk(s) unacked; re-POSTing",
+                round + 1, next.len());
+        }
+        pending = next;
+    }
+
+    if !pending.is_empty() {
+        return Err(ClientError::Pusher(format!(
+            "{} of {} chunks unacked after {MAX_ROUNDS} rounds via {pusher_url}",
+            pending.len(),
+            total
+        )));
+    }
+    Ok(())
 }
 
 /// Populate the daemon's [`ChunkCache`] from a batch of stamped chunks

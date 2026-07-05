@@ -7,11 +7,11 @@
 //!
 //! (See `~/Coding/forks/bee/pkg/postage/stamp.go::MarshalBinary`.)
 //!
-//! The signature is over
-//! `keccak256(chunkAddr[32] || batchID[32] || index[8] || timestamp[8])`,
-//! using a standard secp256k1 EIP-191-like ecrecover. The signer is
-//! the **batch owner's Ethereum address** — the same address that
-//! purchased the postage batch on-chain.
+//! The signature is EIP-191 personal-message signing over the prehash
+//! `keccak256(chunkAddr[32] || batchID[32] || index[8] || timestamp[8])`
+//! — i.e. `sign(keccak256("\x19Ethereum Signed Message:\n32" || prehash))`.
+//! The signer is the **batch owner's Ethereum address** — the same
+//! address that purchased the postage batch on-chain.
 //!
 //! ## What this validator does
 //!
@@ -76,15 +76,25 @@ pub fn validate<'a>(chunk_addr: &[u8; 32], stamp: &'a [u8]) -> Result<ValidStamp
     let timestamp = &stamp[40..48];
     let signature = &stamp[48..113];
 
-    // Build the signed digest exactly as bee does in
-    // `postage/stamp.go::ToSignDigest`: keccak256 of the
-    // concatenation, no EIP-191 prefix.
+    // Prehash: keccak256(chunkAddr || batchID || index || timestamp),
+    // exactly bee's `postage/stamp.go::toSignDigest`.
     let mut h = Keccak256::new();
     h.update(chunk_addr);
     h.update(batch_id);
     h.update(index);
     h.update(timestamp);
-    let digest: [u8; 32] = h.finalize().into();
+    let prehash: [u8; 32] = h.finalize().into();
+
+    // The stamp signature is EIP-191 personal-message signing over that
+    // prehash — nectar's issuer signs with `sign_message_sync(prehash)`
+    // (see nectar-postage-issuer stamper.rs), and bee verifies the same
+    // way (it accepts these stamps). So recover over the prefixed digest
+    // `keccak256("\x19Ethereum Signed Message:\n32" || prehash)`, NOT the
+    // raw prehash.
+    let mut p = Keccak256::new();
+    p.update(b"\x19Ethereum Signed Message:\n32");
+    p.update(prehash);
+    let digest: [u8; 32] = p.finalize().into();
 
     // Recover the signer. Bee's `crypto.Recover` expects the
     // signature in r||s||v form with `v ∈ {0,1}`. We accept the
@@ -103,11 +113,10 @@ pub fn validate<'a>(chunk_addr: &[u8; 32], stamp: &'a [u8]) -> Result<ValidStamp
     })
 }
 
-/// secp256k1 ECDSA address recovery. Mirrors what
-/// `signer.rs::recover_eth_address_from_handshake` does internally,
-/// but operates on a raw 32-byte digest rather than an EIP-191
-/// prefixed payload (since bee's stamp signer does NOT use the
-/// EIP-191 prefix — see `postage/stamp.go::ToSignDigest`).
+/// secp256k1 ECDSA address recovery over an already-final 32-byte
+/// digest. The caller is responsible for constructing the digest,
+/// including the EIP-191 prefix wrap that stamp signing uses (see
+/// [`validate`]).
 fn recover_secp256k1_address(digest: &[u8; 32], signature: &[u8]) -> Result<[u8; 20], StampError> {
     use k256::ecdsa::{RecoveryId, Signature as K256Sig, VerifyingKey};
 
@@ -167,5 +176,32 @@ mod tests {
         // Either ZeroSigner or BadSignature is acceptable.
         let res = validate(&chunk, &stamp);
         assert!(res.is_err(), "all-zero stamp must not validate");
+    }
+
+    /// Round-trip: a stamp produced by the real signing path must
+    /// recover to the signing key's address. Guards the EIP-191 wrap —
+    /// nectar signs stamps with `sign_message_sync` (personal-message /
+    /// EIP-191), so a raw-digest recovery yields a consistent WRONG
+    /// address and every push is rejected as "not the batch owner".
+    #[test]
+    fn validate_recovers_real_stamp_signer() {
+        use crate::signer::SwarmSigner;
+        let key = "0x2cfe73bcd53cc2708a35f6f2238e2aeeb0448b65339f43d398e736102a211569";
+        let signer = SwarmSigner::from_hex_with_nonce(
+            key,
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            1,
+        )
+        .unwrap();
+        let batch = "0x2c18bcb885649cb468732c98d70d9cb0280aaffb30ffd0c882fccd8e22cd7408";
+        let data = b"hoverfly pusher stamp round-trip payload".repeat(8);
+        let (_root, work) =
+            crate::client::prepare_upload_bytes(&signer, batch, 19, false, &data).unwrap();
+        let vs = validate(&work[0].addr, &work[0].stamp).expect("stamp must validate");
+        assert_eq!(
+            vs.signer,
+            *signer.eth_address(),
+            "recovered stamp signer must equal the signing key address"
+        );
     }
 }
