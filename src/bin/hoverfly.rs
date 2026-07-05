@@ -442,6 +442,41 @@ enum Commands {
         error_document: Option<String>,
     },
 
+    /// Run an HTTP chunk-push relay (stage A: /v1/status + the
+    /// flag-gated /v1/probe self-push experiment endpoint). See
+    /// docs/pusher-design.md. No IPC socket, no retrieval over HTTP,
+    /// no key material accepted over the wire; probe mode signs with
+    /// HOVERFLY_PROBE_KEY / HOVERFLY_PROBE_BATCH from the environment.
+    #[cfg(feature = "pusher")]
+    Pusher {
+        /// TCP address the pusher's HTTP endpoint listens on. On
+        /// container platforms bind 0.0.0.0:$PORT.
+        #[arg(long, default_value = "127.0.0.1:8550", value_name = "ADDR")]
+        listen: std::net::SocketAddr,
+
+        /// peers.json path — the warm peer cache probe/push session
+        /// pools fill from (and save reachability observations back to).
+        #[arg(long, default_value = "peers.seed.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Enable POST /v1/probe: generate + stamp + push a random blob
+        /// with the env-provided throwaway key/batch and stream back a
+        /// metrics report. The instrument for the cloud-egress-IP gate
+        /// experiment; off by default because it makes the pusher sign.
+        #[arg(long)]
+        probe: bool,
+
+        /// Gnosis RPC used by probe mode to resolve batch depth and
+        /// owner-check the probe key (skipped when HOVERFLY_PROBE_DEPTH
+        /// is set).
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
+    },
+
     /// Run a long-lived daemon that holds a warm session pool across
     /// upload/fetch requests. Listens on a unix socket; the same CLI
     /// (`upload --daemon <socket>` / `fetch --daemon <socket>`)
@@ -1886,6 +1921,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(c) = root_hex_to_cid(&manifest_root_hex) {
                 println!("  cid: {c}");
             }
+        }
+
+        #[cfg(feature = "pusher")]
+        Commands::Pusher {
+            listen,
+            peerlist,
+            probe,
+            rpc_url,
+        } => {
+            let nonce = load_or_create_nonce(&cli.nonce_file)?;
+            hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
+                listen,
+                peerlist,
+                probe_enabled: probe,
+                nonce,
+                network_id: cli.network_id,
+                rpc_url,
+                transport: cfg,
+            })
+            .await?;
         }
 
         #[cfg(unix)]
