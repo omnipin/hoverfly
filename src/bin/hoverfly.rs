@@ -337,6 +337,15 @@ enum Commands {
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
         peerlist: PathBuf,
 
+        /// Push through a relay (`hoverfly pusher`) over HTTP instead of
+        /// dialing bees directly. The signing key never leaves this
+        /// process — only pre-signed chunk frames go over the wire. Stage
+        /// B: single lane (repeatable, but only the first URL is used for
+        /// now). Bypasses `--peerlist`/`--concurrency` (the pusher owns
+        /// the session pool). See docs/pusher-design.md.
+        #[arg(long, value_name = "URL")]
+        pusher: Vec<String>,
+
         /// Number of peers to try per chunk before giving up
         #[arg(long, default_value_t = 10)]
         max_retries: usize,
@@ -1541,6 +1550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             immutable,
             key,
             peerlist,
+            pusher,
             max_retries,
             raw,
             manifest_path,
@@ -1675,6 +1685,68 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &format!("0x{}", hex::encode(nonce)),
                 cli.network_id,
             )?;
+
+            // Pusher mode: stamp locally and push pre-signed frames over
+            // HTTP to a relay. No transport/peerlist needed here — the
+            // pusher owns the session pool. Stage B: single lane, raw and
+            // single-file manifest uploads (collection via pusher TBD).
+            if !pusher.is_empty() {
+                if pusher.len() > 1 {
+                    eprintln!(
+                        "note: stage B uses one pusher lane; ignoring {} extra --pusher URL(s)",
+                        pusher.len() - 1
+                    );
+                }
+                if collection {
+                    return Err("--collection via --pusher is not supported yet".into());
+                }
+                let pusher_url = pusher[0].clone();
+                let data = std::fs::read(&file)?;
+                let upload_started = std::time::Instant::now();
+                let (root, work) = if raw {
+                    hoverfly::client::prepare_upload_bytes(
+                        &signer, &batch, depth, immutable, &data,
+                    )?
+                } else {
+                    let path = manifest_path.clone().unwrap_or_else(|| {
+                        file.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "file".to_string())
+                    });
+                    let ct = content_type.clone().or_else(|| guess_content_type(&path));
+                    hoverfly::client::prepare_upload_file_with_manifest(
+                        &signer,
+                        &batch,
+                        depth,
+                        immutable,
+                        &data,
+                        &path,
+                        ct.as_deref(),
+                    )?
+                };
+                let n_chunks = work.len();
+                let progress = make_progress_bar();
+                hoverfly::client::push_via_pusher(&pusher_url, work, progress.as_ref()).await?;
+                drop(progress);
+                let elapsed = upload_started.elapsed();
+                let root_hex = hex::encode(root.as_bytes());
+                println!(
+                    "uploaded {} bytes ({} chunks) via pusher {} — {} root: {}",
+                    data.len(),
+                    n_chunks,
+                    pusher_url,
+                    if raw { "raw" } else { "manifest" },
+                    root_hex,
+                );
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/");
+                    println!("subdomain:  https://{c}.bzz.limo/");
+                }
+                print_upload_throughput(data.len(), elapsed);
+                return Ok(());
+            }
+
             // Attach SWAP if configured. We don't validate that the
             // signer's Ethereum address matches the chequebook's
             // on-chain `issuer()` — that requires an RPC call we
