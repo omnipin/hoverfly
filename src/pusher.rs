@@ -128,7 +128,8 @@ async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Respo
     match (req.method(), req.uri().path()) {
         (&Method::GET, "/v1/status") => status_response(&state),
         (&Method::POST, "/v1/probe") => probe_response(state, req.uri().query()),
-        (_, "/v1/probe") | (_, "/v1/status") => {
+        (&Method::POST, "/v1/tcpcheck") => tcpcheck_response(state, req.uri().query()),
+        (_, "/v1/probe") | (_, "/v1/status") | (_, "/v1/tcpcheck") => {
             json_line_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         _ => json_line_response(StatusCode::NOT_FOUND, "not found"),
@@ -205,6 +206,141 @@ fn probe_response(state: Arc<State>, query: Option<&str>) -> Response<RespBody> 
         .header("x-accel-buffering", "no")
         .body(BoxBody::new(StreamBody::new(rx)))
         .expect("static response parts")
+}
+
+/// `POST /v1/tcpcheck?targets=host:port,…&n=20&timeout_ms=3000` — raw
+/// TCP connect tester, the discriminator between "our egress path is
+/// broken" and "peers throttle this source IP". No libp2p, no
+/// handshake: just `TcpStream::connect` × `n` per target with error-kind
+/// classification (refused = RST reached us, so packets flow; timeout =
+/// dropped somewhere; unreachable = routing/NAT). Targets run in
+/// parallel, attempts per target sequentially with a small gap so one
+/// target never sees a SYN flood. One NDJSON line per target as it
+/// finishes. Gated behind `--probe` like the push probe.
+fn tcpcheck_response(state: Arc<State>, query: Option<&str>) -> Response<RespBody> {
+    if !state.opts.probe_enabled {
+        return json_line_response(StatusCode::NOT_FOUND, "probe endpoint disabled (--probe)");
+    }
+    let params = parse_query(query);
+    let targets: Vec<String> = params
+        .get("targets")
+        .map(|t| {
+            t.split(',')
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default();
+    if targets.is_empty() || targets.len() > 16 {
+        return json_line_response(StatusCode::BAD_REQUEST, "need 1..=16 targets=host:port,…");
+    }
+    let n = match param_usize(&params, "n", 20) {
+        Ok(v) if (1..=100).contains(&v) => v,
+        Ok(v) => {
+            return json_line_response(
+                StatusCode::BAD_REQUEST,
+                &format!("n {v} out of range (1..=100)"),
+            );
+        }
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e),
+    };
+    let timeout_ms = match param_usize(&params, "timeout_ms", 3000) {
+        Ok(v) if (100..=10_000).contains(&v) => v as u64,
+        Ok(v) => {
+            return json_line_response(
+                StatusCode::BAD_REQUEST,
+                &format!("timeout_ms {v} out of range (100..=10000)"),
+            );
+        }
+        Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e),
+    };
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Frame<Bytes>, Infallible>>();
+    tokio::spawn(async move {
+        let mut handles = Vec::with_capacity(targets.len());
+        for target in targets {
+            let tx = tx.clone();
+            handles.push(tokio::spawn(async move {
+                let line = tcpcheck_target(&target, n, timeout_ms).await;
+                let mut s = serde_json::json!({"tcpcheck": line}).to_string();
+                s.push('\n');
+                let _ = tx.unbounded_send(Ok(Frame::data(Bytes::from(s))));
+            }));
+        }
+        for h in handles {
+            let _ = h.await;
+        }
+        let _ = tx.unbounded_send(Ok(Frame::data(Bytes::from(
+            serde_json::json!({"done": true}).to_string() + "\n",
+        ))));
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no")
+        .body(BoxBody::new(StreamBody::new(rx)))
+        .expect("static response parts")
+}
+
+async fn tcpcheck_target(target: &str, n: usize, timeout_ms: u64) -> serde_json::Value {
+    use std::io::ErrorKind;
+    let mut ok = 0usize;
+    let mut connect_ms: Vec<u64> = Vec::new();
+    let mut errors: BTreeMap<&'static str, u64> = BTreeMap::new();
+    let mut sample_error: Option<String> = None;
+    for i in 0..n {
+        if i > 0 {
+            // Pace attempts so a single target never sees a SYN burst —
+            // we are measuring policy, not provoking it.
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let started = Instant::now();
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(timeout_ms),
+            tokio::net::TcpStream::connect(target),
+        )
+        .await
+        {
+            Ok(Ok(_stream)) => {
+                ok += 1;
+                connect_ms.push(started.elapsed().as_millis() as u64);
+            }
+            Ok(Err(e)) => {
+                let class = match e.kind() {
+                    ErrorKind::ConnectionRefused => "refused",
+                    ErrorKind::ConnectionReset => "reset",
+                    ErrorKind::TimedOut => "timeout",
+                    ErrorKind::HostUnreachable | ErrorKind::NetworkUnreachable => "unreachable",
+                    _ => "other",
+                };
+                *errors.entry(class).or_insert(0) += 1;
+                sample_error.get_or_insert_with(|| e.to_string());
+            }
+            Err(_) => {
+                *errors.entry("timeout").or_insert(0) += 1;
+            }
+        }
+    }
+    connect_ms.sort_unstable();
+    let med = connect_ms.get(connect_ms.len() / 2).copied();
+    let mut v = serde_json::json!({
+        "target": target,
+        "n": n,
+        "ok": ok,
+        "connect_ms": {
+            "min": connect_ms.first().copied(),
+            "median": med,
+            "max": connect_ms.last().copied(),
+        },
+        "errors": errors,
+    });
+    if let Some(s) = sample_error {
+        v["sample_error"] = serde_json::Value::String(s);
+    }
+    v
 }
 
 /// The probe itself. Every early exit sends a terminal `report` line
