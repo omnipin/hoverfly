@@ -424,8 +424,15 @@ async fn run_probe(
     }));
 
     let snapshot = crate::protocols::status::StatusSnapshot::default();
+    // Stable, premined libp2p identity derived deterministically from the
+    // probe key (same helper the daemon uses) — not a fresh random
+    // keypair per boot. A stable peer-id lets bees recognize reconnections
+    // as one peer instead of a flood of strangers; the overlay (from the
+    // signer's nonce) is what governs bin placement / oversaturation.
+    let keypair = crate::inbound::libp2p_keypair_from_identity(&signer);
     let transport =
-        Transport::new(signer.clone(), state.opts.transport.clone()).with_status_snapshot(snapshot);
+        Transport::new_with_keypair(signer.clone(), state.opts.transport.clone(), keypair)
+            .with_status_snapshot(snapshot);
 
     let before = diag_snapshot();
     let started = Instant::now();
