@@ -1930,7 +1930,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             probe,
             rpc_url,
         } => {
-            let nonce = load_or_create_nonce(&cli.nonce_file)?;
+            // Premined overlay nonce. On ephemeral-FS hosts (Render,
+            // Lambda) there is no persistent `--nonce-file`, so a random
+            // overlay would be minted every boot — landing us in bee's
+            // already-full bin 0 and getting oversaturation-dropped
+            // (PERFORMANCE.md "Vanity overlay"). HOVERFLY_OVERLAY_NONCE
+            // (0x-hex, 32 bytes) pins a premined vanity nonce from the
+            // environment; falls back to the nonce-file otherwise.
+            let nonce = match std::env::var("HOVERFLY_OVERLAY_NONCE") {
+                Ok(h) if !h.trim().is_empty() => {
+                    let raw = h.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    let b = hex::decode(raw)
+                        .map_err(|e| format!("HOVERFLY_OVERLAY_NONCE: bad hex: {e}"))?;
+                    if b.len() != 32 {
+                        return Err(format!(
+                            "HOVERFLY_OVERLAY_NONCE: expected 32 bytes, got {}",
+                            b.len()
+                        )
+                        .into());
+                    }
+                    let mut n = [0u8; 32];
+                    n.copy_from_slice(&b);
+                    n
+                }
+                _ => load_or_create_nonce(&cli.nonce_file)?,
+            };
             hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
                 listen,
                 peerlist,
