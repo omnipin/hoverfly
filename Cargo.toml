@@ -45,10 +45,10 @@ bridge = []
 futures-bounded = { path = "vendor/futures-bounded" }
 
 [dependencies]
-nectar-primitives = "0.3.0"
-nectar-mantaray   = "0.3.0"
-nectar-postage    = { version = "0.3.0", features = ["std"] }
-nectar-postage-issuer = { version = "0.3.0", features = ["std", "local-signer"] }
+nectar-primitives = "0.4.0"
+nectar-mantaray   = "0.4.0"
+nectar-postage    = { version = "0.4.0", features = ["std"] }
+nectar-postage-issuer = { version = "0.4.0", features = ["std", "local-signer"] }
 
 # alloy crypto (matches nectar's signer: nectar 0.1.0 is on the alloy 2.0
 # signer line, so hoverfly must track it too or the BatchStamper signer types

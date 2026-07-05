@@ -24,9 +24,13 @@ out="$here/pkg"
 export RUSTUP_TOOLCHAIN
 
 echo "→ building threadless (no-shared-memory) hoverfly wasm…"
-# Empty RUSTFLAGS overrides .cargo/config.toml's atomics/shared-memory flags.
+# RUSTFLAGS here overrides .cargo/config.toml's atomics/shared-memory flags
+# (that's its original purpose — an empty value sufficed). +simd128 is
+# orthogonal to atomics and universally supported in browsers: it lets
+# nectar 0.4's keccak-batch run BMT hashing across SIMD lanes, which is
+# the dominant cost of stamping large files on the dApp's single thread.
 # build-std with plain std (no atomics) → a non-shared linear memory.
-RUSTFLAGS="" CARGO_BUILD_RUSTFLAGS="" \
+RUSTFLAGS="-C target-feature=+simd128" CARGO_BUILD_RUSTFLAGS="-C target-feature=+simd128" \
   cargo build --release --locked \
     --manifest-path "$repo/Cargo.toml" \
     --target wasm32-unknown-unknown \
