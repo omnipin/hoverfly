@@ -62,6 +62,10 @@ pub struct PusherOpts {
     pub network_id: u64,
     /// Gnosis RPC for probe-mode batch depth/owner resolution.
     pub rpc_url: String,
+    /// Optional node-identity secp256k1 key (hex), distinct from the
+    /// stamp signer — drives the overlay + libp2p peer-id. From
+    /// HOVERFLY_PUSHER_IDENTITY. `None` = reuse the stamp key.
+    pub node_identity: Option<String>,
     pub transport: TransportConfig,
 }
 
@@ -423,15 +427,40 @@ async fn run_probe(
         }
     }));
 
+    // Node identity is separate from the stamp signer. The stamp key
+    // (`signer`) only signs postage; the *network* identity — overlay +
+    // libp2p peer-id — comes from HOVERFLY_PUSHER_IDENTITY when set, so
+    // multiple pushers sharing one batch owner key still present as
+    // distinct bee citizens (required to run them concurrently without a
+    // peer-id collision). Falls back to the stamp key when unset. This is
+    // the coordinator-stamps / workers-push split from
+    // `prepare_upload_bytes`'s docs.
+    let node_signer = match state.opts.node_identity.as_deref() {
+        Some(nk) => match SwarmSigner::from_hex_with_nonce(
+            nk,
+            &format!("0x{}", hex::encode(state.opts.nonce)),
+            state.opts.network_id,
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                send_line(&serde_json::json!({
+                    "report": {"ok": false, "error": format!("HOVERFLY_PUSHER_IDENTITY: {e}")}
+                }));
+                return;
+            }
+        },
+        None => signer.clone(),
+    };
+
     let snapshot = crate::protocols::status::StatusSnapshot::default();
     // Stable, premined libp2p identity derived deterministically from the
-    // probe key (same helper the daemon uses) — not a fresh random
-    // keypair per boot. A stable peer-id lets bees recognize reconnections
-    // as one peer instead of a flood of strangers; the overlay (from the
-    // signer's nonce) is what governs bin placement / oversaturation.
-    let keypair = crate::inbound::libp2p_keypair_from_identity(&signer);
+    // node key — not a fresh random keypair per boot. A stable peer-id lets
+    // bees recognize reconnections as one peer instead of a flood of
+    // strangers; the overlay (node eth address + nonce) governs bin
+    // placement / oversaturation.
+    let keypair = crate::inbound::libp2p_keypair_from_identity(&node_signer);
     let transport =
-        Transport::new_with_keypair(signer.clone(), state.opts.transport.clone(), keypair)
+        Transport::new_with_keypair(node_signer, state.opts.transport.clone(), keypair)
             .with_status_snapshot(snapshot);
 
     let before = diag_snapshot();
