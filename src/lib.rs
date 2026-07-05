@@ -28,6 +28,7 @@ pub mod erasure;
 pub mod feed;
 pub mod manifest;
 pub mod protocols;
+pub mod pushframe;
 pub mod ratelimit;
 pub mod transport;
 

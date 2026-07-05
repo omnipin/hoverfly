@@ -31,16 +31,30 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Instant;
 
 use bytes::Bytes;
-use http_body_util::{BodyExt, Full, StreamBody, combinators::BoxBody};
+use http_body_util::{BodyExt, Full, Limited, StreamBody, combinators::BoxBody};
 use hyper::body::Frame;
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
 use tracing::{info, warn};
 
-use crate::client::{ProgressFn, upload_bytes_ex};
+use crate::client::{
+    ProgressFn, SessionPool, StampedChunk, push_chunks_with_pool, upload_bytes_ex,
+};
 use crate::peers::{DialResult, PeerStore, apply_log};
+use crate::pushframe;
 use crate::signer::SwarmSigner;
 use crate::transport::{Transport, TransportConfig, diag};
+
+/// Max frames per POST /v1/push (also bounds decode allocation).
+const PUSH_BATCH_MAX: usize = 512;
+/// Max /v1/push body: PUSH_BATCH_MAX × max frame + slack.
+const PUSH_MAX_BODY: usize = PUSH_BATCH_MAX * pushframe::MAX_FRAME_LEN + 4096;
+/// Warm-pool target for the push path. Modest on purpose: bee rate-limits
+/// inbound dials per /32 (docs/pusher-design.md §"Stage A results"), so a
+/// held pool of this size + gentle top-up beats a big burst fill.
+const PUSH_POOL_TARGET: usize = 32;
+/// Per-chunk retry budget on the push path.
+const PUSH_MAX_RETRIES: usize = 20;
 
 /// Hard cap on probe payload size — a probe is a measurement, not a
 /// bulk upload, and free-tier egress is the budget being measured.
@@ -72,14 +86,30 @@ pub struct PusherOpts {
 struct State {
     opts: PusherOpts,
     started: Instant,
-    /// Serializes probes: concurrent probes would pollute each other's
-    /// diag-counter deltas and fight over the session pool.
+    /// Serializes network ops (probe + push): concurrent runs would
+    /// pollute each other's diag deltas and fight over the session pool.
     probe_lock: Arc<tokio::sync::Mutex<()>>,
     probe_seq: AtomicU64,
     peers_known: AtomicUsize,
     /// `batch_id → (depth, immutable)` from the on-chain read, so
     /// repeated probes cost one RPC total.
     batch_cache: std::sync::Mutex<HashMap<String, (u8, bool)>>,
+    /// Push-path state, built once at startup: the node-identity
+    /// transport, the peer cache, and a warm session pool reused across
+    /// /v1/push requests (filled lazily on first push). `None` transport
+    /// means the node key was unresolvable; /v1/push then 503s.
+    push: Option<PushState>,
+    /// `batch_id(hex) → on-chain owner`, so repeated pushes for one batch
+    /// cost a single RPC.
+    owner_cache: std::sync::Mutex<HashMap<String, [u8; 20]>>,
+}
+
+struct PushState {
+    transport: Arc<Transport>,
+    peers: Arc<PeerStore>,
+    /// Warm pool, filled on first push and reused. `tokio::Mutex` because
+    /// fills/pushes await; the pool itself is internally sharded.
+    pool: tokio::sync::Mutex<Option<Arc<SessionPool>>>,
 }
 
 type RespBody = BoxBody<Bytes, Infallible>;
@@ -92,11 +122,21 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
             opts.peerlist.display()
         );
     }
+    // Build the push-path node transport once, under the node identity
+    // (HOVERFLY_PUSHER_IDENTITY, else a random ephemeral key — which gives
+    // an unstable overlay and thus oversaturation drops, so a stable
+    // premined identity is strongly recommended for real deployments).
+    let push = build_push_state(&opts);
+    if push.is_none() {
+        warn!("push node identity unresolvable; /v1/push will 503 (probe/status still work)");
+    }
+
     let listener = tokio::net::TcpListener::bind(opts.listen).await?;
     info!(
-        "pusher listening on http://{} (probe {}; {} known peers from {})",
+        "pusher listening on http://{} (probe {}; push {}; {} known peers from {})",
         opts.listen,
         if opts.probe_enabled { "ON" } else { "off" },
+        if push.is_some() { "ON" } else { "off" },
         peers_known,
         opts.peerlist.display(),
     );
@@ -107,6 +147,8 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         probe_seq: AtomicU64::new(0),
         peers_known: AtomicUsize::new(peers_known),
         batch_cache: std::sync::Mutex::new(HashMap::new()),
+        push,
+        owner_cache: std::sync::Mutex::new(HashMap::new()),
     });
 
     loop {
@@ -133,7 +175,8 @@ async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Respo
         (&Method::GET, "/v1/status") => status_response(&state),
         (&Method::POST, "/v1/probe") => probe_response(state, req.uri().query()),
         (&Method::POST, "/v1/tcpcheck") => tcpcheck_response(state, req.uri().query()),
-        (_, "/v1/probe") | (_, "/v1/status") | (_, "/v1/tcpcheck") => {
+        (&Method::POST, "/v1/push") => push_response(state, req).await,
+        (_, "/v1/probe") | (_, "/v1/status") | (_, "/v1/tcpcheck") | (_, "/v1/push") => {
             json_line_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         _ => json_line_response(StatusCode::NOT_FOUND, "not found"),
@@ -145,11 +188,11 @@ fn status_response(state: &State) -> Response<RespBody> {
         "version": crate::VERSION,
         "profile": "persistent",
         "probe": state.opts.probe_enabled,
+        "push": state.push.is_some(),
         "peers_known": state.peers_known.load(Ordering::Relaxed),
         "uptime_secs": state.started.elapsed().as_secs(),
-        // Stage-B fields, advertised as absent so clients can already
-        // key off them: no push endpoint, no metered budget yet.
-        "batch_max": serde_json::Value::Null,
+        "batch_max": if state.push.is_some() { serde_json::json!(PUSH_BATCH_MAX) } else { serde_json::Value::Null },
+        // Metered-budget accounting lands with the client scheduler (§7).
         "budget_remaining_gb": serde_json::Value::Null,
     });
     json_response(StatusCode::OK, &body)
@@ -347,6 +390,254 @@ async fn tcpcheck_target(target: &str, n: usize, timeout_ms: u64) -> serde_json:
     v
 }
 
+/// Build the push-path transport + peer cache from the node identity.
+/// Returns `None` if the node key can't be resolved.
+fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
+    let nonce_hex = format!("0x{}", hex::encode(opts.nonce));
+    let node_signer = match opts.node_identity.as_deref() {
+        Some(k) => SwarmSigner::from_hex_with_nonce(k, &nonce_hex, opts.network_id).ok()?,
+        None => {
+            let mut kb = [0u8; 32];
+            getrandom::fill(&mut kb).ok()?;
+            SwarmSigner::from_hex_with_nonce(
+                &format!("0x{}", hex::encode(kb)),
+                &nonce_hex,
+                opts.network_id,
+            )
+            .ok()?
+        }
+    };
+    let keypair = crate::inbound::libp2p_keypair_from_identity(&node_signer);
+    let snapshot = crate::protocols::status::StatusSnapshot::default();
+    let transport = Transport::new_with_keypair(node_signer, opts.transport.clone(), keypair)
+        .with_status_snapshot(snapshot);
+    let peers = PeerStore::load_or_create(&opts.peerlist);
+    Some(PushState {
+        transport: Arc::new(transport),
+        peers: Arc::new(peers),
+        pool: tokio::sync::Mutex::new(None),
+    })
+}
+
+/// `POST /v1/push` — the real relay endpoint. Body = frames
+/// (`docs/pusher-design.md` §3); response = streamed NDJSON acks. Open
+/// mode: a chunk is accepted iff its stamp signature recovers to the
+/// on-chain owner of the stamp's batch. No keys ever cross the wire —
+/// the client stamps locally and ships only pre-signed frames.
+async fn push_response(
+    state: Arc<State>,
+    req: Request<hyper::body::Incoming>,
+) -> Response<RespBody> {
+    if state.push.is_none() {
+        return json_line_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "push disabled (no node identity resolvable)",
+        );
+    }
+    // Bounded body read — a whole batch, not a stream.
+    let bytes = match Limited::new(req.into_body(), PUSH_MAX_BODY).collect().await {
+        Ok(c) => c.to_bytes(),
+        Err(_) => {
+            return json_line_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "body exceeds limit or read error",
+            );
+        }
+    };
+    let chunks = match pushframe::decode_batch(&bytes, PUSH_BATCH_MAX) {
+        Ok(c) => c,
+        Err(e) => {
+            return json_line_response(StatusCode::BAD_REQUEST, &format!("frame decode: {e}"));
+        }
+    };
+    if chunks.is_empty() {
+        return json_line_response(StatusCode::BAD_REQUEST, "empty batch");
+    }
+
+    // Serialize with probes and other pushes (stage B: one network op at
+    // a time over the shared warm pool).
+    let Ok(guard) = state.probe_lock.clone().try_lock_owned() else {
+        return json_line_response(StatusCode::CONFLICT, "a probe or push is already running");
+    };
+
+    let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Frame<Bytes>, Infallible>>();
+    tokio::spawn(async move {
+        let _guard = guard;
+        run_push(state, chunks, tx).await;
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/x-ndjson")
+        .header("cache-control", "no-store")
+        .header("x-accel-buffering", "no")
+        .body(BoxBody::new(StreamBody::new(rx)))
+        .expect("static response parts")
+}
+
+async fn run_push(
+    state: Arc<State>,
+    chunks: Vec<StampedChunk>,
+    tx: futures::channel::mpsc::UnboundedSender<Result<Frame<Bytes>, Infallible>>,
+) {
+    let send_line = |v: &serde_json::Value| {
+        let mut s = v.to_string();
+        s.push('\n');
+        let _ = tx.unbounded_send(Ok(Frame::data(Bytes::from(s))));
+    };
+    let ack = |addr: &[u8; 32], status: &str, err: Option<&str>| {
+        let mut v = serde_json::json!({"a": hex::encode(addr), "s": status});
+        if let Some(e) = err {
+            v["e"] = serde_json::Value::String(e.to_string());
+        }
+        send_line(&v);
+    };
+
+    // The stamp's batch_id must match the on-chain owner the signature
+    // recovers to. All chunks in one upload share a batch; verify the
+    // batch once, then check each chunk's recovered signer against it.
+    let mut accepted: Vec<StampedChunk> = Vec::with_capacity(chunks.len());
+    let mut batch_owner: Option<[u8; 20]> = None;
+    let mut batch_hex: Option<String> = None;
+
+    for chunk in chunks {
+        let vs = match crate::stamp::validate(&chunk.addr, &chunk.stamp) {
+            Ok(v) => v,
+            Err(e) => {
+                ack(&chunk.addr, "err", Some(&format!("bad stamp: {e}")));
+                continue;
+            }
+        };
+        let bid = hex::encode(vs.batch_id);
+        // Resolve the owner for this batch (cached, one RPC per batch).
+        let owner = if batch_hex.as_deref() == Some(bid.as_str()) {
+            batch_owner
+        } else {
+            match resolve_owner(&state, &bid).await {
+                Ok(o) => {
+                    batch_hex = Some(bid.clone());
+                    batch_owner = Some(o);
+                    Some(o)
+                }
+                Err(e) => {
+                    ack(&chunk.addr, "err", Some(&e));
+                    continue;
+                }
+            }
+        };
+        match owner {
+            Some(o) if o == vs.signer => accepted.push(chunk),
+            Some(o) => ack(
+                &chunk.addr,
+                "err",
+                Some(&format!(
+                    "stamp signer 0x{} is not the on-chain batch owner 0x{}",
+                    hex::encode(vs.signer),
+                    hex::encode(o)
+                )),
+            ),
+            None => ack(&chunk.addr, "err", Some("batch owner unresolved")),
+        }
+    }
+
+    if accepted.is_empty() {
+        send_line(&serde_json::json!({"done": {"pushed": 0, "rejected": true}}));
+        return;
+    }
+
+    // Ensure the warm pool, then push the accepted chunks.
+    let push = state.push.as_ref().expect("push state present");
+    let pool = match ensure_pool(push).await {
+        Ok(p) => p,
+        Err(e) => {
+            for c in &accepted {
+                ack(&c.addr, "err", Some(&format!("pool: {e}")));
+            }
+            return;
+        }
+    };
+
+    let addrs: Vec<[u8; 32]> = accepted.iter().map(|c| c.addr).collect();
+    let total = accepted.len();
+    let result = push_chunks_with_pool(
+        &push.transport,
+        &pool,
+        &push.peers,
+        accepted,
+        PUSH_MAX_RETRIES,
+        true, // hold the warm pool topped up mid-push
+        None,
+    )
+    .await;
+
+    match result {
+        Ok(()) => {
+            for a in &addrs {
+                ack(a, "ok", None);
+            }
+            send_line(&serde_json::json!({"done": {"pushed": total}}));
+        }
+        Err(e) => {
+            // All-or-nothing: on failure the client re-POSTs the batch.
+            let msg = e.to_string();
+            for a in &addrs {
+                ack(a, "err", Some(&msg));
+            }
+            send_line(&serde_json::json!({"done": {"pushed": 0, "error": msg}}));
+        }
+    }
+}
+
+/// On-chain batch owner for `batch_id_hex`, cached. Errors (string) on
+/// RPC failure or unknown batch.
+async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], String> {
+    if let Some(o) = state
+        .owner_cache
+        .lock()
+        .expect("owner cache poisoned")
+        .get(batch_id_hex)
+    {
+        return Ok(*o);
+    }
+    let stamp_addr: alloy_primitives::Address = crate::batch::MAINNET_POSTAGE_STAMP
+        .parse()
+        .expect("hardcoded valid");
+    let info = crate::batch::read_batch(&state.opts.rpc_url, stamp_addr, batch_id_hex)
+        .await
+        .map_err(|e| format!("batch owner RPC: {e}"))?;
+    if info.not_found {
+        return Err(format!("batch {batch_id_hex} not found on-chain"));
+    }
+    let owner = info.owner.into_array();
+    state
+        .owner_cache
+        .lock()
+        .expect("owner cache poisoned")
+        .insert(batch_id_hex.to_string(), owner);
+    Ok(owner)
+}
+
+/// Return the warm pool, filling/topping it up to [`PUSH_POOL_TARGET`].
+async fn ensure_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
+    let mut guard = push.pool.lock().await;
+    if let Some(p) = guard.as_ref() {
+        p.top_up(&push.transport, &push.peers, PUSH_POOL_TARGET)
+            .await;
+        if p.len() == 0 {
+            return Err("warm pool empty after top-up".into());
+        }
+        return Ok(p.clone());
+    }
+    let pool = Arc::new(SessionPool::new());
+    pool.top_up(&push.transport, &push.peers, PUSH_POOL_TARGET)
+        .await;
+    if pool.len() == 0 {
+        return Err("could not open any sessions from the peer cache".into());
+    }
+    *guard = Some(pool.clone());
+    Ok(pool)
+}
+
 /// The probe itself. Every early exit sends a terminal `report` line
 /// with `ok:false` — an errored probe still carries measurement data,
 /// which is the whole point of the gate experiment.
@@ -459,9 +750,8 @@ async fn run_probe(
     // strangers; the overlay (node eth address + nonce) governs bin
     // placement / oversaturation.
     let keypair = crate::inbound::libp2p_keypair_from_identity(&node_signer);
-    let transport =
-        Transport::new_with_keypair(node_signer, state.opts.transport.clone(), keypair)
-            .with_status_snapshot(snapshot);
+    let transport = Transport::new_with_keypair(node_signer, state.opts.transport.clone(), keypair)
+        .with_status_snapshot(snapshot);
 
     let before = diag_snapshot();
     let started = Instant::now();
