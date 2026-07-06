@@ -2201,6 +2201,158 @@ fn stamp_chunks_parallel(
     Ok(out)
 }
 
+/// Windowed, streaming upload: split + build the manifest once, then stamp
+/// and yield the chunks a window at a time. Consumed chunks' wire data is
+/// dropped as each window is taken, so peak memory stays ~one window of
+/// frames instead of the whole file's frames at once — the difference
+/// between a 500 MB upload OOMing the browser and completing.
+///
+/// The chunk order is not preserved (windows pop from the back); every
+/// chunk is independent for pushsync, and the reference root is already
+/// fixed by the full split, so order is irrelevant.
+pub struct UploadStreamer {
+    root: ChunkAddress,
+    /// (addr, wire) still to stamp, in reverse push order (pop from back).
+    remaining: Vec<(ChunkAddress, Vec<u8>)>,
+    stamper: HoverflyStamper,
+    total: usize,
+}
+
+impl UploadStreamer {
+    fn from_parts(
+        root: ChunkAddress,
+        mut stamp_in: Vec<(ChunkAddress, Vec<u8>)>,
+        stamper: HoverflyStamper,
+    ) -> Self {
+        let total = stamp_in.len();
+        stamp_in.reverse();
+        Self {
+            root,
+            remaining: stamp_in,
+            stamper,
+            total,
+        }
+    }
+
+    /// Raw content (no manifest wrap).
+    pub fn new_raw(
+        signer: &SwarmSigner,
+        batch_id_hex: &str,
+        depth: u8,
+        immutable: bool,
+        data: &[u8],
+    ) -> Result<Self, ClientError> {
+        let batch_id = parse_batch_id(batch_id_hex)?;
+        let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
+        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
+        let stamp_in = store
+            .into_chunks()
+            .iter()
+            .map(|(addr, chunk)| (*addr, wire_form(chunk)))
+            .collect();
+        Ok(Self::from_parts(root, stamp_in, stamper))
+    }
+
+    /// Single file wrapped in a one-entry mantaray manifest.
+    pub fn new_file(
+        signer: &SwarmSigner,
+        batch_id_hex: &str,
+        depth: u8,
+        immutable: bool,
+        data: &[u8],
+        path: &str,
+        content_type: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        let batch_id = parse_batch_id(batch_id_hex)?;
+        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(data)?;
+        let (manifest_root, manifest_chunks) =
+            crate::manifest::build_single_entry_manifest(path, file_root, content_type)
+                .map_err(|e| ClientError::Manifest(e.to_string()))?;
+        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
+        let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
+            Vec::with_capacity(file_store.len() + manifest_chunks.len());
+        for (addr, chunk) in file_store.into_chunks() {
+            stamp_in.push((addr, wire_form(&chunk)));
+        }
+        for (addr, wire) in manifest_chunks {
+            stamp_in.push((addr, wire.to_vec()));
+        }
+        Ok(Self::from_parts(manifest_root, stamp_in, stamper))
+    }
+
+    /// Collection (tar / directory) as a multi-entry manifest, deduped.
+    pub fn new_collection(
+        signer: &SwarmSigner,
+        batch_id_hex: &str,
+        depth: u8,
+        immutable: bool,
+        files: &[UploadFile],
+        index_document: Option<&str>,
+        error_document: Option<&str>,
+    ) -> Result<Self, ClientError> {
+        use crate::manifest::CollectionEntry;
+        if files.is_empty() {
+            return Err(ClientError::Manifest("collection is empty".into()));
+        }
+        let batch_id = parse_batch_id(batch_id_hex)?;
+        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
+        let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+        let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> = Vec::new();
+        let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
+        for f in files {
+            let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
+            for (addr, chunk) in file_store.into_chunks() {
+                let mut ab = [0u8; 32];
+                ab.copy_from_slice(addr.as_bytes());
+                if seen.insert(ab) {
+                    stamp_in.push((addr, wire_form(&chunk)));
+                }
+            }
+            entries.push(CollectionEntry {
+                path: f.path.clone(),
+                reference: file_root,
+                content_type: f.content_type.clone(),
+            });
+        }
+        let (manifest_root, manifest_chunks) =
+            crate::manifest::build_collection_manifest(&entries, index_document, error_document)
+                .map_err(|e| ClientError::Manifest(e.to_string()))?;
+        for (addr, wire) in manifest_chunks.iter() {
+            let mut ab = [0u8; 32];
+            ab.copy_from_slice(addr.as_bytes());
+            if seen.insert(ab) {
+                stamp_in.push((*addr, wire.to_vec()));
+            }
+        }
+        Ok(Self::from_parts(manifest_root, stamp_in, stamper))
+    }
+
+    pub fn root(&self) -> ChunkAddress {
+        self.root
+    }
+    pub fn total_chunks(&self) -> usize {
+        self.total
+    }
+    pub fn remaining(&self) -> usize {
+        self.remaining.len()
+    }
+
+    /// Stamp and return the next window of up to `batch_size` chunks (empty
+    /// when done). The window's source data is consumed, so its wire bytes
+    /// free once the returned `StampedChunk`s are dropped by the caller.
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Vec<StampedChunk>, ClientError> {
+        let n = batch_size.min(self.remaining.len());
+        if n == 0 {
+            return Ok(Vec::new());
+        }
+        let mut window: Vec<(ChunkAddress, Vec<u8>)> = Vec::with_capacity(n);
+        for _ in 0..n {
+            window.push(self.remaining.pop().expect("checked len"));
+        }
+        stamp_chunks_parallel(&mut self.stamper, window)
+    }
+}
+
 /// Upload arbitrary-size content. Splits via nectar, stamps each chunk with
 /// the supplied batch + signer, and pushes every chunk via pushsync to the
 /// closest peer in the peerlist. Returns the root content address.
@@ -5192,4 +5344,72 @@ fn parse_batch_id(hex_str: &str) -> Result<BatchId, ClientError> {
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(BatchId::from(arr))
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod streamer_tests {
+    use super::*;
+
+    fn signer() -> SwarmSigner {
+        SwarmSigner::from_hex_with_nonce(
+            "0x2cfe73bcd53cc2708a35f6f2238e2aeeb0448b65339f43d398e736102a211569",
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+            1,
+        )
+        .unwrap()
+    }
+
+    const BATCH: &str = "0x2c18bcb885649cb468732c98d70d9cb0280aaffb30ffd0c882fccd8e22cd7408";
+
+    /// UploadStreamer windows must yield exactly the same chunk set (by
+    /// address) as the one-shot prepare, every stamp must validate to the
+    /// signer, and the root must match — across several window sizes.
+    #[test]
+    fn streamer_raw_matches_oneshot() {
+        let s = signer();
+        // ~40 KiB → many content chunks + intermediate chunks.
+        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+
+        let (root_oneshot, work) = prepare_upload_bytes(&s, BATCH, 19, false, &data).unwrap();
+        let expected: std::collections::HashSet<[u8; 32]> = work.iter().map(|c| c.addr).collect();
+
+        for window in [1usize, 7, 256, 100_000] {
+            let mut stream = UploadStreamer::new_raw(&s, BATCH, 19, false, &data).unwrap();
+            assert_eq!(stream.total_chunks(), work.len(), "chunk count (window={window})");
+            assert_eq!(
+                hex::encode(stream.root().as_bytes()),
+                hex::encode(root_oneshot.as_bytes()),
+                "root (window={window})"
+            );
+            let mut got: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+            loop {
+                let batch = stream.next_batch(window).unwrap();
+                if batch.is_empty() {
+                    break;
+                }
+                for c in &batch {
+                    let vs = crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
+                    assert_eq!(vs.signer, *s.eth_address(), "stamp signer");
+                    got.insert(c.addr);
+                }
+            }
+            assert_eq!(got, expected, "chunk set (window={window})");
+            assert_eq!(stream.remaining(), 0);
+        }
+    }
+
+    /// The manifest (single-file) streamer root must equal the one-shot
+    /// manifest root.
+    #[test]
+    fn streamer_file_root_matches_oneshot() {
+        let s = signer();
+        let data = b"hoverfly streaming upload manifest root check".repeat(50);
+        let (root_oneshot, _) =
+            prepare_upload_file_with_manifest(&s, BATCH, 19, false, &data, "f.bin", None).unwrap();
+        let stream = UploadStreamer::new_file(&s, BATCH, 19, false, &data, "f.bin", None).unwrap();
+        assert_eq!(
+            hex::encode(stream.root().as_bytes()),
+            hex::encode(root_oneshot.as_bytes())
+        );
+    }
 }
