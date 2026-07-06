@@ -19,7 +19,8 @@ use wasm_bindgen::prelude::*;
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
     RetrievalCache, UploadFile, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
-    list_manifest_ex, upload_bytes_ex, upload_collection, upload_file_with_manifest_ex,
+    list_manifest_ex, prepare_upload_bytes, prepare_upload_file_with_manifest, upload_bytes_ex,
+    upload_collection, upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
 use crate::peers::PeerStore;
@@ -717,6 +718,59 @@ impl HoverflyClient {
         Ok(hex::encode(root.as_bytes()))
     }
 
+    /// Stamp a file **locally** and return the root plus POST-ready frame
+    /// batches for the pusher relay path — no network, no in-browser p2p.
+    /// This is the browser side of `docs/pusher-design.md` §3: the wasm
+    /// does the BMT split + EIP-191 postage signing (pure CPU), and JS
+    /// ships the frames to `hoverfly pusher` relays over HTTPS. Escapes
+    /// the wss-sliver problem — the browser never dials a bee.
+    ///
+    /// `raw=false` wraps the file in a single-entry mantaray manifest
+    /// (matching `uploadFile`'s root); `raw=true` returns the bare content
+    /// root. `batch_size` frames are packed per batch (≤ the pusher's
+    /// advertised `batch_max`).
+    #[wasm_bindgen(js_name = "prepareUpload")]
+    pub fn prepare_upload(
+        &self,
+        data: Uint8Array,
+        path: String,
+        content_type: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        immutable: bool,
+        raw: bool,
+        batch_size: usize,
+    ) -> Result<PreparedUpload, JsError> {
+        let signer = self.upload_signer()?;
+        let buf = data.to_vec();
+        let (root, work) = if raw {
+            prepare_upload_bytes(&signer, &batch_id_hex, depth, immutable, &buf)
+                .map_err(into_js_err)?
+        } else {
+            prepare_upload_file_with_manifest(
+                &signer,
+                &batch_id_hex,
+                depth,
+                immutable,
+                &buf,
+                &path,
+                content_type.as_deref(),
+            )
+            .map_err(into_js_err)?
+        };
+        let chunk_count = work.len();
+        let bs = batch_size.clamp(1, 512);
+        let batches: Vec<Vec<u8>> = work
+            .chunks(bs)
+            .map(crate::pushframe::encode_batch)
+            .collect();
+        Ok(PreparedUpload {
+            root: hex::encode(root.as_bytes()),
+            batches,
+            chunk_count,
+        })
+    }
+
     /// Upload a collection of files as a multi-entry mantaray manifest — the
     /// in-browser equivalent of bee's tar / multipart `POST /bzz` directory
     /// upload. Each file is BMT-split independently and gets one manifest entry
@@ -880,6 +934,45 @@ impl ManifestFetch {
     #[wasm_bindgen(getter, js_name = "feedResolved")]
     pub fn feed_resolved(&self) -> bool {
         self.feed_resolved
+    }
+}
+
+/// Locally-stamped upload ready for the pusher relay path: the reference
+/// root plus POST-ready frame batches. Produced by
+/// [`HoverflyClient::prepare_upload`]; JS fetches each `batch(i)` to a
+/// pusher's `/v1/push`.
+#[wasm_bindgen]
+pub struct PreparedUpload {
+    root: String,
+    batches: Vec<Vec<u8>>,
+    chunk_count: usize,
+}
+
+#[wasm_bindgen]
+impl PreparedUpload {
+    /// Reference root (hex, no `0x`) — the manifest root for a normal
+    /// upload, or the bare content root when prepared `raw`.
+    #[wasm_bindgen(getter)]
+    pub fn root(&self) -> String {
+        self.root.clone()
+    }
+
+    /// Total chunk count across all batches (for progress totals).
+    #[wasm_bindgen(getter, js_name = "chunkCount")]
+    pub fn chunk_count(&self) -> usize {
+        self.chunk_count
+    }
+
+    /// Number of POST-ready batches.
+    #[wasm_bindgen(getter, js_name = "batchCount")]
+    pub fn batch_count(&self) -> usize {
+        self.batches.len()
+    }
+
+    /// The `i`th batch as a POST body (concatenated frames), or `None`
+    /// if out of range.
+    pub fn batch(&self, i: usize) -> Option<Uint8Array> {
+        self.batches.get(i).map(|b| Uint8Array::from(b.as_slice()))
     }
 }
 
