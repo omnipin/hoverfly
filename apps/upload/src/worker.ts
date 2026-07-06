@@ -249,15 +249,28 @@ async function postBatch (pushUrl: string, body: Uint8Array): Promise<number> {
       body: body as BodyInit,
       headers: { 'content-type': 'application/x-hoverfly-frames' }
     })
-    if (!resp.ok) return 0
+    if (!resp.ok) {
+      const t = (await resp.text().catch(() => '')).slice(0, 300)
+      log(`Pusher ${pushUrl} → HTTP ${resp.status}: ${t}`)
+      return 0
+    }
     const txt = await resp.text()
     let ok = 0
+    let sampleErr: string | undefined
     for (const line of txt.split('\n')) {
       if (line.length === 0) continue
-      try { if ((JSON.parse(line) as { s?: string }).s === 'ok') ok++ } catch { /* skip */ }
+      try {
+        const v = JSON.parse(line) as { s?: string, e?: string }
+        if (v.s === 'ok') ok++
+        else if (v.s === 'err' && sampleErr == null) sampleErr = v.e
+      } catch { /* skip */ }
     }
+    if (ok === 0 && sampleErr != null) log(`Pusher ${pushUrl} rejected: ${sampleErr}`)
     return ok
-  } catch { return 0 }
+  } catch (e) {
+    log(`Pusher ${pushUrl} fetch failed: ${e instanceof Error ? e.message : String(e)}`)
+    return 0
+  }
 }
 
 /**
