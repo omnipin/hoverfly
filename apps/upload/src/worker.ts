@@ -12,7 +12,7 @@
 import {
   DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, HOVERFLY_JS, IDB_NAME, IDB_PEERS_KEY,
   IDB_STORE, MAINTENANCE_SECS, NETWORK_ID, PEERS_SEED_BUNDLED, PEERS_SEED_URL,
-  STATUS_POLL_SECS, UPLOAD_RETRIES, WARM_POOL
+  PUSH_BATCH_SIZE, PUSHER_URLS, STATUS_POLL_SECS, UPLOAD_RETRIES, WARM_POOL, usePushers
 } from './config.ts'
 import type { Req, Res } from './worker-protocol.ts'
 
@@ -29,6 +29,15 @@ interface HoverflyClient {
   uploadDiagnostics?: () => string
   uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
   uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
+  // Pusher path: stamp locally, return POST-ready frame batches (no network).
+  prepareUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean, batchSize: number) => PreparedUpload
+}
+/** Locally-stamped upload ready for the pusher relay path (wasm PreparedUpload). */
+interface PreparedUpload {
+  readonly root: string
+  readonly chunkCount: number
+  readonly batchCount: number
+  batch: (i: number) => Uint8Array | undefined
 }
 interface HoverflyModule {
   default: (input?: unknown) => Promise<unknown>
@@ -122,6 +131,16 @@ async function start (sessionKeyHex: string): Promise<void> {
     log('Constructing hoverfly client (session-key signer)…')
     const c = new mod.HoverflyClient(sessionKeyHex, BigInt(NETWORK_ID), undefined, 30, undefined)
     client = c
+
+    // Pusher mode: no in-browser p2p at all. The wasm client exists only to
+    // stamp chunks locally (BMT + EIP-191); the relays do the actual pushing
+    // over TCP. Skip the whole discover/warm/seed path — the wss-sliver
+    // problem it fights simply doesn't apply when we never dial a bee.
+    if (usePushers()) {
+      log(`Pusher mode: ${PUSHER_URLS.length} relay(s), no in-browser p2p (browser only stamps).`)
+      post({ kind: 'status', connected: PUSHER_URLS.length })
+      return
+    }
 
     // Load the IndexedDB cache first (peers we actually reached last session),
     // then MERGE the freshly-fetched CDN seed on top. The cache alone goes
@@ -218,6 +237,77 @@ async function withProgress<T> (c: HoverflyClient, run: () => Promise<T>): Promi
   }
 }
 
+// ---- pusher relay path (stamp local, POST frames) ----
+
+/** POST one frame batch to a relay's /v1/push; return how many chunks it
+ *  acked "ok". Any HTTP/transport error → 0 (batch treated as unacked). */
+async function postBatch (pushUrl: string, body: Uint8Array): Promise<number> {
+  try {
+    const resp = await fetch(pushUrl, {
+      method: 'POST',
+      body: body as BodyInit,
+      headers: { 'content-type': 'application/x-hoverfly-frames' }
+    })
+    if (!resp.ok) return 0
+    const txt = await resp.text()
+    let ok = 0
+    for (const line of txt.split('\n')) {
+      if (line.length === 0) continue
+      try { if ((JSON.parse(line) as { s?: string }).s === 'ok') ok++ } catch { /* skip */ }
+    }
+    return ok
+  } catch { return 0 }
+}
+
+/**
+ * Stamp `data` locally and push the frames across the configured relays.
+ * Batches are distributed across lanes and pushed concurrently; a batch a
+ * lane fails to fully ack is re-tried on the next lane (rank+1). The server
+ * is all-or-nothing per POST, so a batch is either fully acked or retried
+ * whole. Returns the reference root.
+ */
+async function pushViaPushers (
+  c: HoverflyClient, data: Uint8Array, path: string, contentType: string | undefined,
+  batchIdHex: string, depth: number, immutable: boolean, raw: boolean
+): Promise<string> {
+  if (c.prepareUpload == null) throw new Error('wasm build lacks prepareUpload (rebuild)')
+  const prep = c.prepareUpload(data, path, contentType, batchIdHex, depth, immutable, raw, PUSH_BATCH_SIZE)
+  const total = prep.chunkCount
+  const nBatches = prep.batchCount
+  // Copy each batch out of wasm linear memory before any await (the view
+  // would otherwise dangle / detach across the fetch).
+  const bodies: Uint8Array[] = []
+  for (let i = 0; i < nBatches; i++) {
+    const b = prep.batch(i)
+    if (b != null) bodies.push(b.slice())
+  }
+  const lanes = PUSHER_URLS.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
+  const batchChunks = (i: number): number =>
+    i < nBatches - 1 ? PUSH_BATCH_SIZE : total - PUSH_BATCH_SIZE * (nBatches - 1)
+
+  let done = 0
+  let pending = bodies.map((_, i) => ({ i, rank: 0 }))
+  const MAX_ROUNDS = 6
+  for (let round = 0; round < MAX_ROUNDS && pending.length > 0; round++) {
+    const results = await Promise.all(pending.map(async ({ i, rank }) => {
+      const lane = lanes[(i + rank) % lanes.length]
+      const acked = await postBatch(lane, bodies[i])
+      return { i, rank, ok: acked === batchChunks(i) }
+    }))
+    const next: Array<{ i: number, rank: number }> = []
+    for (const r of results) {
+      if (r.ok) { done += batchChunks(r.i); post({ kind: 'progress', done, total }) } else { next.push({ i: r.i, rank: r.rank + 1 }) }
+    }
+    if (next.length > 0) log(`Pusher: ${next.length} batch(es) unacked, failing over to next lane…`)
+    pending = next
+  }
+  if (pending.length > 0) {
+    throw new Error(`${pending.length} batch(es) unacked after ${MAX_ROUNDS} rounds across ${lanes.length} lane(s)`)
+  }
+  post({ kind: 'progress', done: total, total })
+  return prep.root
+}
+
 self.onmessage = async (e: MessageEvent<Req>) => {
   const msg = e.data
   try {
@@ -234,15 +324,26 @@ self.onmessage = async (e: MessageEvent<Req>) => {
       }
       case 'uploadFile': {
         const c = requireClient()
-        const root = await withProgress(c, async () => await c.uploadFile(
-          new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
-        ))
-        await pushStatus()
+        const root = usePushers()
+          ? await pushViaPushers(
+              c, new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false
+            )
+          : await withProgress(c, async () => await c.uploadFile(
+              new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+            ))
+        if (!usePushers()) await pushStatus()
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
       case 'uploadCollection': {
         const c = requireClient()
+        if (usePushers()) {
+          // Collections need a multi-entry manifest prep the wasm doesn't
+          // expose yet (prepareUpload is single-file/raw). Until a
+          // prepareCollection export lands, collection uploads can't use the
+          // relay path — surface a clear error rather than silently dialing.
+          throw new Error('collection/tar uploads are not yet supported via pusher relays; upload files individually')
+        }
         const files = msg.files.map(f => ({ path: f.path, data: new Uint8Array(f.data), contentType: f.contentType }))
         const root = await withProgress(c, async () => await c.uploadCollection(
           files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES

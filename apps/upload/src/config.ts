@@ -1,5 +1,30 @@
 // Static configuration for the Swarm upload dApp.
 
+// ---- Pusher relays ----
+/**
+ * Pusher relay URLs (`hoverfly pusher` nodes, docs/pusher-design.md). When
+ * non-empty, uploads go through these relays instead of dialing bees in the
+ * browser over wss: the browser stamps chunks locally (BMT + EIP-191, pure
+ * CPU in wasm) and POSTs pre-signed frames to a relay, which pushes them into
+ * the swarm over real TCP libp2p. This escapes the browser's wss-sliver
+ * problem — reach becomes the relay's (all ~2,800 bees over TCP) instead of
+ * the ~7 flaky wss AutoTLS hosts a browser can dial. The signing key never
+ * leaves the browser. Set to `[]` to fall back to the legacy in-browser p2p
+ * push path.
+ *
+ * Chunks are sharded across the lanes (rendezvous hashing) and pushed
+ * concurrently; a chunk unacked by one lane fails over to the next.
+ */
+export const PUSHER_URLS: string[] = [
+  'https://hoverfly-pusher.onrender.com',
+  'https://hoverfly-pusher-2.onrender.com',
+  'https://hoverfly-pusher-3.onrender.com'
+]
+/** Frames per POST to a pusher (≤ the relay's advertised `batch_max`). */
+export const PUSH_BATCH_SIZE = 256
+/** True when the dApp should push through relays rather than in-browser p2p. */
+export function usePushers (): boolean { return PUSHER_URLS.length > 0 }
+
 // ---- Swarm network ----
 /** 1 = mainnet, 10 = testnet/sepolia. Stamps + overlay derivation use this. */
 export const NETWORK_ID = 1

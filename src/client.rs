@@ -2263,13 +2263,6 @@ pub async fn upload_bytes_with_pool(
     Ok(root)
 }
 
-/// Push locally-stamped chunks through a relay (`hoverfly pusher`) over
-/// HTTP instead of dialing bees directly. The signing key never leaves
-/// this process — only pre-signed frames go over the wire
-/// (docs/pusher-design.md §3). Single-lane (stage B): batched POSTs to
-/// one pusher, streamed NDJSON acks, unacked chunks re-POSTed for a few
-/// rounds before giving up. Returns `Ok` only when every chunk is acked.
-#[cfg(not(target_arch = "wasm32"))]
 /// Push locally-stamped chunks across **multiple** relays in parallel,
 /// sharding by chunk address (docs/pusher-design.md §7). Each chunk is
 /// assigned to a lane by weighted rendezvous hashing — sticky per
@@ -2453,6 +2446,12 @@ fn rendezvous_order(addr: &[u8; 32], lanes: &[std::sync::Arc<String>]) -> Vec<us
     scored.into_iter().map(|(_, i)| i).collect()
 }
 
+/// Push locally-stamped chunks through a single relay (`hoverfly
+/// pusher`) over HTTP instead of dialing bees directly. The signing key
+/// never leaves this process — only pre-signed frames go over the wire
+/// (docs/pusher-design.md §3). Batched POSTs, streamed NDJSON acks,
+/// unacked chunks re-POSTed for a few rounds. `Ok` only when all acked.
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn push_via_pusher(
     pusher_url: &str,
     chunks: Vec<StampedChunk>,
