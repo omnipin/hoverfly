@@ -19,8 +19,9 @@ use wasm_bindgen::prelude::*;
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
     RetrievalCache, UploadFile, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
-    list_manifest_ex, prepare_upload_bytes, prepare_upload_file_with_manifest, upload_bytes_ex,
-    upload_collection, upload_file_with_manifest_ex,
+    list_manifest_ex, prepare_upload_bytes, prepare_upload_collection,
+    prepare_upload_file_with_manifest, upload_bytes_ex, upload_collection,
+    upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
 use crate::peers::PeerStore;
@@ -821,6 +822,51 @@ impl HoverflyClient {
         .await
         .map_err(into_js_err)?;
         Ok(hex::encode(root.as_bytes()))
+    }
+
+    /// Stamp a **collection** (tar / directory) locally for the pusher
+    /// relay path — the multi-entry-manifest analogue of
+    /// [`Self::prepare_upload`]. Builds the mantaray manifest, stamps every
+    /// unique chunk (BMT + EIP-191, pure CPU), and returns the root plus
+    /// POST-ready frame batches. No network; JS ships the frames to a
+    /// relay. `files` is `[{ path, data: Uint8Array, contentType? }]`.
+    #[wasm_bindgen(js_name = "prepareCollection")]
+    pub fn prepare_collection(
+        &self,
+        files: Array,
+        index_document: Option<String>,
+        error_document: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        immutable: bool,
+        batch_size: usize,
+    ) -> Result<PreparedUpload, JsError> {
+        let signer = self.upload_signer()?;
+        let upload_files = parse_upload_files(&files)?;
+        if upload_files.is_empty() {
+            return Err(JsError::new("collection is empty (no files)"));
+        }
+        let (root, work) = prepare_upload_collection(
+            &signer,
+            &batch_id_hex,
+            depth,
+            immutable,
+            &upload_files,
+            index_document.as_deref(),
+            error_document.as_deref(),
+        )
+        .map_err(into_js_err)?;
+        let chunk_count = work.len();
+        let bs = batch_size.clamp(1, 512);
+        let batches: Vec<Vec<u8>> = work
+            .chunks(bs)
+            .map(crate::pushframe::encode_batch)
+            .collect();
+        Ok(PreparedUpload {
+            root: hex::encode(root.as_bytes()),
+            batches,
+            chunk_count,
+        })
     }
 
     /// Live upload progress as `[pushed, total]` chunk counts. The worker
