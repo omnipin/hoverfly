@@ -2270,6 +2270,189 @@ pub async fn upload_bytes_with_pool(
 /// one pusher, streamed NDJSON acks, unacked chunks re-POSTed for a few
 /// rounds before giving up. Returns `Ok` only when every chunk is acked.
 #[cfg(not(target_arch = "wasm32"))]
+/// Push locally-stamped chunks across **multiple** relays in parallel,
+/// sharding by chunk address (docs/pusher-design.md §7). Each chunk is
+/// assigned to a lane by weighted rendezvous hashing — sticky per
+/// address, uniform load (chunk addresses are hash-uniform), and with a
+/// deterministic fallback order: a chunk unacked by its best lane is
+/// re-dispatched to its next-best lane (different IP, different pool),
+/// which is the structural fix for tail stalls. Lanes run concurrently,
+/// so aggregate throughput sums across their independent per-/32 dial
+/// budgets. Delegates to [`push_via_pusher`] for the single-lane case.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn push_via_pushers(
+    pusher_urls: &[String],
+    chunks: Vec<StampedChunk>,
+    progress: Option<&ProgressFn>,
+) -> Result<(), ClientError> {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+    const BATCH: usize = 256;
+    const MAX_ROUNDS: usize = 6;
+
+    if pusher_urls.is_empty() {
+        return Err(ClientError::Pusher("no pusher URLs given".into()));
+    }
+    if pusher_urls.len() == 1 {
+        return push_via_pusher(&pusher_urls[0], chunks, progress).await;
+    }
+
+    let lanes: Vec<Arc<String>> = pusher_urls
+        .iter()
+        .map(|u| Arc::new(format!("{}/v1/push", u.trim_end_matches('/'))))
+        .collect();
+    let n_lanes = lanes.len();
+    let http = Arc::new(
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(300))
+            .build()
+            .map_err(|e| ClientError::Pusher(format!("http client: {e}")))?,
+    );
+    let chunks = Arc::new(chunks);
+    let total = chunks.len();
+
+    // Per-chunk lane preference: lanes ordered by rendezvous score desc.
+    let lane_order: Vec<Vec<usize>> = chunks
+        .iter()
+        .map(|c| rendezvous_order(&c.addr, &lanes))
+        .collect();
+    // `rank[i]` = how many lanes have already failed chunk i (0 = best).
+    let mut rank = vec![0usize; chunks.len()];
+    let mut pending: Vec<usize> = (0..chunks.len()).collect();
+    let mut done = 0usize;
+
+    for round in 0..MAX_ROUNDS {
+        if pending.is_empty() {
+            break;
+        }
+        // Assign each pending chunk to its current-rank lane.
+        let mut per_lane: Vec<Vec<usize>> = vec![Vec::new(); n_lanes];
+        for &i in &pending {
+            let lane = lane_order[i][rank[i] % n_lanes];
+            per_lane[lane].push(i);
+        }
+        // Fire all lanes concurrently; each returns the indices it acked.
+        let mut tasks = Vec::new();
+        for (lane, idxs) in per_lane.into_iter().enumerate() {
+            if idxs.is_empty() {
+                continue;
+            }
+            let http = http.clone();
+            let url = lanes[lane].clone();
+            let chunks = chunks.clone();
+            tasks.push(tokio::spawn(async move {
+                let mut acked: Vec<usize> = Vec::new();
+                for sub in idxs.chunks(BATCH) {
+                    let batch: Vec<StampedChunk> = sub.iter().map(|&i| chunks[i].clone()).collect();
+                    let ok = post_batch_acks(&http, &url, &batch).await;
+                    for &i in sub {
+                        if ok.contains(&hex::encode(chunks[i].addr)) {
+                            acked.push(i);
+                        }
+                    }
+                }
+                acked
+            }));
+        }
+        let mut acked_this_round: HashSet<usize> = HashSet::new();
+        for t in tasks {
+            if let Ok(idxs) = t.await {
+                acked_this_round.extend(idxs);
+            }
+        }
+        let mut next = Vec::new();
+        for &i in &pending {
+            if acked_this_round.contains(&i) {
+                done += 1;
+                if let Some(p) = progress {
+                    p(done, total);
+                }
+            } else {
+                rank[i] += 1; // fail over to the next-best lane
+                next.push(i);
+            }
+        }
+        if !next.is_empty() {
+            warn!(target: "hoverfly::upload",
+                "multi-pusher round {} left {} unacked; failing over to next lanes",
+                round + 1, next.len());
+        }
+        pending = next;
+    }
+
+    if !pending.is_empty() {
+        return Err(ClientError::Pusher(format!(
+            "{} of {} chunks unacked after {MAX_ROUNDS} rounds across {} lanes",
+            pending.len(),
+            total,
+            n_lanes
+        )));
+    }
+    Ok(())
+}
+
+/// POST one batch to a lane and return the set of addr-hex strings the
+/// lane acked "ok". Any transport/HTTP error yields an empty set (whole
+/// batch treated as unacked → retried/failed-over by the caller).
+#[cfg(not(target_arch = "wasm32"))]
+async fn post_batch_acks(
+    http: &reqwest::Client,
+    push_url: &str,
+    batch: &[StampedChunk],
+) -> std::collections::HashSet<String> {
+    use std::collections::HashSet;
+    let mut acked = HashSet::new();
+    let body = crate::pushframe::encode_batch(batch);
+    let resp = match http.post(push_url).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(target: "hoverfly::upload", "lane {push_url} POST failed: {e}");
+            return acked;
+        }
+    };
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        warn!(target: "hoverfly::upload", "lane {push_url} rejected batch ({code}): {}", txt.trim());
+        return acked;
+    }
+    let Ok(txt) = resp.text().await else {
+        return acked;
+    };
+    for line in txt.lines() {
+        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if v.get("s").and_then(|s| s.as_str()) == Some("ok") {
+            if let Some(a) = v.get("a").and_then(|a| a.as_str()) {
+                acked.insert(a.to_string());
+            }
+        }
+    }
+    acked
+}
+
+/// Weighted rendezvous (HRW) lane ordering for a chunk: lanes sorted by
+/// `hash(addr ‖ lane_url)` descending, so each address deterministically
+/// prefers one lane (sticky, dedupe-friendly) and has a stable fallback
+/// order. Uniform weights for now; status-weighting is a §7 refinement.
+#[cfg(not(target_arch = "wasm32"))]
+fn rendezvous_order(addr: &[u8; 32], lanes: &[std::sync::Arc<String>]) -> Vec<usize> {
+    use std::hash::{Hash, Hasher};
+    let mut scored: Vec<(u64, usize)> = lanes
+        .iter()
+        .enumerate()
+        .map(|(i, url)| {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            addr.hash(&mut h);
+            url.as_bytes().hash(&mut h);
+            (h.finish(), i)
+        })
+        .collect();
+    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
+    scored.into_iter().map(|(_, i)| i).collect()
+}
+
 pub async fn push_via_pusher(
     pusher_url: &str,
     chunks: Vec<StampedChunk>,

@@ -49,10 +49,18 @@ use crate::transport::{Transport, TransportConfig, diag};
 const PUSH_BATCH_MAX: usize = 512;
 /// Max /v1/push body: PUSH_BATCH_MAX × max frame + slack.
 const PUSH_MAX_BODY: usize = PUSH_BATCH_MAX * pushframe::MAX_FRAME_LEN + 4096;
-/// Warm-pool target for the push path. Modest on purpose: bee rate-limits
-/// inbound dials per /32 (docs/pusher-design.md §"Stage A results"), so a
-/// held pool of this size + gentle top-up beats a big burst fill.
-const PUSH_POOL_TARGET: usize = 32;
+/// Default warm-pool target for the push path, overridable via
+/// `HOVERFLY_PUSH_POOL`. Deliberately modest because the *default*
+/// deployment is free cloud (shared egress /32): bee rate-limits inbound
+/// dials per /32 (10/s, burst 40 — docs/pusher-design.md §"Stage A
+/// results"), so a shared-IP pool starves at ~10–35 live sessions and a
+/// bigger target just burns dial churn that trips the limiter harder. On
+/// a **dedicated** IP (VPS, Oracle free VM) the pool reaches 76+ and bee
+/// itself sustains 137 — raise this to 128–256 there for much higher
+/// throughput.
+const PUSH_POOL_TARGET_DEFAULT: usize = 32;
+/// Clamp for the env override.
+const PUSH_POOL_TARGET_MAX: usize = 512;
 /// Per-chunk retry budget on the push path.
 const PUSH_MAX_RETRIES: usize = 20;
 
@@ -110,6 +118,8 @@ struct PushState {
     /// Warm pool, filled on first push and reused. `tokio::Mutex` because
     /// fills/pushes await; the pool itself is internally sharded.
     pool: tokio::sync::Mutex<Option<Arc<SessionPool>>>,
+    /// Target warm-pool size (from `HOVERFLY_PUSH_POOL`).
+    pool_target: usize,
 }
 
 type RespBody = BoxBody<Bytes, Infallible>;
@@ -412,10 +422,17 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
     let transport = Transport::new_with_keypair(node_signer, opts.transport.clone(), keypair)
         .with_status_snapshot(snapshot);
     let peers = PeerStore::load_or_create(&opts.peerlist);
+    let pool_target = std::env::var("HOVERFLY_PUSH_POOL")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(1, PUSH_POOL_TARGET_MAX))
+        .unwrap_or(PUSH_POOL_TARGET_DEFAULT);
+    info!("push warm-pool target = {pool_target} (HOVERFLY_PUSH_POOL to override)");
     Some(PushState {
         transport: Arc::new(transport),
         peers: Arc::new(peers),
         pool: tokio::sync::Mutex::new(None),
+        pool_target,
     })
 }
 
@@ -617,11 +634,11 @@ async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], St
     Ok(owner)
 }
 
-/// Return the warm pool, filling/topping it up to [`PUSH_POOL_TARGET`].
+/// Return the warm pool, filling/topping it up to `push.pool_target`.
 async fn ensure_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
     let mut guard = push.pool.lock().await;
     if let Some(p) = guard.as_ref() {
-        p.top_up(&push.transport, &push.peers, PUSH_POOL_TARGET)
+        p.top_up(&push.transport, &push.peers, push.pool_target)
             .await;
         if p.len() == 0 {
             return Err("warm pool empty after top-up".into());
@@ -629,7 +646,7 @@ async fn ensure_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
         return Ok(p.clone());
     }
     let pool = Arc::new(SessionPool::new());
-    pool.top_up(&push.transport, &push.peers, PUSH_POOL_TARGET)
+    pool.top_up(&push.transport, &push.peers, push.pool_target)
         .await;
     if pool.len() == 0 {
         return Err("could not open any sessions from the peer cache".into());
