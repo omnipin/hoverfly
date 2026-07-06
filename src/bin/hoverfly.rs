@@ -1691,16 +1691,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // pusher owns the session pool. Stage B: single lane, raw and
             // single-file manifest uploads (collection via pusher TBD).
             if !pusher.is_empty() {
-                if pusher.len() > 1 {
-                    eprintln!(
-                        "note: stage B uses one pusher lane; ignoring {} extra --pusher URL(s)",
-                        pusher.len() - 1
-                    );
-                }
                 if collection {
                     return Err("--collection via --pusher is not supported yet".into());
                 }
-                let pusher_url = pusher[0].clone();
                 let data = std::fs::read(&file)?;
                 let upload_started = std::time::Instant::now();
                 let (root, work) = if raw {
@@ -1727,15 +1720,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let n_chunks = work.len();
                 let progress = make_progress_bar();
-                hoverfly::client::push_via_pusher(&pusher_url, work, progress.as_ref()).await?;
+                hoverfly::client::push_via_pushers(&pusher, work, progress.as_ref()).await?;
                 drop(progress);
                 let elapsed = upload_started.elapsed();
                 let root_hex = hex::encode(root.as_bytes());
                 println!(
-                    "uploaded {} bytes ({} chunks) via pusher {} — {} root: {}",
+                    "uploaded {} bytes ({} chunks) via {} pusher lane(s) — {} root: {}",
                     data.len(),
                     n_chunks,
-                    pusher_url,
+                    pusher.len(),
                     if raw { "raw" } else { "manifest" },
                     root_hex,
                 );
