@@ -1788,29 +1788,21 @@ pub struct UploadFile {
     pub data: Vec<u8>,
 }
 
-/// Upload a collection of files as a multi-entry mantaray manifest, the way
-/// bee handles `POST /bzz` with `Content-Type: application/x-tar` or
-/// `multipart/form-data`. Each file is split with BMT independently, and a
-/// single manifest is built with one entry per file. Optional
-/// `index_document` / `error_document` are written as website metadata at
-/// the root path so that gateways serve `index.html` for `/<root>/` etc.
-///
-/// Returns the manifest root.
+/// Split + build the multi-entry manifest + stamp a collection, WITHOUT
+/// pushing. Returns the manifest root and the stamped chunks ready for
+/// the wire — the pure-CPU half of [`upload_collection`], shared with the
+/// pusher relay path (the browser calls this via wasm, then ships the
+/// frames to a relay). No network, no key beyond the stamp signer.
 #[allow(clippy::too_many_arguments)]
-pub async fn upload_collection(
-    transport: &Transport,
-    peers: &PeerStore,
+pub fn prepare_upload_collection(
     signer: &SwarmSigner,
     batch_id_hex: &str,
     depth: u8,
     immutable: bool,
-    files: Vec<UploadFile>,
+    files: &[UploadFile],
     index_document: Option<&str>,
     error_document: Option<&str>,
-    max_retries_per_chunk: usize,
-    concurrency: usize,
-    progress: Option<&ProgressFn>,
-) -> Result<ChunkAddress, ClientError> {
+) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     use crate::manifest::CollectionEntry;
 
     if files.is_empty() {
@@ -1831,7 +1823,7 @@ pub async fn upload_collection(
     let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
     let mut total_bytes: usize = 0;
     let mut raw_chunks = 0usize;
-    for f in &files {
+    for f in files {
         let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
         debug!(
             target: "hoverfly::upload",
@@ -1855,12 +1847,11 @@ pub async fn upload_collection(
         });
     }
 
-    // 2. Build the multi-entry manifest.
+    // Build the multi-entry manifest, then add its chunks (also deduped).
     let (manifest_root, manifest_chunks) =
         crate::manifest::build_collection_manifest(&entries, index_document, error_document)
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
     let unique_data_chunks = stamp_in.len();
-    // 3. Add manifest chunks (also dedup; share the seen set).
     for (addr, wire) in manifest_chunks.iter() {
         let mut addr_bytes = [0u8; 32];
         addr_bytes.copy_from_slice(addr.as_bytes());
@@ -1877,8 +1868,42 @@ pub async fn upload_collection(
         manifest_chunks.len(), manifest_root,
     );
 
-    // 4. Stamp in parallel, then push everything concurrently.
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
+    Ok((manifest_root, work))
+}
+
+/// Upload a collection of files as a multi-entry mantaray manifest, the way
+/// bee handles `POST /bzz` with `Content-Type: application/x-tar` or
+/// `multipart/form-data`. Each file is split with BMT independently, and a
+/// single manifest is built with one entry per file. Optional
+/// `index_document` / `error_document` are written as website metadata at
+/// the root path so that gateways serve `index.html` for `/<root>/` etc.
+///
+/// Returns the manifest root.
+#[allow(clippy::too_many_arguments)]
+pub async fn upload_collection(
+    transport: &Transport,
+    peers: &PeerStore,
+    signer: &SwarmSigner,
+    batch_id_hex: &str,
+    depth: u8,
+    immutable: bool,
+    files: Vec<UploadFile>,
+    index_document: Option<&str>,
+    error_document: Option<&str>,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    progress: Option<&ProgressFn>,
+) -> Result<ChunkAddress, ClientError> {
+    let (manifest_root, work) = prepare_upload_collection(
+        signer,
+        batch_id_hex,
+        depth,
+        immutable,
+        &files,
+        index_document,
+        error_document,
+    )?;
     push_chunks_concurrent(
         transport,
         peers,
