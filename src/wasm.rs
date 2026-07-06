@@ -18,10 +18,10 @@ use wasm_bindgen::prelude::*;
 
 use crate::DEFAULT_DOH_URL;
 use crate::client::{
-    RetrievalCache, UploadFile, fetch_bytes_cached_ex, fetch_manifest_path_cached_meta,
-    list_manifest_ex, prepare_upload_bytes, prepare_upload_collection,
-    prepare_upload_file_with_manifest, upload_bytes_ex, upload_collection,
-    upload_file_with_manifest_ex,
+    RetrievalCache, UploadFile, UploadStreamer, fetch_bytes_cached_ex,
+    fetch_manifest_path_cached_meta, list_manifest_ex, prepare_upload_bytes,
+    prepare_upload_collection, prepare_upload_file_with_manifest, upload_bytes_ex,
+    upload_collection, upload_file_with_manifest_ex,
 };
 use crate::doh::Doh;
 use crate::peers::PeerStore;
@@ -824,6 +824,73 @@ impl HoverflyClient {
         Ok(hex::encode(root.as_bytes()))
     }
 
+    /// Begin a **streaming** upload for the pusher path (single file or
+    /// raw). Splits + builds the manifest once, then the returned
+    /// [`UploadStream`] stamps and yields frames one window at a time via
+    /// `nextBatch`, freeing each window as it goes — flat memory regardless
+    /// of file size (500 MB / multi-GB without OOMing the tab). Stamp time
+    /// also overlaps the push instead of blocking up front.
+    #[wasm_bindgen(js_name = "beginUpload")]
+    pub fn begin_upload(
+        &self,
+        data: Uint8Array,
+        path: String,
+        content_type: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        immutable: bool,
+        raw: bool,
+    ) -> Result<UploadStream, JsError> {
+        let signer = self.upload_signer()?;
+        let buf = data.to_vec();
+        let inner = if raw {
+            UploadStreamer::new_raw(&signer, &batch_id_hex, depth, immutable, &buf)
+        } else {
+            UploadStreamer::new_file(
+                &signer,
+                &batch_id_hex,
+                depth,
+                immutable,
+                &buf,
+                &path,
+                content_type.as_deref(),
+            )
+        }
+        .map_err(into_js_err)?;
+        Ok(UploadStream { inner })
+    }
+
+    /// Streaming variant of [`Self::prepare_collection`] — a windowed
+    /// [`UploadStream`] over a tar / directory, so large collections don't
+    /// materialize every frame at once.
+    #[wasm_bindgen(js_name = "beginCollection")]
+    pub fn begin_collection(
+        &self,
+        files: Array,
+        index_document: Option<String>,
+        error_document: Option<String>,
+        batch_id_hex: String,
+        depth: u8,
+        immutable: bool,
+    ) -> Result<UploadStream, JsError> {
+        let signer = self.upload_signer()?;
+        let upload_files = parse_upload_files(&files)?;
+        if upload_files.is_empty() {
+            return Err(JsError::new("collection is empty (no files)"));
+        }
+        let inner = UploadStreamer::new_collection(
+            &signer,
+            &batch_id_hex,
+            depth,
+            immutable,
+            &upload_files,
+            index_document.as_deref(),
+            error_document.as_deref(),
+        )
+        .map_err(into_js_err)?;
+        Ok(UploadStream { inner })
+    }
+
     /// Stamp a **collection** (tar / directory) locally for the pusher
     /// relay path — the multi-entry-manifest analogue of
     /// [`Self::prepare_upload`]. Builds the mantaray manifest, stamps every
@@ -1019,6 +1086,42 @@ impl PreparedUpload {
     /// if out of range.
     pub fn batch(&self, i: usize) -> Option<Uint8Array> {
         self.batches.get(i).map(|b| Uint8Array::from(b.as_slice()))
+    }
+}
+
+/// A windowed streaming upload (see [`HoverflyClient::begin_upload`]). JS
+/// pulls `nextBatch(batchSize)` until it returns `undefined`, pushing each
+/// body to a relay — memory stays flat regardless of file size.
+#[wasm_bindgen]
+pub struct UploadStream {
+    inner: UploadStreamer,
+}
+
+#[wasm_bindgen]
+impl UploadStream {
+    /// Reference root (hex) — fixed by the initial split, available before
+    /// any chunk is pushed.
+    #[wasm_bindgen(getter)]
+    pub fn root(&self) -> String {
+        hex::encode(self.inner.root().as_bytes())
+    }
+
+    /// Total chunk count (for progress totals).
+    #[wasm_bindgen(getter, js_name = "chunkCount")]
+    pub fn chunk_count(&self) -> usize {
+        self.inner.total_chunks()
+    }
+
+    /// Stamp + encode the next window as a POST body, or `undefined` when
+    /// the stream is exhausted. Each call frees the window it consumed.
+    #[wasm_bindgen(js_name = "nextBatch")]
+    pub fn next_batch(&mut self, batch_size: usize) -> Result<Option<Uint8Array>, JsError> {
+        let work = self.inner.next_batch(batch_size).map_err(into_js_err)?;
+        if work.is_empty() {
+            return Ok(None);
+        }
+        let body = crate::pushframe::encode_batch(&work);
+        Ok(Some(Uint8Array::from(body.as_slice())))
     }
 }
 

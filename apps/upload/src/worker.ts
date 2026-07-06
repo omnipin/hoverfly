@@ -29,16 +29,17 @@ interface HoverflyClient {
   uploadDiagnostics?: () => string
   uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
   uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
-  // Pusher path: stamp locally, return POST-ready frame batches (no network).
-  prepareUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean, batchSize: number) => PreparedUpload
-  prepareCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, batchSize: number) => PreparedUpload
+  // Pusher path: windowed streaming — stamp + yield one bundle at a time so
+  // memory stays flat for arbitrarily large files (see UploadStream).
+  beginUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean) => UploadStream
+  beginCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean) => UploadStream
 }
-/** Locally-stamped upload ready for the pusher relay path (wasm PreparedUpload). */
-interface PreparedUpload {
+/** Windowed streaming upload handle (wasm UploadStream). */
+interface UploadStream {
   readonly root: string
   readonly chunkCount: number
-  readonly batchCount: number
-  batch: (i: number) => Uint8Array | undefined
+  /** Stamp + encode the next bundle, or undefined when exhausted. */
+  nextBatch: (batchSize: number) => Uint8Array | undefined
 }
 interface HoverflyModule {
   default: (input?: unknown) => Promise<unknown>
@@ -238,12 +239,13 @@ async function withProgress<T> (c: HoverflyClient, run: () => Promise<T>): Promi
   }
 }
 
-// ---- pusher relay path (stamp local, POST frames) ----
+// ---- pusher relay path (windowed streaming: stamp local, POST frames) ----
 
-/** POST one frame batch to a relay's /v1/push and stream the NDJSON acks,
- *  invoking `onAck()` per chunk acked "ok" (for live progress). Returns the
- *  total "ok" count. Any HTTP/transport error → 0 (batch treated unacked). */
-async function postBatch (pushUrl: string, body: Uint8Array, onAck: () => void): Promise<number> {
+/** POST one bundle to a relay's /v1/push, streaming NDJSON acks and calling
+ *  `onAck()` per chunk acked "ok" (live progress). Returns `{ok, hadErr}`:
+ *  the relay is all-or-nothing, so a bundle either fully acks (hadErr=false,
+ *  ok>0) or is rejected. Any HTTP/transport failure → {ok:0, hadErr:true}. */
+async function postBundle (pushUrl: string, body: Uint8Array, onAck: () => void): Promise<{ ok: number, hadErr: boolean }> {
   try {
     const resp = await fetch(pushUrl, {
       method: 'POST',
@@ -253,7 +255,7 @@ async function postBatch (pushUrl: string, body: Uint8Array, onAck: () => void):
     if (!resp.ok) {
       const t = (await resp.text().catch(() => '')).slice(0, 300)
       log(`Pusher ${pushUrl} → HTTP ${resp.status}: ${t}`)
-      return 0
+      return { ok: 0, hadErr: true }
     }
     let ok = 0
     let sampleErr: string | undefined
@@ -266,7 +268,6 @@ async function postBatch (pushUrl: string, body: Uint8Array, onAck: () => void):
     }
     const reader = resp.body?.getReader()
     if (reader != null) {
-      // Stream the acks so progress advances per chunk, not per batch.
       const dec = new TextDecoder()
       let buf = ''
       for (;;) {
@@ -280,39 +281,39 @@ async function postBatch (pushUrl: string, body: Uint8Array, onAck: () => void):
     } else {
       for (const line of (await resp.text()).split('\n')) handle(line)
     }
-    if (ok === 0 && sampleErr != null) log(`Pusher ${pushUrl} rejected: ${sampleErr}`)
-    return ok
+    if (sampleErr != null) log(`Pusher ${pushUrl} rejected: ${sampleErr}`)
+    return { ok, hadErr: sampleErr != null }
   } catch (e) {
     log(`Pusher ${pushUrl} fetch failed: ${e instanceof Error ? e.message : String(e)}`)
-    return 0
+    return { ok: 0, hadErr: true }
   }
 }
 
-/**
- * Push an already-stamped upload (frames) across the configured relays.
- * Batches are distributed across lanes and pushed concurrently; a batch a
- * lane fails to fully ack is re-tried on the next lane (rank+1). The server
- * is all-or-nothing per POST, so a batch is either fully acked or retried
- * whole. Returns the reference root.
- */
-async function pushPrepared (prep: PreparedUpload): Promise<string> {
-  const total = prep.chunkCount
-  const nBatches = prep.batchCount
-  // Copy each batch out of wasm linear memory before any await (the view
-  // would otherwise dangle / detach across the fetch).
-  const bodies: Uint8Array[] = []
-  for (let i = 0; i < nBatches; i++) {
-    const b = prep.batch(i)
-    if (b != null) bodies.push(b.slice())
+/** Push one bundle, failing over across lanes (starting at `start`) until a
+ *  relay fully acks it. Rejects if every lane fails `maxRounds` times. */
+async function pushBundle (body: Uint8Array, start: number, lanes: string[], onAck: () => void): Promise<void> {
+  const maxRounds = Math.max(6, lanes.length * 2)
+  for (let r = 0; r < maxRounds; r++) {
+    const lane = lanes[(start + r) % lanes.length]
+    const { ok, hadErr } = await postBundle(lane, body, onAck)
+    if (ok > 0 && !hadErr) return
   }
-  const lanes = PUSHER_URLS.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
-  const batchChunks = (i: number): number =>
-    i < nBatches - 1 ? PUSH_BATCH_SIZE : total - PUSH_BATCH_SIZE * (nBatches - 1)
-  log(`Stamped ${total} chunks → ${nBatches} batch(es); pushing across ${lanes.length} lane(s)…`)
+  throw new Error(`bundle unacked after ${maxRounds} lane attempts`)
+}
 
-  // Live progress from streamed acks. `done` drives only the bar (clamped to
-  // total); completion is gated on confirmed batches below, so an over-count
-  // from a mid-stream reconnect is cosmetic.
+/**
+ * Windowed streaming push. Pulls one stamped bundle at a time from the wasm
+ * `UploadStream` (memory stays flat), dispatching each to a relay lane with
+ * bounded in-flight concurrency — so stamping the next window overlaps the
+ * network push of earlier ones, and lanes are used in parallel. Returns the
+ * reference root.
+ */
+async function pushStream (stream: UploadStream): Promise<string> {
+  const total = stream.chunkCount
+  const lanes = PUSHER_URLS.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
+  const INFLIGHT = Math.max(3, lanes.length * 2)
+  log(`Streaming ${total} chunks across ${lanes.length} relay lane(s)…`)
+
   let done = 0
   let lastPost = 0
   const onAck = (): void => {
@@ -324,24 +325,25 @@ async function pushPrepared (prep: PreparedUpload): Promise<string> {
     }
   }
 
-  let pending = bodies.map((_, i) => ({ i, rank: 0 }))
-  const MAX_ROUNDS = 6
-  for (let round = 0; round < MAX_ROUNDS && pending.length > 0; round++) {
-    const results = await Promise.all(pending.map(async ({ i, rank }) => {
-      const lane = lanes[(i + rank) % lanes.length]
-      const acked = await postBatch(lane, bodies[i], onAck)
-      return { i, rank, ok: acked === batchChunks(i) }
-    }))
-    const next: Array<{ i: number, rank: number }> = []
-    for (const r of results) if (!r.ok) next.push({ i: r.i, rank: r.rank + 1 })
-    if (next.length > 0) log(`Pusher: ${next.length} batch(es) unacked, failing over to next lane…`)
-    pending = next
+  const inflight = new Set<Promise<void>>()
+  let fatal: Error | null = null
+  let bundleIdx = 0
+  for (;;) {
+    if (fatal != null) break
+    const b = stream.nextBatch(PUSH_BATCH_SIZE) // stamps the next window
+    if (b == null) break
+    const body = b.slice() // copy out of wasm memory before awaiting
+    const start = bundleIdx++
+    const p = pushBundle(body, start, lanes, onAck)
+      .catch((e: unknown) => { fatal = e instanceof Error ? e : new Error(String(e)) })
+    inflight.add(p)
+    void p.finally(() => inflight.delete(p))
+    if (inflight.size >= INFLIGHT) await Promise.race(inflight)
   }
-  if (pending.length > 0) {
-    throw new Error(`${pending.length} batch(es) unacked after ${MAX_ROUNDS} rounds across ${lanes.length} lane(s)`)
-  }
+  await Promise.all(inflight)
+  if (fatal != null) throw fatal
   post({ kind: 'progress', done: total, total })
-  return prep.root
+  return stream.root
 }
 
 self.onmessage = async (e: MessageEvent<Req>) => {
@@ -362,9 +364,9 @@ self.onmessage = async (e: MessageEvent<Req>) => {
         const c = requireClient()
         let root: string
         if (usePushers()) {
-          if (c.prepareUpload == null) throw new Error('wasm build lacks prepareUpload (rebuild)')
-          root = await pushPrepared(c.prepareUpload(
-            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false, PUSH_BATCH_SIZE
+          if (c.beginUpload == null) throw new Error('wasm build lacks beginUpload (rebuild)')
+          root = await pushStream(c.beginUpload(
+            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false
           ))
         } else {
           root = await withProgress(c, async () => await c.uploadFile(
@@ -380,9 +382,9 @@ self.onmessage = async (e: MessageEvent<Req>) => {
         const files = msg.files.map(f => ({ path: f.path, data: new Uint8Array(f.data), contentType: f.contentType }))
         let root: string
         if (usePushers()) {
-          if (c.prepareCollection == null) throw new Error('wasm build lacks prepareCollection (rebuild)')
-          root = await pushPrepared(c.prepareCollection(
-            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, PUSH_BATCH_SIZE
+          if (c.beginCollection == null) throw new Error('wasm build lacks beginCollection (rebuild)')
+          root = await pushStream(c.beginCollection(
+            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable
           ))
         } else {
           root = await withProgress(c, async () => await c.uploadCollection(
