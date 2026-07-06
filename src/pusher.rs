@@ -181,7 +181,15 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Response<RespBody> {
-    match (req.method(), req.uri().path()) {
+    // Browsers push cross-origin (a dApp on some origin → this relay), with a
+    // custom content-type that triggers a CORS preflight. Answer OPTIONS and
+    // tag every response with permissive CORS headers — the relay serves no
+    // credentialed/secret data, auth is per-frame stamp signatures, so `*` is
+    // correct. Without this the browser blocks /v1/push entirely.
+    if req.method() == Method::OPTIONS {
+        return cors_preflight();
+    }
+    let mut resp = match (req.method(), req.uri().path()) {
         (&Method::GET, "/v1/status") => status_response(&state),
         (&Method::POST, "/v1/probe") => probe_response(state, req.uri().query()),
         (&Method::POST, "/v1/tcpcheck") => tcpcheck_response(state, req.uri().query()),
@@ -190,7 +198,46 @@ async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Respo
             json_line_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         _ => json_line_response(StatusCode::NOT_FOUND, "not found"),
-    }
+    };
+    add_cors(resp.headers_mut());
+    resp
+}
+
+/// Add permissive CORS headers to a response.
+fn add_cors(h: &mut hyper::HeaderMap) {
+    use hyper::header::HeaderValue;
+    h.insert(
+        "access-control-allow-origin",
+        HeaderValue::from_static("*"),
+    );
+    h.insert(
+        "access-control-expose-headers",
+        HeaderValue::from_static("*"),
+    );
+}
+
+/// 204 response for a CORS preflight (`OPTIONS`).
+fn cors_preflight() -> Response<RespBody> {
+    use hyper::header::HeaderValue;
+    let mut resp = Response::builder()
+        .status(StatusCode::NO_CONTENT)
+        .body(Full::new(Bytes::new()).boxed())
+        .expect("static response parts");
+    let h = resp.headers_mut();
+    add_cors(h);
+    h.insert(
+        "access-control-allow-methods",
+        HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    h.insert(
+        "access-control-allow-headers",
+        HeaderValue::from_static("content-type"),
+    );
+    h.insert(
+        "access-control-max-age",
+        HeaderValue::from_static("86400"),
+    );
+    resp
 }
 
 fn status_response(state: &State) -> Response<RespBody> {
