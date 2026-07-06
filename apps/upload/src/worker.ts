@@ -31,6 +31,7 @@ interface HoverflyClient {
   uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
   // Pusher path: stamp locally, return POST-ready frame batches (no network).
   prepareUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean, batchSize: number) => PreparedUpload
+  prepareCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, batchSize: number) => PreparedUpload
 }
 /** Locally-stamped upload ready for the pusher relay path (wasm PreparedUpload). */
 interface PreparedUpload {
@@ -260,18 +261,13 @@ async function postBatch (pushUrl: string, body: Uint8Array): Promise<number> {
 }
 
 /**
- * Stamp `data` locally and push the frames across the configured relays.
+ * Push an already-stamped upload (frames) across the configured relays.
  * Batches are distributed across lanes and pushed concurrently; a batch a
  * lane fails to fully ack is re-tried on the next lane (rank+1). The server
  * is all-or-nothing per POST, so a batch is either fully acked or retried
  * whole. Returns the reference root.
  */
-async function pushViaPushers (
-  c: HoverflyClient, data: Uint8Array, path: string, contentType: string | undefined,
-  batchIdHex: string, depth: number, immutable: boolean, raw: boolean
-): Promise<string> {
-  if (c.prepareUpload == null) throw new Error('wasm build lacks prepareUpload (rebuild)')
-  const prep = c.prepareUpload(data, path, contentType, batchIdHex, depth, immutable, raw, PUSH_BATCH_SIZE)
+async function pushPrepared (prep: PreparedUpload): Promise<string> {
   const total = prep.chunkCount
   const nBatches = prep.batchCount
   // Copy each batch out of wasm linear memory before any await (the view
@@ -324,31 +320,36 @@ self.onmessage = async (e: MessageEvent<Req>) => {
       }
       case 'uploadFile': {
         const c = requireClient()
-        const root = usePushers()
-          ? await pushViaPushers(
-              c, new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false
-            )
-          : await withProgress(c, async () => await c.uploadFile(
-              new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
-            ))
-        if (!usePushers()) await pushStatus()
+        let root: string
+        if (usePushers()) {
+          if (c.prepareUpload == null) throw new Error('wasm build lacks prepareUpload (rebuild)')
+          root = await pushPrepared(c.prepareUpload(
+            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false, PUSH_BATCH_SIZE
+          ))
+        } else {
+          root = await withProgress(c, async () => await c.uploadFile(
+            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+          ))
+          await pushStatus()
+        }
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
       case 'uploadCollection': {
         const c = requireClient()
-        if (usePushers()) {
-          // Collections need a multi-entry manifest prep the wasm doesn't
-          // expose yet (prepareUpload is single-file/raw). Until a
-          // prepareCollection export lands, collection uploads can't use the
-          // relay path — surface a clear error rather than silently dialing.
-          throw new Error('collection/tar uploads are not yet supported via pusher relays; upload files individually')
-        }
         const files = msg.files.map(f => ({ path: f.path, data: new Uint8Array(f.data), contentType: f.contentType }))
-        const root = await withProgress(c, async () => await c.uploadCollection(
-          files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
-        ))
-        await pushStatus()
+        let root: string
+        if (usePushers()) {
+          if (c.prepareCollection == null) throw new Error('wasm build lacks prepareCollection (rebuild)')
+          root = await pushPrepared(c.prepareCollection(
+            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, PUSH_BATCH_SIZE
+          ))
+        } else {
+          root = await withProgress(c, async () => await c.uploadCollection(
+            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+          ))
+          await pushStatus()
+        }
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
