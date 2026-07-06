@@ -2482,9 +2482,13 @@ pub async fn push_via_pusher(
     chunks: Vec<StampedChunk>,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
-    use std::collections::HashSet;
+    use futures::stream::StreamExt;
     /// Frames per POST — must stay ≤ the pusher's advertised batch_max.
     const BATCH: usize = 256;
+    /// Batches POSTed concurrently to the relay. The relay pushes each
+    /// through its shared warm pool, so pipelining keeps that pool
+    /// saturated instead of idling between one-at-a-time POSTs.
+    const INFLIGHT: usize = 4;
     /// Rounds of re-POSTing unacked chunks before failing.
     const MAX_ROUNDS: usize = 6;
 
@@ -2503,55 +2507,27 @@ pub async fn push_via_pusher(
         if pending.is_empty() {
             break;
         }
+        let batches: Vec<Vec<usize>> = pending.chunks(BATCH).map(|c| c.to_vec()).collect();
+        // POST up to INFLIGHT batches concurrently; each returns its acked set.
+        let results: Vec<(Vec<usize>, std::collections::HashSet<String>)> =
+            futures::stream::iter(batches.into_iter().map(|idxs| {
+                let http = &http;
+                let push_url = &push_url;
+                let chunks = &chunks;
+                async move {
+                    let batch: Vec<StampedChunk> =
+                        idxs.iter().map(|&i| chunks[i].clone()).collect();
+                    let acked = post_batch_acks(http, push_url, &batch).await;
+                    (idxs, acked)
+                }
+            }))
+            .buffer_unordered(INFLIGHT)
+            .collect()
+            .await;
+
         let mut next: Vec<usize> = Vec::new();
-        for idx_batch in pending.chunks(BATCH) {
-            let batch: Vec<StampedChunk> = idx_batch.iter().map(|&i| chunks[i].clone()).collect();
-            let body = crate::pushframe::encode_batch(&batch);
-            let resp = match http.post(&push_url).body(body).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(target: "hoverfly::upload", "pusher POST failed: {e}; retrying batch");
-                    next.extend_from_slice(idx_batch);
-                    continue;
-                }
-            };
-            if !resp.status().is_success() {
-                let code = resp.status();
-                let txt = resp.text().await.unwrap_or_default();
-                warn!(target: "hoverfly::upload",
-                    "pusher rejected batch ({code}): {}", txt.trim());
-                next.extend_from_slice(idx_batch);
-                continue;
-            }
-            // Parse streamed NDJSON acks; collect the addrs marked "ok".
-            let txt = resp
-                .text()
-                .await
-                .map_err(|e| ClientError::Pusher(format!("read acks: {e}")))?;
-            let mut acked: HashSet<String> = HashSet::new();
-            let mut sample_err: Option<String> = None;
-            for line in txt.lines() {
-                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                match v.get("s").and_then(|s| s.as_str()) {
-                    Some("ok") => {
-                        if let Some(a) = v.get("a").and_then(|a| a.as_str()) {
-                            acked.insert(a.to_string());
-                        }
-                    }
-                    Some("err") => {
-                        if sample_err.is_none() {
-                            sample_err = v.get("e").and_then(|e| e.as_str()).map(str::to_string);
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            if let Some(e) = &sample_err {
-                warn!(target: "hoverfly::upload", "pusher rejected chunk(s): {e}");
-            }
-            for &i in idx_batch {
+        for (idxs, acked) in results {
+            for i in idxs {
                 if acked.contains(&hex::encode(chunks[i].addr)) {
                     done += 1;
                     if let Some(p) = progress {

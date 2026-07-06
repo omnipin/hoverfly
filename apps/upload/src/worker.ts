@@ -240,9 +240,10 @@ async function withProgress<T> (c: HoverflyClient, run: () => Promise<T>): Promi
 
 // ---- pusher relay path (stamp local, POST frames) ----
 
-/** POST one frame batch to a relay's /v1/push; return how many chunks it
- *  acked "ok". Any HTTP/transport error → 0 (batch treated as unacked). */
-async function postBatch (pushUrl: string, body: Uint8Array): Promise<number> {
+/** POST one frame batch to a relay's /v1/push and stream the NDJSON acks,
+ *  invoking `onAck()` per chunk acked "ok" (for live progress). Returns the
+ *  total "ok" count. Any HTTP/transport error → 0 (batch treated unacked). */
+async function postBatch (pushUrl: string, body: Uint8Array, onAck: () => void): Promise<number> {
   try {
     const resp = await fetch(pushUrl, {
       method: 'POST',
@@ -254,16 +255,30 @@ async function postBatch (pushUrl: string, body: Uint8Array): Promise<number> {
       log(`Pusher ${pushUrl} → HTTP ${resp.status}: ${t}`)
       return 0
     }
-    const txt = await resp.text()
     let ok = 0
     let sampleErr: string | undefined
-    for (const line of txt.split('\n')) {
-      if (line.length === 0) continue
+    const handle = (line: string): void => {
+      if (line.length === 0) return
       try {
         const v = JSON.parse(line) as { s?: string, e?: string }
-        if (v.s === 'ok') ok++
-        else if (v.s === 'err' && sampleErr == null) sampleErr = v.e
-      } catch { /* skip */ }
+        if (v.s === 'ok') { ok++; onAck() } else if (v.s === 'err' && sampleErr == null) sampleErr = v.e
+      } catch { /* skip non-JSON */ }
+    }
+    const reader = resp.body?.getReader()
+    if (reader != null) {
+      // Stream the acks so progress advances per chunk, not per batch.
+      const dec = new TextDecoder()
+      let buf = ''
+      for (;;) {
+        const { done, value } = await reader.read()
+        if (done) break
+        buf += dec.decode(value, { stream: true })
+        let nl: number
+        while ((nl = buf.indexOf('\n')) >= 0) { handle(buf.slice(0, nl)); buf = buf.slice(nl + 1) }
+      }
+      handle(buf)
+    } else {
+      for (const line of (await resp.text()).split('\n')) handle(line)
     }
     if (ok === 0 && sampleErr != null) log(`Pusher ${pushUrl} rejected: ${sampleErr}`)
     return ok
@@ -293,20 +308,32 @@ async function pushPrepared (prep: PreparedUpload): Promise<string> {
   const lanes = PUSHER_URLS.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
   const batchChunks = (i: number): number =>
     i < nBatches - 1 ? PUSH_BATCH_SIZE : total - PUSH_BATCH_SIZE * (nBatches - 1)
+  log(`Stamped ${total} chunks → ${nBatches} batch(es); pushing across ${lanes.length} lane(s)…`)
 
+  // Live progress from streamed acks. `done` drives only the bar (clamped to
+  // total); completion is gated on confirmed batches below, so an over-count
+  // from a mid-stream reconnect is cosmetic.
   let done = 0
+  let lastPost = 0
+  const onAck = (): void => {
+    done++
+    const now = Date.now()
+    if (now - lastPost >= 150 || done >= total) {
+      lastPost = now
+      post({ kind: 'progress', done: Math.min(done, total), total })
+    }
+  }
+
   let pending = bodies.map((_, i) => ({ i, rank: 0 }))
   const MAX_ROUNDS = 6
   for (let round = 0; round < MAX_ROUNDS && pending.length > 0; round++) {
     const results = await Promise.all(pending.map(async ({ i, rank }) => {
       const lane = lanes[(i + rank) % lanes.length]
-      const acked = await postBatch(lane, bodies[i])
+      const acked = await postBatch(lane, bodies[i], onAck)
       return { i, rank, ok: acked === batchChunks(i) }
     }))
     const next: Array<{ i: number, rank: number }> = []
-    for (const r of results) {
-      if (r.ok) { done += batchChunks(r.i); post({ kind: 'progress', done, total }) } else { next.push({ i: r.i, rank: r.rank + 1 }) }
-    }
+    for (const r of results) if (!r.ok) next.push({ i: r.i, rank: r.rank + 1 })
     if (next.length > 0) log(`Pusher: ${next.length} batch(es) unacked, failing over to next lane…`)
     pending = next
   }
