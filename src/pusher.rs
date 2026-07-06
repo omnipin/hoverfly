@@ -161,6 +161,14 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         owner_cache: std::sync::Mutex::new(HashMap::new()),
     });
 
+    // Background warm-pool maintenance: fill on startup and keep the pool
+    // topped up so /v1/push requests find live sessions ready and never
+    // dial-burst inline. Gentle cadence stays under bee's per-/32 rate limit.
+    if state.push.is_some() {
+        let s = state.clone();
+        tokio::spawn(async move { push_maintenance(s).await });
+    }
+
     loop {
         let (stream, _remote) = listener.accept().await?;
         let io = hyper_util::rt::TokioIo::new(stream);
@@ -206,10 +214,7 @@ async fn handle(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Respo
 /// Add permissive CORS headers to a response.
 fn add_cors(h: &mut hyper::HeaderMap) {
     use hyper::header::HeaderValue;
-    h.insert(
-        "access-control-allow-origin",
-        HeaderValue::from_static("*"),
-    );
+    h.insert("access-control-allow-origin", HeaderValue::from_static("*"));
     h.insert(
         "access-control-expose-headers",
         HeaderValue::from_static("*"),
@@ -233,10 +238,7 @@ fn cors_preflight() -> Response<RespBody> {
         "access-control-allow-headers",
         HeaderValue::from_static("content-type"),
     );
-    h.insert(
-        "access-control-max-age",
-        HeaderValue::from_static("86400"),
-    );
+    h.insert("access-control-max-age", HeaderValue::from_static("86400"));
     resp
 }
 
@@ -518,15 +520,13 @@ async fn push_response(
         return json_line_response(StatusCode::BAD_REQUEST, "empty batch");
     }
 
-    // Serialize with probes and other pushes (stage B: one network op at
-    // a time over the shared warm pool).
-    let Ok(guard) = state.probe_lock.clone().try_lock_owned() else {
-        return json_line_response(StatusCode::CONFLICT, "a probe or push is already running");
-    };
-
+    // Pushes run CONCURRENTLY over the shared warm pool — clients pipeline
+    // several batches at once, so serializing them (the old 409-on-contention
+    // behavior) forced needless failover churn. The pool is Arc/RwLock-shared
+    // and kept filled by the background maintenance loop; each push only reads
+    // sessions from it (maintain=false), so no per-push dial burst.
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Frame<Bytes>, Infallible>>();
     tokio::spawn(async move {
-        let _guard = guard;
         run_push(state, chunks, tx).await;
     });
 
@@ -609,9 +609,9 @@ async fn run_push(
         return;
     }
 
-    // Ensure the warm pool, then push the accepted chunks.
+    // Grab the warm pool (kept filled by the maintenance loop) and push.
     let push = state.push.as_ref().expect("push state present");
-    let pool = match ensure_pool(push).await {
+    let pool = match get_pool(push).await {
         Ok(p) => p,
         Err(e) => {
             for c in &accepted {
@@ -629,7 +629,9 @@ async fn run_push(
         &push.peers,
         accepted,
         PUSH_MAX_RETRIES,
-        true, // hold the warm pool topped up mid-push
+        false, // the background maintenance loop owns pool upkeep — no per-push
+        // top-up (concurrent pushes would otherwise each dial-burst and trip
+        // bee's per-/32 rate limiter).
         None,
     )
     .await;
@@ -683,23 +685,56 @@ async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], St
 
 /// Return the warm pool, filling/topping it up to `push.pool_target`.
 async fn ensure_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
-    let mut guard = push.pool.lock().await;
-    if let Some(p) = guard.as_ref() {
-        p.top_up(&push.transport, &push.peers, push.pool_target)
-            .await;
-        if p.len() == 0 {
-            return Err("warm pool empty after top-up".into());
+    // Get-or-install the pool handle under a brief lock, then top up WITHOUT
+    // holding it — dialing takes seconds and must not block concurrent pushes
+    // reading the pool.
+    let pool = {
+        let mut guard = push.pool.lock().await;
+        match guard.as_ref() {
+            Some(p) => p.clone(),
+            None => {
+                let p = Arc::new(SessionPool::new());
+                *guard = Some(p.clone());
+                p
+            }
         }
-        return Ok(p.clone());
-    }
-    let pool = Arc::new(SessionPool::new());
+    };
     pool.top_up(&push.transport, &push.peers, push.pool_target)
         .await;
     if pool.len() == 0 {
         return Err("could not open any sessions from the peer cache".into());
     }
-    *guard = Some(pool.clone());
     Ok(pool)
+}
+
+/// The warm pool for a push: the background loop keeps it filled, so this is
+/// normally a lock-free read. Only on a cold first request (before the
+/// maintenance loop has filled it) does it fall back to building/dialing.
+async fn get_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
+    {
+        let guard = push.pool.lock().await;
+        if let Some(p) = guard.as_ref() {
+            if p.len() > 0 {
+                return Ok(p.clone());
+            }
+        }
+    }
+    ensure_pool(push).await
+}
+
+/// Background loop: fill the warm pool on startup and keep it topped up to
+/// target on a gentle cadence, so /v1/push never dials inline.
+async fn push_maintenance(state: Arc<State>) {
+    let Some(push) = state.push.as_ref() else {
+        return;
+    };
+    loop {
+        match ensure_pool(push).await {
+            Ok(p) => info!(target: "hoverfly::pusher", "warm pool: {} session(s)", p.len()),
+            Err(e) => warn!(target: "hoverfly::pusher", "warm pool maintenance: {e}"),
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
 }
 
 /// The probe itself. Every early exit sends a terminal `report` line
