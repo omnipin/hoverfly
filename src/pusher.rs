@@ -1,7 +1,14 @@
-//! `hoverfly pusher` — HTTP chunk-push relay, stage A (docs/pusher-design.md §11).
+//! `hoverfly pusher` — HTTP chunk-push relay, stages A+B implemented
+//! (docs/pusher-design.md §11).
 //!
-//! Serves exactly two routes:
+//! Routes:
 //!
+//! - `POST /v1/push` — the real relay endpoint (stage B): pre-signed
+//!   frames in (docs/pusher-design.md §3), streamed NDJSON acks out.
+//!   Open mode: a chunk is accepted iff its stamp signature recovers to
+//!   the on-chain owner of a **live** batch (owner + `remainingBalance >
+//!   0`, both cached — one RPC pair per batch). Keys stay strictly
+//!   client-side; the pusher only ever sees pre-signed material.
 //! - `GET /v1/status` — health/advertisement JSON. Doubles as the
 //!   platform health check on Render/Lambda-style hosts.
 //! - `POST /v1/probe?size=N&concurrency=M&max_retries=R` — flag-gated
@@ -10,14 +17,20 @@
 //!   (`HOVERFLY_PROBE_KEY`, `HOVERFLY_PROBE_BATCH`), runs the standard
 //!   one-shot push path, and streams NDJSON progress lines followed by a
 //!   final metrics report (throughput, `transport::diag` counter deltas,
-//!   dial reachability split, per-host dial-failure clustering). This is
-//!   the instrument for the shared-cloud-egress-IP gate experiment.
+//!   dial reachability split, per-host dial-failure clustering). This was
+//!   the instrument for the shared-cloud-egress-IP gate experiment
+//!   (stage A, results in the design doc); it stays as a diagnostics
+//!   endpoint.
+//! - `POST /v1/tcpcheck?targets=…` — flag-gated raw TCP connect tester
+//!   (network-layer vs application-layer throttling discriminator).
 //!
 //! Probe mode is the one sanctioned exception to "the pusher never
 //! signs": it signs with its *own* env key against a dust batch, exists
-//! only for self-testing, and is off by default. The stage-B `/v1/push`
-//! endpoint (pre-signed frames in, acks out) will keep keys strictly
-//! client-side.
+//! only for self-testing, and is off by default.
+//!
+//! Still open from the design doc: stage C (weighted rendezvous is
+//! client-side; `budget_remaining_gb` accounting here), and the deferred
+//! `--push-quota` / `--push-challenge` / `--push-allow` hardening.
 //!
 //! Deliberately absent: IPC socket, retrieval-over-HTTP, any acceptance
 //! of key material over the wire.
@@ -120,6 +133,11 @@ struct PushState {
     pool: tokio::sync::Mutex<Option<Arc<SessionPool>>>,
     /// Target warm-pool size (from `HOVERFLY_PUSH_POOL`).
     pool_target: usize,
+    /// This node's Kademlia overlay (node eth address + nonce). Published
+    /// in `/v1/status` so a multi-lane client can route each chunk to the
+    /// relay whose overlay is nearest the chunk's destination neighborhood
+    /// (proximity rendezvous, docs/pusher-design.md §7).
+    overlay: [u8; 32],
 }
 
 type RespBody = BoxBody<Bytes, Infallible>;
@@ -251,6 +269,9 @@ fn status_response(state: &State) -> Response<RespBody> {
         "peers_known": state.peers_known.load(Ordering::Relaxed),
         "uptime_secs": state.started.elapsed().as_secs(),
         "batch_max": if state.push.is_some() { serde_json::json!(PUSH_BATCH_MAX) } else { serde_json::Value::Null },
+        // The node's Kademlia overlay, so a multi-lane client can route
+        // each chunk to the nearest relay (proximity rendezvous, §7).
+        "overlay": state.push.as_ref().map(|p| format!("0x{}", hex::encode(p.overlay))),
         // Metered-budget accounting lands with the client scheduler (§7).
         "budget_remaining_gb": serde_json::Value::Null,
     });
@@ -467,9 +488,11 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
         }
     };
     let keypair = crate::inbound::libp2p_keypair_from_identity(&node_signer);
+    let overlay = *node_signer.overlay();
     let snapshot = crate::protocols::status::StatusSnapshot::default();
     let transport = Transport::new_with_keypair(node_signer, opts.transport.clone(), keypair)
         .with_status_snapshot(snapshot);
+    info!("push node overlay = 0x{}", hex::encode(overlay));
     let peers = PeerStore::load_or_create(&opts.peerlist);
     let pool_target = std::env::var("HOVERFLY_PUSH_POOL")
         .ok()
@@ -482,14 +505,17 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
         peers: Arc::new(peers),
         pool: tokio::sync::Mutex::new(None),
         pool_target,
+        overlay,
     })
 }
 
 /// `POST /v1/push` — the real relay endpoint. Body = frames
 /// (`docs/pusher-design.md` §3); response = streamed NDJSON acks. Open
 /// mode: a chunk is accepted iff its stamp signature recovers to the
-/// on-chain owner of the stamp's batch. No keys ever cross the wire —
-/// the client stamps locally and ships only pre-signed frames.
+/// on-chain owner of the stamp's batch AND the batch is alive
+/// (`remainingBalance > 0`) — that pair *is* the auth (§5). No keys ever
+/// cross the wire — the client stamps locally and ships only pre-signed
+/// frames.
 async fn push_response(
     state: Arc<State>,
     req: Request<hyper::body::Incoming>,
@@ -655,7 +681,13 @@ async fn run_push(
 }
 
 /// On-chain batch owner for `batch_id_hex`, cached. Errors (string) on
-/// RPC failure or unknown batch.
+/// RPC failure, unknown batch, or an **expired** batch: open-mode auth
+/// is "the batch is alive" (docs/pusher-design.md §5), so a batch whose
+/// `remainingBalance` has drained to zero is rejected — bee nodes would
+/// refuse its stamps anyway, and pushing them just burns relay egress.
+/// The aliveness read happens once per batch (the cache never expires);
+/// a batch that dies *while cached* only wastes its own push attempts —
+/// bees reject the stamps downstream — and a pusher restart re-checks.
 async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], String> {
     if let Some(o) = state
         .owner_cache
@@ -673,6 +705,15 @@ async fn resolve_owner(state: &State, batch_id_hex: &str) -> Result<[u8; 20], St
         .map_err(|e| format!("batch owner RPC: {e}"))?;
     if info.not_found {
         return Err(format!("batch {batch_id_hex} not found on-chain"));
+    }
+    let remaining =
+        crate::batch::read_remaining_balance(&state.opts.rpc_url, stamp_addr, batch_id_hex)
+            .await
+            .map_err(|e| format!("batch balance RPC: {e}"))?;
+    if remaining.is_zero() {
+        return Err(format!(
+            "batch {batch_id_hex} has expired (zero remaining balance) — bees would reject every stamp"
+        ));
     }
     let owner = info.owner.into_array();
     state
