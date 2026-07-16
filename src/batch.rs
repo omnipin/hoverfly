@@ -269,6 +269,35 @@ pub async fn read_batch(
     })
 }
 
+/// Read a batch's remaining balance (PLUR per chunk still funded) from
+/// the PostageStamp contract's `remainingBalance(bytes32)` getter. Zero
+/// means the batch has expired — bee nodes garbage-collect its chunks
+/// and reject new stamps against it. Reverts on-chain (surfacing as an
+/// RPC error here) when the batch does not exist; call [`read_batch`]
+/// first if "unknown batch" must be distinguished from "RPC down".
+pub async fn read_remaining_balance(
+    rpc_url: &str,
+    postage_stamp: Address,
+    batch_id_hex: &str,
+) -> Result<U256, BatchError> {
+    let trimmed = batch_id_hex
+        .trim_start_matches("0x")
+        .trim_start_matches("0X");
+    let raw = hex::decode(trimmed).map_err(|e| BatchError::Rpc(format!("batch id hex: {e}")))?;
+    if raw.len() != 32 {
+        return Err(BatchError::Rpc(format!(
+            "batch id must be 32 bytes, got {}",
+            raw.len()
+        )));
+    }
+    let mut id = [0u8; 32];
+    id.copy_from_slice(&raw);
+
+    let rpc = EthRpc::new(rpc_url.to_string());
+    rpc.call_view::<remainingBalanceCall, _>(postage_stamp, remainingBalanceCall { id: id.into() })
+        .await
+}
+
 sol! {
     // PostageStamp.createBatch(address,uint256,uint8,uint8,bytes32,bool)
     function createBatch(
@@ -291,6 +320,10 @@ sol! {
         uint256 normalisedBalance,
         uint256 lastUpdatedBlockNumber
     );
+
+    // PostageStamp.remainingBalance(bytes32) — PLUR per chunk still
+    // funded; 0 = expired batch. Reverts when the batch doesn't exist.
+    function remainingBalance(bytes32 id) external view returns (uint256);
 
     // PostageStamp.lastPrice() returns (uint64)
     function lastPrice() external view returns (uint64);

@@ -2440,25 +2440,43 @@ pub async fn upload_bytes_with_pool(
     Ok(root)
 }
 
-/// Push locally-stamped chunks across **multiple** relays in parallel,
-/// sharding by chunk address (docs/pusher-design.md §7). Each chunk is
-/// assigned to a lane by weighted rendezvous hashing — sticky per
-/// address, uniform load (chunk addresses are hash-uniform), and with a
-/// deterministic fallback order: a chunk unacked by its best lane is
-/// re-dispatched to its next-best lane (different IP, different pool),
-/// which is the structural fix for tail stalls. Lanes run concurrently,
-/// so aggregate throughput sums across their independent per-/32 dial
-/// budgets. Delegates to [`push_via_pusher`] for the single-lane case.
+/// Push locally-stamped chunks across **multiple** relays, routing each
+/// chunk to the relay best placed to inject it and balancing load by real
+/// throughput (docs/pusher-design.md §7). Two layers:
+///
+/// - **Proximity rendezvous** (when every lane advertises an `overlay` in
+///   `/v1/status`): a chunk's *preferred* lane is the relay whose Kademlia
+///   overlay is nearest the chunk address, so most chunks are injected by
+///   a relay already deep in the destination neighborhood — fewer pushsync
+///   hops. Falls back to round-robin when any lane hides its overlay.
+/// - **Capacity stealing**: each lane drains its own preferred queue
+///   first, then steals from the most-backed-up lane, so a fast lane never
+///   idles while a slow / rate-limited lane sets the finish time.
+///
+/// Robustness: a chunk a lane fails to ack is requeued to its preferred
+/// lane, capped at `MAX_ATTEMPTS` (any lane can then steal it); a lane
+/// that fully bounces `DEAD_AFTER` batches in a row retires. Delegates to
+/// [`push_via_pusher`] for the single-lane case.
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn push_via_pushers(
     pusher_urls: &[String],
     chunks: Vec<StampedChunk>,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
-    use std::collections::HashSet;
-    use std::sync::Arc;
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    /// Frames per POST — must stay ≤ the pusher's advertised batch_max.
     const BATCH: usize = 256;
-    const MAX_ROUNDS: usize = 6;
+    /// Concurrent POSTs *per lane* (pipeline depth). Matches the
+    /// single-lane path so a lone fast lane in a multi-lane run isn't
+    /// starved of pipelining just for sharing the run with slower lanes.
+    const INFLIGHT_PER_LANE: usize = 4;
+    /// Per-chunk failover cap: lane attempts before the chunk is dropped.
+    const MAX_ATTEMPTS: u16 = 6;
+    /// Retire a lane after this many consecutive fully-unacked batches.
+    const DEAD_AFTER: usize = 3;
 
     if pusher_urls.is_empty() {
         return Err(ClientError::Pusher("no pusher URLs given".into()));
@@ -2480,85 +2498,207 @@ pub async fn push_via_pushers(
     );
     let chunks = Arc::new(chunks);
     let total = chunks.len();
+    if total == 0 {
+        return Ok(());
+    }
 
-    // Per-chunk lane preference: lanes ordered by rendezvous score desc.
-    let lane_order: Vec<Vec<usize>> = chunks
-        .iter()
-        .map(|c| rendezvous_order(&c.addr, &lanes))
-        .collect();
-    // `rank[i]` = how many lanes have already failed chunk i (0 = best).
-    let mut rank = vec![0usize; chunks.len()];
-    let mut pending: Vec<usize> = (0..chunks.len()).collect();
-    let mut done = 0usize;
+    // Learn each lane's overlay (for proximity routing). All-or-nothing:
+    // if any lane hides it, route round-robin so a chunk is never pinned
+    // to a relay we can't place. `HOVERFLY_PUSH_NO_PROXIMITY` forces
+    // round-robin (A/B lever).
+    let force_rr = std::env::var("HOVERFLY_PUSH_NO_PROXIMITY")
+        .is_ok_and(|v| !v.is_empty() && v != "0");
+    let overlays: Vec<Option<[u8; 32]>> = if force_rr {
+        vec![None; n_lanes]
+    } else {
+        futures::future::join_all(pusher_urls.iter().map(|u| fetch_lane_overlay(&http, u))).await
+    };
+    let proximity: Option<Vec<[u8; 32]>> = overlays.iter().copied().collect();
 
-    for round in 0..MAX_ROUNDS {
-        if pending.is_empty() {
-            break;
-        }
-        // Assign each pending chunk to its current-rank lane.
-        let mut per_lane: Vec<Vec<usize>> = vec![Vec::new(); n_lanes];
-        for &i in &pending {
-            let lane = lane_order[i][rank[i] % n_lanes];
-            per_lane[lane].push(i);
-        }
-        // Fire all lanes concurrently; each returns the indices it acked.
-        let mut tasks = Vec::new();
-        for (lane, idxs) in per_lane.into_iter().enumerate() {
-            if idxs.is_empty() {
-                continue;
-            }
+    // Preferred lane per chunk: nearest overlay (proximity) or round-robin.
+    let pref: Arc<Vec<usize>> = Arc::new(match &proximity {
+        Some(ov) => (0..total)
+            .map(|i| {
+                (0..n_lanes)
+                    .max_by_key(|&l| chunk_proximity(&chunks[i].addr, &ov[l]))
+                    .unwrap_or(0)
+            })
+            .collect(),
+        None => (0..total).map(|i| i % n_lanes).collect(),
+    });
+
+    // Seed each lane's queue with the chunks that prefer it.
+    let mut init_qs: Vec<VecDeque<usize>> = vec![VecDeque::new(); n_lanes];
+    for i in 0..total {
+        init_qs[pref[i]].push_back(i);
+    }
+    let dist: Vec<usize> = init_qs.iter().map(|q| q.len()).collect();
+    info!(target: "hoverfly::upload",
+        "multi-pusher: {} routing over {n_lanes} lanes, per-lane chunks {:?}",
+        if proximity.is_some() { "proximity" } else { "round-robin" }, dist);
+
+    struct Shared {
+        qs: Vec<VecDeque<usize>>, // per-lane preferred queues
+        attempts: Vec<u16>,
+        unresolved: usize, // chunks neither acked nor permanently dropped
+    }
+    let shared = Arc::new(Mutex::new(Shared {
+        qs: init_qs,
+        attempts: vec![0u16; total],
+        unresolved: total,
+    }));
+    let acked = Arc::new(AtomicUsize::new(0));
+    let lane_dead: Arc<Vec<AtomicBool>> =
+        Arc::new((0..n_lanes).map(|_| AtomicBool::new(false)).collect());
+    let lane_fail: Arc<Vec<AtomicUsize>> =
+        Arc::new((0..n_lanes).map(|_| AtomicUsize::new(0)).collect());
+    let progress = progress.cloned();
+
+    let mut tasks = Vec::with_capacity(n_lanes * INFLIGHT_PER_LANE);
+    for lane in 0..n_lanes {
+        for _ in 0..INFLIGHT_PER_LANE {
             let http = http.clone();
-            let url = lanes[lane].clone();
+            let lane_url = lanes[lane].clone();
             let chunks = chunks.clone();
+            let shared = shared.clone();
+            let acked = acked.clone();
+            let lane_dead = lane_dead.clone();
+            let lane_fail = lane_fail.clone();
+            let progress = progress.clone();
+            let pref = pref.clone();
             tasks.push(tokio::spawn(async move {
-                let mut acked: Vec<usize> = Vec::new();
-                for sub in idxs.chunks(BATCH) {
-                    let batch: Vec<StampedChunk> = sub.iter().map(|&i| chunks[i].clone()).collect();
-                    let ok = post_batch_acks(&http, &url, &batch).await;
-                    for &i in sub {
-                        if ok.contains(&hex::encode(chunks[i].addr)) {
-                            acked.push(i);
+                loop {
+                    // All work resolved, or this lane retired → stop.
+                    if shared.lock().unwrap().unresolved == 0
+                        || lane_dead[lane].load(Ordering::Relaxed)
+                    {
+                        break;
+                    }
+                    // Own preferred queue first; else steal from the
+                    // most-backed-up lane (drains slow / dead lanes too).
+                    let idxs: Vec<usize> = {
+                        let mut s = shared.lock().unwrap();
+                        let own = s.qs[lane].len().min(BATCH);
+                        if own > 0 {
+                            s.qs[lane].drain(..own).collect()
+                        } else {
+                            let victim = (0..n_lanes)
+                                .filter(|&k| k != lane)
+                                .max_by_key(|&k| s.qs[k].len())
+                                .filter(|&k| !s.qs[k].is_empty());
+                            match victim {
+                                Some(k) => {
+                                    let take = s.qs[k].len().min(BATCH);
+                                    s.qs[k].drain(..take).collect()
+                                }
+                                None => Vec::new(),
+                            }
+                        }
+                    };
+                    if idxs.is_empty() {
+                        // Nothing to pull, but chunks are in flight on other
+                        // lanes (which may requeue on failure).
+                        if shared.lock().unwrap().unresolved == 0 {
+                            break;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                        continue;
+                    }
+                    let batch: Vec<StampedChunk> =
+                        idxs.iter().map(|&i| chunks[i].clone()).collect();
+                    let ok = post_batch_acks(&http, lane_url.as_str(), &batch).await;
+
+                    let mut wins = 0usize;
+                    {
+                        let mut s = shared.lock().unwrap();
+                        for &i in &idxs {
+                            if ok.contains(&hex::encode(chunks[i].addr)) {
+                                wins += 1;
+                                s.unresolved -= 1;
+                            } else {
+                                s.attempts[i] += 1;
+                                if s.attempts[i] >= MAX_ATTEMPTS {
+                                    s.unresolved -= 1; // give up on this chunk
+                                } else {
+                                    let p = pref[i];
+                                    s.qs[p].push_back(i); // retry near, steal-able
+                                }
+                            }
+                        }
+                    }
+                    // Progress + lane-health, outside the lock.
+                    if wins > 0 {
+                        lane_fail[lane].store(0, Ordering::Relaxed);
+                        if let Some(p) = &progress {
+                            for _ in 0..wins {
+                                let d = acked.fetch_add(1, Ordering::Relaxed) + 1;
+                                p(d, total);
+                            }
+                        } else {
+                            acked.fetch_add(wins, Ordering::Relaxed);
+                        }
+                    } else {
+                        // Whole batch bounced — count it against the lane.
+                        let c = lane_fail[lane].fetch_add(1, Ordering::Relaxed) + 1;
+                        if c >= DEAD_AFTER {
+                            lane_dead[lane].store(true, Ordering::Relaxed);
+                            warn!(target: "hoverfly::upload",
+                                "pusher lane {lane_url} retired after {c} unacked batches");
                         }
                     }
                 }
-                acked
             }));
         }
-        let mut acked_this_round: HashSet<usize> = HashSet::new();
-        for t in tasks {
-            if let Ok(idxs) = t.await {
-                acked_this_round.extend(idxs);
-            }
-        }
-        let mut next = Vec::new();
-        for &i in &pending {
-            if acked_this_round.contains(&i) {
-                done += 1;
-                if let Some(p) = progress {
-                    p(done, total);
-                }
-            } else {
-                rank[i] += 1; // fail over to the next-best lane
-                next.push(i);
-            }
-        }
-        if !next.is_empty() {
-            warn!(target: "hoverfly::upload",
-                "multi-pusher round {} left {} unacked; failing over to next lanes",
-                round + 1, next.len());
-        }
-        pending = next;
     }
 
-    if !pending.is_empty() {
+    for t in tasks {
+        let _ = t.await;
+    }
+
+    let acked_final = acked.load(Ordering::Relaxed);
+    if acked_final < total {
         return Err(ClientError::Pusher(format!(
-            "{} of {} chunks unacked after {MAX_ROUNDS} rounds across {} lanes",
-            pending.len(),
-            total,
-            n_lanes
+            "{} of {total} chunks unacked across {n_lanes} lane(s) — lanes exhausted or retired",
+            total - acked_final
         )));
     }
     Ok(())
+}
+
+/// Kademlia proximity order: count of leading bits shared by two 32-byte
+/// addresses. Used only for *relative* comparison (which lane is nearest a
+/// chunk), so the exact MaxPO cap is irrelevant.
+#[cfg(not(target_arch = "wasm32"))]
+fn chunk_proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
+    for i in 0..32 {
+        let x = a[i] ^ b[i];
+        if x != 0 {
+            return (i as u8) * 8 + x.leading_zeros() as u8;
+        }
+    }
+    255
+}
+
+/// Fetch a pusher's advertised overlay from `GET {base}/v1/status`.
+/// `None` on any error or if the field is absent (→ round-robin fallback).
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_lane_overlay(http: &reqwest::Client, base_url: &str) -> Option<[u8; 32]> {
+    let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
+    let resp = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(15))
+        .send()
+        .await
+        .ok()?;
+    let v: serde_json::Value = resp.json().await.ok()?;
+    let s = v.get("overlay")?.as_str()?;
+    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
+    if bytes.len() != 32 {
+        return None;
+    }
+    let mut a = [0u8; 32];
+    a.copy_from_slice(&bytes);
+    Some(a)
 }
 
 /// POST one batch to a lane and return the set of addr-hex strings the
@@ -2600,27 +2740,6 @@ async fn post_batch_acks(
         }
     }
     acked
-}
-
-/// Weighted rendezvous (HRW) lane ordering for a chunk: lanes sorted by
-/// `hash(addr ‖ lane_url)` descending, so each address deterministically
-/// prefers one lane (sticky, dedupe-friendly) and has a stable fallback
-/// order. Uniform weights for now; status-weighting is a §7 refinement.
-#[cfg(not(target_arch = "wasm32"))]
-fn rendezvous_order(addr: &[u8; 32], lanes: &[std::sync::Arc<String>]) -> Vec<usize> {
-    use std::hash::{Hash, Hasher};
-    let mut scored: Vec<(u64, usize)> = lanes
-        .iter()
-        .enumerate()
-        .map(|(i, url)| {
-            let mut h = std::collections::hash_map::DefaultHasher::new();
-            addr.hash(&mut h);
-            url.as_bytes().hash(&mut h);
-            (h.finish(), i)
-        })
-        .collect();
-    scored.sort_unstable_by(|a, b| b.0.cmp(&a.0));
-    scored.into_iter().map(|(_, i)| i).collect()
 }
 
 /// Push locally-stamped chunks through a single relay (`hoverfly
