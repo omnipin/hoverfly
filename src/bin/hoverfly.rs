@@ -1687,20 +1687,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )?;
 
             // Pusher mode: stamp locally and push pre-signed frames over
-            // HTTP to a relay. No transport/peerlist needed here — the
-            // pusher owns the session pool. Stage B: single lane, raw and
-            // single-file manifest uploads (collection via pusher TBD).
+            // HTTP to a relay (or several, sharded). No transport/peerlist
+            // here — the pusher owns the session pool. Handles raw,
+            // single-file manifest, and collection/tar uploads.
             if !pusher.is_empty() {
-                if collection {
-                    return Err("--collection via --pusher is not supported yet".into());
-                }
-                let data = std::fs::read(&file)?;
+                let is_tar = file
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("tar"))
+                    .unwrap_or(false);
+                let is_collection = collection || (is_tar && !raw);
                 let upload_started = std::time::Instant::now();
-                let (root, work) = if raw {
-                    hoverfly::client::prepare_upload_bytes(
-                        &signer, &batch, depth, immutable, &data,
-                    )?
+                let (root, work, total_bytes, kind): (_, _, usize, &str) = if is_collection {
+                    let bytes = std::fs::read(&file)?;
+                    let files = read_tar_files(&bytes)?;
+                    if files.is_empty() {
+                        return Err("tar archive contains no regular files".into());
+                    }
+                    let total: usize = files.iter().map(|f| f.data.len()).sum();
+                    let index_doc = index_document
+                        .as_deref()
+                        .map(|s| if s.is_empty() { None } else { Some(s) })
+                        .unwrap_or(Some("index.html"));
+                    let (root, work) = hoverfly::client::prepare_upload_collection(
+                        &signer,
+                        &batch,
+                        depth,
+                        immutable,
+                        &files,
+                        index_doc,
+                        error_document.as_deref(),
+                    )?;
+                    (root, work, total, "collection")
+                } else if raw {
+                    let data = std::fs::read(&file)?;
+                    let total = data.len();
+                    let (root, work) =
+                        hoverfly::client::prepare_upload_bytes(&signer, &batch, depth, immutable, &data)?;
+                    (root, work, total, "raw")
                 } else {
+                    let data = std::fs::read(&file)?;
+                    let total = data.len();
                     let path = manifest_path.clone().unwrap_or_else(|| {
                         file.file_name()
                             .and_then(|s| s.to_str())
@@ -1708,7 +1735,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_else(|| "file".to_string())
                     });
                     let ct = content_type.clone().or_else(|| guess_content_type(&path));
-                    hoverfly::client::prepare_upload_file_with_manifest(
+                    let (root, work) = hoverfly::client::prepare_upload_file_with_manifest(
                         &signer,
                         &batch,
                         depth,
@@ -1716,7 +1743,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &data,
                         &path,
                         ct.as_deref(),
-                    )?
+                    )?;
+                    (root, work, total, "manifest")
                 };
                 let n_chunks = work.len();
                 let progress = make_progress_bar();
@@ -1726,17 +1754,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let root_hex = hex::encode(root.as_bytes());
                 println!(
                     "uploaded {} bytes ({} chunks) via {} pusher lane(s) — {} root: {}",
-                    data.len(),
+                    total_bytes,
                     n_chunks,
                     pusher.len(),
-                    if raw { "raw" } else { "manifest" },
+                    kind,
                     root_hex,
                 );
                 if let Some(c) = root_hex_to_cid(&root_hex) {
                     println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/");
                     println!("subdomain:  https://{c}.bzz.limo/");
                 }
-                print_upload_throughput(data.len(), elapsed);
+                print_upload_throughput(total_bytes, elapsed);
                 return Ok(());
             }
 
