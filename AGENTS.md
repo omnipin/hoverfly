@@ -270,6 +270,18 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   recovery). Does NOT verify on-chain batch ownership (no RPC). Currently
   unused for ingestion; ready for a future chunk-ingestion path.
 - `src/manifest.rs` — mantaray encode/decode helpers.
+- `src/erasure/` — **erasure-coding-aware download** (Reed–Solomon). Since
+  ~bee v2.8.1 gateway uploads are RS erasure coded by default, so a fresh
+  upload's data chunks can be unretrievable for a forwarding-dependent light
+  client while parity chunks let the file be reconstructed (ethersphere/bee
+  #5541). `reedsolomon.rs` is a byte-exact port of klauspost's default matrix +
+  GF(2^8) reconstruction (golden-vector tested); `mod.rs` has the bee span/level
+  decode, per-level erasure tables, and `ReferenceCount`/`ChunkAddresses`
+  helpers; `joiner.rs` is a bee-compatible tree-walking joiner that fetches each
+  intermediate node's data children and RS-reconstructs any that time out from
+  the node's parity siblings. `client::join_target` detects a level-encoded root
+  span and routes to it, else falls back to nectar's plain `GenericJoiner`. All
+  download entry points (CLI/daemon/wasm) funnel through it.
 - `src/signer.rs` — `SwarmSigner`: overlay derivation, handshake signing
   (v14 + cached v15), eth-address recovery. See "Bee 2.8.0 protocol support".
 - `src/wasm.rs` — `wasm-bindgen` façade (`HoverflyClient`): `start`/`stop`,

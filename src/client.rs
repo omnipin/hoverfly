@@ -90,6 +90,13 @@ pub enum ClientError {
     /// `maxPushErrors` give-up) rather than aborting the whole upload.
     #[error("shallow-only receipt (no neighborhood storer reached)")]
     ShallowOnly,
+    /// Erasure-coded object could not be joined/reconstructed. This wraps a
+    /// failure in the erasure-aware joiner (e.g. too many unretrievable data
+    /// chunks even after pulling their RS parity siblings). Distinct from a
+    /// plain fetch failure so the caller can tell "content genuinely
+    /// unrecoverable right now" from "wrong join path".
+    #[error("erasure: {0}")]
+    Erasure(#[from] crate::erasure::ErasureError),
 }
 
 impl From<nectar_primitives::error::PrimitivesError> for ClientError {
@@ -1271,24 +1278,111 @@ pub async fn fetch_bytes_cached_ex(
     let root = parse_root(root_hex)?;
     let store =
         NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, cache);
-    // Drive nectar's BMT joiner with a HIGHER chunks-in-flight count than the
-    // per-chunk peer-race width. These are different knobs: `concurrency` (the
-    // store's) is how many peers we race for ONE chunk — useful while cold for
-    // discovery, wasteful once warm (the extra attempts just consume substream
-    // slots). The joiner's concurrency is how many DISTINCT chunks pull at once,
-    // which is the real throughput lever. Decoupling them (and giving the joiner
-    // the larger value via `joiner_concurrency`) pumps many chunks through the
-    // few warm forwarders instead of redundantly racing each chunk against the
-    // whole pool.
-    let bytes =
+    join_target(&store, root, concurrency, None).await
+}
+
+/// Like [`fetch_bytes_ex`], but drives a byte-based `progress` callback as the
+/// file body is joined (used by the CLI to render a progress bar). Works for
+/// both plain and erasure-coded objects.
+pub async fn fetch_bytes_progress(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    progress: Option<&ProgressFn>,
+) -> Result<Vec<u8>, ClientError> {
+    let root = parse_root(root_hex)?;
+    let cache = RetrievalCache::new();
+    let store =
+        NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, &cache);
+    join_target(&store, root, concurrency, progress).await
+}
+
+/// Join a BMT reference into its full byte content, transparently handling
+/// **erasure-coded** objects.
+///
+/// Since ~bee v2.8.1, gateway uploads are Reed–Solomon erasure coded by default
+/// (see [`crate::erasure`]). Such an object's root chunk encodes a redundancy
+/// level in the top byte of its span, and its intermediate nodes carry parity
+/// references that nectar's plain joiner would mis-traverse as data. So we
+/// first fetch the root chunk (served from the store's cache on the subsequent
+/// join, no extra round-trip) and inspect its span:
+///
+/// - **level-encoded** → drive the erasure-aware joiner
+///   ([`crate::erasure::fetch_erasure_bytes`]), which fetches each node's data
+///   children and, for any that time out (the exact failure mode of a fresh
+///   upload on a light client — bee#5541), reconstructs them from the node's RS
+///   parity siblings;
+/// - **plain** → drive nectar's `GenericJoiner` as before.
+///
+/// The erasure joiner is byte-exact with bee's encoder, so a fully-retrievable
+/// object round-trips identically down either path; the difference only shows
+/// when some data chunks are unretrievable.
+async fn join_target<'a>(
+    store: &NetworkedStore<'a>,
+    root: ChunkAddress,
+    concurrency: usize,
+    progress: Option<&ProgressFn>,
+) -> Result<Vec<u8>, ClientError> {
+    // Peek at the root span. `get` populates the store's in-memory cache, so
+    // whichever joiner runs next re-reads the root for free.
+    if let Ok(root_chunk) = ChunkGet::get(store, &root).await {
+        // `AnyChunk::span()` returns the raw little-endian span as a u64 with
+        // the redundancy-level byte intact.
+        let raw_span = root_chunk.span().to_le_bytes();
+        if crate::erasure::joiner::root_is_erasure_coded(&raw_span) {
+            info!(
+                target: "hoverfly::fetch",
+                "root {} is erasure-coded; using RS-aware joiner",
+                root_chunk.address(),
+            );
+            return Ok(crate::erasure::fetch_erasure_bytes_progress(store, root, progress).await?);
+        }
+    }
+
+    // Plain (non-redundant) object: drive nectar's BMT joiner with a HIGHER
+    // chunks-in-flight count than the per-chunk peer-race width. These are
+    // different knobs: `concurrency` (the store's) is how many peers we race for
+    // ONE chunk — useful while cold for discovery, wasteful once warm (the extra
+    // attempts just consume substream slots). The joiner's concurrency is how
+    // many DISTINCT chunks pull at once, which is the real throughput lever.
+    // Decoupling them (and giving the joiner the larger value via
+    // `joiner_concurrency`) pumps many chunks through the few warm forwarders
+    // instead of redundantly racing each chunk against the whole pool.
+    let joiner =
         GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
             store, root,
         )
         .await?
-        .with_concurrency(joiner_concurrency(concurrency))
-        .read_all()
-        .await?;
-    Ok(bytes)
+        .with_concurrency(joiner_concurrency(concurrency));
+
+    // Without a progress sink, `read_all()` is the simplest path. With one,
+    // stream leaves by offset and reassemble, reporting bytes as they land so
+    // the CLI can drive a byte-based bar (nectar's joiner has no progress
+    // callback of its own).
+    let Some(cb) = progress else {
+        return Ok(joiner.read_all().await?);
+    };
+
+    use futures::StreamExt as _;
+    let total = joiner.size() as usize;
+    let mut out = vec![0u8; total];
+    let mut done = 0usize;
+    cb(0, total);
+    let mut stream = std::pin::pin!(joiner.into_offset_stream());
+    while let Some(item) = stream.next().await {
+        let (offset, bytes) = item?;
+        let start = offset as usize;
+        let end = (start + bytes.len()).min(total);
+        if start < total {
+            out[start..end].copy_from_slice(&bytes[..end - start]);
+        }
+        done += bytes.len();
+        cb(done.min(total), total);
+    }
+    cb(total, total);
+    Ok(out)
 }
 
 /// Resolve `path` through the mantaray manifest at `root_hex` and fetch the
@@ -1375,15 +1469,31 @@ pub async fn fetch_manifest_path_cached_meta(
         feed_resolved,
     } = resolve_feed_root(&store, root, Some(cache)).await?;
     let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
-    let bytes =
-        GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
-            store, target,
-        )
-        .await?
-        .with_concurrency(joiner_concurrency(concurrency))
-        .read_all()
-        .await?;
+    let bytes = join_target(&store, target, concurrency, None).await?;
     Ok((bytes, content_type, feed_resolved))
+}
+
+/// Like [`fetch_manifest_path_ex`], but drives a byte-based `progress` callback
+/// as the resolved entry's body is joined (used by the CLI to render a progress
+/// bar). Works for both plain and erasure-coded entries.
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_manifest_path_progress(
+    transport: &Transport,
+    peers: &PeerStore,
+    root_hex: &str,
+    path: &str,
+    max_retries_per_chunk: usize,
+    concurrency: usize,
+    progress: Option<&ProgressFn>,
+) -> Result<(Vec<u8>, Option<String>), ClientError> {
+    let root = parse_root(root_hex)?;
+    let cache = RetrievalCache::new();
+    let store =
+        NetworkedStore::with_cache(transport, peers, max_retries_per_chunk, concurrency, &cache);
+    let ResolvedRoot { root, .. } = resolve_feed_root(&store, root, Some(&cache)).await?;
+    let (target, content_type) = lookup_manifest_path(&store, root, path).await?;
+    let bytes = join_target(&store, target, concurrency, progress).await?;
+    Ok((bytes, content_type))
 }
 
 /// List entries in the mantaray manifest at `root_hex`.

@@ -24,6 +24,7 @@ pub mod stamp;
 pub mod proto;
 
 pub mod client;
+pub mod erasure;
 pub mod feed;
 pub mod manifest;
 pub mod protocols;
