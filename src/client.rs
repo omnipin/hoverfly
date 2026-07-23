@@ -963,7 +963,16 @@ impl<'a> NetworkedStore<'a> {
                 }
                 AttemptOutcome::Failed(e) => {
                     failed_attempts = failed_attempts.saturating_add(1);
-                    warn!(target: "hoverfly::fetch", "peer {} failed: {}", overlay, e);
+                    // Per-peer fetch failures (timeout, `storage: not found`,
+                    // dead dial) are ROUTINE on a light client whose requests are
+                    // forwarded through the network — most peers tried for a
+                    // chunk won't have it locally. Logging each at WARN floods
+                    // the terminal and shreds the progress bar, so it's `debug!`
+                    // (visible with `-d`). The chunk still succeeds via another
+                    // peer, or (for erasure-coded content) is reconstructed from
+                    // parity; a genuinely unrecoverable chunk surfaces as the
+                    // returned error, not this line.
+                    debug!(target: "hoverfly::fetch", "peer {} failed: {}", overlay, e);
                     last_err = e;
                     consecutive_deferrals = 0;
                     // Tier 2: park failed peer in per-chunk skiplist.
@@ -977,7 +986,12 @@ impl<'a> NetworkedStore<'a> {
                 inflight.push(try_peer(next));
             }
         }
-        warn!(
+        // A whole chunk that no peer could serve is expected under erasure
+        // coding: the erasure joiner deliberately lets some data chunks fail and
+        // reconstructs them from the node's parity siblings. So this is `debug!`
+        // too — the joiner decides whether it's actually fatal (and returns an
+        // error if the node is unrecoverable). `-d` shows it.
+        debug!(
             target: "hoverfly::fetch",
             "chunk {}: all peers failed after {} attempt(s) of {} candidates; last error: {}",
             hex::encode(&address.as_bytes()[..4]),
