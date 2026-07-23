@@ -9,8 +9,8 @@ use std::sync::Arc;
 use clap::{Parser, Subcommand};
 use hoverfly::client::{
     DEFAULT_DISCOVER_CONCURRENCY, DEFAULT_FETCH_CONCURRENCY, DEFAULT_UPLOAD_CONCURRENCY,
-    ProgressFn, fetch_bytes_ex, fetch_manifest_path_ex, list_manifest_ex, upload_bytes_ex,
-    upload_collection, upload_file_with_manifest_ex,
+    ProgressFn, fetch_bytes_progress, fetch_manifest_path_progress, list_manifest_ex,
+    upload_bytes_ex, upload_collection, upload_file_with_manifest_ex,
 };
 use indicatif::{ProgressBar, ProgressStyle};
 
@@ -951,6 +951,36 @@ fn make_progress_bar() -> Option<ProgressFn> {
     Some(cb)
 }
 
+/// Build a CLI-side byte-based progress bar wrapped in a [`ProgressFn`] for the
+/// **fetch** path. The callback receives `(done_bytes, total_bytes)`; the total
+/// is the file's size (known from the root span), so the length is set on the
+/// first call. Like [`make_progress_bar`], returns `None` when stdout isn't a
+/// TTY so log captures stay clean.
+fn make_byte_progress_bar() -> Option<ProgressFn> {
+    let pb = ProgressBar::new(0);
+    if pb.is_hidden() {
+        return None;
+    }
+    pb.set_style(
+        ProgressStyle::with_template(
+            "  fetching {bar:40.cyan/blue} {bytes}/{total_bytes}  ({percent}%, {bytes_per_sec}, eta {eta})",
+        )
+        .ok()?
+        .progress_chars("##-"),
+    );
+    pb.enable_steady_tick(Duration::from_millis(250));
+    let cb: ProgressFn = Arc::new(move |done: usize, total: usize| {
+        if pb.length() != Some(total as u64) {
+            pb.set_length(total as u64);
+        }
+        pb.set_position(done as u64);
+        if total > 0 && done >= total {
+            pb.finish_and_clear();
+        }
+    });
+    Some(cb)
+}
+
 /// Convert a 64-char hex Swarm reference to a multibase-encoded CIDv1
 /// (`b...` lowercase base32). Returns `None` on malformed input.
 fn root_hex_to_cid(root_hex: &str) -> Option<String> {
@@ -1419,14 +1449,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Ok(())
                 } else {
                     let output = output.ok_or("--output is required (omit only with --list)")?;
+                    // Byte-based progress bar (TTY only; `None` when piped so
+                    // log captures stay clean). Drives on file-body bytes as
+                    // they join, for both plain and erasure-coded objects.
+                    let progress = make_byte_progress_bar();
                     if let Some(p) = path {
-                        let (bytes, content_type) = fetch_manifest_path_ex(
+                        let (bytes, content_type) = fetch_manifest_path_progress(
                             &transport,
                             &peers,
                             &hash,
                             &p,
                             max_retries,
                             concurrency,
+                            progress.as_ref(),
                         )
                         .await?;
                         std::fs::write(&output, &bytes)?;
@@ -1438,9 +1473,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             output.display()
                         );
                     } else {
-                        let bytes =
-                            fetch_bytes_ex(&transport, &peers, &hash, max_retries, concurrency)
-                                .await?;
+                        let bytes = fetch_bytes_progress(
+                            &transport,
+                            &peers,
+                            &hash,
+                            max_retries,
+                            concurrency,
+                            progress.as_ref(),
+                        )
+                        .await?;
                         std::fs::write(&output, &bytes)?;
                         println!("fetched {} bytes -> {}", bytes.len(), output.display());
                     }
