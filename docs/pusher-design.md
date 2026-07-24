@@ -1,8 +1,11 @@
 # Pusher: chunk-push relays on free compute
 
-Status: **design settled, not yet implemented.** This doc is the single source of
-truth for the pusher subsystem; it captures decisions made during the
-browser-performance investigation (mid-2026) so implementation can start cold.
+Status: **stages A+B implemented and deployed** (`src/pusher.rs`,
+`src/pushframe.rs`, `client::push_via_pusher(s)`, the dApp relay path in
+`apps/upload/`); stage C is partially there (client-side address-sharding with
+failover exists; weighted rendezvous + budget accounting do not). This doc is
+the single source of truth for the pusher subsystem; it captures decisions made
+during the browser-performance investigation (mid-2026).
 
 ## 1. Why
 
@@ -392,7 +395,7 @@ single-IP-throughput-limited (~0.05 MiB/s). Throughput is a client-side
 multi-lane concern (§7, stage C), not a single-host property. AWS Lambda's
 per-invocation egress-IP diversity (the natural fix) is untested — no account.
 
-### Stage B — the protocol end-to-end (~2–3 days)
+### Stage B — the protocol end-to-end (~2–3 days) — **implemented**
 
 - `POST /v1/push`: frame decode → validation (BMT recompute, stamp sig,
   cached batch-alive RPC) → push → streamed NDJSON acks. Open mode only; no

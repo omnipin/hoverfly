@@ -18,7 +18,10 @@
 export const PUSHER_URLS: string[] = [
   'https://hoverfly-pusher.onrender.com',
   'https://hoverfly-pusher-2.onrender.com',
-  'https://hoverfly-pusher-3.onrender.com'
+  'https://hoverfly-pusher-3.onrender.com',
+  // Hugging Face Space — a different provider/IP-range from Render (probed:
+  // HF permits outbound TCP to bee nodes), for cross-provider lane diversity.
+  'https://ivam5567-hoverfly.hf.space'
 ]
 /** Frames per POST to a pusher (≤ the relay's advertised `batch_max`). */
 export const PUSH_BATCH_SIZE = 256
