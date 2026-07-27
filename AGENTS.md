@@ -282,6 +282,21 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   the node's parity siblings. `client::join_target` detects a level-encoded root
   span and routes to it, else falls back to nectar's plain `GenericJoiner`. All
   download entry points (CLI/daemon/wasm) funnel through it.
+- `src/pushsched.rs` — **sans-I/O multi-lane push scheduler** (relay lanes,
+  docs/pusher-design.md §7). No clock, no network, no env: the caller passes
+  `now_ms`, does the HTTP, feeds acks back — so the native CLI (reqwest) and
+  the browser (wasm `UploadSession` + `fetch`) run the *same* scheduler, and
+  lane pathologies are tested against mock lanes on a virtual clock
+  (`pushsched/tests.rs`) instead of against real free-tier relays. Weighted
+  rendezvous hashing (`w / -ln u`) for assignment — weight = observed rate ×
+  budget headroom × concurrency; rank #2 is the deterministic hedge target.
+  Lane health is `Warming → Live → Backoff(exp) → Retired` with half-open
+  probes, because free-tier relays cold-start rather than die. Proximity
+  routing is present but **off** (`proximity_alpha = 0`): measured against
+  production overlays it starved two of four lanes, and the receipt-`po`
+  histogram shows relay-overlay proximity doesn't change how deep chunks land.
+  `CompletionPolicy::Group` is the seam for erasure-coded upload — a codeword
+  completes at `need` acks, the same rule `erasure::joiner` uses on read.
 - `src/signer.rs` — `SwarmSigner`: overlay derivation, handshake signing
   (v14 + cached v15), eth-address recovery. See "Bee 2.8.0 protocol support".
 - `src/wasm.rs` — `wasm-bindgen` façade (`HoverflyClient`): `start`/`stop`,

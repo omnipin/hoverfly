@@ -51,7 +51,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use tracing::{info, warn};
 
 use crate::client::{
-    ProgressFn, SessionPool, StampedChunk, push_chunks_with_pool, upload_bytes_ex,
+    ProgressFn, SessionPool, StampedChunk, push_chunks_with_pool_ex, upload_bytes_ex,
 };
 use crate::peers::{DialResult, PeerStore, apply_log};
 use crate::pushframe;
@@ -76,6 +76,13 @@ const PUSH_POOL_TARGET_DEFAULT: usize = 32;
 const PUSH_POOL_TARGET_MAX: usize = 512;
 /// Per-chunk retry budget on the push path.
 const PUSH_MAX_RETRIES: usize = 20;
+/// Recently-acked address cache: enough to cover several in-flight
+/// batches across every lane a client might hedge between.
+const RECENT_ACK_CAP: usize = 8192;
+/// How long a cached ack answers duplicates. Long enough to absorb a
+/// hedge (which fires on the order of one batch deadline) without
+/// pretending a chunk pushed minutes ago is still fresh.
+const RECENT_ACK_TTL_SECS: u64 = 120;
 
 /// Hard cap on probe payload size — a probe is a measurement, not a
 /// bulk upload, and free-tier egress is the budget being measured.
@@ -133,11 +140,67 @@ struct PushState {
     pool: tokio::sync::Mutex<Option<Arc<SessionPool>>>,
     /// Target warm-pool size (from `HOVERFLY_PUSH_POOL`).
     pool_target: usize,
+    /// Live session count, published in `/v1/status`. Refreshed by the
+    /// maintenance loop so the (sync) status handler never has to touch
+    /// the async pool mutex.
+    pool_live: AtomicUsize,
     /// This node's Kademlia overlay (node eth address + nonce). Published
     /// in `/v1/status` so a multi-lane client can route each chunk to the
     /// relay whose overlay is nearest the chunk's destination neighborhood
     /// (proximity rendezvous, docs/pusher-design.md §7).
     overlay: [u8; 32],
+    /// Egress budget in GB (`HOVERFLY_PUSH_BUDGET_GB`), and bytes pushed
+    /// since boot. Free tiers meter bandwidth, so a lane that has burned
+    /// its month should attract less traffic *before* it starts failing.
+    /// The client turns `budget_remaining_gb` into a scheduling weight.
+    budget_gb: Option<f64>,
+    bytes_pushed: AtomicU64,
+    /// Addresses acked recently, so a duplicate frame (client hedging a
+    /// straggler across two lanes) is answered from cache instead of
+    /// paying a second real push. docs/pusher-design.md §7 "ChunkCache".
+    recent: std::sync::Mutex<RecentAcks>,
+}
+
+/// Bounded, TTL'd set of recently-acked chunk addresses.
+///
+/// Insert order doubles as eviction order (a chunk's ack time only moves
+/// forward), so a `VecDeque` of `(addr, when)` plus a `HashMap` index is
+/// enough — no LRU bookkeeping, since re-acking an address doesn't need
+/// to extend its life.
+struct RecentAcks {
+    seen: HashMap<[u8; 32], Instant>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    cap: usize,
+    ttl: std::time::Duration,
+}
+
+impl RecentAcks {
+    fn new(cap: usize, ttl: std::time::Duration) -> Self {
+        Self {
+            seen: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap,
+            ttl,
+        }
+    }
+
+    fn contains(&self, addr: &[u8; 32]) -> bool {
+        self.seen.get(addr).is_some_and(|t| t.elapsed() < self.ttl)
+    }
+
+    fn insert(&mut self, addr: [u8; 32]) {
+        if self.seen.insert(addr, Instant::now()).is_none() {
+            self.order.push_back(addr);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                // Only drop the index entry if it wasn't re-inserted
+                // (re-insert keeps a single order slot, so this is just
+                // belt-and-braces against a stale key lingering).
+                self.seen.remove(&old);
+            }
+        }
+    }
 }
 
 type RespBody = BoxBody<Bytes, Infallible>;
@@ -272,8 +335,27 @@ fn status_response(state: &State) -> Response<RespBody> {
         // The node's Kademlia overlay, so a multi-lane client can route
         // each chunk to the nearest relay (proximity rendezvous, §7).
         "overlay": state.push.as_ref().map(|p| format!("0x{}", hex::encode(p.overlay))),
-        // Metered-budget accounting lands with the client scheduler (§7).
-        "budget_remaining_gb": serde_json::Value::Null,
+        // Egress budget headroom. `null` = unmetered (no cap configured);
+        // the client treats that as "no budget penalty" rather than "no
+        // budget left". Feeds the lane weight in the client scheduler (§7).
+        "budget_remaining_gb": state.push.as_ref().and_then(|p| {
+            let gb = p.budget_gb?;
+            let used = p.bytes_pushed.load(Ordering::Relaxed) as f64 / 1e9;
+            Some(((gb - used).max(0.0) * 1000.0).round() / 1000.0)
+        }),
+        // Warm-pool occupancy. A lane whose pool is starved (shared cloud
+        // /32 vs dedicated IP) can sustain far less throughput, and the
+        // client shouldn't have to discover that only by timing out.
+        "pool": state.push.as_ref().map(|p| serde_json::json!({
+            "live": p.pool_live.load(Ordering::Relaxed),
+            "target": p.pool_target,
+        })),
+        // Suggested concurrent POSTs per lane. Derived from pool
+        // occupancy: a starved pool can't absorb more parallel batches.
+        "inflight_max": state.push.as_ref().map(|p| {
+            let live = p.pool_live.load(Ordering::Relaxed);
+            (live / 16).clamp(1, 8)
+        }),
     });
     json_response(StatusCode::OK, &body)
 }
@@ -500,12 +582,29 @@ fn build_push_state(opts: &PusherOpts) -> Option<PushState> {
         .map(|n| n.clamp(1, PUSH_POOL_TARGET_MAX))
         .unwrap_or(PUSH_POOL_TARGET_DEFAULT);
     info!("push warm-pool target = {pool_target} (HOVERFLY_PUSH_POOL to override)");
+    let budget_gb = std::env::var("HOVERFLY_PUSH_BUDGET_GB")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| *v > 0.0);
+    match budget_gb {
+        Some(gb) => info!("push egress budget = {gb} GB (HOVERFLY_PUSH_BUDGET_GB)"),
+        None => {
+            info!("push egress budget = unmetered (set HOVERFLY_PUSH_BUDGET_GB to advertise one)")
+        }
+    }
     Some(PushState {
         transport: Arc::new(transport),
         peers: Arc::new(peers),
         pool: tokio::sync::Mutex::new(None),
         pool_target,
+        pool_live: AtomicUsize::new(0),
         overlay,
+        budget_gb,
+        bytes_pushed: AtomicU64::new(0),
+        recent: std::sync::Mutex::new(RecentAcks::new(
+            RECENT_ACK_CAP,
+            std::time::Duration::from_secs(RECENT_ACK_TTL_SECS),
+        )),
     })
 }
 
@@ -570,6 +669,8 @@ async fn run_push(
     chunks: Vec<StampedChunk>,
     tx: futures::channel::mpsc::UnboundedSender<Result<Frame<Bytes>, Infallible>>,
 ) {
+    let push = state.push.as_ref().expect("push state present");
+    let mut dedup_hits = 0usize;
     let send_line = |v: &serde_json::Value| {
         let mut s = v.to_string();
         s.push('\n');
@@ -579,6 +680,24 @@ async fn run_push(
         let mut v = serde_json::json!({"a": hex::encode(addr), "s": status});
         if let Some(e) = err {
             v["e"] = serde_json::Value::String(e.to_string());
+        }
+        send_line(&v);
+    };
+    let ack_ok = |addr: &[u8; 32], info: crate::client::PushInfo| {
+        // `po` is the proximity order of the peer whose receipt we took —
+        // i.e. how deep into the chunk's own neighborhood it actually
+        // landed. This is the measurement that decides whether client-side
+        // proximity routing to a relay's overlay is worth anything at all
+        // (docs/pusher-design.md §7); without it that question can only be
+        // guessed at.
+        let mut v = serde_json::json!({
+            "a": hex::encode(addr),
+            "s": "ok",
+            "po": info.po,
+            "ms": info.ms,
+        });
+        if info.shallow {
+            v["shallow"] = serde_json::Value::Bool(true);
         }
         send_line(&v);
     };
@@ -616,7 +735,30 @@ async fn run_push(
             }
         };
         match owner {
-            Some(o) if o == vs.signer => accepted.push(chunk),
+            Some(o) if o == vs.signer => {
+                // Duplicate suppression: a client hedging a straggler
+                // sends the same frame to two lanes on purpose. Answering
+                // from the recent-ack cache makes the loser of that race
+                // free instead of a second real push through the pool.
+                let dup = push
+                    .recent
+                    .lock()
+                    .expect("recent-ack cache poisoned")
+                    .contains(&chunk.addr);
+                if dup {
+                    dedup_hits += 1;
+                    ack_ok(
+                        &chunk.addr,
+                        crate::client::PushInfo {
+                            po: 0,
+                            ms: 0,
+                            shallow: false,
+                        },
+                    );
+                } else {
+                    accepted.push(chunk);
+                }
+            }
             Some(o) => ack(
                 &chunk.addr,
                 "err",
@@ -631,12 +773,13 @@ async fn run_push(
     }
 
     if accepted.is_empty() {
-        send_line(&serde_json::json!({"done": {"pushed": 0, "rejected": true}}));
+        send_line(&serde_json::json!({
+            "done": {"pushed": 0, "rejected": dedup_hits == 0, "dedup": dedup_hits}
+        }));
         return;
     }
 
     // Grab the warm pool (kept filled by the maintenance loop) and push.
-    let push = state.push.as_ref().expect("push state present");
     let pool = match get_pool(push).await {
         Ok(p) => p,
         Err(e) => {
@@ -649,7 +792,46 @@ async fn run_push(
 
     let addrs: Vec<[u8; 32]> = accepted.iter().map(|c| c.addr).collect();
     let total = accepted.len();
-    let result = push_chunks_with_pool(
+    let bytes: u64 = accepted.iter().map(|c| c.wire.len() as u64).sum();
+
+    // Per-chunk acks, streamed as each chunk resolves. Chunks are
+    // independent for pushsync, so one failure inside a 256-frame batch
+    // says nothing about the other 255 — reporting a single verdict for
+    // the whole batch (the old behaviour) forced the client to re-push
+    // everything over one loss, and made the dApp's "streaming" progress
+    // bar jump in 256-chunk steps.
+    //
+    // The channel send is what carries the ack out, so the callback has to
+    // own a clone of the sender rather than borrow `send_line`.
+    let acked: Arc<std::sync::Mutex<HashMap<[u8; 32], bool>>> =
+        Arc::new(std::sync::Mutex::new(HashMap::with_capacity(total)));
+    let on_chunk: crate::client::ChunkDoneFn = {
+        let tx = tx.clone();
+        let acked = acked.clone();
+        Arc::new(move |addr: &[u8; 32], res| {
+            let v = match &res {
+                Ok(info) => {
+                    let mut v = serde_json::json!({
+                        "a": hex::encode(addr), "s": "ok", "po": info.po, "ms": info.ms,
+                    });
+                    if info.shallow {
+                        v["shallow"] = serde_json::Value::Bool(true);
+                    }
+                    v
+                }
+                Err(e) => serde_json::json!({"a": hex::encode(addr), "s": "err", "e": e}),
+            };
+            acked
+                .lock()
+                .expect("ack map poisoned")
+                .insert(*addr, res.is_ok());
+            let mut s = v.to_string();
+            s.push('\n');
+            let _ = tx.unbounded_send(Ok(Frame::data(Bytes::from(s))));
+        })
+    };
+
+    let result = push_chunks_with_pool_ex(
         &push.transport,
         &pool,
         &push.peers,
@@ -659,25 +841,51 @@ async fn run_push(
         // top-up (concurrent pushes would otherwise each dial-burst and trip
         // bee's per-/32 rate limiter).
         None,
+        Some(&on_chunk),
     )
     .await;
 
-    match result {
-        Ok(()) => {
-            for a in &addrs {
-                ack(a, "ok", None);
-            }
-            send_line(&serde_json::json!({"done": {"pushed": total}}));
-        }
-        Err(e) => {
-            // All-or-nothing: on failure the client re-POSTs the batch.
-            let msg = e.to_string();
-            for a in &addrs {
-                ack(a, "err", Some(&msg));
-            }
-            send_line(&serde_json::json!({"done": {"pushed": 0, "error": msg}}));
+    // A fatal error aborts the dispatcher with chunks still queued; those
+    // never reached the callback, so name them here. Without this the
+    // client would wait out its own deadline for acks that can't come.
+    let seen = acked.lock().expect("ack map poisoned").clone();
+    let mut pushed = 0usize;
+    let mut pushed_bytes = 0u64;
+    for (a, ok) in &seen {
+        if *ok {
+            pushed += 1;
+            push.recent
+                .lock()
+                .expect("recent-ack cache poisoned")
+                .insert(*a);
         }
     }
+    if total > 0 {
+        pushed_bytes = bytes * pushed as u64 / total as u64;
+    }
+    push.bytes_pushed.fetch_add(pushed_bytes, Ordering::Relaxed);
+    let err_msg = result.err().map(|e| e.to_string());
+    let unresolved = addrs.iter().filter(|a| !seen.contains_key(*a)).count();
+    if unresolved > 0 {
+        let msg = err_msg
+            .clone()
+            .unwrap_or_else(|| "dispatcher exited before this chunk resolved".into());
+        for a in &addrs {
+            if !seen.contains_key(a) {
+                ack(a, "err", Some(&msg));
+            }
+        }
+    }
+    let mut done = serde_json::json!({"pushed": pushed, "total": total});
+    if dedup_hits > 0 {
+        done["dedup"] = serde_json::json!(dedup_hits);
+        info!(target: "hoverfly::pusher",
+            "batch: {pushed}/{total} pushed, {dedup_hits} served from the recent-ack cache");
+    }
+    if let Some(e) = err_msg {
+        done["error"] = serde_json::Value::String(e);
+    }
+    send_line(&serde_json::json!({ "done": done }));
 }
 
 /// On-chain batch owner for `batch_id_hex`, cached. Errors (string) on
@@ -742,6 +950,7 @@ async fn ensure_pool(push: &PushState) -> Result<Arc<SessionPool>, String> {
     };
     pool.top_up(&push.transport, &push.peers, push.pool_target)
         .await;
+    push.pool_live.store(pool.len(), Ordering::Relaxed);
     if pool.len() == 0 {
         return Err("could not open any sessions from the peer cache".into());
     }

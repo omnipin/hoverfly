@@ -159,6 +159,35 @@ pub const DEFAULT_DISCOVER_CONCURRENCY: usize = 16;
 /// whatever they like.
 pub type ProgressFn = std::sync::Arc<dyn Fn(usize, usize) + Send + Sync + 'static>;
 
+/// What a single chunk's push actually achieved. Reported per chunk via
+/// [`ChunkDoneFn`] so a relay can stream real acks (rather than one
+/// batch-terminal verdict) and so the client scheduler has the receipt
+/// quality it needs to decide whether routing choices matter at all
+/// (docs/pusher-design.md §7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PushInfo {
+    /// Proximity order between the chunk address and the peer whose
+    /// receipt we accepted — how deep into the destination neighborhood
+    /// the chunk actually landed. `0` when unknown (shallow accept).
+    pub po: u8,
+    /// Wall time from dispatch entry to receipt, in milliseconds.
+    pub ms: u32,
+    /// True when this chunk was accepted on a *shallow* receipt after the
+    /// retry budget ran out: forwarded into the network, but no
+    /// neighborhood storer confirmed it. Retrievability is not guaranteed.
+    pub shallow: bool,
+}
+
+/// Callback invoked once per chunk as it resolves, with the chunk address
+/// and either its [`PushInfo`] or a human-readable failure reason.
+///
+/// Distinct from [`ProgressFn`] (which only counts) because the pusher
+/// relay has to name *which* chunks landed: `/v1/push` acks per chunk as
+/// it lands, so a client re-dispatches only the chunks that actually
+/// failed instead of re-pushing a whole 256-frame batch over one loss.
+pub type ChunkDoneFn =
+    std::sync::Arc<dyn Fn(&[u8; 32], Result<PushInfo, String>) + Send + Sync + 'static>;
+
 /// A `ChunkGet` adapter that routes requests through libp2p retrieval to the
 /// closest peers in a peerlist. Up to `concurrency` requests are raced in
 /// parallel; whichever peer responds first with a valid chunk wins, and
@@ -2440,391 +2469,510 @@ pub async fn upload_bytes_with_pool(
     Ok(root)
 }
 
-/// Push locally-stamped chunks across **multiple** relays, routing each
-/// chunk to the relay best placed to inject it and balancing load by real
-/// throughput (docs/pusher-design.md §7). Two layers:
+/// Push locally-stamped chunks across one or more relays.
 ///
-/// - **Proximity rendezvous** (when every lane advertises an `overlay` in
-///   `/v1/status`): a chunk's *preferred* lane is the relay whose Kademlia
-///   overlay is nearest the chunk address, so most chunks are injected by
-///   a relay already deep in the destination neighborhood — fewer pushsync
-///   hops. Falls back to round-robin when any lane hides its overlay.
-/// - **Capacity stealing**: each lane drains its own preferred queue
-///   first, then steals from the most-backed-up lane, so a fast lane never
-///   idles while a slow / rate-limited lane sets the finish time.
+/// A thin driver over [`crate::pushsched::Scheduler`]: this function owns
+/// only the HTTP (reqwest + tokio) and the clock. Every routing, failover,
+/// hedging and lane-health decision lives in the scheduler, which is
+/// sans-I/O and shared with the browser dApp — so both targets behave
+/// identically and the behaviour is testable without a network.
 ///
-/// Robustness: a chunk a lane fails to ack is requeued to its preferred
-/// lane, capped at `MAX_ATTEMPTS` (any lane can then steal it); a lane
-/// that fully bounces `DEAD_AFTER` batches in a row retires. Delegates to
-/// [`push_via_pusher`] for the single-lane case.
+/// The signing key never leaves this process; only pre-signed frames go
+/// over the wire (docs/pusher-design.md §3).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn push_via_pushers(
     pusher_urls: &[String],
     chunks: Vec<StampedChunk>,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    let total = chunks.len();
+    let mut once = Some(chunks);
+    drive_pushers(
+        pusher_urls,
+        total,
+        move |_| Ok(once.take().unwrap_or_default()),
+        progress,
+    )
+    .await
+}
 
-    /// Frames per POST — must stay ≤ the pusher's advertised batch_max.
-    const BATCH: usize = 256;
-    /// Concurrent POSTs *per lane* (pipeline depth). Matches the
-    /// single-lane path so a lone fast lane in a multi-lane run isn't
-    /// starved of pipelining just for sharing the run with slower lanes.
-    const INFLIGHT_PER_LANE: usize = 4;
-    /// Per-chunk failover cap: lane attempts before the chunk is dropped.
-    const MAX_ATTEMPTS: u16 = 6;
-    /// Retire a lane after this many consecutive fully-unacked batches.
-    const DEAD_AFTER: usize = 3;
+/// Shared driver for every relay push, one-shot or streaming.
+///
+/// `produce(want)` yields up to `want` more stamped chunks; an empty result
+/// means the source is exhausted. That indirection is what lets a windowed
+/// upload stamp lazily — the scheduler is told about new work as it appears,
+/// while earlier windows are still on the wire.
+#[cfg(not(target_arch = "wasm32"))]
+async fn drive_pushers<P>(
+    pusher_urls: &[String],
+    total_hint: usize,
+    mut produce: P,
+    progress: Option<&ProgressFn>,
+) -> Result<(), ClientError>
+where
+    P: FnMut(usize) -> Result<Vec<StampedChunk>, ClientError>,
+{
+    use crate::pushsched::{Config, LaneInfo, Scheduler};
 
     if pusher_urls.is_empty() {
         return Err(ClientError::Pusher("no pusher URLs given".into()));
     }
-    if pusher_urls.len() == 1 {
-        return push_via_pusher(&pusher_urls[0], chunks, progress).await;
+    if total_hint == 0 {
+        return Ok(());
     }
 
-    let lanes: Vec<Arc<String>> = pusher_urls
-        .iter()
-        .map(|u| Arc::new(format!("{}/v1/push", u.trim_end_matches('/'))))
-        .collect();
-    let n_lanes = lanes.len();
-    let http = Arc::new(
+    let http = std::sync::Arc::new(
         reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(300))
             .build()
             .map_err(|e| ClientError::Pusher(format!("http client: {e}")))?,
     );
-    let chunks = Arc::new(chunks);
-    let total = chunks.len();
-    if total == 0 {
-        return Ok(());
+
+    // Poll each lane's advertisement independently. A cold free-tier relay
+    // (measured: 35 s to first byte on a sleeping instance) must only cost
+    // *itself* a default-weighted start, never degrade routing for the
+    // others — which is exactly what the previous all-or-nothing overlay
+    // collection did.
+    let infos: Vec<LaneInfo> =
+        futures::future::join_all(pusher_urls.iter().map(|u| fetch_lane_info(&http, u))).await;
+    for (i, (u, info)) in pusher_urls.iter().zip(&infos).enumerate() {
+        info!(target: "hoverfly::upload",
+            "lane {i} {u}: pool={:?} batch_max={:?} inflight_max={:?} budget_gb={:?}",
+            info.pool_live, info.batch_max, info.inflight_max, info.budget_remaining_gb);
     }
 
-    // Learn each lane's overlay (for proximity routing). All-or-nothing:
-    // if any lane hides it, route round-robin so a chunk is never pinned
-    // to a relay we can't place. `HOVERFLY_PUSH_NO_PROXIMITY` forces
-    // round-robin (A/B lever).
-    let force_rr = std::env::var("HOVERFLY_PUSH_NO_PROXIMITY")
-        .is_ok_and(|v| !v.is_empty() && v != "0");
-    let overlays: Vec<Option<[u8; 32]>> = if force_rr {
-        vec![None; n_lanes]
-    } else {
-        futures::future::join_all(pusher_urls.iter().map(|u| fetch_lane_overlay(&http, u))).await
+    let mut cfg = Config::default();
+    // A/B lever kept from Stage C's first cut, now inverted: proximity is
+    // OFF unless asked for, because routing to a relay's own overlay is at
+    // best a weak proxy for how deep a chunk lands (the relay pushes to the
+    // closest peer in its own multi-thousand-entry peerstore). The `po`
+    // field on `/v1/push` acks is the measurement that decides whether this
+    // is ever worth enabling.
+    if let Ok(v) = std::env::var("HOVERFLY_PUSH_PROXIMITY") {
+        cfg.proximity_alpha = v.parse().unwrap_or(0.0);
+    }
+    let cfg_alpha = cfg.proximity_alpha;
+
+    let lanes: Vec<std::sync::Arc<String>> = pusher_urls
+        .iter()
+        .map(|u| std::sync::Arc::new(format!("{}/v1/push", u.trim_end_matches('/'))))
+        .collect();
+    let mut sched = Scheduler::new(infos, cfg);
+    // Frames are held by address, not by index: `admit` de-duplicates, so an
+    // index-parallel Vec would silently skew. Keying by address also lets a
+    // frame be dropped the moment its chunk is acked, which is what keeps a
+    // streaming upload's memory flat.
+    let mut frames: HashMap<[u8; 32], StampedChunk> = HashMap::new();
+    let mut total = 0usize;
+    let mut exhausted = false;
+    let mut refill = |sched: &mut Scheduler,
+                      frames: &mut HashMap<[u8; 32], StampedChunk>,
+                      total: &mut usize,
+                      exhausted: &mut bool|
+     -> Result<(), ClientError> {
+        if *exhausted {
+            return Ok(());
+        }
+        let batch = produce(PUSH_WINDOW)?;
+        if batch.is_empty() {
+            *exhausted = true;
+            return Ok(());
+        }
+        sched.admit(batch.iter().map(|c| (c.addr, c.wire.len() as u32)));
+        for c in batch {
+            frames.entry(c.addr).or_insert(c);
+        }
+        *total = sched.total();
+        Ok(())
     };
-    let proximity: Option<Vec<[u8; 32]>> = overlays.iter().copied().collect();
+    refill(&mut sched, &mut frames, &mut total, &mut exhausted)?;
 
-    // Preferred lane per chunk: nearest overlay (proximity) or round-robin.
-    let pref: Arc<Vec<usize>> = Arc::new(match &proximity {
-        Some(ov) => (0..total)
-            .map(|i| {
-                (0..n_lanes)
-                    .max_by_key(|&l| chunk_proximity(&chunks[i].addr, &ov[l]))
-                    .unwrap_or(0)
-            })
-            .collect(),
-        None => (0..total).map(|i| i % n_lanes).collect(),
-    });
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<LaneEv>();
+    let start = std::time::Instant::now();
+    let now_ms = move || start.elapsed().as_millis() as u64;
+    let mut done_count = 0usize;
+    // Receipt-depth instrument (docs/pusher-design.md §7). Proximity routing
+    // is off by default precisely because nobody had measured whether it
+    // changes anything; this is the measurement. Compare mean/histogram
+    // across `HOVERFLY_PUSH_PROXIMITY=0` and `=1` runs.
+    let mut po_sum = 0u64;
+    let mut po_n = 0u64;
+    let mut po_hist = [0u32; 33];
+    // Chunks the relay accepted on a shallow receipt: forwarded, but no
+    // neighborhood storer confirmed storage. They count as pushed (there is
+    // nothing more the relay can do) but they are the population that goes
+    // on to 404 on retrieval, so the caller deserves to be told.
+    let mut shallow_n = 0u64;
 
-    // Seed each lane's queue with the chunks that prefer it.
-    let mut init_qs: Vec<VecDeque<usize>> = vec![VecDeque::new(); n_lanes];
-    for i in 0..total {
-        init_qs[pref[i]].push_back(i);
-    }
-    let dist: Vec<usize> = init_qs.iter().map(|q| q.len()).collect();
-    info!(target: "hoverfly::upload",
-        "multi-pusher: {} routing over {n_lanes} lanes, per-lane chunks {:?}",
-        if proximity.is_some() { "proximity" } else { "round-robin" }, dist);
+    loop {
+        // Keep the scheduler fed: stamp the next window once the backlog is
+        // small enough that lanes could go idle waiting for it.
+        while !exhausted && sched.total() - sched.acked() - sched.failed() < PUSH_WINDOW {
+            refill(&mut sched, &mut frames, &mut total, &mut exhausted)?;
+        }
 
-    struct Shared {
-        qs: Vec<VecDeque<usize>>, // per-lane preferred queues
-        attempts: Vec<u16>,
-        unresolved: usize, // chunks neither acked nor permanently dropped
-    }
-    let shared = Arc::new(Mutex::new(Shared {
-        qs: init_qs,
-        attempts: vec![0u16; total],
-        unresolved: total,
-    }));
-    let acked = Arc::new(AtomicUsize::new(0));
-    let lane_dead: Arc<Vec<AtomicBool>> =
-        Arc::new((0..n_lanes).map(|_| AtomicBool::new(false)).collect());
-    let lane_fail: Arc<Vec<AtomicUsize>> =
-        Arc::new((0..n_lanes).map(|_| AtomicUsize::new(0)).collect());
-    let progress = progress.cloned();
-
-    let mut tasks = Vec::with_capacity(n_lanes * INFLIGHT_PER_LANE);
-    for lane in 0..n_lanes {
-        for _ in 0..INFLIGHT_PER_LANE {
+        // Hand out everything the scheduler is willing to dispatch.
+        while let Some(a) = sched.next(now_ms()) {
+            let batch: Vec<StampedChunk> = a
+                .chunks
+                .iter()
+                .filter_map(|&i| frames.get(&sched.chunk_addr(i)).cloned())
+                .collect();
             let http = http.clone();
-            let lane_url = lanes[lane].clone();
-            let chunks = chunks.clone();
-            let shared = shared.clone();
-            let acked = acked.clone();
-            let lane_dead = lane_dead.clone();
-            let lane_fail = lane_fail.clone();
-            let progress = progress.clone();
-            let pref = pref.clone();
-            tasks.push(tokio::spawn(async move {
-                loop {
-                    // All work resolved, or this lane retired → stop.
-                    if shared.lock().unwrap().unresolved == 0
-                        || lane_dead[lane].load(Ordering::Relaxed)
-                    {
-                        break;
-                    }
-                    // Own preferred queue first; else steal from the
-                    // most-backed-up lane (drains slow / dead lanes too).
-                    let idxs: Vec<usize> = {
-                        let mut s = shared.lock().unwrap();
-                        let own = s.qs[lane].len().min(BATCH);
-                        if own > 0 {
-                            s.qs[lane].drain(..own).collect()
-                        } else {
-                            let victim = (0..n_lanes)
-                                .filter(|&k| k != lane)
-                                .max_by_key(|&k| s.qs[k].len())
-                                .filter(|&k| !s.qs[k].is_empty());
-                            match victim {
-                                Some(k) => {
-                                    let take = s.qs[k].len().min(BATCH);
-                                    s.qs[k].drain(..take).collect()
-                                }
-                                None => Vec::new(),
-                            }
-                        }
-                    };
-                    if idxs.is_empty() {
-                        // Nothing to pull, but chunks are in flight on other
-                        // lanes (which may requeue on failure).
-                        if shared.lock().unwrap().unresolved == 0 {
-                            break;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-                        continue;
-                    }
-                    let batch: Vec<StampedChunk> =
-                        idxs.iter().map(|&i| chunks[i].clone()).collect();
-                    let ok = post_batch_acks(&http, lane_url.as_str(), &batch).await;
+            let url = lanes[a.lane].clone();
+            let tx = tx.clone();
+            let (batch_id, lane, hedge) = (a.batch, a.lane, a.hedge);
+            if hedge {
+                debug!(target: "hoverfly::upload",
+                    "hedging {} straggler(s) onto lane {lane}", batch.len());
+            }
+            tokio::spawn(async move {
+                post_batch_streaming(&http, url.as_str(), batch_id, lane, &batch, &tx).await;
+            });
+        }
 
-                    let mut wins = 0usize;
-                    {
-                        let mut s = shared.lock().unwrap();
-                        for &i in &idxs {
-                            if ok.contains(&hex::encode(chunks[i].addr)) {
-                                wins += 1;
-                                s.unresolved -= 1;
-                            } else {
-                                s.attempts[i] += 1;
-                                if s.attempts[i] >= MAX_ATTEMPTS {
-                                    s.unresolved -= 1; // give up on this chunk
-                                } else {
-                                    let p = pref[i];
-                                    s.qs[p].push_back(i); // retry near, steal-able
-                                }
-                            }
-                        }
+        if sched.done() && exhausted {
+            break;
+        }
+
+        if sched.in_flight() == 0 {
+            if sched.done() {
+                // Everything admitted so far has landed; go stamp more.
+                continue;
+            }
+            if let Some(reason) = sched.stalled(now_ms()) {
+                let stats = sched.lane_stats();
+                return Err(ClientError::Pusher(format!(
+                    "push stalled ({reason:?}) with {}/{} acked; lanes: {}",
+                    sched.acked(),
+                    total,
+                    stats
+                        .iter()
+                        .enumerate()
+                        .map(|(i, s)| format!(
+                            "{i}={:?} ok={} err={}",
+                            s.health.expect("health"),
+                            s.acked,
+                            s.failed
+                        ))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                )));
+            }
+            // Nothing in flight and nothing dispatchable: every lane is
+            // backing off. Sleep exactly until the earliest one is due.
+            match sched.next_wake_ms(now_ms()) {
+                Some(t) if t > now_ms() => {
+                    tokio::time::sleep(std::time::Duration::from_millis(t - now_ms())).await;
+                    continue;
+                }
+                _ => break,
+            }
+        }
+
+        // Wait for the next event, but never past a pending hedge deadline.
+        let wake = sched.next_wake_ms(now_ms());
+        let sleep_for = wake
+            .map(|t| std::time::Duration::from_millis(t.saturating_sub(now_ms())))
+            .unwrap_or(std::time::Duration::from_secs(3600));
+        let ev = tokio::select! {
+            ev = rx.recv() => ev,
+            _ = tokio::time::sleep(sleep_for) => continue,
+        };
+        let Some(ev) = ev else { break };
+        match ev {
+            LaneEv::Ack {
+                lane,
+                addr,
+                ok,
+                po,
+                shallow,
+            } => {
+                let before = sched.acked();
+                sched.on_ack(lane, &addr, ok, now_ms());
+                if sched.acked() > before {
+                    done_count += 1;
+                    if shallow {
+                        shallow_n += 1;
                     }
-                    // Progress + lane-health, outside the lock.
-                    if wins > 0 {
-                        lane_fail[lane].store(0, Ordering::Relaxed);
-                        if let Some(p) = &progress {
-                            for _ in 0..wins {
-                                let d = acked.fetch_add(1, Ordering::Relaxed) + 1;
-                                p(d, total);
-                            }
-                        } else {
-                            acked.fetch_add(wins, Ordering::Relaxed);
-                        }
-                    } else {
-                        // Whole batch bounced — count it against the lane.
-                        let c = lane_fail[lane].fetch_add(1, Ordering::Relaxed) + 1;
-                        if c >= DEAD_AFTER {
-                            lane_dead[lane].store(true, Ordering::Relaxed);
-                            warn!(target: "hoverfly::upload",
-                                "pusher lane {lane_url} retired after {c} unacked batches");
-                        }
+                    if po > 0 {
+                        po_sum += u64::from(po);
+                        po_n += 1;
+                        po_hist[usize::from(po).min(po_hist.len() - 1)] += 1;
+                    }
+                    // The frame is no longer needed by any lane: a Done
+                    // chunk is never re-dispatched, and a hedged twin's
+                    // later ack is dropped by the scheduler.
+                    frames.remove(&addr);
+                    if let Some(p) = progress {
+                        let t = total_hint.max(sched.total());
+                        p(done_count.min(t), t);
                     }
                 }
-            }));
+            }
+            LaneEv::Done {
+                batch,
+                lane,
+                acked,
+                elapsed_ms,
+                outcome,
+            } => {
+                sched.on_batch_timing(lane, acked, elapsed_ms);
+                sched.on_batch_result(batch, outcome, now_ms());
+            }
         }
     }
 
-    for t in tasks {
-        let _ = t.await;
+    let total = sched.total();
+    let stats = sched.lane_stats();
+    info!(target: "hoverfly::upload",
+        "pusher run: {}/{} acked ({} hedged) over {} lane(s): {}",
+        sched.acked(), total, sched.hedges(), lanes.len(),
+        stats.iter().enumerate()
+            .map(|(i, s)| format!("{i}:{}ok/{}err@{:.1}/s", s.acked, s.failed, s.rate))
+            .collect::<Vec<_>>().join(" "));
+    if shallow_n > 0 {
+        warn!(target: "hoverfly::upload",
+            "{shallow_n}/{} chunk(s) landed on a SHALLOW receipt — forwarded but not \
+             confirmed stored by a neighborhood peer; those may be unretrievable",
+            sched.acked());
+    }
+    if po_n > 0 {
+        let top: Vec<String> = po_hist
+            .iter()
+            .enumerate()
+            .filter(|(_, n)| **n > 0)
+            .map(|(po, n)| format!("{po}:{n}"))
+            .collect();
+        info!(target: "hoverfly::upload",
+            "receipt depth: mean po {:.2} over {po_n} receipt(s) (alpha={}) — {}",
+            po_sum as f64 / po_n as f64, cfg_alpha, top.join(" "));
     }
 
-    let acked_final = acked.load(Ordering::Relaxed);
-    if acked_final < total {
+    if sched.acked() < total {
         return Err(ClientError::Pusher(format!(
-            "{} of {total} chunks unacked across {n_lanes} lane(s) — lanes exhausted or retired",
-            total - acked_final
+            "{} of {total} chunks unacked across {} lane(s)",
+            total - sched.acked(),
+            lanes.len()
         )));
     }
     Ok(())
 }
 
-/// Kademlia proximity order: count of leading bits shared by two 32-byte
-/// addresses. Used only for *relative* comparison (which lane is nearest a
-/// chunk), so the exact MaxPO cap is irrelevant.
+/// Chunks stamped per refill of the scheduler. Big enough to keep every
+/// lane's pipeline full, small enough that a streaming upload's peak memory
+/// is a window of frames rather than the whole file.
 #[cfg(not(target_arch = "wasm32"))]
-fn chunk_proximity(a: &[u8; 32], b: &[u8; 32]) -> u8 {
-    for i in 0..32 {
-        let x = a[i] ^ b[i];
-        if x != 0 {
-            return (i as u8) * 8 + x.leading_zeros() as u8;
-        }
-    }
-    255
-}
+const PUSH_WINDOW: usize = 1024;
 
-/// Fetch a pusher's advertised overlay from `GET {base}/v1/status`.
-/// `None` on any error or if the field is absent (→ round-robin fallback).
-#[cfg(not(target_arch = "wasm32"))]
-async fn fetch_lane_overlay(http: &reqwest::Client, base_url: &str) -> Option<[u8; 32]> {
-    let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
-    let resp = http
-        .get(&url)
-        .timeout(std::time::Duration::from_secs(15))
-        .send()
-        .await
-        .ok()?;
-    let v: serde_json::Value = resp.json().await.ok()?;
-    let s = v.get("overlay")?.as_str()?;
-    let bytes = hex::decode(s.trim_start_matches("0x")).ok()?;
-    if bytes.len() != 32 {
-        return None;
-    }
-    let mut a = [0u8; 32];
-    a.copy_from_slice(&bytes);
-    Some(a)
-}
-
-/// POST one batch to a lane and return the set of addr-hex strings the
-/// lane acked "ok". Any transport/HTTP error yields an empty set (whole
-/// batch treated as unacked → retried/failed-over by the caller).
-#[cfg(not(target_arch = "wasm32"))]
-async fn post_batch_acks(
-    http: &reqwest::Client,
-    push_url: &str,
-    batch: &[StampedChunk],
-) -> std::collections::HashSet<String> {
-    use std::collections::HashSet;
-    let mut acked = HashSet::new();
-    let body = crate::pushframe::encode_batch(batch);
-    let resp = match http.post(push_url).body(body).send().await {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(target: "hoverfly::upload", "lane {push_url} POST failed: {e}");
-            return acked;
-        }
-    };
-    if !resp.status().is_success() {
-        let code = resp.status();
-        let txt = resp.text().await.unwrap_or_default();
-        warn!(target: "hoverfly::upload", "lane {push_url} rejected batch ({code}): {}", txt.trim());
-        return acked;
-    }
-    let Ok(txt) = resp.text().await else {
-        return acked;
-    };
-    for line in txt.lines() {
-        let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
-            continue;
-        };
-        if v.get("s").and_then(|s| s.as_str()) == Some("ok") {
-            if let Some(a) = v.get("a").and_then(|a| a.as_str()) {
-                acked.insert(a.to_string());
-            }
-        }
-    }
-    acked
-}
-
-/// Push locally-stamped chunks through a single relay (`hoverfly
-/// pusher`) over HTTP instead of dialing bees directly. The signing key
-/// never leaves this process — only pre-signed frames go over the wire
-/// (docs/pusher-design.md §3). Batched POSTs, streamed NDJSON acks,
-/// unacked chunks re-POSTed for a few rounds. `Ok` only when all acked.
+/// Push through a single relay. Same driver, one lane (so no hedging).
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn push_via_pusher(
     pusher_url: &str,
     chunks: Vec<StampedChunk>,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
-    use futures::stream::StreamExt;
-    /// Frames per POST — must stay ≤ the pusher's advertised batch_max.
-    const BATCH: usize = 256;
-    /// Batches POSTed concurrently to the relay. The relay pushes each
-    /// through its shared warm pool, so pipelining keeps that pool
-    /// saturated instead of idling between one-at-a-time POSTs.
-    const INFLIGHT: usize = 4;
-    /// Rounds of re-POSTing unacked chunks before failing.
-    const MAX_ROUNDS: usize = 6;
+    push_via_pushers(
+        std::slice::from_ref(&pusher_url.to_string()),
+        chunks,
+        progress,
+    )
+    .await
+}
 
-    let base = pusher_url.trim_end_matches('/');
-    let push_url = format!("{base}/v1/push");
-    let http = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(300))
-        .build()
-        .map_err(|e| ClientError::Pusher(format!("http client: {e}")))?;
+/// Push a windowed [`UploadStreamer`] through relays.
+///
+/// Stamps one window at a time and admits it to the scheduler while earlier
+/// windows are still on the wire, so peak memory is one window of frames
+/// rather than the whole file. This is what the browser has been doing since
+/// the streamer landed; the native `--pusher` path used the one-shot
+/// prepare-everything-first route and would OOM on large files.
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn push_stream_via_pushers(
+    pusher_urls: &[String],
+    mut streamer: UploadStreamer,
+    progress: Option<&ProgressFn>,
+) -> Result<ChunkAddress, ClientError> {
+    let root = streamer.root();
+    let total = streamer.total_chunks();
+    drive_pushers(
+        pusher_urls,
+        total,
+        move |want| streamer.next_batch(want),
+        progress,
+    )
+    .await?;
+    Ok(root)
+}
 
-    let total = chunks.len();
-    let mut done = 0usize;
-    let mut pending: Vec<usize> = (0..chunks.len()).collect();
+/// Event from an in-flight POST back to the scheduler driver.
+#[cfg(not(target_arch = "wasm32"))]
+enum LaneEv {
+    Ack {
+        lane: usize,
+        addr: [u8; 32],
+        ok: bool,
+        /// Receipt proximity order reported by the relay — how deep into the
+        /// chunk's own neighborhood it actually landed.
+        po: u8,
+        /// The relay accepted this chunk on a *shallow* receipt: forwarded
+        /// into the network, but no neighborhood storer confirmed it.
+        shallow: bool,
+    },
+    Done {
+        batch: u64,
+        lane: usize,
+        acked: usize,
+        elapsed_ms: u64,
+        outcome: crate::pushsched::BatchOutcome,
+    },
+}
 
-    for round in 0..MAX_ROUNDS {
-        if pending.is_empty() {
-            break;
+/// POST one batch and forward each NDJSON ack to the driver as it arrives.
+///
+/// Acks are streamed rather than collected because the relay now resolves
+/// chunks independently: waiting for the whole response before crediting
+/// anything would put the tail of every batch back on the critical path and
+/// blind the hedger to which chunks are actually stuck.
+#[cfg(not(target_arch = "wasm32"))]
+async fn post_batch_streaming(
+    http: &reqwest::Client,
+    push_url: &str,
+    batch_id: u64,
+    lane: usize,
+    batch: &[StampedChunk],
+    tx: &tokio::sync::mpsc::UnboundedSender<LaneEv>,
+) {
+    use crate::pushsched::BatchOutcome;
+    use futures::StreamExt;
+
+    let t0 = std::time::Instant::now();
+    let body = crate::pushframe::encode_batch(batch);
+    let mut acked = 0usize;
+
+    let finish = |outcome: BatchOutcome, acked: usize| {
+        let _ = tx.send(LaneEv::Done {
+            batch: batch_id,
+            lane,
+            acked,
+            elapsed_ms: t0.elapsed().as_millis() as u64,
+            outcome,
+        });
+    };
+
+    let resp = match http.post(push_url).body(body).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(target: "hoverfly::upload", "lane {push_url} POST failed: {e}");
+            finish(BatchOutcome::Failed(e.to_string()), 0);
+            return;
         }
-        let batches: Vec<Vec<usize>> = pending.chunks(BATCH).map(|c| c.to_vec()).collect();
-        // POST up to INFLIGHT batches concurrently; each returns its acked set.
-        let results: Vec<(Vec<usize>, std::collections::HashSet<String>)> =
-            futures::stream::iter(batches.into_iter().map(|idxs| {
-                let http = &http;
-                let push_url = &push_url;
-                let chunks = &chunks;
-                async move {
-                    let batch: Vec<StampedChunk> =
-                        idxs.iter().map(|&i| chunks[i].clone()).collect();
-                    let acked = post_batch_acks(http, push_url, &batch).await;
-                    (idxs, acked)
-                }
-            }))
-            .buffer_unordered(INFLIGHT)
-            .collect()
-            .await;
+    };
+    if !resp.status().is_success() {
+        let code = resp.status();
+        let txt = resp.text().await.unwrap_or_default();
+        warn!(target: "hoverfly::upload",
+            "lane {push_url} rejected batch ({code}): {}", txt.trim());
+        finish(BatchOutcome::Failed(format!("http {code}")), 0);
+        return;
+    }
 
-        let mut next: Vec<usize> = Vec::new();
-        for (idxs, acked) in results {
-            for i in idxs {
-                if acked.contains(&hex::encode(chunks[i].addr)) {
-                    done += 1;
-                    if let Some(p) = progress {
-                        p(done, total);
-                    }
-                } else {
-                    next.push(i);
+    let mut stream = resp.bytes_stream();
+    let mut buf = Vec::new();
+    let handle = |line: &[u8], acked: &mut usize| {
+        let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
+            return;
+        };
+        let Some(a) = v.get("a").and_then(|a| a.as_str()) else {
+            return;
+        };
+        let Ok(raw) = hex::decode(a) else { return };
+        if raw.len() != 32 {
+            return;
+        }
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(&raw);
+        let ok = v.get("s").and_then(|s| s.as_str()) == Some("ok");
+        if ok {
+            *acked += 1;
+        }
+        let po = v.get("po").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
+        let shallow = v.get("shallow").and_then(|s| s.as_bool()).unwrap_or(false);
+        let _ = tx.send(LaneEv::Ack {
+            lane,
+            addr,
+            ok,
+            po,
+            shallow,
+        });
+    };
+
+    while let Some(part) = stream.next().await {
+        match part {
+            Ok(bytes) => {
+                buf.extend_from_slice(&bytes);
+                while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
+                    let line: Vec<u8> = buf.drain(..=nl).collect();
+                    handle(&line[..line.len() - 1], &mut acked);
                 }
             }
+            Err(e) => {
+                warn!(target: "hoverfly::upload", "lane {push_url} stream error: {e}");
+                finish(BatchOutcome::Failed(e.to_string()), acked);
+                return;
+            }
         }
-        if !next.is_empty() {
-            warn!(target: "hoverfly::upload",
-                "pusher round {} left {} chunk(s) unacked; re-POSTing",
-                round + 1, next.len());
-        }
-        pending = next;
     }
+    if !buf.is_empty() {
+        handle(&buf, &mut acked);
+    }
+    finish(BatchOutcome::Answered, acked);
+}
 
-    if !pending.is_empty() {
-        return Err(ClientError::Pusher(format!(
-            "{} of {} chunks unacked after {MAX_ROUNDS} rounds via {pusher_url}",
-            pending.len(),
-            total
-        )));
+/// Read a lane's `/v1/status` advertisement.
+///
+/// Every field is best-effort: a lane that is asleep, old, or simply terse
+/// yields `LaneInfo::default()` and gets scheduled on priors rather than
+/// being excluded.
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch_lane_info(http: &reqwest::Client, base_url: &str) -> crate::pushsched::LaneInfo {
+    use crate::pushsched::LaneInfo;
+    let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
+    // Generous: free-tier instances cold-start on the first request.
+    let Ok(resp) = http
+        .get(&url)
+        .timeout(std::time::Duration::from_secs(60))
+        .send()
+        .await
+    else {
+        warn!(target: "hoverfly::upload", "lane {base_url}: /v1/status unreachable; using defaults");
+        return LaneInfo::default();
+    };
+    let Ok(v) = resp.json::<serde_json::Value>().await else {
+        return LaneInfo::default();
+    };
+    let overlay = v
+        .get("overlay")
+        .and_then(|s| s.as_str())
+        .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    LaneInfo {
+        overlay,
+        batch_max: v
+            .get("batch_max")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize),
+        inflight_max: v
+            .get("inflight_max")
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize),
+        budget_remaining_gb: v.get("budget_remaining_gb").and_then(|x| x.as_f64()),
+        pool_live: v
+            .get("pool")
+            .and_then(|p| p.get("live"))
+            .and_then(|x| x.as_u64())
+            .map(|x| x as usize),
     }
-    Ok(())
 }
 
 /// Populate the daemon's [`ChunkCache`] from a batch of stamped chunks
@@ -3557,6 +3705,42 @@ pub async fn push_chunks_with_pool(
     maintain: bool,
     progress: Option<&ProgressFn>,
 ) -> Result<(), ClientError> {
+    push_chunks_with_pool_ex(
+        transport,
+        session_pool,
+        peers,
+        work,
+        max_retries,
+        maintain,
+        progress,
+        None,
+    )
+    .await
+}
+
+/// [`push_chunks_with_pool`] plus a per-chunk completion hook.
+///
+/// `on_chunk` fires exactly once per chunk the dispatcher resolves, in
+/// completion order, with the chunk's address and outcome. Chunks still
+/// queued when a fatal error aborts the run never fire — the caller owns
+/// deciding what to report for those (the pusher relay marks them failed).
+///
+/// This is what makes `/v1/push` stream honest per-chunk acks: the
+/// dispatcher internally resolves chunks independently (each is its own
+/// future in a `FuturesUnordered`), so collapsing that into a single
+/// all-or-nothing `Result` at the end threw away information the client
+/// scheduler needs — one lost chunk in 256 forced a re-push of all 256.
+#[allow(clippy::too_many_arguments)]
+pub async fn push_chunks_with_pool_ex(
+    transport: &Transport,
+    session_pool: &SessionPool,
+    peers: &PeerStore,
+    work: Vec<StampedChunk>,
+    max_retries: usize,
+    maintain: bool,
+    progress: Option<&ProgressFn>,
+    on_chunk: Option<&ChunkDoneFn>,
+) -> Result<(), ClientError> {
     let topup_secs: u64 = std::env::var("HOVERFLY_PUSH_TOPUP_SECS")
         .ok()
         .and_then(|s| s.parse().ok())
@@ -3576,6 +3760,7 @@ pub async fn push_chunks_with_pool(
             max_retries,
             pool_can_recover,
             progress,
+            on_chunk,
         )
         .await;
     }
@@ -3600,7 +3785,7 @@ pub async fn push_chunks_with_pool(
     };
     tokio::select! {
         r = push_chunks_with_pool_inner(
-            transport, session_pool, peers, work, max_retries, pool_can_recover, progress,
+            transport, session_pool, peers, work, max_retries, pool_can_recover, progress, on_chunk,
         ) => r,
         _ = topup => unreachable!("top-up loop only exits when the push future wins the select"),
     }
@@ -3617,6 +3802,7 @@ pub async fn push_chunks_with_pool(
 /// verification on `is_shallow`). This is the entrypoint a multi-worker
 /// pusher hits to push pre-stamped chunks under its own ephemeral
 /// overlay key.
+#[allow(clippy::too_many_arguments)]
 async fn push_chunks_with_pool_inner(
     transport: &Transport,
     session_pool: &SessionPool,
@@ -3632,6 +3818,7 @@ async fn push_chunks_with_pool_inner(
     // wastes everything already pushed.
     pool_can_recover: bool,
     progress: Option<&ProgressFn>,
+    on_chunk: Option<&ChunkDoneFn>,
 ) -> Result<(), ClientError> {
     use futures::stream::{FuturesUnordered, StreamExt};
     use std::sync::Arc;
@@ -3740,7 +3927,7 @@ async fn push_chunks_with_pool_inner(
             // count alongside so the dispatch driver can re-queue
             // failed chunks for another round (bee's pusher does the
             // same when pushsync exits without a valid receipt).
-            let result: Result<(), ClientError> = async move {
+            let result: Result<PushInfo, ClientError> = async move {
             use futures::stream::{FuturesUnordered, StreamExt};
 
             // Take a fresh snapshot of the pool for this dispatch so
@@ -4076,7 +4263,13 @@ async fn push_chunks_with_pool_inner(
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay), price);
                                 }
-                                return Ok::<_, ClientError>(());
+                                // `ms` is stamped by the caller once the
+                                // whole dispatch (including retries) unwinds.
+                                return Ok::<_, ClientError>(PushInfo {
+                                    po: u8::from(chunk_addr.proximity(&entry.overlay)),
+                                    ms: 0,
+                                    shallow: false,
+                                });
                             }
                             Ok(PushOutcome::Overdraft) => {
                                 overdrafts += 1;
@@ -4193,7 +4386,13 @@ async fn push_chunks_with_pool_inner(
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay));
                                 }
-                                return Ok::<_, ClientError>(());
+                                // `ms` is stamped by the caller once the
+                                // whole dispatch (including retries) unwinds.
+                                return Ok::<_, ClientError>(PushInfo {
+                                    po: u8::from(chunk_addr.proximity(&entry.overlay)),
+                                    ms: 0,
+                                    shallow: false,
+                                });
                             }
                             Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
                             Err(e) => {
@@ -4223,7 +4422,13 @@ async fn push_chunks_with_pool_inner(
                                         done, total, entry.overlay_hex,
                                         chunk_addr.proximity(&entry.overlay));
                                 }
-                                return Ok::<_, ClientError>(());
+                                // `ms` is stamped by the caller once the
+                                // whole dispatch (including retries) unwinds.
+                                return Ok::<_, ClientError>(PushInfo {
+                                    po: u8::from(chunk_addr.proximity(&entry.overlay)),
+                                    ms: 0,
+                                    shallow: false,
+                                });
                             }
                             Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
                             Err(e) => {
@@ -4312,6 +4517,10 @@ async fn push_chunks_with_pool_inner(
             // entry to receipt-or-give-up. Bucketed to be directly
             // comparable to bee's `bee_pusher_sync_time` histogram.
             let chunk_ms = t_chunk_start.elapsed().as_millis() as u64;
+            let result = result.map(|i| PushInfo {
+                ms: chunk_ms.min(u64::from(u32::MAX)) as u32,
+                ..i
+            });
             if chunk_ms < 500 {
                 crate::transport::diag::CHUNK_LATENCY_LT_500MS.fetch_add(1, Ordering::Relaxed);
             } else if chunk_ms < 2000 {
@@ -4332,10 +4541,10 @@ async fn push_chunks_with_pool_inner(
     // unify on a single Future type that FuturesUnordered can hold.
     #[cfg(not(target_arch = "wasm32"))]
     type DispatchFut<'a> =
-        futures::future::BoxFuture<'a, (Arc<StampedChunk>, u8, Result<(), ClientError>)>;
+        futures::future::BoxFuture<'a, (Arc<StampedChunk>, u8, Result<PushInfo, ClientError>)>;
     #[cfg(target_arch = "wasm32")]
     type DispatchFut<'a> =
-        futures::future::LocalBoxFuture<'a, (Arc<StampedChunk>, u8, Result<(), ClientError>)>;
+        futures::future::LocalBoxFuture<'a, (Arc<StampedChunk>, u8, Result<PushInfo, ClientError>)>;
     let mut inflight: FuturesUnordered<DispatchFut<'_>> = FuturesUnordered::new();
     let mut iter = work.into_iter().map(|c| Arc::new(c));
 
@@ -4483,7 +4692,10 @@ async fn push_chunks_with_pool_inner(
                     }
                 }
                 match res {
-                    Ok(()) => {
+                    Ok(info) => {
+                        if let Some(cb) = on_chunk {
+                            cb(&chunk.addr, Ok(info));
+                        }
                         if let Some(c) = iter.next() {
                             inflight.push(Box::pin(dispatch(c, 0)));
                         } else {
@@ -4501,6 +4713,9 @@ async fn push_chunks_with_pool_inner(
                         warn!(target: "hoverfly::upload",
                             "batch not found on-chain — aborting upload after {}/{} chunks pushed: {}",
                             pushed.load(Ordering::Relaxed), total, e);
+                        if let Some(cb) = on_chunk {
+                            cb(&chunk.addr, Err(e.to_string()));
+                        }
                         first_err = Some(e);
                         break;
                     }
@@ -4572,6 +4787,14 @@ async fn push_chunks_with_pool_inner(
                         if let Some(p) = &progress {
                             p(done, total);
                         }
+                        // Reported as a *success* with `shallow: true`: the
+                        // chunk is in the network, so re-dispatching it to
+                        // another lane would only burn egress, but the
+                        // caller can still see it never reached a
+                        // neighborhood storer.
+                        if let Some(cb) = on_chunk {
+                            cb(&chunk.addr, Ok(PushInfo { po: 0, ms: 0, shallow: true }));
+                        }
                         warn!(target: "hoverfly::upload",
                             "accepting shallow-only chunk {} as last resort after {} retries ({}/{} pushed) — may be slow/unretrievable",
                             hex::encode(chunk.addr), attempts, done, total);
@@ -4582,6 +4805,9 @@ async fn push_chunks_with_pool_inner(
                         }
                     }
                     Err(e) => {
+                        if let Some(cb) = on_chunk {
+                            cb(&chunk.addr, Err(e.to_string()));
+                        }
                         first_err = Some(e);
                         break;
                     }
@@ -5487,14 +5713,20 @@ mod streamer_tests {
     fn streamer_raw_matches_oneshot() {
         let s = signer();
         // ~40 KiB → many content chunks + intermediate chunks.
-        let data: Vec<u8> = (0..40_000u32).map(|i| (i.wrapping_mul(2654435761) >> 13) as u8).collect();
+        let data: Vec<u8> = (0..40_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+            .collect();
 
         let (root_oneshot, work) = prepare_upload_bytes(&s, BATCH, 19, false, &data).unwrap();
         let expected: std::collections::HashSet<[u8; 32]> = work.iter().map(|c| c.addr).collect();
 
         for window in [1usize, 7, 256, 100_000] {
             let mut stream = UploadStreamer::new_raw(&s, BATCH, 19, false, &data).unwrap();
-            assert_eq!(stream.total_chunks(), work.len(), "chunk count (window={window})");
+            assert_eq!(
+                stream.total_chunks(),
+                work.len(),
+                "chunk count (window={window})"
+            );
             assert_eq!(
                 hex::encode(stream.root().as_bytes()),
                 hex::encode(root_oneshot.as_bytes()),

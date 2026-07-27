@@ -891,6 +891,27 @@ impl HoverflyClient {
         Ok(UploadStream { inner })
     }
 
+    /// Wrap an [`UploadStream`] in a scheduler-driven multi-lane session.
+    ///
+    /// `lanes` is only a count here — the session refers to lanes by index
+    /// and never performs I/O, so JS keeps the URL list and does the
+    /// `fetch`ing. See [`UploadSession`] for the loop shape.
+    #[wasm_bindgen(js_name = "beginSession")]
+    pub fn begin_session(&self, lanes: usize, stream: UploadStream) -> UploadSession {
+        let cfg = crate::pushsched::Config::default();
+        let infos = (0..lanes.max(1))
+            .map(|_| crate::pushsched::LaneInfo::default())
+            .collect();
+        UploadSession {
+            sched: crate::pushsched::Scheduler::new(infos, cfg),
+            root: hex::encode(stream.inner.root().as_bytes()),
+            total_hint: stream.inner.total_chunks(),
+            stream: Some(stream.inner),
+            frames: std::collections::HashMap::new(),
+            exhausted: false,
+        }
+    }
+
     /// Stamp a **collection** (tar / directory) locally for the pusher
     /// relay path — the multi-entry-manifest analogue of
     /// [`Self::prepare_upload`]. Builds the mantaray manifest, stamps every
@@ -1122,6 +1143,280 @@ impl UploadStream {
         }
         let body = crate::pushframe::encode_batch(&work);
         Ok(Some(Uint8Array::from(body.as_slice())))
+    }
+}
+
+/// A multi-lane relay upload driven from JS.
+///
+/// The browser used to own its own scheduler (round-robin lanes, whole-bundle
+/// failover, no weights, no stickiness) while the CLI owned a better one in
+/// Rust — two implementations that inevitably drifted. This exposes the *same*
+/// [`crate::pushsched::Scheduler`] the native path uses; JS is left with only
+/// the parts it must own, `fetch` and the clock.
+///
+/// Usage:
+/// ```js
+/// const s = client.beginSession(urls, stream)
+/// for (const [i, u] of urls.entries()) s.setLaneStatus(i, await (await fetch(u + '/v1/status')).json())
+/// while (!s.done) {
+///   const req = s.nextRequest(Date.now())
+///   if (req === undefined) { await sleep(s.waitMs(Date.now())); continue }
+///   // POST req.body to urls[req.lane], stream NDJSON acks:
+///   //   s.reportAck(req.lane, addrHex, ok, Date.now())
+///   // then: s.reportBatch(req.batch, req.lane, acked, elapsedMs, ok, Date.now())
+/// }
+/// ```
+#[wasm_bindgen]
+pub struct UploadSession {
+    sched: crate::pushsched::Scheduler,
+    stream: Option<UploadStreamer>,
+    frames: std::collections::HashMap<[u8; 32], crate::client::StampedChunk>,
+    root: String,
+    total_hint: usize,
+    exhausted: bool,
+}
+
+/// One dispatch for JS to perform.
+#[wasm_bindgen]
+pub struct PushRequest {
+    lane: usize,
+    batch: u64,
+    body: Vec<u8>,
+    hedge: bool,
+}
+
+#[wasm_bindgen]
+impl PushRequest {
+    /// Index into the lane URL list this session was created with.
+    #[wasm_bindgen(getter)]
+    pub fn lane(&self) -> usize {
+        self.lane
+    }
+    /// Opaque id to pass back to `reportBatch`.
+    #[wasm_bindgen(getter)]
+    pub fn batch(&self) -> f64 {
+        self.batch as f64
+    }
+    /// Encoded frames to POST.
+    #[wasm_bindgen(getter)]
+    pub fn body(&self) -> Uint8Array {
+        Uint8Array::from(self.body.as_slice())
+    }
+    /// True when this duplicates work already in flight on another lane
+    /// (a straggler hedge). Purely informational for logging.
+    #[wasm_bindgen(getter)]
+    pub fn hedge(&self) -> bool {
+        self.hedge
+    }
+}
+
+/// Window of chunks stamped per refill. Same rationale as the native
+/// `PUSH_WINDOW`: keep lanes fed without holding the whole file's frames.
+const SESSION_WINDOW: usize = 1024;
+
+#[wasm_bindgen]
+impl UploadSession {
+    /// Reference root (hex), fixed by the split before anything is pushed.
+    #[wasm_bindgen(getter)]
+    pub fn root(&self) -> String {
+        self.root.clone()
+    }
+
+    #[wasm_bindgen(getter, js_name = "chunkCount")]
+    pub fn chunk_count(&self) -> usize {
+        self.total_hint.max(self.sched.total())
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn acked(&self) -> usize {
+        self.sched.acked()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn failed(&self) -> usize {
+        self.sched.failed()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn hedges(&self) -> usize {
+        self.sched.hedges()
+    }
+
+    #[wasm_bindgen(getter)]
+    pub fn done(&self) -> bool {
+        self.exhausted && self.sched.done()
+    }
+
+    /// Feed a lane's `/v1/status` JSON. Per lane and idempotent: a relay
+    /// that is asleep when polled simply keeps its default priors instead
+    /// of degrading routing for every other lane.
+    #[wasm_bindgen(js_name = "setLaneStatus")]
+    pub fn set_lane_status(&mut self, lane: usize, status: JsValue) -> Result<(), JsError> {
+        // Round-trip through JSON text rather than pulling in
+        // serde-wasm-bindgen for one struct.
+        let txt = js_sys::JSON::stringify(&status)
+            .map_err(|_| JsError::new("status is not JSON-serialisable"))?;
+        let v: serde_json::Value = serde_json::from_str(&String::from(txt))
+            .map_err(|e| JsError::new(&format!("status json: {e}")))?;
+        let overlay = v
+            .get("overlay")
+            .and_then(|s| s.as_str())
+            .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
+            .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+        self.sched.set_lane_info(
+            lane,
+            crate::pushsched::LaneInfo {
+                overlay,
+                batch_max: v
+                    .get("batch_max")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
+                inflight_max: v
+                    .get("inflight_max")
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
+                budget_remaining_gb: v.get("budget_remaining_gb").and_then(|x| x.as_f64()),
+                pool_live: v
+                    .get("pool")
+                    .and_then(|p| p.get("live"))
+                    .and_then(|x| x.as_u64())
+                    .map(|x| x as usize),
+            },
+        );
+        Ok(())
+    }
+
+    /// Next POST to issue, or `undefined` if nothing is dispatchable right
+    /// now (everything in flight, or every lane backing off — see
+    /// `waitMs`). Stamps another window when the backlog runs low.
+    #[wasm_bindgen(js_name = "nextRequest")]
+    pub fn next_request(&mut self, now_ms: f64) -> Result<Option<PushRequest>, JsError> {
+        let now = now_ms.max(0.0) as u64;
+        while !self.exhausted
+            && self.sched.total() - self.sched.acked() - self.sched.failed() < SESSION_WINDOW
+        {
+            self.refill()?;
+        }
+        let Some(a) = self.sched.next(now) else {
+            return Ok(None);
+        };
+        let batch: Vec<crate::client::StampedChunk> = a
+            .chunks
+            .iter()
+            .filter_map(|&i| self.frames.get(&self.sched.chunk_addr(i)).cloned())
+            .collect();
+        Ok(Some(PushRequest {
+            lane: a.lane,
+            batch: a.batch,
+            body: crate::pushframe::encode_batch(&batch),
+            hedge: a.hedge,
+        }))
+    }
+
+    /// Record one streamed NDJSON ack. Idempotent per address, which is what
+    /// makes hedging safe: the losing copy's late ack is ignored.
+    #[wasm_bindgen(js_name = "reportAck")]
+    pub fn report_ack(&mut self, lane: usize, addr_hex: &str, ok: bool, now_ms: f64) {
+        let Ok(raw) = hex::decode(addr_hex.trim_start_matches("0x")) else {
+            return;
+        };
+        let Ok(addr) = <[u8; 32]>::try_from(raw.as_slice()) else {
+            return;
+        };
+        let before = self.sched.acked();
+        self.sched.on_ack(lane, &addr, ok, now_ms.max(0.0) as u64);
+        if self.sched.acked() > before {
+            // Acked chunks are never re-dispatched, so the frame can go.
+            self.frames.remove(&addr);
+        }
+    }
+
+    /// Record the HTTP-level result of a dispatch, after all of its acks.
+    #[wasm_bindgen(js_name = "reportBatch")]
+    pub fn report_batch(
+        &mut self,
+        batch: f64,
+        lane: usize,
+        acked: usize,
+        elapsed_ms: f64,
+        ok: bool,
+        now_ms: f64,
+    ) {
+        let outcome = if ok {
+            crate::pushsched::BatchOutcome::Answered
+        } else {
+            crate::pushsched::BatchOutcome::Failed("post failed".into())
+        };
+        self.sched
+            .on_batch_timing(lane, acked, elapsed_ms.max(0.0) as u64);
+        self.sched
+            .on_batch_result(batch as u64, outcome, now_ms.max(0.0) as u64);
+    }
+
+    /// Milliseconds to wait before calling `nextRequest` again when it
+    /// returned `undefined`. `0` means "there is work in flight, wait on
+    /// that instead".
+    #[wasm_bindgen(js_name = "waitMs")]
+    pub fn wait_ms(&self, now_ms: f64) -> f64 {
+        let now = now_ms.max(0.0) as u64;
+        match self.sched.next_wake_ms(now) {
+            Some(t) if t > now => (t - now) as f64,
+            _ => 0.0,
+        }
+    }
+
+    /// Non-empty when the run cannot proceed: every lane is gone, or the
+    /// remaining chunks exhausted their attempts. The counterpart of the
+    /// erasure joiner's early bail — better to report a hopeless state than
+    /// to keep timing out against it.
+    #[wasm_bindgen(js_name = "stallReason")]
+    pub fn stall_reason(&self, now_ms: f64) -> Option<String> {
+        if !self.exhausted {
+            return None;
+        }
+        self.sched
+            .stalled(now_ms.max(0.0) as u64)
+            .map(|r| format!("{r:?}"))
+    }
+
+    /// Per-lane counters, for logging: `[{acked, failed, bytes, rate, health}]`.
+    #[wasm_bindgen(js_name = "laneStats")]
+    pub fn lane_stats(&self) -> JsValue {
+        let stats: Vec<serde_json::Value> = self
+            .sched
+            .lane_stats()
+            .into_iter()
+            .map(|s| {
+                serde_json::json!({
+                    "acked": s.acked,
+                    "failed": s.failed,
+                    "bytes": s.bytes,
+                    "rate": s.rate,
+                    "health": s.health.map(|h| format!("{h:?}")),
+                })
+            })
+            .collect();
+        let txt = serde_json::to_string(&stats).unwrap_or_else(|_| "[]".into());
+        js_sys::JSON::parse(&txt).unwrap_or(JsValue::NULL)
+    }
+
+    fn refill(&mut self) -> Result<(), JsError> {
+        let Some(stream) = self.stream.as_mut() else {
+            self.exhausted = true;
+            return Ok(());
+        };
+        let batch = stream.next_batch(SESSION_WINDOW).map_err(into_js_err)?;
+        if batch.is_empty() {
+            self.exhausted = true;
+            self.stream = None;
+            return Ok(());
+        }
+        self.sched
+            .admit(batch.iter().map(|c| (c.addr, c.wire.len() as u32)));
+        for c in batch {
+            self.frames.entry(c.addr).or_insert(c);
+        }
+        Ok(())
     }
 }
 

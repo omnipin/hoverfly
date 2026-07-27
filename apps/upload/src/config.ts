@@ -23,8 +23,14 @@ export const PUSHER_URLS: string[] = [
   // HF permits outbound TCP to bee nodes), for cross-provider lane diversity.
   'https://ivam5567-hoverfly.hf.space'
 ]
-/** Frames per POST to a pusher (≤ the relay's advertised `batch_max`). */
-export const PUSH_BATCH_SIZE = 256
+/**
+ * How long to wait for a relay's `/v1/status` before scheduling it on
+ * defaults. Free-tier instances cold-start (measured: 35 s to first byte on a
+ * sleeping Render container), but a slow advertisement must not hold up the
+ * upload — the lane simply starts on priors and corrects itself from observed
+ * throughput.
+ */
+export const STATUS_TIMEOUT_MS = 8_000
 /** True when the dApp should push through relays rather than in-browser p2p. */
 export function usePushers (): boolean { return PUSHER_URLS.length > 0 }
 
