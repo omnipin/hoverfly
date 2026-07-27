@@ -334,7 +334,24 @@ barely enters the hop count — pool *coverage* is the real signal, not overlay
 position. Proximity stays at α = 0 until a relay advertises its pool's
 coverage (and biases its top-ups toward the keyspace arc it receives, below).
 
-### Measured
+### Measured — in the wild
+
+Four production lanes as deployed (3 × Render free + 1 × Hugging Face Space,
+all shared-egress-IP free tiers), 4 MiB, from a residential client:
+**1033/1033 acked at 21.9 KiB/s**, split 698 / 234 / 99 / 2, 104 hedged (the
+10 % cap, as expected when most lanes are straggling). Verified byte-identical
+back through bzz.limo. Throughput is the §10 shared-cloud-IP gate, not the
+scheduler — the point of the run is that four heterogeneous, rate-limited,
+cold-starting lanes still complete without a single lost chunk.
+
+That run also exercised the **mixed-version** path: those relays still run
+pre-stage-C builds, so they advertise no `pool` / `inflight_max` /
+`budget_remaining_gb` and emit no `po`. Every new field is optional at the
+type level, so the client just schedules on priors — a stage-C client against
+a stage-B relay works (259/259 acked on a single old lane), which means relays
+and clients can be rolled out in either order.
+
+### Measured — dedicated IP
 
 Dedicated-IP VPS relay, pool 128, 10 MiB random, all chunks acked:
 
