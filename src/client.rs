@@ -172,6 +172,16 @@ pub struct PushInfo {
     pub po: u8,
     /// Wall time from dispatch entry to receipt, in milliseconds.
     pub ms: u32,
+    /// Proximity order of the *best* candidate the dispatcher had available
+    /// for this chunk when it built its candidate list.
+    ///
+    /// Compared against [`Self::po`] this separates two very different
+    /// explanations for chunks landing far from their neighborhood: if
+    /// `best_po ≈ po` the pool simply doesn't contain a near peer (fix the
+    /// pool), if `best_po ≫ po` the near peers existed but were skipped —
+    /// at their in-flight cap, parked dead, or in dial cooldown (fix the
+    /// dispatcher). Guessing between those two costs a lot of wasted work.
+    pub best_po: u8,
     /// True when this chunk was accepted on a *shallow* receipt after the
     /// retry budget ran out: forwarded into the network, but no
     /// neighborhood storer confirmed it. Retrievability is not guaranteed.
@@ -2603,6 +2613,10 @@ where
     // nothing more the relay can do) but they are the population that goes
     // on to 404 on retrieval, so the caller deserves to be told.
     let mut shallow_n = 0u64;
+    // Best-available proximity at dispatch time, for the same acks. The gap
+    // between this and the achieved PO is the dispatcher's own loss.
+    let mut best_po_sum = 0u64;
+    let mut best_po_n = 0u64;
 
     loop {
         // Keep the scheduler fed: stamp the next window once the backlog is
@@ -2686,6 +2700,7 @@ where
                 addr,
                 ok,
                 po,
+                best_po,
                 shallow,
             } => {
                 let before = sched.acked();
@@ -2699,6 +2714,10 @@ where
                         po_sum += u64::from(po);
                         po_n += 1;
                         po_hist[usize::from(po).min(po_hist.len() - 1)] += 1;
+                    }
+                    if best_po > 0 {
+                        best_po_sum += u64::from(best_po);
+                        best_po_n += 1;
                     }
                     // The frame is no longer needed by any lane: a Done
                     // chunk is never re-dispatched, and a hedged twin's
@@ -2744,8 +2763,14 @@ where
             .filter(|(_, n)| **n > 0)
             .map(|(po, n)| format!("{po}:{n}"))
             .collect();
+        let best = if best_po_n > 0 {
+            format!("{:.2}", best_po_sum as f64 / best_po_n as f64)
+        } else {
+            "n/a".into()
+        };
         info!(target: "hoverfly::upload",
-            "receipt depth: mean po {:.2} over {po_n} receipt(s) (alpha={}) — {}",
+            "receipt depth: mean po {:.2} (best available {best}) over {po_n} receipt(s) \
+             (alpha={}) — {}",
             po_sum as f64 / po_n as f64, cfg_alpha, top.join(" "));
     }
 
@@ -2815,6 +2840,8 @@ enum LaneEv {
         /// Receipt proximity order reported by the relay — how deep into the
         /// chunk's own neighborhood it actually landed.
         po: u8,
+        /// Best proximity the relay's dispatcher could reach for this chunk.
+        best_po: u8,
         /// The relay accepted this chunk on a *shallow* receipt: forwarded
         /// into the network, but no neighborhood storer confirmed it.
         shallow: bool,
@@ -2897,12 +2924,14 @@ async fn post_batch_streaming(
             *acked += 1;
         }
         let po = v.get("po").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
+        let best_po = v.get("bpo").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
         let shallow = v.get("shallow").and_then(|s| s.as_bool()).unwrap_or(false);
         let _ = tx.send(LaneEv::Ack {
             lane,
             addr,
             ok,
             po,
+            best_po,
             shallow,
         });
     };
@@ -4094,6 +4123,25 @@ async fn push_chunks_with_pool_inner(
                 &mut filter_cap,
                 &mut filter_dead_session_cooldown,
             );
+            // Best proximity the dispatcher could actually reach for this
+            // chunk, before any attempt. Reported alongside the receipt PO so
+            // "chunks land far out" can be attributed to the pool or to the
+            // eligibility filters rather than guessed at.
+            let best_po = order
+                .first()
+                .map(|&i| u8::from(chunk_addr.proximity(&pool[i].overlay)))
+                .unwrap_or(0);
+            // Same, but over the *whole* pool ignoring eligibility filters.
+            // `pool_po - best_po` is what the dead/cap/cooldown filters cost
+            // us in depth; `best_po - po` is what the peer race costs.
+            let pool_po = pool
+                .iter()
+                .map(|e| u8::from(chunk_addr.proximity(&e.overlay)))
+                .max()
+                .unwrap_or(0);
+            crate::transport::diag::PUSH_POOL_PO_SUM
+                .fetch_add(u64::from(pool_po), Ordering::Relaxed);
+            crate::transport::diag::PUSH_POOL_PO_N.fetch_add(1, Ordering::Relaxed);
 
             // `cap` caps how many distinct peers a single chunk
             // attempts before giving up. With max_retries=DEFAULT=6
@@ -4269,6 +4317,7 @@ async fn push_chunks_with_pool_inner(
                                     po: u8::from(chunk_addr.proximity(&entry.overlay)),
                                     ms: 0,
                                     shallow: false,
+                                    best_po,
                                 });
                             }
                             Ok(PushOutcome::Overdraft) => {
@@ -4392,6 +4441,7 @@ async fn push_chunks_with_pool_inner(
                                     po: u8::from(chunk_addr.proximity(&entry.overlay)),
                                     ms: 0,
                                     shallow: false,
+                                    best_po,
                                 });
                             }
                             Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
@@ -4428,6 +4478,7 @@ async fn push_chunks_with_pool_inner(
                                     po: u8::from(chunk_addr.proximity(&entry.overlay)),
                                     ms: 0,
                                     shallow: false,
+                                    best_po,
                                 });
                             }
                             Ok(PushOutcome::Overdraft) | Ok(PushOutcome::Shallow(_)) => continue,
@@ -4793,7 +4844,10 @@ async fn push_chunks_with_pool_inner(
                         // caller can still see it never reached a
                         // neighborhood storer.
                         if let Some(cb) = on_chunk {
-                            cb(&chunk.addr, Ok(PushInfo { po: 0, ms: 0, shallow: true }));
+                            cb(
+                                &chunk.addr,
+                                Ok(PushInfo { po: 0, ms: 0, shallow: true, best_po: 0 }),
+                            );
                         }
                         warn!(target: "hoverfly::upload",
                             "accepting shallow-only chunk {} as last resort after {} retries ({}/{} pushed) — may be slow/unretrievable",

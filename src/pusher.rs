@@ -356,6 +356,11 @@ fn status_response(state: &State) -> Response<RespBody> {
             let live = p.pool_live.load(Ordering::Relaxed);
             (live / 16).clamp(1, 8)
         }),
+        // Cumulative push diagnostics since boot (push RTT buckets, session
+        // retirement causes, pool proximity). Queryable rather than
+        // log-only, so a deployed relay can be inspected without shell
+        // access to it.
+        "diag": diag::summary(),
     });
     json_response(StatusCode::OK, &body)
 }
@@ -753,6 +758,7 @@ async fn run_push(
                             po: 0,
                             ms: 0,
                             shallow: false,
+                            best_po: 0,
                         },
                     );
                 } else {
@@ -813,6 +819,10 @@ async fn run_push(
                 Ok(info) => {
                     let mut v = serde_json::json!({
                         "a": hex::encode(addr), "s": "ok", "po": info.po, "ms": info.ms,
+                        // Best proximity the dispatcher could reach for this
+                        // chunk; `po` vs `bpo` attributes far landings to the
+                        // pool's coverage or to the eligibility filters.
+                        "bpo": info.best_po,
                     });
                     if info.shallow {
                         v["shallow"] = serde_json::Value::Bool(true);

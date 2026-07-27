@@ -349,16 +349,48 @@ The two-lane split also demonstrates the weight loop: lane 1 (pool 16) started
 on a 89 / 11 prior from pool size and settled at 79 / 21 once its measured
 throughput came in higher than its pool suggested.
 
-**Pusher-side adaptive pool bias (zero protocol).** Push debt per chunk scales
-with the distance from the pusher's closest pooled bee to the chunk address,
-and per-peer debt is what retires sessions (overdraft/ghost-balance). Under
-rendezvous each pusher consistently receives the *same* pseudo-random ~1/N of
-the address space — so it can observe arriving addresses and bias pool top-ups
-toward bees whose overlays match that distribution: less debt per chunk →
-longer session lives → higher sustained throughput. Still deferred, but the
-receipt-depth histogram above is now the instrument that would show it
-working: mean PO 3.1 against a 128-session pool says chunks are landing
-several hops out, so there is headroom here.
+### Where the proximity actually goes — measured, and why pool bias is not the fix
+
+The receipt histogram showed chunks landing at mean PO ~3.1 against a
+128-session pool, which looks like an obvious argument for **pusher-side
+adaptive pool bias**: under rendezvous each pusher consistently receives the
+same pseudo-random ~1/N of the address space, so it could bias pool top-ups
+toward bees whose overlays match that arc — less push debt per chunk, longer
+session lives, higher sustained throughput.
+
+Before building that, the loss was attributed. Acks carry `bpo` (the best
+proximity the dispatcher could reach for that chunk after eligibility
+filtering) alongside `po`, and `diag::summary()` reports `pool_po` (the best
+proximity anywhere in the pool, ignoring filters). One 10 MiB VPS run,
+pool 128:
+
+| stage | mean PO | lost to |
+|---|---|---|
+| best peer anywhere in the pool | **7.31** | — |
+| best peer still *eligible* | **5.43** | −1.9 to dead / in-flight-cap / dial-cooldown filters |
+| actually achieved | **3.28** | −2.2 to the deliberate 3-way peer race |
+
+`7.31` is already what theory predicts for 128 uniformly-drawn overlays
+(`E[max PO] ≈ log₂ 128`). **The pool's coverage is not the problem** — biasing
+it toward the received arc would raise a number that is already good, while
+the two downstream losses, which are ~4 bits combined, would remain. Pool bias
+is therefore low-leverage and stays deferred.
+
+The two real losses are both defended positions:
+
+- The **race** (`CHUNK_PEER_PARALLELISM = 3`, take the first non-shallow
+  receipt) costs depth by construction — the fastest of three peers is not the
+  nearest — and buys 2–3× throughput. Not worth trading back.
+- The **in-flight cap** is the obvious lever for the filter loss, and it is
+  already tuned: a uniform `cap = 8` measured *worse* than `cap = 4`
+  (590 vs 665 KiB/s median) because of yamux substream contention per session.
+  `inflight_cap()` widens it only for peers whose measured latency says they
+  can take it. Raising it for high-PO peers instead would re-enter that
+  regression from a different direction.
+
+So the deliverable here is the instrument, not a tuning change: `po` / `bpo` /
+`pool_po` make this a three-line attribution instead of an argument, and any
+future work on push depth has a baseline to beat.
 ## 8. Runtime profiles
 
 The insight that makes serverless viable: **the warm pool was never
