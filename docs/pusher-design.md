@@ -424,7 +424,8 @@ pusher can be: frames in → fill small pool from CDN cache → push → stream 
 | **P2 workerd** | CF Workers (later Deno Deploy) | wasm + a **JS-socket transport backend**: one Rust module against an abstract JS TCP-duplex (template: `src/wsws/`), ~50-line shims per platform (`connect()` / `Deno.connect` / `net.Socket`) | 6 sockets/invocation → DO sharding; 3 MB-gzip script limit is tight but passes |
 
 Per-profile tunables (advertised via `/v1/status`, not hardcoded client-side):
-batch 256 / pool 16 on P0–P1; batch ~32 / pool ~5 on P2-free.
+batch 256 / pool 128 on P0–P1 (was 16 — see the pool A/B in §10);
+batch ~32 / pool ~5 on P2-free.
 
 ## 9. Free-tier capacity (planning figures, mid-2026)
 
@@ -548,6 +549,27 @@ untangled:
    Confirmed as *source-IP*, not our own code: same binary/overlay/peers, VPS
    unaffected. A dedicated IP (VPS) has the full per-/32 budget; a shared
    cloud IP does not.
+
+   **Superseded 2026-07 (stage C rollout).** Re-measured on the same Render
+   free plan, the pool now reaches a full **128/128** — the ~8–35 ceiling is
+   gone (larger CI peer cache: 2 819 → 3 517 known peers, and the background
+   maintenance loop fills gently instead of burst-dialling). The stage-B
+   default of `HOVERFLY_PUSH_POOL=32` was therefore leaving most of the lane
+   on the table. Single-lane A/B, 2 MiB, same platform and hour:
+
+   | pool | throughput | shallow receipts per chunk | best available PO |
+   |---|---|---|---|
+   | 32 | 14.2 KiB/s | 8.1 | 3.61 |
+   | 128 | **37.0 KiB/s** | **0.44** | 4.70 |
+
+   2.6× throughput and 18× less wasted work. The mechanism is a
+   shallow-receipt cascade: a small pool leaves the closest session to a
+   chunk far from it, so bee forwards rather than stores, the dispatcher
+   takes a shallow receipt and retries against another peer. The default is
+   now 128; raising it is safe on a host that really is limited, because
+   `top_up` is best-effort and `/v1/status` advertises `pool.live`, so the
+   client's scheduler weights a lane by what it achieved rather than what it
+   asked for.
 
 **Aggregation (two free pushers, distinct node identities + vanity overlays):**
 solo 0.063 + 0.075; concurrent combined **0.094** (vs ~0.07 for one alone).
