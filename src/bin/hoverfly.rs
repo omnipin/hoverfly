@@ -1698,7 +1698,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     .unwrap_or(false);
                 let is_collection = collection || (is_tar && !raw);
                 let upload_started = std::time::Instant::now();
-                let (root, work, total_bytes, kind): (_, _, usize, &str) = if is_collection {
+                // Windowed streaming: split + manifest once, then stamp a
+                // window at a time as the scheduler drains it. Peak memory
+                // is one window of frames instead of the whole file — the
+                // browser has worked this way since the streamer landed;
+                // the native path used to stamp everything up front and
+                // would blow up on large files.
+                let (streamer, total_bytes, kind): (_, usize, &str) = if is_collection {
                     let bytes = std::fs::read(&file)?;
                     let files = read_tar_files(&bytes)?;
                     if files.is_empty() {
@@ -1709,7 +1715,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .as_deref()
                         .map(|s| if s.is_empty() { None } else { Some(s) })
                         .unwrap_or(Some("index.html"));
-                    let (root, work) = hoverfly::client::prepare_upload_collection(
+                    let s = hoverfly::client::UploadStreamer::new_collection(
                         &signer,
                         &batch,
                         depth,
@@ -1718,13 +1724,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         index_doc,
                         error_document.as_deref(),
                     )?;
-                    (root, work, total, "collection")
+                    (s, total, "collection")
                 } else if raw {
                     let data = std::fs::read(&file)?;
                     let total = data.len();
-                    let (root, work) =
-                        hoverfly::client::prepare_upload_bytes(&signer, &batch, depth, immutable, &data)?;
-                    (root, work, total, "raw")
+                    let s = hoverfly::client::UploadStreamer::new_raw(
+                        &signer, &batch, depth, immutable, &data,
+                    )?;
+                    (s, total, "raw")
                 } else {
                     let data = std::fs::read(&file)?;
                     let total = data.len();
@@ -1735,7 +1742,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             .unwrap_or_else(|| "file".to_string())
                     });
                     let ct = content_type.clone().or_else(|| guess_content_type(&path));
-                    let (root, work) = hoverfly::client::prepare_upload_file_with_manifest(
+                    let s = hoverfly::client::UploadStreamer::new_file(
                         &signer,
                         &batch,
                         depth,
@@ -1744,11 +1751,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &path,
                         ct.as_deref(),
                     )?;
-                    (root, work, total, "manifest")
+                    (s, total, "manifest")
                 };
-                let n_chunks = work.len();
+                let n_chunks = streamer.total_chunks();
                 let progress = make_progress_bar();
-                hoverfly::client::push_via_pushers(&pusher, work, progress.as_ref()).await?;
+                let root =
+                    hoverfly::client::push_stream_via_pushers(&pusher, streamer, progress.as_ref())
+                        .await?;
                 drop(progress);
                 let elapsed = upload_started.elapsed();
                 let root_hex = hex::encode(root.as_bytes());

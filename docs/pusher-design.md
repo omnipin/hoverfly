@@ -89,11 +89,18 @@ application/x-hoverfly-frames`. Response is **streamed NDJSON**, one line per
 chunk as its push resolves (not end-of-batch):
 
 ```json
-{"a":"<hex addr>","s":"ok"}
-{"a":"<hex addr>","s":"dup"}                          // cache hit, not re-pushed
-{"a":"<hex addr>","s":"ok","r":"<hex receipt sig>"}   // with ?receipts=1
+{"a":"<hex addr>","s":"ok","po":5,"ms":812}
+{"a":"<hex addr>","s":"ok","po":0,"ms":0}          // recent-ack cache hit, not re-pushed
+{"a":"<hex addr>","s":"ok","po":0,"shallow":true}  // forwarded, no neighborhood storer
 {"a":"<hex addr>","s":"err","e":"overdraft"}
+{"done":{"pushed":254,"total":256,"dedup":3}}      // terminator
 ```
+
+`po` is the proximity order of the peer whose receipt was accepted — how deep
+into its own neighborhood the chunk actually landed — and `ms` its push
+latency. Together they are the receipt-quality signal the client scheduler
+needs to decide whether routing choices matter at all (§7); without them that
+question can only be guessed at.
 
 Client sends ~`batch_max` chunks per POST with 2–4 POSTs in flight per lane.
 Retry = re-POST unacked frames; the protocol is connectionless, nothing to
@@ -105,11 +112,12 @@ resume.
 {
   "version": "…",
   "profile": "persistent | request-scoped | workerd",
-  "batch_max": 256,
-  "inflight_max": 4,
-  "budget_remaining_gb": 61.4,    // monthly egress budget left (null = unmetered)
-  "load": 0.3,
-  "modes": {"allowlist": false, "quota": false, "challenge": false}
+  "batch_max": 512,
+  "inflight_max": 8,              // derived from pool occupancy
+  "budget_remaining_gb": 61.4,    // HOVERFLY_PUSH_BUDGET_GB minus pushed (null = unmetered)
+  "overlay": "0x…",               // Kademlia overlay
+  "pool": {"live": 128, "target": 128},
+  "peers_known": 2819
 }
 ```
 
@@ -192,41 +200,154 @@ Recommended postures: **free-tier public pusher** = defaults (batch-alive
 only) + `--push-max-mbps`; **paid/metered pusher** = `--push-quota
 --push-challenge`; **private pusher** = `--push-allow`, no RPC at all.
 
-## 7. Client scheduler: lanes + weighted rendezvous
+## 7. Client scheduler: lanes + weighted rendezvous — **implemented**
 
-The client pushes to **multiple pushers in parallel** and splits chunks by
-address. Racing lives client-side; **pushers always push each chunk once**
-(race=1 internally).
+One scheduler, `src/pushsched.rs`, sans-I/O: no clock, no network, no
+environment reads. The caller supplies `now_ms`, performs the HTTP and feeds
+results back. The native CLI drives it over reqwest/tokio; the browser drives
+the *same* code through the wasm `UploadSession` and `fetch`. Before this
+there were two schedulers — a decent one in Rust that only the CLI used, and a
+round-robin one in the dApp worker that the actual users hit — and they had
+already drifted.
 
-**Assignment — weighted rendezvous hashing.** For each chunk, score every
-healthy lane with `hash(addr ‖ lane_id) × weight`, send to the max. This buys:
+### What the first cut got wrong
 
-- **Sticky by address** — retries can't double-spend quota across platforms;
-  lane-side `ChunkCache` dedupes across retries and repeat uploads.
+Stage C originally routed each chunk to `argmax po(chunk_addr, lane_overlay)`.
+Measured against the four production relay overlays (read from `/v1/status`,
+20 k random addresses):
+
+| lane | overlay | share |
+|---|---|---|
+| render-1 | `0xdf3d…` | 0.8 % |
+| render-2 | `0xdd74…` | 0.2 % |
+| render-3 | `0xddc9…` | 49.0 % |
+| hf-space | `0x2bba…` | 50.0 % |
+
+Two independent causes:
+
+- **Proximity-argmax is not a load balancer.** Its cells are Voronoi regions
+  in Kademlia space, so their sizes depend entirely on how the overlays happen
+  to cluster — and three of the four relays share a 6-bit prefix (pairwise PO
+  6, 6, 8).
+- **Ties went to the highest lane index.** PO ties are the common case (two
+  lanes agree at PO 1 half the time) and `Iterator::max_by_key` returns the
+  *last* maximum.
+
+Load only balanced because a work-stealing layer drained the backed-up lanes —
+which discarded the routing decision anyway. The proximity machinery cost
+balance and bought nothing. Both facts are now regression tests
+(`distribution_is_uniform_on_clustered_production_overlays`,
+`proximity_argmax_would_be_pathological`).
+
+### Assignment — weighted rendezvous hashing
+
+Score every eligible lane with `w_l / -ln(u(addr ‖ lane_id))` and take the
+max, `u` uniform from a splitmix64 hash. This gives, by construction:
+
 - **Weight-proportional load** — chunk addresses are hash-uniform, so load
-  follows weights exactly. Weights = f(advertised `budget_remaining_gb`,
-  `batch_max`, EWMA of observed ack throughput). A drained/erroring lane
-  decays toward 0 without remapping everyone else's chunks.
-- **Deterministic fallback order** — rendezvous score rank #2 is a chunk's
-  designated straggler lane.
+  follows weights exactly.
+- **Sticky by address** — retries can't double-spend quota across platforms;
+  the lane's recent-ack cache dedupes repeats.
+- **Minimal disruption** — a lane's weight changing (or the lane dropping out)
+  moves only that lane's share; everyone else's assignment is untouched.
+- **Deterministic rank #2** — a chunk's designated hedge/failover lane.
 
-**Shard-first, race-on-straggle.** Default: each chunk goes to exactly one
-lane. A chunk unacked past its deadline is re-dispatched to its #2 lane
-(different platform, different egress /32, different session pool) — the same
-escalation the in-client dispatcher does today across peer sessions, one level
-up, and a structural fix for the tail-stall pattern (stragglers currently
-retry against the same decayed pool). Blanket k>1 racing burns aggregate quota
-k× and is not the default.
+Assignment is **lazy**: a chunk is bound to a lane at dispatch time, not at
+admission. A lane going bad mid-run therefore reroutes everything still
+pending with no work-stealing layer at all.
 
-Mechanics: one queue per lane, flush at the lane's `batch_max` or a short
-timeout, 2–4 POSTs in flight per lane, NDJSON acks feed the existing per-chunk
-state machine. Upload completes when every chunk is acked by some lane.
-Cross-platform egress ≈ payload × ~1.0–1.2 (only stragglers transit twice) vs
-~4× under today's in-client 3-way racing.
+**Weights** = `rate × budget × concurrency`:
 
-The dispatcher, inflight caps, deadline and retry accounting all exist in
-`src/client.rs` — lanes slot in as high-capacity sessions; rendezvous is ~20
-lines.
+- `rate` — EWMA of observed acked-chunks per second. Samples below 16 chunks
+  are ignored: rate is `acked / elapsed`, which is meaningless for a handful
+  of chunks (a 4-chunk batch answered in 10 ms reads as 400/s — measured on a
+  two-lane VPS run, an under-fed lane reported 355–516/s against a real rate
+  an order of magnitude lower). Before any measurement the prior is
+  `pool_live / 8`, which is exactly what separates a shared-IP free tier
+  (pool starves at ~10–35) from a dedicated IP (128+).
+- `budget` — sheds load as `budget_remaining_gb` approaches zero, instead of
+  waiting for a metered lane to start erroring.
+- `concurrency` — the lane's `inflight_max`. Two lanes that answer a batch
+  equally fast are not equal if one accepts 8 concurrent POSTs and the other 1.
+
+**Proximity is off by default** (`Config::proximity_alpha = 0`, override with
+`HOVERFLY_PUSH_PROXIMITY`). It survives only as a bounded weight multiplier,
+`w *= 1 + α·min(po,8)/8`. The reason is measurement, not taste — see below.
+
+### Lane health
+
+`Warming → Live → Backoff(exp, capped) → Retired`, replacing the old
+"3 consecutive failures ⇒ retired for the whole run". A `Warming` lane gets
+one probe batch of 16 in flight, not a full 256 × 8: free-tier relays
+cold-start (measured: 0.15 s / 2.15 s / **35.2 s** to answer `/v1/status`
+across the three Render lanes) and a sleeping lane must not be able to swallow
+a full batch before proving it is awake. Backoff doubles from 2 s to a 120 s
+cap, each expiry re-opening half-open; only after 5 doublings is a lane
+retired. Verified live by killing a relay mid-upload: the lane failed 3
+POSTs, backed off 2 s → 4 s → 8 s, and the run still completed 7901/7901.
+
+### Hedging — race the stragglers, not everything
+
+Modelled on `erasure::joiner::fetch_node_children`, which races every sibling
+and cancels the rest the moment enough have landed rather than walking them
+one at a time and waiting out each timeout. Here the race is deliberately
+*late* and bounded: only chunks that have already blown their lane's own
+observed latency budget (`p_batch × 1.5`, clamped 3–60 s), only to their
+rank-#2 lane, and only up to `hedge_fraction` (10 %) of the run. First ack
+wins; the loser's later ack is ignored (`on_ack` is idempotent per address),
+and the relay's recent-ack cache answers the duplicate frame without a second
+real push. Measured 0.4–2.4 % of chunks hedged on healthy two-lane runs.
+
+The joiner's *other* stopping rule is here too: `stalled()` reports
+`AllLanesDown` / `ChunksExhausted` the moment nothing can proceed, instead of
+grinding through the full retry budget waiting out timeouts that cannot
+succeed.
+
+### Completion policy — the erasure seam
+
+`CompletionPolicy::Group` lets a set of chunks complete at `need` acks rather
+than all of them. That is a Reed–Solomon codeword: `need` = data shards, the
+rest parity, the same stopping rule `erasure::joiner` already uses on the read
+side (`present >= shard_cnt`). Under it the tail of an upload stops being
+blocking — stragglers are repaired by parity at download time rather than
+scheduled around. The encoder that produces such groups is separate work; the
+scheduler is ready for it and tested (`group_policy_completes_at_threshold`).
+
+### Does proximity routing do anything? — measured, no
+
+`/v1/push` acks now carry `po` (the proximity order of the peer whose receipt
+was accepted) and `ms`. The client aggregates them into a receipt-depth
+histogram, so the question is answerable rather than arguable.
+
+Two-lane VPS A/B, 8 MiB each, alternating:
+
+| α | mean receipt PO | throughput |
+|---|---|---|
+| 0 | 3.26 | 530 KiB/s |
+| 1 | 2.95 | 545 KiB/s |
+| 0 | 3.05 | 589 KiB/s |
+| 1 | 3.08 | 447 KiB/s |
+
+No effect beyond noise. The mechanism explains it: a relay pushes to the
+closest peer in its **own** multi-thousand-entry peerstore, so its own overlay
+barely enters the hop count — pool *coverage* is the real signal, not overlay
+position. Proximity stays at α = 0 until a relay advertises its pool's
+coverage (and biases its top-ups toward the keyspace arc it receives, below).
+
+### Measured
+
+Dedicated-IP VPS relay, pool 128, 10 MiB random, all chunks acked:
+
+| configuration | throughput |
+|---|---|
+| stage B baseline (recorded, 1 lane) | 0.42 MiB/s |
+| stage C, 1 lane | 0.58 MiB/s (555 / 624 / 616 KiB/s) |
+| stage C, 2 lanes | 0.68 MiB/s (677 / 716 / 685 KiB/s) |
+| stage C, 2 lanes, 32 MB | 0.85 MiB/s |
+
+The two-lane split also demonstrates the weight loop: lane 1 (pool 16) started
+on a 89 / 11 prior from pool size and settled at 79 / 21 once its measured
+throughput came in higher than its pool suggested.
 
 **Pusher-side adaptive pool bias (zero protocol).** Push debt per chunk scales
 with the distance from the pusher's closest pooled bee to the chunk address,
@@ -234,10 +355,10 @@ and per-peer debt is what retires sessions (overdraft/ghost-balance). Under
 rendezvous each pusher consistently receives the *same* pseudo-random ~1/N of
 the address space — so it can observe arriving addresses and bias pool top-ups
 toward bees whose overlays match that distribution: less debt per chunk →
-longer session lives → higher sustained throughput. Contiguous keyspace arcs
-(consistent-hashing style) would specialize deeper; deferred until receipts
-show forwarding depth actually costs us (§11).
-
+longer session lives → higher sustained throughput. Still deferred, but the
+receipt-depth histogram above is now the instrument that would show it
+working: mean PO 3.1 against a 128-session pool says chunks are landing
+several hops out, so there is headroom here.
 ## 8. Runtime profiles
 
 The insight that makes serverless viable: **the warm pool was never
@@ -409,11 +530,32 @@ per-invocation egress-IP diversity (the natural fix) is untested — no account.
 through the Lambda lane** (vs 1–3 chunks/s direct today) with the key never
 leaving the browser.
 
-### Stage C — multi-lane (~1–2 days)
+### Stage C — multi-lane — **implemented**
 
 Weighted rendezvous scheduler (§7), status-weighted lanes, straggler
-re-dispatch to rank-#2 lane, `budget_remaining_gb` accounting. Ship as the
-default browser push path: Render + Lambda lanes.
+re-dispatch to rank-#2 lane, `budget_remaining_gb` accounting. Shipped as the
+default browser push path.
+
+Delivered beyond the original scope, because the original scope could not have
+worked without it:
+
+- **Per-chunk acks.** `/v1/push` used to run the whole batch to completion and
+  emit one all-or-nothing verdict, so a single lost chunk re-pushed all 256
+  and the client's scheduling unit was really the batch. `push_chunks_with_pool_ex`
+  takes a per-chunk hook; the relay streams each ack as it lands.
+- **One scheduler, both targets.** `src/pushsched.rs` is sans-I/O and drives
+  the CLI *and* the dApp (via the wasm `UploadSession`), replacing the
+  browser's separate round-robin implementation.
+- **Windowed streaming on native.** `hoverfly upload --pusher` now uses
+  `UploadStreamer` like the browser does, so large files no longer stamp
+  everything up front.
+- **Receipt-depth instrument.** Acks carry `po`/`ms`; the client aggregates a
+  histogram. This is what settled the proximity-routing question (§7).
+- **Real advertisements.** `budget_remaining_gb`, `pool{live,target}` and
+  `inflight_max` are populated rather than `null`, and the client reads
+  `batch_max` instead of hardcoding it.
+- **Recent-ack cache.** Duplicate frames (hedges, re-POSTs) are answered from
+  a TTL'd LRU rather than paying a second real push.
 
 ### Deferred / watchlist
 

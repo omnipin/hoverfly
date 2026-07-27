@@ -29,6 +29,7 @@ pub mod feed;
 pub mod manifest;
 pub mod protocols;
 pub mod pushframe;
+pub mod pushsched;
 pub mod ratelimit;
 pub mod transport;
 

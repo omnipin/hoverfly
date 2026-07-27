@@ -117,7 +117,10 @@ libp2p-tcp = { git = "https://github.com/libp2p/rust-libp2p", branch = "master",
 libp2p-websocket = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 libp2p-core = { git = "https://github.com/libp2p/rust-libp2p", branch = "master" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-util", "net", "time", "sync", "signal"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+# `stream` is what lets the pusher client consume `/v1/push` NDJSON acks as
+# they arrive instead of buffering the whole response — per-chunk acks are
+# the unit the scheduler schedules on.
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "stream"] }
 clap = { version = "4", features = ["derive"], optional = true }
 tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 tar = { version = "0.4", optional = true }
