@@ -450,6 +450,17 @@ pub mod diag {
     pub static CHUNK_LATENCY_5_15S: AtomicU64 = AtomicU64::new(0);
     pub static CHUNK_LATENCY_GT_15S: AtomicU64 = AtomicU64::new(0);
 
+    /// Sum/count of the best proximity order available anywhere in the warm
+    /// pool at dispatch time, ignoring eligibility filters.
+    ///
+    /// Read together with the client's receipt-depth histogram this splits
+    /// "chunks land far from their neighborhood" into its two causes:
+    /// `pool_po - best_po` is what the dead/cap/cooldown filters cost, and
+    /// `best_po - po` is what the deliberate multi-peer race costs. Without
+    /// the split, tuning either one is guesswork.
+    pub static PUSH_POOL_PO_SUM: AtomicU64 = AtomicU64::new(0);
+    pub static PUSH_POOL_PO_N: AtomicU64 = AtomicU64::new(0);
+
     /// One-line human-readable dump of every diagnostic counter. Used by the
     /// wasm client (`HoverflyClient::uploadDiagnostics`) to surface where an
     /// upload actually spent its time in the browser console — push RTT vs
@@ -464,7 +475,8 @@ pub mod diag {
              chunk_ms[<500={} 500-2k={} 2-5k={} 5-15k={} >15k={}] \
              retire[dead_low={} dead_prewarm={} dead_high={} ghost={} maxpush={}] \
              prewarm[on_dead={} on_ghost={}] \
-             conn_closed[io={} keepalive={} clean={}]",
+             conn_closed[io={} keepalive={} clean={}] \
+             pool_po[mean={:.2} n={}]",
             g(&PUSH_OUTCOME_OK),
             g(&PUSH_OUTCOME_SHALLOW),
             g(&PUSH_OUTCOME_OVERDRAFT),
@@ -494,6 +506,15 @@ pub mod diag {
             g(&CONN_CLOSED_IO),
             g(&CONN_CLOSED_KEEPALIVE),
             g(&CONN_CLOSED_CLEAN),
+            {
+                let n = g(&PUSH_POOL_PO_N);
+                if n == 0 {
+                    0.0
+                } else {
+                    g(&PUSH_POOL_PO_SUM) as f64 / n as f64
+                }
+            },
+            g(&PUSH_POOL_PO_N),
         )
     }
 }
