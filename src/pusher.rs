@@ -63,15 +63,31 @@ const PUSH_BATCH_MAX: usize = 512;
 /// Max /v1/push body: PUSH_BATCH_MAX × max frame + slack.
 const PUSH_MAX_BODY: usize = PUSH_BATCH_MAX * pushframe::MAX_FRAME_LEN + 4096;
 /// Default warm-pool target for the push path, overridable via
-/// `HOVERFLY_PUSH_POOL`. Deliberately modest because the *default*
-/// deployment is free cloud (shared egress /32): bee rate-limits inbound
-/// dials per /32 (10/s, burst 40 — docs/pusher-design.md §"Stage A
-/// results"), so a shared-IP pool starves at ~10–35 live sessions and a
-/// bigger target just burns dial churn that trips the limiter harder. On
-/// a **dedicated** IP (VPS, Oracle free VM) the pool reaches 76+ and bee
-/// itself sustains 137 — raise this to 128–256 there for much higher
-/// throughput.
-const PUSH_POOL_TARGET_DEFAULT: usize = 32;
+/// `HOVERFLY_PUSH_POOL`.
+///
+/// Was 32, on the theory that a shared cloud /32 starves at ~10–35 live
+/// sessions (bee rate-limits inbound dials per /32 at 10/s, burst 40 —
+/// docs/pusher-design.md §"Stage A results") so a bigger target would only
+/// burn dial churn. **Measured 2026-07 on Render free, that is no longer
+/// true**: the pool reaches a full 128/128 and the difference is not
+/// marginal. Single-lane, 2 MiB, same platform, same hour:
+///
+/// | pool | throughput | shallow receipts per chunk | best available PO |
+/// |------|------------|----------------------------|-------------------|
+/// | 32   | 14.2 KiB/s | 8.1                        | 3.61              |
+/// | 128  | 37.0 KiB/s | 0.44                       | 4.70              |
+///
+/// The mechanism is the shallow-receipt cascade: a small pool means the
+/// closest session to a given chunk is far from it (best available PO ~3.6
+/// vs ~4.7), so bee forwards instead of storing, the dispatcher gets a
+/// shallow receipt and retries against another peer — 8 wasted pushes per
+/// chunk at pool 32 against 0.44 at pool 128.
+///
+/// Raising the target is safe on a genuinely rate-limited host: `top_up` is
+/// best-effort, so a pool that *can't* reach the target simply doesn't, and
+/// `/v1/status` advertises `pool.live` so the client's scheduler weights the
+/// lane by what it actually achieved rather than what it asked for.
+const PUSH_POOL_TARGET_DEFAULT: usize = 128;
 /// Clamp for the env override.
 const PUSH_POOL_TARGET_MAX: usize = 512;
 /// Per-chunk retry budget on the push path.
