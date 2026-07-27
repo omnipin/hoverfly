@@ -336,17 +336,32 @@ coverage (and biases its top-ups toward the keyspace arc it receives, below).
 
 ### Measured — in the wild
 
-Four production lanes as deployed (3 × Render free + 1 × Hugging Face Space,
-all shared-egress-IP free tiers), 4 MiB, from a residential client:
-**1033/1033 acked at 21.9 KiB/s**, split 698 / 234 / 99 / 2, 104 hedged (the
-10 % cap, as expected when most lanes are straggling). Verified byte-identical
-back through bzz.limo. Throughput is the §10 shared-cloud-IP gate, not the
-scheduler — the point of the run is that four heterogeneous, rate-limited,
-cold-starting lanes still complete without a single lost chunk.
+Four production lanes (3 × Render free + 1 × Hugging Face Space, all
+shared-egress-IP free tiers), 4 MiB, from a residential client. All three runs
+acked 1033/1033 and verified byte-identical back through bzz.limo:
 
-That run also exercised the **mixed-version** path: those relays still run
-pre-stage-C builds, so they advertise no `pool` / `inflight_max` /
-`budget_remaining_gb` and emit no `po`. Every new field is optional at the
+| relays | client | pool | throughput |
+|---|---|---|---|
+| stage B (v0.1.9) | stage C | 32 | 21.9 KiB/s |
+| stage C (v0.1.10) | stage C | 32 | 28.9 KiB/s |
+| stage C (v0.1.10) | stage C | **128** | **59.0 KiB/s** |
+
+**2.7× end to end**, roughly half from the scheduler seeing real
+advertisements (`pool`, `inflight_max`, `batch_max`) instead of priors, and
+half from the pool default the instrument exposed as wrong (§10). Throughput
+in absolute terms is still the shared-cloud-IP gate, not the scheduler — the
+structural point is that four heterogeneous, rate-limited, cold-starting lanes
+complete without a single lost chunk.
+
+The lane split is worth reading: the final run went 92 / 18 / 909 / 14, i.e.
+the weight loop concentrated almost everything on the lane that was actually
+performing, rather than spreading evenly across four nominally identical
+lanes. 104 hedged in every run — the 10 % cap, which is where a run with this
+many stragglers is expected to sit.
+
+The first run also exercised the **mixed-version** path: those relays were
+still on pre-stage-C builds, advertising no `pool` / `inflight_max` /
+`budget_remaining_gb` and emitting no `po`. Every new field is optional at the
 type level, so the client just schedules on priors — a stage-C client against
 a stage-B relay works (259/259 acked on a single old lane), which means relays
 and clients can be rolled out in either order.
