@@ -28,6 +28,8 @@ pub mod erasure;
 pub mod feed;
 pub mod manifest;
 pub mod protocols;
+pub mod pushframe;
+pub mod pushsched;
 pub mod ratelimit;
 pub mod transport;
 
@@ -65,6 +67,9 @@ pub mod daemon;
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod inbound;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod pusher;
 
 pub use cache::{CachedChunk, ChunkCache};
 pub use doh::Doh;

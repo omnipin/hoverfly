@@ -337,6 +337,15 @@ enum Commands {
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
         peerlist: PathBuf,
 
+        /// Push through a relay (`hoverfly pusher`) over HTTP instead of
+        /// dialing bees directly. The signing key never leaves this
+        /// process — only pre-signed chunk frames go over the wire. Stage
+        /// B: single lane (repeatable, but only the first URL is used for
+        /// now). Bypasses `--peerlist`/`--concurrency` (the pusher owns
+        /// the session pool). See docs/pusher-design.md.
+        #[arg(long, value_name = "URL")]
+        pusher: Vec<String>,
+
         /// Number of peers to try per chunk before giving up
         #[arg(long, default_value_t = 10)]
         max_retries: usize,
@@ -440,6 +449,41 @@ enum Commands {
         /// match what `upload` will use for the roots to agree.
         #[arg(long, value_name = "FILE")]
         error_document: Option<String>,
+    },
+
+    /// Run an HTTP chunk-push relay (stage A: /v1/status + the
+    /// flag-gated /v1/probe self-push experiment endpoint). See
+    /// docs/pusher-design.md. No IPC socket, no retrieval over HTTP,
+    /// no key material accepted over the wire; probe mode signs with
+    /// HOVERFLY_PROBE_KEY / HOVERFLY_PROBE_BATCH from the environment.
+    #[cfg(feature = "pusher")]
+    Pusher {
+        /// TCP address the pusher's HTTP endpoint listens on. On
+        /// container platforms bind 0.0.0.0:$PORT.
+        #[arg(long, default_value = "127.0.0.1:8550", value_name = "ADDR")]
+        listen: std::net::SocketAddr,
+
+        /// peers.json path — the warm peer cache probe/push session
+        /// pools fill from (and save reachability observations back to).
+        #[arg(long, default_value = "peers.seed.json", value_name = "FILE")]
+        peerlist: PathBuf,
+
+        /// Enable POST /v1/probe: generate + stamp + push a random blob
+        /// with the env-provided throwaway key/batch and stream back a
+        /// metrics report. The instrument for the cloud-egress-IP gate
+        /// experiment; off by default because it makes the pusher sign.
+        #[arg(long)]
+        probe: bool,
+
+        /// Gnosis RPC used by probe mode to resolve batch depth and
+        /// owner-check the probe key (skipped when HOVERFLY_PROBE_DEPTH
+        /// is set).
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
+        rpc_url: String,
     },
 
     /// Run a long-lived daemon that holds a warm session pool across
@@ -1506,6 +1550,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             immutable,
             key,
             peerlist,
+            pusher,
             max_retries,
             raw,
             manifest_path,
@@ -1640,6 +1685,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 &format!("0x{}", hex::encode(nonce)),
                 cli.network_id,
             )?;
+
+            // Pusher mode: stamp locally and push pre-signed frames over
+            // HTTP to a relay (or several, sharded). No transport/peerlist
+            // here — the pusher owns the session pool. Handles raw,
+            // single-file manifest, and collection/tar uploads.
+            if !pusher.is_empty() {
+                let is_tar = file
+                    .extension()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.eq_ignore_ascii_case("tar"))
+                    .unwrap_or(false);
+                let is_collection = collection || (is_tar && !raw);
+                let upload_started = std::time::Instant::now();
+                // Windowed streaming: split + manifest once, then stamp a
+                // window at a time as the scheduler drains it. Peak memory
+                // is one window of frames instead of the whole file — the
+                // browser has worked this way since the streamer landed;
+                // the native path used to stamp everything up front and
+                // would blow up on large files.
+                let (streamer, total_bytes, kind): (_, usize, &str) = if is_collection {
+                    let bytes = std::fs::read(&file)?;
+                    let files = read_tar_files(&bytes)?;
+                    if files.is_empty() {
+                        return Err("tar archive contains no regular files".into());
+                    }
+                    let total: usize = files.iter().map(|f| f.data.len()).sum();
+                    let index_doc = index_document
+                        .as_deref()
+                        .map(|s| if s.is_empty() { None } else { Some(s) })
+                        .unwrap_or(Some("index.html"));
+                    let s = hoverfly::client::UploadStreamer::new_collection(
+                        &signer,
+                        &batch,
+                        depth,
+                        immutable,
+                        &files,
+                        index_doc,
+                        error_document.as_deref(),
+                    )?;
+                    (s, total, "collection")
+                } else if raw {
+                    let data = std::fs::read(&file)?;
+                    let total = data.len();
+                    let s = hoverfly::client::UploadStreamer::new_raw(
+                        &signer, &batch, depth, immutable, &data,
+                    )?;
+                    (s, total, "raw")
+                } else {
+                    let data = std::fs::read(&file)?;
+                    let total = data.len();
+                    let path = manifest_path.clone().unwrap_or_else(|| {
+                        file.file_name()
+                            .and_then(|s| s.to_str())
+                            .map(str::to_string)
+                            .unwrap_or_else(|| "file".to_string())
+                    });
+                    let ct = content_type.clone().or_else(|| guess_content_type(&path));
+                    let s = hoverfly::client::UploadStreamer::new_file(
+                        &signer,
+                        &batch,
+                        depth,
+                        immutable,
+                        &data,
+                        &path,
+                        ct.as_deref(),
+                    )?;
+                    (s, total, "manifest")
+                };
+                let n_chunks = streamer.total_chunks();
+                let progress = make_progress_bar();
+                let root =
+                    hoverfly::client::push_stream_via_pushers(&pusher, streamer, progress.as_ref())
+                        .await?;
+                drop(progress);
+                let elapsed = upload_started.elapsed();
+                let root_hex = hex::encode(root.as_bytes());
+                println!(
+                    "uploaded {} bytes ({} chunks) via {} pusher lane(s) — {} root: {}",
+                    total_bytes,
+                    n_chunks,
+                    pusher.len(),
+                    kind,
+                    root_hex,
+                );
+                if let Some(c) = root_hex_to_cid(&root_hex) {
+                    println!("bzz.limo:   https://bzz.limo/bzz/{root_hex}/");
+                    println!("subdomain:  https://{c}.bzz.limo/");
+                }
+                print_upload_throughput(total_bytes, elapsed);
+                return Ok(());
+            }
+
             // Attach SWAP if configured. We don't validate that the
             // signer's Ethereum address matches the chequebook's
             // on-chain `issuer()` — that requires an RPC call we
@@ -1886,6 +2023,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(c) = root_hex_to_cid(&manifest_root_hex) {
                 println!("  cid: {c}");
             }
+        }
+
+        #[cfg(feature = "pusher")]
+        Commands::Pusher {
+            listen,
+            peerlist,
+            probe,
+            rpc_url,
+        } => {
+            // Premined overlay nonce. On ephemeral-FS hosts (Render,
+            // Lambda) there is no persistent `--nonce-file`, so a random
+            // overlay would be minted every boot — landing us in bee's
+            // already-full bin 0 and getting oversaturation-dropped
+            // (PERFORMANCE.md "Vanity overlay"). HOVERFLY_OVERLAY_NONCE
+            // (0x-hex, 32 bytes) pins a premined vanity nonce from the
+            // environment; falls back to the nonce-file otherwise.
+            let nonce = match std::env::var("HOVERFLY_OVERLAY_NONCE") {
+                Ok(h) if !h.trim().is_empty() => {
+                    let raw = h.trim().trim_start_matches("0x").trim_start_matches("0X");
+                    let b = hex::decode(raw)
+                        .map_err(|e| format!("HOVERFLY_OVERLAY_NONCE: bad hex: {e}"))?;
+                    if b.len() != 32 {
+                        return Err(format!(
+                            "HOVERFLY_OVERLAY_NONCE: expected 32 bytes, got {}",
+                            b.len()
+                        )
+                        .into());
+                    }
+                    let mut n = [0u8; 32];
+                    n.copy_from_slice(&b);
+                    n
+                }
+                _ => load_or_create_nonce(&cli.nonce_file)?,
+            };
+            let node_identity = std::env::var("HOVERFLY_PUSHER_IDENTITY")
+                .ok()
+                .filter(|s| !s.trim().is_empty());
+            hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
+                listen,
+                peerlist,
+                probe_enabled: probe,
+                nonce,
+                network_id: cli.network_id,
+                rpc_url,
+                node_identity,
+                transport: cfg,
+            })
+            .await?;
         }
 
         #[cfg(unix)]

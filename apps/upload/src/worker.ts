@@ -12,7 +12,7 @@
 import {
   DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, HOVERFLY_JS, IDB_NAME, IDB_PEERS_KEY,
   IDB_STORE, MAINTENANCE_SECS, NETWORK_ID, PEERS_SEED_BUNDLED, PEERS_SEED_URL,
-  STATUS_POLL_SECS, UPLOAD_RETRIES, WARM_POOL
+  PUSHER_URLS, STATUS_POLL_SECS, STATUS_TIMEOUT_MS, UPLOAD_RETRIES, WARM_POOL, usePushers
 } from './config.ts'
 import type { Req, Res } from './worker-protocol.ts'
 
@@ -29,6 +29,52 @@ interface HoverflyClient {
   uploadDiagnostics?: () => string
   uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
   uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
+  // Pusher path: windowed streaming — stamp + yield one bundle at a time so
+  // memory stays flat for arbitrarily large files (see UploadStream).
+  beginUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean) => UploadStream
+  beginCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean) => UploadStream
+  /** Wrap a stream in the shared multi-lane scheduler (wasm UploadSession). */
+  beginSession?: (lanes: number, stream: UploadStream) => UploadSession
+}
+/** Windowed streaming upload handle (wasm UploadStream). */
+interface UploadStream {
+  readonly root: string
+  readonly chunkCount: number
+  /** Stamp + encode the next bundle, or undefined when exhausted. */
+  nextBatch: (batchSize: number) => Uint8Array | undefined
+}
+/** One dispatch the scheduler wants POSTed (wasm PushRequest). */
+interface PushRequest {
+  readonly lane: number
+  readonly batch: number
+  readonly body: Uint8Array
+  readonly hedge: boolean
+}
+/**
+ * Scheduler-driven multi-lane upload (wasm UploadSession) — the same
+ * `pushsched::Scheduler` the native CLI drives. It performs no I/O: JS asks
+ * for a dispatch, POSTs it, and reports acks back.
+ */
+interface UploadSession {
+  readonly root: string
+  readonly chunkCount: number
+  readonly acked: number
+  readonly failed: number
+  readonly hedges: number
+  readonly done: boolean
+  /** Feed a lane's /v1/status JSON (pool size, batch_max, budget, overlay). */
+  setLaneStatus: (lane: number, status: unknown) => void
+  /** Next POST to issue, or undefined if nothing is dispatchable now. */
+  nextRequest: (nowMs: number) => PushRequest | undefined
+  /** One streamed NDJSON ack. Idempotent per address (hedges rely on this). */
+  reportAck: (lane: number, addrHex: string, ok: boolean, nowMs: number) => void
+  /** HTTP-level result of a dispatch, after all of its acks. */
+  reportBatch: (batch: number, lane: number, acked: number, elapsedMs: number, ok: boolean, nowMs: number) => void
+  /** How long to wait before retrying nextRequest (0 = wait on in-flight). */
+  waitMs: (nowMs: number) => number
+  /** Non-empty when the run cannot proceed (all lanes gone / attempts spent). */
+  stallReason: (nowMs: number) => string | undefined
+  laneStats: () => unknown
 }
 interface HoverflyModule {
   default: (input?: unknown) => Promise<unknown>
@@ -122,6 +168,16 @@ async function start (sessionKeyHex: string): Promise<void> {
     log('Constructing hoverfly client (session-key signer)…')
     const c = new mod.HoverflyClient(sessionKeyHex, BigInt(NETWORK_ID), undefined, 30, undefined)
     client = c
+
+    // Pusher mode: no in-browser p2p at all. The wasm client exists only to
+    // stamp chunks locally (BMT + EIP-191); the relays do the actual pushing
+    // over TCP. Skip the whole discover/warm/seed path — the wss-sliver
+    // problem it fights simply doesn't apply when we never dial a bee.
+    if (usePushers()) {
+      log(`Pusher mode: ${PUSHER_URLS.length} relay(s), no in-browser p2p (browser only stamps).`)
+      post({ kind: 'status', connected: PUSHER_URLS.length })
+      return
+    }
 
     // Load the IndexedDB cache first (peers we actually reached last session),
     // then MERGE the freshly-fetched CDN seed on top. The cache alone goes
@@ -218,6 +274,165 @@ async function withProgress<T> (c: HoverflyClient, run: () => Promise<T>): Promi
   }
 }
 
+// ---- pusher relay path (windowed streaming: stamp local, POST frames) ----
+//
+// Routing, failover, hedging and lane health all live in the wasm
+// `UploadSession` — the same `pushsched::Scheduler` the native CLI drives.
+// This file owns only what JS must: `fetch` and the clock. The browser used
+// to carry its own round-robin scheduler with whole-bundle failover, which
+// re-pushed chunks a relay had already acked and drifted from the Rust one.
+
+/** One relay's `/v1/status`, best-effort: a sleeping free-tier instance just
+ *  keeps its default priors instead of degrading routing for every lane. */
+async function fetchLaneStatus (baseUrl: string): Promise<unknown | undefined> {
+  try {
+    const ctl = new AbortController()
+    const t = setTimeout(() => { ctl.abort() }, STATUS_TIMEOUT_MS)
+    const resp = await fetch(`${baseUrl.replace(/\/+$/, '')}/v1/status`, { signal: ctl.signal })
+    clearTimeout(t)
+    if (!resp.ok) return undefined
+    return await resp.json()
+  } catch { return undefined }
+}
+
+/** POST one dispatch, feeding each streamed NDJSON ack straight back into the
+ *  session so the scheduler can retire chunks (and hedges) as they land. */
+async function postDispatch (
+  session: UploadSession, lane: number, pushUrl: string, body: Uint8Array, batch: number,
+  onAck: () => void
+): Promise<void> {
+  const t0 = Date.now()
+  let acked = 0
+  let ok = false
+  let loggedErr = false
+  const handle = (line: string): void => {
+    if (line.length === 0) return
+    try {
+      const v = JSON.parse(line) as { a?: string, s?: string, e?: string }
+      if (v.a == null) return
+      const good = v.s === 'ok'
+      if (!good && v.e != null && !loggedErr) {
+        // One sample per dispatch: a batch can carry hundreds of chunks and
+        // they nearly always fail for the same reason.
+        loggedErr = true
+        log(`Pusher ${pushUrl} rejected a chunk: ${v.e}`)
+      }
+      // Report *before* signalling progress: `Scheduler::on_ack` is idempotent
+      // by address, so `session.acked` is the deduped truth, and progress is
+      // derived from it below.
+      session.reportAck(lane, v.a, good, Date.now())
+      if (good) {
+        acked++
+        onAck()
+      }
+    } catch { /* skip non-JSON */ }
+  }
+  try {
+    const resp = await fetch(pushUrl, {
+      method: 'POST',
+      body: body as BodyInit,
+      headers: { 'content-type': 'application/octet-stream' }
+    })
+    if (!resp.ok) {
+      const t = (await resp.text().catch(() => '')).slice(0, 300)
+      log(`Pusher ${pushUrl} → HTTP ${resp.status}: ${t}`)
+    } else {
+      ok = true
+      const reader = resp.body?.getReader()
+      if (reader != null) {
+        const dec = new TextDecoder()
+        let buf = ''
+        for (;;) {
+          const { done, value } = await reader.read()
+          if (done) break
+          buf += dec.decode(value, { stream: true })
+          let nl: number
+          while ((nl = buf.indexOf('\n')) >= 0) { handle(buf.slice(0, nl)); buf = buf.slice(nl + 1) }
+        }
+        handle(buf)
+      } else {
+        for (const line of (await resp.text()).split('\n')) handle(line)
+      }
+    }
+  } catch (e) {
+    log(`Pusher ${pushUrl} fetch failed: ${e instanceof Error ? e.message : String(e)}`)
+  }
+  // `ok` is the HTTP-level verdict; per-chunk outcomes were already reported.
+  session.reportBatch(batch, lane, acked, Date.now() - t0, ok, Date.now())
+}
+
+/**
+ * Drive an `UploadSession` to completion: pull dispatches, POST them, feed
+ * results back. Stamping the next window happens inside `nextRequest`, so it
+ * overlaps the network push of earlier ones and memory stays flat.
+ */
+async function pushSession (session: UploadSession, lanes: string[]): Promise<string> {
+  const total = session.chunkCount
+  log(`Streaming ${total} chunks across ${lanes.length} relay lane(s)…`)
+
+  // Warm the scheduler with each lane's advertisement (pool size, batch_max,
+  // budget) before the first dispatch, so weights start from measurements
+  // rather than priors. Lanes that don't answer are simply left on defaults.
+  await Promise.all(lanes.map(async (u, i) => {
+    const st = await fetchLaneStatus(u)
+    if (st !== undefined) session.setLaneStatus(i, st)
+  }))
+
+  const pushUrls = lanes.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
+  let lastPost = 0
+  const onAck = (): void => {
+    // Must come from `session.acked`, not a local counter incremented per
+    // `"ok"` line. The scheduler hedges stragglers onto a second lane, so one
+    // chunk can be acked twice on the wire; `on_ack` dedupes by address but a
+    // wire-line counter does not. Counting lines made the bar read 100% (via
+    // the `Math.min` clamp) while chunks were still genuinely outstanding —
+    // i.e. "1755/1755" with no root, which is precisely the stuck-tail case.
+    const done = session.acked
+    const now = Date.now()
+    if (now - lastPost >= 150 || done >= total) {
+      lastPost = now
+      post({ kind: 'progress', done: Math.min(done, total), total })
+    }
+  }
+
+  const inflight = new Set<Promise<void>>()
+  for (;;) {
+    if (session.done) break
+    const req = session.nextRequest(Date.now())
+    if (req != null) {
+      const p = postDispatch(session, req.lane, pushUrls[req.lane], req.body, req.batch, onAck)
+      inflight.add(p)
+      void p.finally(() => inflight.delete(p))
+      continue
+    }
+    if (inflight.size > 0) {
+      // Something is on the wire; wake on whichever finishes first, but no
+      // later than the next hedge deadline the scheduler is waiting on.
+      const wait = session.waitMs(Date.now())
+      await (wait > 0
+        ? Promise.race([...inflight, new Promise(r => setTimeout(r, wait))])
+        : Promise.race(inflight))
+      continue
+    }
+    const stall = session.stallReason(Date.now())
+    if (stall != null) {
+      throw new Error(`push stalled (${stall}): ${session.acked}/${total} acked — ${JSON.stringify(session.laneStats())}`)
+    }
+    const wait = session.waitMs(Date.now())
+    if (wait <= 0) break
+    // Every lane is backing off; sleep exactly until the earliest is due.
+    await new Promise(r => setTimeout(r, wait))
+  }
+  await Promise.all(inflight)
+
+  if (session.acked < total) {
+    throw new Error(`${total - session.acked} of ${total} chunks unacked — ${JSON.stringify(session.laneStats())}`)
+  }
+  if (session.hedges > 0) log(`Hedged ${session.hedges} straggler(s) onto a second lane.`)
+  post({ kind: 'progress', done: total, total })
+  return session.root
+}
+
 self.onmessage = async (e: MessageEvent<Req>) => {
   const msg = e.data
   try {
@@ -234,20 +449,38 @@ self.onmessage = async (e: MessageEvent<Req>) => {
       }
       case 'uploadFile': {
         const c = requireClient()
-        const root = await withProgress(c, async () => await c.uploadFile(
-          new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
-        ))
-        await pushStatus()
+        let root: string
+        if (usePushers()) {
+          if (c.beginUpload == null || c.beginSession == null) throw new Error('wasm build lacks beginUpload/beginSession (rebuild)')
+          const stream = c.beginUpload(
+            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, false
+          )
+          root = await pushSession(c.beginSession(PUSHER_URLS.length, stream), PUSHER_URLS)
+        } else {
+          root = await withProgress(c, async () => await c.uploadFile(
+            new Uint8Array(msg.data), msg.path, msg.contentType, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+          ))
+          await pushStatus()
+        }
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
       case 'uploadCollection': {
         const c = requireClient()
         const files = msg.files.map(f => ({ path: f.path, data: new Uint8Array(f.data), contentType: f.contentType }))
-        const root = await withProgress(c, async () => await c.uploadCollection(
-          files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
-        ))
-        await pushStatus()
+        let root: string
+        if (usePushers()) {
+          if (c.beginCollection == null || c.beginSession == null) throw new Error('wasm build lacks beginCollection/beginSession (rebuild)')
+          const stream = c.beginCollection(
+            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable
+          )
+          root = await pushSession(c.beginSession(PUSHER_URLS.length, stream), PUSHER_URLS)
+        } else {
+          root = await withProgress(c, async () => await c.uploadCollection(
+            files, msg.indexDocument, msg.errorDocument, msg.batchIdHex, msg.depth, msg.immutable, UPLOAD_RETRIES
+          ))
+          await pushStatus()
+        }
         post({ kind: 'result', id: msg.id, ok: true, value: root })
         break
       }
