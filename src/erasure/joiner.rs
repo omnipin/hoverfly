@@ -23,14 +23,13 @@
 //! recovered short last data chunk is truncated back to its span length.
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use nectar_primitives::bmt::{DEFAULT_BODY_SIZE, SPAN_SIZE};
-use nectar_primitives::chunk::{AnyChunk, ChunkAddress};
-use nectar_primitives::store::ChunkGet;
+use nectar_primitives::bmt::SPAN_SIZE;
+use nectar_primitives::chunk::ChunkAddress;
 use tracing::{debug, info};
 
 use super::reedsolomon::{ReedSolomon, RsError};
 use super::{
-    CHUNK_SIZE, Level, chunk_addresses, chunk_payload_size, decode_span, is_level_encoded,
+    CHUNK_SIZE, Level, WireGet, chunk_addresses, chunk_payload_size, decode_span, is_level_encoded,
     reference_count,
 };
 
@@ -56,11 +55,20 @@ struct DecodedChunk {
 }
 
 impl DecodedChunk {
-    fn from_any(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Self {
-        DecodedChunk {
-            raw_span: chunk.span(),
-            data: chunk.data().to_vec(),
+    /// Split a chunk's wire form (`span_LE_8 || payload`) into span + payload.
+    ///
+    /// No span/length consistency check: a parity chunk's span is Reed–Solomon
+    /// output, not a length (see [`super::wire_address`]).
+    fn from_wire(wire: &[u8]) -> Result<Self, ErasureError> {
+        if wire.len() < SPAN_SIZE {
+            return Err(ErasureError::Malformed("chunk shorter than its span"));
         }
+        let mut span = [0u8; SPAN_SIZE];
+        span.copy_from_slice(&wire[..SPAN_SIZE]);
+        Ok(DecodedChunk {
+            raw_span: u64::from_le_bytes(span),
+            data: wire[SPAN_SIZE..].to_vec(),
+        })
     }
 
     /// The redundancy level and true length encoded in the span.
@@ -78,7 +86,7 @@ impl DecodedChunk {
 /// [`root_is_erasure_coded`]).
 pub async fn fetch_erasure_bytes<G>(store: &G, root: ChunkAddress) -> Result<Vec<u8>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
     fetch_erasure_bytes_progress(store, root, None).await
 }
@@ -96,13 +104,13 @@ pub async fn fetch_erasure_bytes_progress<G>(
     progress: Option<&crate::client::ProgressFn>,
 ) -> Result<Vec<u8>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
-    let root_chunk = store
-        .get(&root)
+    let root_wire = store
+        .get_wire(&root)
         .await
         .map_err(|e| ErasureError::Fetch(e.to_string()))?;
-    let root_dc = DecodedChunk::from_any(&root_chunk);
+    let root_dc = DecodedChunk::from_wire(&root_wire)?;
     let (level, span) = root_dc.level_and_len();
 
     let mut out = Vec::with_capacity(span as usize);
@@ -146,7 +154,7 @@ where
 /// Boxed recursion future. `Send` on native so a fetch can run inside a
 /// multi-thread `tokio::spawn` (the daemon does this); `!Send` on wasm where the
 /// store is `Rc`-backed. The actual Send-ness follows from the store `G`
-/// (`ChunkGet::get` is `Send` on native via `MaybeSend`), so this only relaxes
+/// (`WireGet::get_wire` is `Send` on native via `MaybeSend`), so this only relaxes
 /// the trait-object bound per target — identical to `MaybeSendWalk` in
 /// `client.rs`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -171,7 +179,7 @@ fn read_node<'a, G>(
     progress: EcProgress<'a>,
 ) -> ReadNodeFut<'a>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
     Box::pin(async move {
         // Leaf data chunk: its payload IS the file bytes for this range.
@@ -237,7 +245,7 @@ async fn fetch_node_children<G>(
     shard_cnt: usize,
 ) -> Result<Vec<DecodedChunk>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
     let total = addrs.len();
     let parity_cnt = total - shard_cnt;
@@ -248,12 +256,12 @@ where
         let mut futs = FuturesUnordered::new();
         for (i, a) in addrs.iter().take(shard_cnt).enumerate() {
             let addr = ChunkAddress::from(*a);
-            futs.push(async move { (i, store.get(&addr).await) });
+            futs.push(async move { (i, store.get_wire(&addr).await) });
         }
         let mut slots: Vec<Option<DecodedChunk>> = (0..shard_cnt).map(|_| None).collect();
         while let Some((i, res)) = futs.next().await {
-            let ch = res.map_err(|e| ErasureError::Fetch(e.to_string()))?;
-            slots[i] = Some(DecodedChunk::from_any(&ch));
+            let wire = res.map_err(|e| ErasureError::Fetch(e.to_string()))?;
+            slots[i] = Some(DecodedChunk::from_wire(&wire)?);
         }
         return Ok(slots.into_iter().map(|d| d.unwrap()).collect());
     }
@@ -272,13 +280,13 @@ where
     let mut futs = FuturesUnordered::new();
     for (i, a) in addrs.iter().enumerate() {
         let addr = ChunkAddress::from(*a);
-        futs.push(async move { (i, store.get(&addr).await) });
+        futs.push(async move { (i, store.get_wire(&addr).await) });
     }
 
     while let Some((i, res)) = futs.next().await {
         match res {
-            Ok(ch) => {
-                let dc = DecodedChunk::from_any(&ch);
+            Ok(wire) => {
+                let dc = DecodedChunk::from_wire(&wire)?;
                 rs_shards[i] = Some(to_wire_padded(&dc, shard_wire_size));
                 if i < shard_cnt {
                     decoded_data[i] = Some(dc);
@@ -397,11 +405,11 @@ pub fn root_is_erasure_coded(root_span: &[u8]) -> bool {
     is_level_encoded(root_span)
 }
 
-/// Convenience: given an already-fetched root chunk, report `(is_erasure,
-/// level, span_len)`.
+/// Convenience: given an already-fetched root chunk's raw span, report
+/// `(is_erasure, level, span_len)`.
 #[allow(dead_code)]
-pub fn inspect_root(root: &AnyChunk<DEFAULT_BODY_SIZE>) -> (bool, Level, u64) {
-    let raw = root.span().to_le_bytes();
+pub fn inspect_root(raw_span: u64) -> (bool, Level, u64) {
+    let raw = raw_span.to_le_bytes();
     let (level, len) = decode_span(&raw);
     (is_level_encoded(&raw), level, len)
 }
@@ -409,8 +417,7 @@ pub fn inspect_root(root: &AnyChunk<DEFAULT_BODY_SIZE>) -> (bool, Level, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nectar_primitives::Chunk as _;
-    use nectar_primitives::chunk::ContentChunk;
+    use crate::erasure::wire_address;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -425,20 +432,14 @@ mod tests {
     #[error("not found")]
     struct NotFound;
 
-    impl ChunkGet<DEFAULT_BODY_SIZE> for MemStore {
+    impl WireGet for MemStore {
         type Error = NotFound;
-        async fn get(
-            &self,
-            address: &ChunkAddress,
-        ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+        async fn get_wire(&self, address: &ChunkAddress) -> Result<Vec<u8>, Self::Error> {
             let key: [u8; 32] = (*address).into();
             if self.lost.lock().unwrap().contains(&key) {
                 return Err(NotFound);
             }
-            let wire = self.map.get(&key).ok_or(NotFound)?;
-            let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice())
-                .map_err(|_| NotFound)?;
-            Ok(AnyChunk::from(cc))
+            self.map.get(&key).cloned().ok_or(NotFound)
         }
     }
 
@@ -448,8 +449,7 @@ mod tests {
         let mut wire = Vec::with_capacity(SPAN_SIZE + payload.len());
         wire.extend_from_slice(&raw_span.to_le_bytes());
         wire.extend_from_slice(payload);
-        let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-        let addr: [u8; 32] = (*cc.address()).into();
+        let addr: [u8; 32] = wire_address(&wire).unwrap().into();
         (addr, wire)
     }
 
@@ -508,9 +508,9 @@ mod tests {
                 let wire = &shards[n_data + p];
                 // parity chunk is stored as a content chunk of the full padded
                 // wire (span is whatever the encode produced in the first 8
-                // bytes; store as-is).
-                let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-                let addr: [u8; 32] = (*cc.address()).into();
+                // bytes; store as-is — nectar's ContentChunk would reject it,
+                // which is precisely why the joiner reads wire bytes).
+                let addr: [u8; 32] = wire_address(wire).unwrap().into();
                 map.insert(addr, wire.clone());
                 parity_addrs.push(addr);
             }
@@ -594,8 +594,7 @@ mod tests {
             let mut parity_addrs: Vec<[u8; 32]> = Vec::new();
             for p in 0..parity_cnt {
                 let wire = &shards[n_data + p];
-                let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-                let addr: [u8; 32] = (*cc.address()).into();
+                let addr: [u8; 32] = wire_address(wire).unwrap().into();
                 map.insert(addr, wire.clone());
                 parity_addrs.push(addr);
             }

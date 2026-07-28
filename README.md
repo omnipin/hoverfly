@@ -9,6 +9,7 @@ Experimental [Swarm][swarm] light client. Works natively and in a browser.
 - **Light node functionality.** End-to-end content upload and download.
 - **Browser-friendly.** Use [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) in a browser.
 - **Collection support.** Upload, download and list content-addressable tarballs.
+- **Erasure coding.** Reed–Solomon redundancy on both upload and download, byte-compatible with bee — content stays retrievable when some of its chunks aren't.
 - **Onchain postage batch creation.** Buy storage straight from the CLI.
 - **One-shot and daemon modes.** Static commands for ease of use, daemon mode for max performance and warm connection pool.
 - **Cross-platform.** Compiles to WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
@@ -114,6 +115,23 @@ cp peers.seed.json peers.json
 ```bash
 hoverfly upload --daemon /tmp/hoverfly.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
 ```
+
+Uploads are Reed–Solomon erasure coded at level `medium` by default, exactly as
+a bee gateway codes `POST /bzz`. The extra parity chunks are what keep a freshly
+uploaded object readable while its data chunks are still confined to their
+storage neighbourhood ([bee#5541]) — at a cost of roughly +8% chunks (and hence
+postage) on large files, more on small ones. Pass `--redundancy` to change it:
+
+```bash
+hoverfly upload --redundancy none   ... # no parity, cheapest, pre-erasure behaviour
+hoverfly upload --redundancy strong ... # ~5% expected chunk retrieval error rate
+```
+
+Note that the level is encoded in the root chunk's span, so the same file has a
+different reference at each level. `hoverfly bmt --redundancy <level>` computes
+that reference offline.
+
+[bee#5541]: https://github.com/ethersphere/bee/issues/5541
 
 ## Compatibility
 

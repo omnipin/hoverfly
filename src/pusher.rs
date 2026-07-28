@@ -1161,6 +1161,10 @@ async fn run_probe(
         depth,
         immutable,
         &data,
+        // The probe measures push throughput for a known chunk count, so it
+        // deliberately uploads *without* redundancy: parity chunks would add
+        // an implicit ~8% to the workload the caller asked to measure.
+        crate::erasure::Level::None,
         max_retries,
         concurrency,
         Some(&progress),

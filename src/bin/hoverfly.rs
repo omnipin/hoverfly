@@ -390,6 +390,22 @@ enum Commands {
         #[arg(long, value_name = "FILE")]
         error_document: Option<String>,
 
+        /// Reed–Solomon redundancy level for the upload:
+        /// `none`|`medium`|`strong`|`insane`|`paranoid` (or 0-4, bee's
+        /// `Swarm-Redundancy-Level` values). Defaults to `medium`, which is
+        /// what a bee gateway applies to `POST /bytes` and `POST /bzz`.
+        ///
+        /// Erasure coding adds parity chunks so the object stays readable
+        /// when some of its data chunks are unretrievable — the normal state
+        /// of a freshly uploaded object for a forwarding-dependent client
+        /// (ethersphere/bee#5541). It costs postage: ~+8% chunks on large
+        /// files at `medium`, but proportionally much more on small ones (a
+        /// two-chunk file gets three parity chunks). `--redundancy none`
+        /// reproduces the pre-erasure behaviour — and a different reference,
+        /// since the level is encoded in the root chunk's span.
+        #[arg(long, value_name = "LEVEL", default_value_t = hoverfly::erasure::DEFAULT_UPLOAD_LEVEL)]
+        redundancy: hoverfly::erasure::Level,
+
         /// Connect to a running daemon instead of executing the upload
         /// in this process. The daemon must own a warm session pool —
         /// see `hoverfly daemon`. Mutually exclusive with the in-process
@@ -449,6 +465,13 @@ enum Commands {
         /// match what `upload` will use for the roots to agree.
         #[arg(long, value_name = "FILE")]
         error_document: Option<String>,
+
+        /// Redundancy level to hash at — must match the `--redundancy` you
+        /// will pass to `upload` for the roots to agree, since the level is
+        /// encoded in the root chunk's span. Defaults to `medium`, the same
+        /// default `upload` uses.
+        #[arg(long, value_name = "LEVEL", default_value_t = hoverfly::erasure::DEFAULT_UPLOAD_LEVEL)]
+        redundancy: hoverfly::erasure::Level,
     },
 
     /// Run an HTTP chunk-push relay (stage A: /v1/status + the
@@ -1559,6 +1582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection,
             index_document,
             error_document,
+            redundancy,
             #[cfg(unix)]
             daemon,
         } => {
@@ -1643,6 +1667,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     content_type: content_type.clone(),
                     index_document: index_document.clone(),
                     error_document: error_document.clone(),
+                    redundancy: Some(redundancy.to_string()),
                     progress: progress_cb.is_some(),
                 });
                 // Time the daemon round-trip end-to-end on the client
@@ -1723,13 +1748,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &files,
                         index_doc,
                         error_document.as_deref(),
+                        redundancy,
                     )?;
                     (s, total, "collection")
                 } else if raw {
                     let data = std::fs::read(&file)?;
                     let total = data.len();
                     let s = hoverfly::client::UploadStreamer::new_raw(
-                        &signer, &batch, depth, immutable, &data,
+                        &signer, &batch, depth, immutable, &data, redundancy,
                     )?;
                     (s, total, "raw")
                 } else {
@@ -1750,6 +1776,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &data,
                         &path,
                         ct.as_deref(),
+                        redundancy,
                     )?;
                     (s, total, "manifest")
                 };
@@ -1837,6 +1864,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     files,
                     index_doc,
                     error_document.as_deref(),
+                    redundancy,
                     max_retries,
                     concurrency,
                     progress.as_ref(),
@@ -1878,6 +1906,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     depth,
                     immutable,
                     &data,
+                    redundancy,
                     max_retries,
                     concurrency,
                     progress.as_ref(),
@@ -1910,6 +1939,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &data,
                     &path,
                     ct.as_deref(),
+                    redundancy,
                     max_retries,
                     concurrency,
                     progress.as_ref(),
@@ -1953,6 +1983,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             collection,
             index_document,
             error_document,
+            redundancy,
         } => {
             let data = std::fs::read(&file)?;
 
@@ -1981,6 +2012,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     &files,
                     index_doc,
                     error_document.as_deref(),
+                    redundancy,
                 )?;
                 let root_hex = hex::encode(manifest_root.as_bytes());
                 println!(
@@ -1995,7 +2027,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
 
             // Bare content root — identical to `upload --raw`.
-            let (file_root, n_chunks) = hoverfly::client::bmt_root(&data)?;
+            let (file_root, n_chunks) = hoverfly::client::bmt_root(&data, redundancy)?;
             let file_root_hex = hex::encode(file_root.as_bytes());
 
             // Manifest root — what the default (non-raw) `upload` yields.
