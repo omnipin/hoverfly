@@ -1433,7 +1433,17 @@ async fn join_target<'a>(
                 "root {} is erasure-coded; using RS-aware joiner",
                 root_chunk.address(),
             );
-            return Ok(crate::erasure::fetch_erasure_bytes_progress(store, root, progress).await?);
+            // Same in-flight budget the plain joiner gets: the erasure path
+            // used to race every sibling of a node at once (up to 128), which
+            // overshoots the session pool's substream capacity and converts
+            // throughput into `stream control` failures and retries.
+            return Ok(crate::erasure::fetch_erasure_bytes_progress(
+                store,
+                root,
+                progress,
+                joiner_concurrency(concurrency),
+            )
+            .await?);
         }
     }
 

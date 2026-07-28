@@ -709,6 +709,43 @@ mod tests {
         assert_eq!(got, data);
     }
 
+    /// A node's siblings are fetched through a bounded in-flight window that
+    /// refills as fetches land. The window must not change what the joiner
+    /// *gets*: it still has to reach `shard_cnt` and reconstruct, even when the
+    /// window is far narrower than a codeword and some data chunks are missing
+    /// (so the refill has to walk into the parity tail to finish).
+    #[test]
+    fn narrow_in_flight_window_still_reconstructs() {
+        use crate::erasure::joiner::fetch_erasure_bytes_progress;
+
+        let data = data_of(CHUNK_SIZE * 20);
+        let out = split_with_redundancy(&data, Level::Medium).unwrap();
+        let parities = Level::Medium.parities(20);
+
+        // Drop every parity's worth of data leaves, forcing the window to reach
+        // past the data references into the parity tail.
+        let leaves: Vec<[u8; 32]> = out
+            .chunks
+            .iter()
+            .filter(|(a, w)| {
+                *a != out.root
+                    && u64::from_le_bytes(w[..SPAN_SIZE].try_into().unwrap()) == CHUNK_SIZE as u64
+            })
+            .map(|(a, _)| <[u8; 32]>::from(*a))
+            .take(parities)
+            .collect();
+
+        for window in [1usize, 2, 7, 1000] {
+            let store = MemStore::new(&out);
+            store.lose(&leaves);
+            let got = futures::executor::block_on(fetch_erasure_bytes_progress(
+                &store, out.root, None, window,
+            ))
+            .unwrap_or_else(|e| panic!("window={window}: {e}"));
+            assert_eq!(got, data, "window={window}");
+        }
+    }
+
     /// Chunk addresses are deduplicated: repeated content (and the identical
     /// parity it produces) must not be emitted twice, or stamping burns two
     /// postage indices in one bucket.
