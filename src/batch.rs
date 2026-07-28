@@ -38,11 +38,21 @@
 //!
 //! ## Transaction shape
 //!
-//! Legacy EIP-155 transactions only (type-0). Gnosis chain (the
-//! Swarm mainnet) supports EIP-1559 but legacy is universally
-//! accepted, simpler to RLP-encode by hand, and tx fees are
-//! negligible there regardless. The single-shot nature of batch
-//! creation doesn't need fee optimization.
+//! EIP-1559 transactions (type-2). This was legacy type-0 originally,
+//! on the reasoning that fees are negligible on Gnosis so there was
+//! nothing to optimize. That reasoning was about *cost* and missed the
+//! *liveness* failure it implies: a legacy `gasPrice` is fixed at
+//! signing time, and Gnosis's `eth_gasPrice` returns roughly
+//! `base_fee + 1 wei`. If base fee ticks up before inclusion — it can
+//! rise 12.5% per block — the transaction is permanently unmineable and
+//! wedges the sender's nonce, queueing every later transaction behind
+//! it until it is manually replaced. Observed in practice.
+//!
+//! Type-2 removes the trade-off rather than tuning it. `maxFeePerGas`
+//! is a ceiling, not a payment: the chain charges
+//! `base_fee + min(tip, maxFee - base_fee)` and never spends the rest.
+//! So the fee paid is exactly the prevailing rate, while the headroom
+//! that keeps the transaction mineable costs nothing.
 
 use alloy_primitives::{Address, B256, U256, keccak256};
 use alloy_rlp::Encodable;
@@ -609,6 +619,21 @@ struct CallObj {
     data: String,
 }
 
+/// Just the fee-relevant part of a block header. `baseFeePerGas` is absent
+/// on pre-London chains, so it stays optional rather than defaulting to 0
+/// implicitly.
+#[derive(Debug, Deserialize)]
+struct BlockHeader {
+    #[serde(rename = "baseFeePerGas")]
+    base_fee_per_gas: Option<String>,
+}
+
+/// Parse a `0x`-prefixed, non-zero-padded JSON-RPC quantity into a `U256`.
+fn parse_u256_hex(s: &str) -> Result<U256, BatchError> {
+    let bytes = hex::decode(format!("{:0>64}", s.trim_start_matches("0x")))?;
+    Ok(U256::from_be_slice(&bytes))
+}
+
 #[derive(Debug, Deserialize)]
 struct ReceiptResp {
     status: String,
@@ -715,10 +740,33 @@ impl EthRpc {
             .map_err(|e| BatchError::Rpc(format!("nonce parse: {e}")))
     }
 
-    async fn gas_price(&self) -> Result<U256, BatchError> {
-        let hex_str: String = self.raw("eth_gasPrice", Vec::<()>::new()).await?;
-        let bytes = hex::decode(format!("{:0>64}", hex_str.trim_start_matches("0x")))?;
-        Ok(U256::from_be_slice(&bytes))
+    /// EIP-1559 fee parameters as `(max_priority_fee_per_gas, max_fee_per_gas)`.
+    ///
+    /// The ceiling is `2 × base_fee + tip`. Base fee can rise at most
+    /// 12.5% per block, so 2× survives ~6 consecutive maximally-full
+    /// blocks — and because the excess is never charged, the headroom is
+    /// free. The amount actually paid is `base_fee + tip` at inclusion.
+    async fn fee_params(&self) -> Result<(U256, U256), BatchError> {
+        let head: BlockHeader = self.raw("eth_getBlockByNumber", ("pending", false)).await?;
+        let base_fee = match head.base_fee_per_gas.as_deref() {
+            Some(h) => parse_u256_hex(h)?,
+            // Pre-London or a non-1559 chain: nothing to outrun.
+            None => U256::ZERO,
+        };
+        // Node-suggested tip. Not every endpoint implements
+        // `eth_maxPriorityFeePerGas`; fall back to deriving it from the
+        // legacy suggestion.
+        let tip = match self
+            .raw::<_, String>("eth_maxPriorityFeePerGas", Vec::<()>::new())
+            .await
+        {
+            Ok(h) => parse_u256_hex(&h)?,
+            Err(_) => {
+                let h: String = self.raw("eth_gasPrice", Vec::<()>::new()).await?;
+                parse_u256_hex(&h)?.saturating_sub(base_fee)
+            }
+        };
+        Ok((tip, base_fee * U256::from(2) + tip))
     }
 
     async fn estimate_gas(
@@ -750,12 +798,22 @@ impl EthRpc {
     ) -> Result<B256, BatchError> {
         let from = signer.address();
         let nonce = self.nonce(from).await?;
-        let gas_price = self.gas_price().await?;
+        let (max_priority_fee, max_fee) = self.fee_params().await?;
         // Bump gas estimate by 25% — `createBatch` calls into the
         // ordered-tree library which has variable cost depending on
-        // tree depth.
+        // tree depth. Unlike the fee ceiling, an overestimate here is
+        // refunded, so this only sets how much gas the tx *may* burn.
         let gas = self.estimate_gas(from, to, data).await? * 125 / 100;
-        let raw = sign_legacy_tx(signer, chain_id, nonce, gas_price, gas, to, data)?;
+        let raw = sign_eip1559_tx(
+            signer,
+            chain_id,
+            nonce,
+            max_priority_fee,
+            max_fee,
+            gas,
+            to,
+            data,
+        )?;
         let hex_str: String = self
             .raw(
                 "eth_sendRawTransaction",
@@ -797,32 +855,36 @@ impl EthRpc {
 }
 
 // ──────────────────────────────────────────────────────────────────────
-// Legacy EIP-155 transaction signing
+// EIP-1559 (type-2) transaction signing
 // ──────────────────────────────────────────────────────────────────────
 
-/// Build a signed legacy (type-0) transaction per EIP-155.
-/// Returns the RLP-encoded raw bytes ready for `eth_sendRawTransaction`.
-fn sign_legacy_tx(
+/// Build a signed EIP-1559 (type-2) transaction.
+/// Returns `0x02 || rlp([...])`, ready for `eth_sendRawTransaction`.
+fn sign_eip1559_tx(
     signer: &PrivateKeySigner,
     chain_id: u64,
     nonce: u64,
-    gas_price: U256,
+    max_priority_fee_per_gas: U256,
+    max_fee_per_gas: U256,
     gas_limit: u64,
     to: Address,
     data: &[u8],
 ) -> Result<Vec<u8>, BatchError> {
-    // EIP-155 signing hash: keccak256(rlp([nonce, gasPrice, gasLimit,
-    //                                       to, value, data, chainId, 0, 0]))
-    let mut sighash_payload = Vec::new();
-    encode_legacy_fields(
+    // Sighash preimage: keccak256(0x02 || rlp([chainId, nonce,
+    //   maxPriorityFeePerGas, maxFeePerGas, gasLimit, to, value, data,
+    //   accessList]))
+    let mut sighash_payload = vec![TX_TYPE_EIP1559];
+    encode_1559_fields(
         &mut sighash_payload,
+        chain_id,
         nonce,
-        gas_price,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
         gas_limit,
         to,
         U256::ZERO,
         data,
-        Some(chain_id),
+        None,
     );
     let sighash = keccak256(&sighash_payload);
 
@@ -830,83 +892,65 @@ fn sign_legacy_tx(
         .sign_hash_sync(&sighash)
         .map_err(|e| BatchError::Rpc(format!("sign: {e}")))?;
 
-    // EIP-155: v = chain_id * 2 + 35 + recovery_id
-    let v: u64 = chain_id * 2 + 35 + (sig.v() as u64);
-    let r = sig.r();
-    let s = sig.s();
-
-    let mut out = Vec::new();
-    encode_legacy_signed(
+    // Type-2 carries a bare y-parity (0/1) — the EIP-155 `chain_id * 2 + 35`
+    // encoding is legacy-only, since chainId is now an explicit field.
+    let mut out = vec![TX_TYPE_EIP1559];
+    encode_1559_fields(
         &mut out,
+        chain_id,
         nonce,
-        gas_price,
+        max_priority_fee_per_gas,
+        max_fee_per_gas,
         gas_limit,
         to,
         U256::ZERO,
         data,
-        v,
-        r,
-        s,
+        Some((sig.v() as u64, sig.r(), sig.s())),
     );
     Ok(out)
 }
 
-/// Encode the 9 RLP fields of a legacy tx envelope.
-/// When `chain_id` is `Some`, this is the EIP-155 sighash preimage
-/// (v=chain_id, r=0, s=0). When `None`, callers must use
-/// `encode_legacy_signed` instead.
-fn encode_legacy_fields(
-    out: &mut Vec<u8>,
-    nonce: u64,
-    gas_price: U256,
-    gas_limit: u64,
-    to: Address,
-    value: U256,
-    data: &[u8],
-    chain_id: Option<u64>,
-) {
-    let mut payload = Vec::new();
-    nonce.encode(&mut payload);
-    gas_price.encode(&mut payload);
-    gas_limit.encode(&mut payload);
-    to.encode(&mut payload);
-    value.encode(&mut payload);
-    data.encode(&mut payload);
-    if let Some(cid) = chain_id {
-        cid.encode(&mut payload);
-        0u64.encode(&mut payload);
-        0u64.encode(&mut payload);
-    }
-    let header = alloy_rlp::Header {
-        list: true,
-        payload_length: payload.len(),
-    };
-    header.encode(out);
-    out.extend_from_slice(&payload);
-}
+/// EIP-2718 envelope discriminator for EIP-1559 transactions.
+const TX_TYPE_EIP1559: u8 = 0x02;
 
-fn encode_legacy_signed(
+/// Encode a type-2 envelope's RLP list.
+///
+/// `sig = None` yields the 9-field sighash preimage; `Some` appends the
+/// `(y_parity, r, s)` triple for the 12-field signed form. Both share this
+/// encoder so the signed bytes can't drift from what was actually signed.
+#[allow(clippy::too_many_arguments)]
+fn encode_1559_fields(
     out: &mut Vec<u8>,
+    chain_id: u64,
     nonce: u64,
-    gas_price: U256,
+    max_priority_fee_per_gas: U256,
+    max_fee_per_gas: U256,
     gas_limit: u64,
     to: Address,
     value: U256,
     data: &[u8],
-    v: u64,
-    r: U256,
-    s: U256,
+    sig: Option<(u64, U256, U256)>,
 ) {
     let mut payload = Vec::new();
+    chain_id.encode(&mut payload);
     nonce.encode(&mut payload);
-    gas_price.encode(&mut payload);
+    max_priority_fee_per_gas.encode(&mut payload);
+    max_fee_per_gas.encode(&mut payload);
     gas_limit.encode(&mut payload);
     to.encode(&mut payload);
     value.encode(&mut payload);
     data.encode(&mut payload);
-    v.encode(&mut payload);
-    r.encode(&mut payload);
-    s.encode(&mut payload);
+    // Empty access list.
+    alloy_rlp::Header {
+        list: true,
+        payload_length: 0,
+    }
+    .encode(&mut payload);
+    if let Some((y_parity, r, s)) = sig {
+        y_parity.encode(&mut payload);
+        r.encode(&mut payload);
+        s.encode(&mut payload);
+    }
     let header = alloy_rlp::Header {
         list: true,
         payload_length: payload.len(),
@@ -918,6 +962,48 @@ fn encode_legacy_signed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Byte-for-byte cross-check of the hand-rolled type-2 envelope against
+    /// an independent implementation.
+    ///
+    /// Recovering the sender from our own sighash preimage would be
+    /// vacuous — it round-trips whatever we hashed, correct or not. The
+    /// only thing that catches an encoding divergence from consensus is
+    /// comparing against a signer we didn't write. Expected value produced
+    /// by foundry:
+    ///
+    /// ```text
+    /// cast mktx --private-key 0x2cfe…1569 --nonce 719 --gas-limit 100000 \
+    ///   --gas-price 1432 --priority-gas-price 1 --chain 100 --value 0 \
+    ///   0x45a1502382541Cd610CC9068e88727426b696293 0xdeadbeef
+    /// ```
+    #[test]
+    fn eip1559_envelope_matches_foundry() {
+        let signer: PrivateKeySigner =
+            "0x2cfe73bcd53cc2708a35f6f2238e2aeeb0448b65339f43d398e736102a211569"
+                .parse()
+                .unwrap();
+        let raw = sign_eip1559_tx(
+            &signer,
+            100,
+            719,
+            U256::from(1),
+            U256::from(1432),
+            100_000,
+            "0x45a1502382541Cd610CC9068e88727426b696293"
+                .parse()
+                .unwrap(),
+            &hex::decode("deadbeef").unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            raw[0], TX_TYPE_EIP1559,
+            "must be an EIP-2718 type-2 envelope"
+        );
+        assert_eq!(hex::encode(&raw), FOUNDRY_REFERENCE_TX);
+    }
+
+    const FOUNDRY_REFERENCE_TX: &str = "02f86b648202cf01820598830186a09445a1502382541cd610cc9068e88727426b6962938084deadbeefc001a0730b51de4f0ccabb418de873399fc265c7c7f8d6e397b334f15211d1da551d0fa07391d0301aaa4870a5832730aa05ed0177b4b09ecc4e079000838c109059cab9";
 
     #[test]
     fn parse_size_binary_units() {
