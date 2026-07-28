@@ -195,9 +195,11 @@ mod tests {
         .unwrap();
         let batch = "0x2c18bcb885649cb468732c98d70d9cb0280aaffb30ffd0c882fccd8e22cd7408";
         let data = b"hoverfly pusher stamp round-trip payload".repeat(8);
-        let (_root, work) =
-            crate::client::prepare_upload_bytes(&signer, batch, 19, false, &data).unwrap();
-        let vs = validate(&work[0].addr, &work[0].stamp).expect("stamp must validate");
+        let mut stream =
+            crate::client::UploadStreamer::new_raw(&signer, batch, 19, false, &data).unwrap();
+        let batch = stream.next_batch(1).unwrap();
+        let sc = &batch[0];
+        let vs = validate(&sc.addr, &sc.stamp).expect("stamp must validate");
         assert_eq!(
             vs.signer,
             *signer.eth_address(),
