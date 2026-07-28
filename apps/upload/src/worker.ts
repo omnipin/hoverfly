@@ -27,12 +27,14 @@ interface HoverflyClient {
   connectedPeerCount?: () => Promise<number>
   uploadProgress?: () => number[]
   uploadDiagnostics?: () => string
-  uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
-  uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number) => Promise<string>
+  // `redundancy` is the Reed–Solomon level ('none'|'medium'|'strong'|'insane'|'paranoid');
+  // omitted means bee's default, 'medium'. See src/erasure/ in the Rust crate.
+  uploadFile: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number, redundancy?: string) => Promise<string>
+  uploadCollection: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, maxRetries: number, redundancy?: string) => Promise<string>
   // Pusher path: windowed streaming — stamp + yield one bundle at a time so
   // memory stays flat for arbitrarily large files (see UploadStream).
-  beginUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean) => UploadStream
-  beginCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean) => UploadStream
+  beginUpload?: (data: Uint8Array, path: string, contentType: string | undefined, batchIdHex: string, depth: number, immutable: boolean, raw: boolean, redundancy?: string) => UploadStream
+  beginCollection?: (files: Array<{ path: string, data: Uint8Array, contentType?: string }>, indexDocument: string | undefined, errorDocument: string | undefined, batchIdHex: string, depth: number, immutable: boolean, redundancy?: string) => UploadStream
   /** Wrap a stream in the shared multi-lane scheduler (wasm UploadSession). */
   beginSession?: (lanes: number, stream: UploadStream) => UploadSession
 }
