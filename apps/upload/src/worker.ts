@@ -311,16 +311,20 @@ async function postDispatch (
       const v = JSON.parse(line) as { a?: string, s?: string, e?: string }
       if (v.a == null) return
       const good = v.s === 'ok'
-      if (good) {
-        acked++
-        onAck()
-      } else if (v.e != null && !loggedErr) {
+      if (!good && v.e != null && !loggedErr) {
         // One sample per dispatch: a batch can carry hundreds of chunks and
         // they nearly always fail for the same reason.
         loggedErr = true
         log(`Pusher ${pushUrl} rejected a chunk: ${v.e}`)
       }
+      // Report *before* signalling progress: `Scheduler::on_ack` is idempotent
+      // by address, so `session.acked` is the deduped truth, and progress is
+      // derived from it below.
       session.reportAck(lane, v.a, good, Date.now())
+      if (good) {
+        acked++
+        onAck()
+      }
     } catch { /* skip non-JSON */ }
   }
   try {
@@ -375,10 +379,15 @@ async function pushSession (session: UploadSession, lanes: string[]): Promise<st
   }))
 
   const pushUrls = lanes.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
-  let done = 0
   let lastPost = 0
   const onAck = (): void => {
-    done++
+    // Must come from `session.acked`, not a local counter incremented per
+    // `"ok"` line. The scheduler hedges stragglers onto a second lane, so one
+    // chunk can be acked twice on the wire; `on_ack` dedupes by address but a
+    // wire-line counter does not. Counting lines made the bar read 100% (via
+    // the `Math.min` clamp) while chunks were still genuinely outstanding —
+    // i.e. "1755/1755" with no root, which is precisely the stuck-tail case.
+    const done = session.acked
     const now = Date.now()
     if (now - lastPost >= 150 || done >= total) {
       lastPost = now
