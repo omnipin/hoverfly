@@ -53,9 +53,11 @@ mod reedsolomon;
 
 pub mod encoder;
 pub mod joiner;
+pub mod replicas;
 
 pub use encoder::{EncodeError, SplitOutput, split_with_redundancy};
 pub use joiner::{ErasureError, fetch_erasure_bytes, fetch_erasure_bytes_progress};
+pub use replicas::dispersed_replicas;
 
 use nectar_primitives::bmt::{DEFAULT_BODY_SIZE, HASH_SIZE, Hasher, SPAN_SIZE};
 use nectar_primitives::chunk::ChunkAddress;

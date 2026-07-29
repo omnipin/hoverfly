@@ -5953,16 +5953,26 @@ mod streamer_tests {
         assert_ne!(plain_root, ec_root);
         assert!(ec.len() > plain.len(), "{} !> {}", ec.len(), plain.len());
         // Every erasure chunk is still a validly stamped, correctly addressed
-        // chunk — including the parity ones, whose spans are RS output.
+        // chunk. `validate_delivery` is the exact check the retrieval path
+        // applies on the wire, and it has to pass for all three kinds this
+        // produces: content chunks, parity chunks (whose spans are RS output,
+        // not lengths) and the dispersed root replicas (single-owner chunks,
+        // addressed by `keccak256(id || owner)` rather than a BMT root).
+        let mut socs = 0usize;
         for c in &ec {
             let vs = crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
             assert_eq!(vs.signer, *s.eth_address());
-            assert_eq!(
-                crate::erasure::wire_address(&c.wire).map(<[u8; 32]>::from),
-                Some(c.addr),
-                "chunk address must be the BMT hash of its wire form"
+            let addr = ChunkAddress::from(c.addr);
+            assert!(
+                validate_delivery(&c.wire, &addr),
+                "chunk must validate as a content or single-owner chunk"
             );
+            if crate::erasure::wire_address(&c.wire) != Some(addr) {
+                socs += 1;
+            }
         }
+        // MEDIUM stores two dispersed replicas of the root.
+        assert_eq!(socs, 2, "expected exactly the two root replicas as SOCs");
     }
 
     /// The manifest (single-file) streamer root must equal the one-shot

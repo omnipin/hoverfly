@@ -77,6 +77,8 @@ pub enum EncodeError {
     TrieFull,
     #[error("erasure encode: inconsistent references at the root level")]
     InconsistentRefs,
+    #[error("erasure encode: dispersed replica: {0}")]
+    Replica(String),
 }
 
 /// One reference held by a trie level: the child's raw span (level byte intact,
@@ -113,6 +115,8 @@ pub struct SplitOutput {
     pub chunks: Vec<(ChunkAddress, Vec<u8>)>,
     /// Number of parity chunks among `chunks` (diagnostics only).
     pub parity_chunks: usize,
+    /// Number of dispersed root replicas among `chunks` (diagnostics only).
+    pub replica_chunks: usize,
 }
 
 /// Split `data` into an erasure-coded chunk tree at redundancy `level`.
@@ -389,10 +393,32 @@ impl Encoder {
             return Err(EncodeError::InconsistentRefs);
         }
         let root = ChunkAddress::from(top.entries[0].reference);
+
+        // Dispersed replicas of the root (bee `hashtrie.Sum` -> `replicas`).
+        // The root is the one chunk no parity covers, so it gets its own
+        // redundancy: copies at deliberately scattered addresses, derivable
+        // from the root reference alone. Emitted for every non-NONE level,
+        // including objects too small to carry any parity.
+        let root_wire = self
+            .out
+            .iter()
+            .find(|(a, _)| *a == root)
+            .map(|(_, w)| w.clone())
+            .ok_or(EncodeError::InconsistentRefs)?;
+        let mut replica_chunks = 0usize;
+        for (addr, wire) in super::replicas::dispersed_replicas(&root_wire, self.level)? {
+            let key: [u8; HASH_SIZE] = addr.into();
+            if self.seen.insert(key) {
+                self.out.push((addr, wire));
+                replica_chunks += 1;
+            }
+        }
+
         Ok(SplitOutput {
             root,
             chunks: self.out,
             parity_chunks: self.parity_chunks,
+            replica_chunks,
         })
     }
 }
@@ -505,11 +531,19 @@ mod tests {
     fn single_chunk_file_is_level_independent() {
         let data = data_of(1000);
         let plain = split_with_redundancy(&data, Level::None).unwrap();
-        for level in [Level::Medium, Level::Strong, Level::Paranoid] {
+        assert_eq!(plain.chunks.len(), 1);
+        for (level, replicas) in [
+            (Level::Medium, 2),
+            (Level::Strong, 4),
+            (Level::Paranoid, 16),
+        ] {
             let out = split_with_redundancy(&data, level).unwrap();
-            assert_eq!(out.root, plain.root);
-            assert_eq!(out.chunks.len(), 1);
-            assert_eq!(out.parity_chunks, 0);
+            assert_eq!(out.root, plain.root, "{level}");
+            // No tree to hang parity off — but the root still gets replicas,
+            // which is bee's behaviour too.
+            assert_eq!(out.parity_chunks, 0, "{level}");
+            assert_eq!(out.replica_chunks, replicas, "{level}");
+            assert_eq!(out.chunks.len(), 1 + replicas, "{level}");
         }
     }
 
@@ -598,9 +632,10 @@ mod tests {
         let level2_parity = Level::Medium.parities(3);
         assert_eq!((level1_parity, level2_parity), (23, 3));
         assert_eq!(out.parity_chunks, level1_parity + level2_parity);
+        assert_eq!(out.replica_chunks, 2);
         assert_eq!(
             out.chunks.len(),
-            260 + level1_parity + 3 + level2_parity + 1
+            260 + level1_parity + 3 + level2_parity + 1 + out.replica_chunks
         );
 
         let store = MemStore::new(&out);
@@ -626,8 +661,10 @@ mod tests {
         assert_eq!(level.parities(97), 31);
         assert_eq!(level.parities(2), 6);
         assert_eq!(out.parity_chunks, 37);
-        // 98 data + 37 parity + 2 intermediate (level-1 node + root).
-        assert_eq!(out.chunks.len(), 98 + 37 + 2);
+        // 98 data + 37 parity + 2 intermediate (level-1 node + root) + the 8
+        // dispersed replicas INSANE stores of the root.
+        assert_eq!(out.replica_chunks, 8);
+        assert_eq!(out.chunks.len(), 98 + 37 + 2 + 8);
 
         // Root span: level INSANE, length 98 * 4096 — bee's `span check`.
         let root_wire = out
@@ -699,8 +736,11 @@ mod tests {
         );
 
         // Addresses are still the plain BMT hash of the wire form, so bee
-        // accepts them (`cac.Valid` only re-hashes) — and so do we.
-        for (addr, wire) in &out.chunks {
+        // accepts them (`cac.Valid` only re-hashes) — and so do we. Replicas
+        // are appended last and are single-owner chunks, whose address is
+        // `keccak256(id || owner)` rather than a BMT root, so they are excluded.
+        let tree = &out.chunks[..out.chunks.len() - out.replica_chunks];
+        for (addr, wire) in tree {
             assert_eq!(wire_address(wire).as_ref(), Some(addr));
         }
 

@@ -287,7 +287,8 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   - **Upload** — `encoder.rs` is a port of bee's `hashtrie` writer +
     `redundancy.Params`: it emits the parity chunks and the level-encoded
     intermediate nodes, so a hoverfly upload is byte-identical to a bee gateway
-    upload at the same level. Verified: it reproduces the bee#5541 reference
+    upload at the same level — same reference *and* same chunk set. Verified:
+    it reproduces the bee#5541 reference
     `f9af765e…d1a478` (mfsbsd-mini-14.2 ISO, 40,491,008 B) exactly, and matches
     bee's own `hashtrie.TestRedundancy` expectations for the carrier-chunk case.
     Every upload path splits through `client::split_chunks`; `Level::None`
@@ -295,6 +296,20 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
     **The default is MEDIUM**, matching bee's `DefaultUploadLevel` — so the
     same bytes yield a *different* reference than a pre-erasure hoverfly (the
     level rides in the root chunk's span). `--redundancy none` restores it.
+  - **Dispersed root replicas** — `replicas.rs` ports bee `pkg/replicas`. The
+    root is the one chunk no parity covers (it has no parent), so bee also
+    stores it as `GetReplicaCount(level)` single-owner chunks — 0/2/4/8/16 —
+    under the fixed public owner `dc5b2084…` (the address of private key
+    `0x01`+31 zeros), with `id = root_addr` but `id[0]` set to a *mined* byte,
+    so any retriever can derive the addresses from the root reference alone.
+    Dispersal is a search, not a count: candidate bytes are tried in order and
+    kept only when the resulting address falls in a neighbourhood (top `d` bits,
+    d = 1..4) no earlier replica occupies, claimed at the **coarsest** free
+    depth. Emitted for every non-NONE level, including objects too small to
+    carry parity (a one-chunk file at MEDIUM = 1 chunk + 2 replicas). nectar's
+    `SingleOwnerChunk::new_dispersed_replica` does the SOC construction and
+    signing; only the selection is ported here. Differential-tested against
+    `cmd/ecref -replicas` over 5 roots × 4 levels.
   - **Gotcha — parity chunks are not nectar chunks.** A parity shard's first
     eight bytes are RS output over the data shards' *spans*, not a length, so
     nectar's `ContentChunk` (which enforces `span == data.len()` below the body
