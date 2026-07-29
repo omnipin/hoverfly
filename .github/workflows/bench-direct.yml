@@ -169,6 +169,7 @@ jobs:
 
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import re
+          import sys
           rates = []
           row_idx = 0
           with open("/tmp/bench.results") as f:
@@ -190,6 +191,13 @@ jobs:
           else:
               print()
               print("**No successful uploads parsed from results.**")
+              # Fail loudly. The upload loop swallows per-run errors with
+              # `|| true` so one bad run doesn't abort the rest, and the grep
+              # only forwards success lines — so a run where EVERY upload
+              # failed still reported green. That is how an expired
+              # BENCH_BATCH went unnoticed across months of runs: the
+              # workflow passed while uploading nothing at all.
+              sys.exit(1)
           PY
 
           cat "$GITHUB_STEP_SUMMARY"
