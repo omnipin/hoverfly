@@ -84,6 +84,13 @@ pub struct UploadRequest {
     pub content_type: Option<String>,
     pub index_document: Option<String>,
     pub error_document: Option<String>,
+    /// Reed–Solomon redundancy level for the upload, as the string
+    /// `none`/`medium`/`strong`/`insane`/`paranoid` (see
+    /// [`crate::erasure::Level`]). `None` — including from a client that
+    /// predates this field — means bee's default upload level, MEDIUM, so a
+    /// daemon-routed upload matches an in-process one.
+    #[serde(default)]
+    pub redundancy: Option<String>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -711,6 +718,13 @@ async fn run_upload(
     let data = std::fs::read(&r.file).map_err(|e| ClientError::File(e.to_string()))?;
     let bytes = data.len();
 
+    // An absent/unset level means bee's default (MEDIUM), so a `--daemon`
+    // upload produces the same reference as the same file uploaded in-process.
+    let redundancy = match r.redundancy.as_deref() {
+        None => crate::erasure::DEFAULT_UPLOAD_LEVEL,
+        Some(s) => s.parse().map_err(ClientError::File)?,
+    };
+
     // Collections / single-entry manifests still build their own
     // pool via the existing helpers (they handle dedup + multiple
     // pre-stamp passes). Only the raw / single-file path benefits
@@ -752,6 +766,7 @@ async fn run_upload(
             files,
             index_doc,
             r.error_document.as_deref(),
+            redundancy,
             r.max_retries,
             r.concurrency,
             progress,
@@ -773,6 +788,7 @@ async fn run_upload(
                 r.depth,
                 r.immutable,
                 &data,
+                redundancy,
                 r.max_retries,
                 Some(&state.cache),
                 progress,
@@ -798,6 +814,7 @@ async fn run_upload(
                 &data,
                 &path,
                 ct.as_deref(),
+                redundancy,
                 r.max_retries,
                 Some(&state.cache),
                 progress,

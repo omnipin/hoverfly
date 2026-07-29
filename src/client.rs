@@ -27,6 +27,7 @@ use tracing::{debug, info, warn};
 
 use crate::dnsaddr::{DnsAddrError, resolve};
 use crate::doh::Doh;
+use crate::erasure::Level;
 use crate::peers::{DialResult, Peer, PeerStore};
 use crate::protocols::pushsync::PushsyncReceipt;
 use crate::signer::SwarmSigner;
@@ -218,7 +219,13 @@ pub struct NetworkedStore<'a> {
     ///
     /// `Clone` shares the cache: pass a clone of the store to nectar's
     /// `join` and our manifest walkers and they'll reuse fetched chunks.
-    cache: std::sync::Arc<std::sync::Mutex<HashMap<ChunkAddress, AnyChunk<DEFAULT_BODY_SIZE>>>>,
+    /// Cached as **wire bytes** (`span_LE_8 || payload`) rather than a parsed
+    /// `AnyChunk`: nectar cannot represent a bee erasure *parity* chunk, whose
+    /// span is Reed–Solomon output rather than a length (see
+    /// [`crate::erasure::wire_address`]). Keeping the delivered bytes makes the
+    /// store the source of truth for both consumers — [`ChunkGet`] parses on
+    /// demand, [`crate::erasure::WireGet`] takes the bytes as-is.
+    cache: std::sync::Arc<std::sync::Mutex<HashMap<ChunkAddress, std::sync::Arc<Vec<u8>>>>>,
     /// Per-peer `PeerSession` cache shared across all of the joiner's
     /// concurrent chunk fetches for a single `fetch_bytes_ex` call.
     /// Without this, every chunk-level call to `Transport::fetch_chunk`
@@ -581,15 +588,37 @@ impl<'a> NetworkedStore<'a> {
         *e = (*e - 1).max(PEER_SCORE_MIN);
     }
 
-    // (validate_delivery is a free fn defined below the impl)
+    // (validate_delivery / parse_delivery are free fns defined below the impl)
 
-    /// Body of [`ChunkGet::get`]. Pulled into a private helper so the
-    /// `ChunkGet` impl can be split per-target: native uses `async fn`,
-    /// wasm wraps in `SendWrapper` to satisfy the trait's `+ Send` bound.
+    /// Body of [`ChunkGet::get`]: retrieve, then parse into a nectar chunk.
+    /// Pulled into a private helper so the `ChunkGet` impl can be split
+    /// per-target: native uses `async fn`, wasm wraps in `SendWrapper` to
+    /// satisfy the trait's `+ Send` bound.
     async fn fetch_chunk_inner(
         &self,
         address: ChunkAddress,
     ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, ChunkStoreError> {
+        let wire = self.fetch_wire_inner(address).await?;
+        parse_delivery(&wire, &address).ok_or_else(|| {
+            // Reachable only for a bee erasure parity chunk, which nectar's
+            // types cannot hold (its span is RS output, not a length). Those
+            // are fetched through `WireGet` instead; the plain joiner and the
+            // manifest walker never ask for one.
+            ChunkStoreError::Other(
+                "chunk is not representable as a nectar chunk (parity chunk?)"
+                    .to_string()
+                    .into(),
+            )
+        })
+    }
+
+    /// Retrieve a chunk's validated **wire bytes**, racing peers as described
+    /// on [`NetworkedStore`]. This is the real retrieval loop;
+    /// [`Self::fetch_chunk_inner`] is a parsing façade over it.
+    async fn fetch_wire_inner(
+        &self,
+        address: ChunkAddress,
+    ) -> Result<std::sync::Arc<Vec<u8>>, ChunkStoreError> {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // Cache hit: skip the entire network round-trip. Manifest decode
@@ -615,7 +644,6 @@ impl<'a> NetworkedStore<'a> {
         #[cfg(target_arch = "wasm32")]
         if let Some(store) = crate::idb_chunk_store::get_store().await {
             use futures::future::Either;
-            use nectar_primitives::Chunk;
             let key = hex::encode(address.as_bytes());
             let get_fut = std::pin::pin!(store.get(key));
             let timeout = std::pin::pin!(futures_timer::Delay::new(Duration::from_secs(2)));
@@ -624,13 +652,11 @@ impl<'a> NetworkedStore<'a> {
                 Either::Right((_, _)) => None, // L2 read stalled — fall through to network
             };
             if let Some(wire) = maybe_wire {
-                if let Ok(cc) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()) {
-                    if cc.address() == &address {
-                        let chunk = AnyChunk::from(cc);
-                        self.cache.lock().unwrap().insert(address, chunk.clone());
-                        crate::idb_chunk_store::note_hit();
-                        return Ok(chunk);
-                    }
+                if validate_delivery(&wire, &address) {
+                    let wire = std::sync::Arc::new(wire);
+                    self.cache.lock().unwrap().insert(address, wire.clone());
+                    crate::idb_chunk_store::note_hit();
+                    return Ok(wire);
                 }
             }
         }
@@ -853,13 +879,14 @@ impl<'a> NetworkedStore<'a> {
                         // them ("address mismatch"). Try CAC first (the common
                         // case), then fall back to SOC, accepting whichever
                         // validates against the requested address.
-                        match validate_delivery(&delivery.data, &address) {
-                            Some(chunk) => (peer, overlay, AttemptOutcome::Got(chunk)),
-                            None => (
+                        if validate_delivery(&delivery.data, &address) {
+                            (peer, overlay, AttemptOutcome::Got(delivery.data))
+                        } else {
+                            (
                                 peer,
                                 overlay,
                                 AttemptOutcome::Failed("address mismatch".to_string()),
-                            ),
+                            )
                         }
                     }
                     // DialTooSoon = another concurrent fetch claimed this peer's
@@ -973,8 +1000,9 @@ impl<'a> NetworkedStore<'a> {
                 continue;
             };
             match outcome {
-                AttemptOutcome::Got(chunk) => {
-                    self.cache.lock().unwrap().insert(address, chunk.clone());
+                AttemptOutcome::Got(wire) => {
+                    let wire = std::sync::Arc::new(wire);
+                    self.cache.lock().unwrap().insert(address, wire.clone());
                     // Write-back to the persistent L2 (browser). Fire-and-forget
                     // so the IndexedDB write never blocks retrieval — the chunk
                     // is already in L1 for this session. `get_store()` is awaited
@@ -984,14 +1012,14 @@ impl<'a> NetworkedStore<'a> {
                     #[cfg(target_arch = "wasm32")]
                     {
                         let key = hex::encode(address.as_bytes());
-                        let wire = wire_form(&chunk);
+                        let bytes = wire.as_ref().clone();
                         wasm_bindgen_futures::spawn_local(async move {
                             if let Some(store) = crate::idb_chunk_store::get_store().await {
-                                store.put(key, wire).await;
+                                store.put(key, bytes).await;
                             }
                         });
                     }
-                    return Ok(chunk);
+                    return Ok(wire);
                 }
                 AttemptOutcome::Deferred => {
                     // Transient: do not log, do not record failure, requeue.
@@ -1070,6 +1098,37 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
         address: &ChunkAddress,
     ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
         self.fetch_chunk_inner(*address).await
+    }
+}
+
+/// Raw-bytes view of the store, for the erasure joiner. Same retrieval loop,
+/// same caches — it just skips the nectar parse that a parity chunk can't
+/// survive (see [`validate_delivery`]).
+impl<'a> NetworkedStore<'a> {
+    /// Seed the content cache with a chunk we obtained by other means.
+    ///
+    /// Used when the root is recovered from a dispersed replica: the bytes are
+    /// the root's, but they arrived under the replica's address, so nothing has
+    /// them filed under the root. Seeding lets whichever joiner runs next find
+    /// the root for free instead of re-issuing the fetch that just failed.
+    ///
+    /// The caller is responsible for having verified the bytes hash to
+    /// `address` (see `erasure::replicas::recover_root`).
+    fn seed_wire(&self, address: ChunkAddress, wire: Vec<u8>) {
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(address, std::sync::Arc::new(wire));
+    }
+}
+
+impl<'a> crate::erasure::WireGet for NetworkedStore<'a> {
+    type Error = ChunkStoreError;
+
+    async fn get_wire(&self, address: &ChunkAddress) -> Result<Vec<u8>, Self::Error> {
+        self.fetch_wire_inner(*address)
+            .await
+            .map(|w| w.as_ref().clone())
     }
 }
 
@@ -1382,6 +1441,23 @@ async fn join_target<'a>(
 ) -> Result<Vec<u8>, ClientError> {
     // Peek at the root span. `get` populates the store's in-memory cache, so
     // whichever joiner runs next re-reads the root for free.
+    //
+    // If the root can't be retrieved at all, fall back to its dispersed
+    // replicas before giving up (bee `pkg/replicas`, applied — as bee does —
+    // only to the root, which is the only chunk that has any). The upload level
+    // is unknowable without the root, so the search assumes the widest level;
+    // dispersal order means a narrower upload's replicas come up first.
+    if ChunkGet::get(store, &root).await.is_err()
+        && let Some(wire) = crate::erasure::replicas::recover_root(
+            store,
+            root,
+            crate::erasure::replicas::DEFAULT_DOWNLOAD_LEVEL,
+        )
+        .await
+    {
+        store.seed_wire(root, wire);
+    }
+
     if let Ok(root_chunk) = ChunkGet::get(store, &root).await {
         // `AnyChunk::span()` returns the raw little-endian span as a u64 with
         // the redundancy-level byte intact.
@@ -1392,7 +1468,17 @@ async fn join_target<'a>(
                 "root {} is erasure-coded; using RS-aware joiner",
                 root_chunk.address(),
             );
-            return Ok(crate::erasure::fetch_erasure_bytes_progress(store, root, progress).await?);
+            // Same in-flight budget the plain joiner gets: the erasure path
+            // used to race every sibling of a node at once (up to 128), which
+            // overshoots the session pool's substream capacity and converts
+            // throughput into `stream control` failures and retries.
+            return Ok(crate::erasure::fetch_erasure_bytes_progress(
+                store,
+                root,
+                progress,
+                joiner_concurrency(concurrency),
+            )
+            .await?);
         }
     }
 
@@ -1577,26 +1663,56 @@ pub async fn list_manifest_ex(
     walk_manifest(&store, root, Vec::new()).await
 }
 
-/// Validate a delivered chunk against the address that was requested, trying
-/// both chunk kinds. Returns the parsed chunk if it validates, else `None`.
+/// Validate delivered bytes against the address that was requested, trying both
+/// chunk kinds. Returns whether the delivery is authentic for that address.
 ///
 /// - Content-addressed chunk (CAC): address is the BMT hash of the data.
 /// - Single-owner chunk (SOC): address is `keccak256(id || owner)`; the data
 ///   is `id(32) || signature(65) || wrapped-cac`. Feed updates are SOCs, so a
 ///   retrieval that requested a SOC address must be validated this way — the
 ///   CAC BMT check would (correctly) reject it.
-fn validate_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEFAULT_BODY_SIZE>> {
+///
+/// The CAC check hashes the wire bytes directly
+/// ([`crate::erasure::wire_address`]) rather than going through nectar's
+/// `ContentChunk`, which additionally insists that a span below the body size
+/// equal the payload length. Bee has no such rule and its erasure **parity**
+/// chunks break it routinely (a parity span is RS output over the data shards'
+/// spans, so at leaf level it is a small 16-bit number and lands at or below
+/// 4096 for ~5% of parity chunks, measured across a sweep of file sizes at
+/// MEDIUM). Validating through nectar therefore threw those away as "address
+/// mismatch" — exactly the chunks the erasure joiner needs when data chunks are
+/// unretrievable.
+fn validate_delivery(data: &[u8], address: &ChunkAddress) -> bool {
     use nectar_primitives::Chunk as _;
     // CAC first — the overwhelmingly common case.
-    if let Ok(cac) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(data) {
-        if cac.address() == address {
-            return Some(AnyChunk::from(cac));
-        }
+    if crate::erasure::wire_address(data).as_ref() == Some(address) {
+        return true;
     }
     // Fall back to SOC: nectar computes its address as keccak256(id||owner)
     // and verifies the owner by recovering it from the signature over
     // keccak256(id || wrapped.bmt_hash), so a matching address means the
     // single-owner chunk is authentic.
+    if let Ok(soc) = SingleOwnerChunk::<DEFAULT_BODY_SIZE>::try_from(data)
+        && soc.address() == address
+    {
+        return true;
+    }
+    false
+}
+
+/// Parse already-validated wire bytes into a nectar chunk.
+///
+/// `None` for a bee erasure parity chunk — nectar's `ContentChunk` rejects its
+/// span (see [`validate_delivery`]). Such chunks are only ever requested by the
+/// erasure joiner, which reads wire bytes through [`crate::erasure::WireGet`]
+/// and never needs a nectar type.
+fn parse_delivery(data: &[u8], address: &ChunkAddress) -> Option<AnyChunk<DEFAULT_BODY_SIZE>> {
+    use nectar_primitives::Chunk as _;
+    if let Ok(cac) = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(data) {
+        if cac.address() == address {
+            return Some(AnyChunk::from(cac));
+        }
+    }
     if let Ok(soc) = SingleOwnerChunk::<DEFAULT_BODY_SIZE>::try_from(data) {
         if soc.address() == address {
             return Some(AnyChunk::from(soc));
@@ -1800,6 +1916,7 @@ pub async fn upload_file_with_manifest(
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
+    redundancy: Level,
     max_retries_per_chunk: usize,
 ) -> Result<ChunkAddress, ClientError> {
     upload_file_with_manifest_ex(
@@ -1812,6 +1929,7 @@ pub async fn upload_file_with_manifest(
         data,
         path,
         content_type,
+        redundancy,
         max_retries_per_chunk,
         DEFAULT_UPLOAD_CONCURRENCY,
         None,
@@ -1841,6 +1959,7 @@ pub fn prepare_upload_collection(
     files: &[UploadFile],
     index_document: Option<&str>,
     error_document: Option<&str>,
+    redundancy: Level,
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     use crate::manifest::CollectionEntry;
 
@@ -1863,21 +1982,21 @@ pub fn prepare_upload_collection(
     let mut total_bytes: usize = 0;
     let mut raw_chunks = 0usize;
     for f in files {
-        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
+        let (file_root, file_chunks) = split_chunks(&f.data, redundancy)?;
         debug!(
             target: "hoverfly::upload",
             "collection: {} ({} bytes) -> {} chunks (root {})",
-            f.path, f.data.len(), file_store.len(), file_root
+            f.path, f.data.len(), file_chunks.len(), file_root
         );
         total_bytes += f.data.len();
-        for (addr, chunk) in file_store.into_chunks() {
+        for (addr, wire) in file_chunks {
             raw_chunks += 1;
             let mut addr_bytes = [0u8; 32];
             addr_bytes.copy_from_slice(addr.as_bytes());
             if !seen.insert(addr_bytes) {
                 continue; // already stamped — bee dedupes on address anyway
             }
-            stamp_in.push((addr, wire_form(&chunk)));
+            stamp_in.push((addr, wire));
         }
         entries.push(CollectionEntry {
             path: f.path.clone(),
@@ -1930,6 +2049,7 @@ pub async fn upload_collection(
     files: Vec<UploadFile>,
     index_document: Option<&str>,
     error_document: Option<&str>,
+    redundancy: Level,
     max_retries_per_chunk: usize,
     concurrency: usize,
     progress: Option<&ProgressFn>,
@@ -1942,6 +2062,7 @@ pub async fn upload_collection(
         &files,
         index_document,
         error_document,
+        redundancy,
     )?;
     push_chunks_concurrent(
         transport,
@@ -1966,6 +2087,7 @@ pub async fn upload_file_with_manifest_ex(
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
+    redundancy: Level,
     max_retries_per_chunk: usize,
     concurrency: usize,
     progress: Option<&ProgressFn>,
@@ -1978,6 +2100,7 @@ pub async fn upload_file_with_manifest_ex(
         data,
         path,
         content_type,
+        redundancy,
     )?;
     push_chunks_concurrent(
         transport,
@@ -2004,6 +2127,7 @@ pub async fn upload_file_with_manifest_with_pool(
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
+    redundancy: Level,
     max_retries_per_chunk: usize,
     cache: Option<&crate::cache::ChunkCache>,
     progress: Option<&ProgressFn>,
@@ -2016,6 +2140,7 @@ pub async fn upload_file_with_manifest_with_pool(
         data,
         path,
         content_type,
+        redundancy,
     )?;
     if let Some(c) = cache {
         populate_cache(c, &work);
@@ -2039,6 +2164,7 @@ pub async fn upload_file_with_manifest_with_pool(
 /// file's chunks and the manifest entry chunks. Used by the
 /// multi-worker coordinator when uploading a single file with path
 /// metadata.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_upload_file_with_manifest(
     signer: &SwarmSigner,
     batch_id_hex: &str,
@@ -2047,12 +2173,13 @@ pub fn prepare_upload_file_with_manifest(
     data: &[u8],
     path: &str,
     content_type: Option<&str>,
+    redundancy: Level,
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
-    let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(data)?;
+    let (file_root, mut stamp_in) = split_chunks(data, redundancy)?;
     info!(target: "hoverfly::upload", "file: {} bytes -> {} chunks (root {})",
-        data.len(), file_store.len(), file_root);
+        data.len(), stamp_in.len(), file_root);
 
     let (manifest_root, manifest_chunks) =
         crate::manifest::build_single_entry_manifest(path, file_root, content_type)
@@ -2060,11 +2187,7 @@ pub fn prepare_upload_file_with_manifest(
     info!(target: "hoverfly::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
 
     let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
-    let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
-        Vec::with_capacity(file_store.len() + manifest_chunks.len());
-    for (addr, chunk) in file_store.into_chunks() {
-        stamp_in.push((addr, wire_form(&chunk)));
-    }
+    stamp_in.reserve(manifest_chunks.len());
     for (addr, wire) in manifest_chunks {
         stamp_in.push((addr, wire.to_vec()));
     }
@@ -2078,6 +2201,45 @@ fn wire_form(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Vec<u8> {
     wire.extend_from_slice(&chunk.span().to_le_bytes());
     wire.extend_from_slice(chunk.data());
     wire
+}
+
+/// A split object: the content root plus every chunk in wire form
+/// (`address`, `span_LE_8 || payload`), ready to be stamped and pushed.
+type SplitChunks = (ChunkAddress, Vec<(ChunkAddress, Vec<u8>)>);
+
+/// Split `data` into wire-ready chunks at redundancy `level`, returning the
+/// content root and every chunk as `(address, span_LE_8 || payload)`.
+///
+/// The single splitting seam for **all** upload paths. At [`Level::None`] this
+/// is nectar's plain BMT split; at any other level it is
+/// [`crate::erasure::split_with_redundancy`], which additionally emits
+/// Reed–Solomon parity chunks and level-encodes the intermediate nodes exactly
+/// as bee's upload pipeline does. Both deduplicate by chunk address — stamping
+/// one address twice burns two indices in the same postage bucket, which bee
+/// rejects as `invalid stamp: invalid index`.
+///
+/// Note that the root **differs between levels** for the same bytes: the
+/// redundancy level rides in the top byte of the root chunk's span, which is
+/// part of the BMT preimage. Bee behaves identically (`POST /bytes` with
+/// `Swarm-Redundancy-Level: 0` vs `: 1` returns different references).
+fn split_chunks(data: &[u8], level: Level) -> Result<SplitChunks, ClientError> {
+    if level == Level::None {
+        let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
+        let chunks = store
+            .into_chunks()
+            .iter()
+            .map(|(addr, chunk)| (*addr, wire_form(chunk)))
+            .collect();
+        return Ok((root, chunks));
+    }
+    let out = crate::erasure::split_with_redundancy(data, level)
+        .map_err(|e| ClientError::File(e.to_string()))?;
+    debug!(
+        target: "hoverfly::upload",
+        "erasure split ({level}): {} bytes -> {} chunks ({} parity), root {}",
+        data.len(), out.chunks.len(), out.parity_chunks, out.root,
+    );
+    Ok((out.root, out.chunks))
 }
 
 /// A chunk pre-stamped and ready for the wire.
@@ -2280,19 +2442,16 @@ impl UploadStreamer {
         depth: u8,
         immutable: bool,
         data: &[u8],
+        redundancy: Level,
     ) -> Result<Self, ClientError> {
         let batch_id = parse_batch_id(batch_id_hex)?;
-        let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
+        let (root, stamp_in) = split_chunks(data, redundancy)?;
         let stamper = build_stamper(signer, batch_id, depth, immutable)?;
-        let stamp_in = store
-            .into_chunks()
-            .iter()
-            .map(|(addr, chunk)| (*addr, wire_form(chunk)))
-            .collect();
         Ok(Self::from_parts(root, stamp_in, stamper))
     }
 
     /// Single file wrapped in a one-entry mantaray manifest.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_file(
         signer: &SwarmSigner,
         batch_id_hex: &str,
@@ -2301,18 +2460,15 @@ impl UploadStreamer {
         data: &[u8],
         path: &str,
         content_type: Option<&str>,
+        redundancy: Level,
     ) -> Result<Self, ClientError> {
         let batch_id = parse_batch_id(batch_id_hex)?;
-        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(data)?;
+        let (file_root, mut stamp_in) = split_chunks(data, redundancy)?;
         let (manifest_root, manifest_chunks) =
             crate::manifest::build_single_entry_manifest(path, file_root, content_type)
                 .map_err(|e| ClientError::Manifest(e.to_string()))?;
         let stamper = build_stamper(signer, batch_id, depth, immutable)?;
-        let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> =
-            Vec::with_capacity(file_store.len() + manifest_chunks.len());
-        for (addr, chunk) in file_store.into_chunks() {
-            stamp_in.push((addr, wire_form(&chunk)));
-        }
+        stamp_in.reserve(manifest_chunks.len());
         for (addr, wire) in manifest_chunks {
             stamp_in.push((addr, wire.to_vec()));
         }
@@ -2320,6 +2476,7 @@ impl UploadStreamer {
     }
 
     /// Collection (tar / directory) as a multi-entry manifest, deduped.
+    #[allow(clippy::too_many_arguments)]
     pub fn new_collection(
         signer: &SwarmSigner,
         batch_id_hex: &str,
@@ -2328,6 +2485,7 @@ impl UploadStreamer {
         files: &[UploadFile],
         index_document: Option<&str>,
         error_document: Option<&str>,
+        redundancy: Level,
     ) -> Result<Self, ClientError> {
         use crate::manifest::CollectionEntry;
         if files.is_empty() {
@@ -2339,12 +2497,12 @@ impl UploadStreamer {
         let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> = Vec::new();
         let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
         for f in files {
-            let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
-            for (addr, chunk) in file_store.into_chunks() {
+            let (file_root, file_chunks) = split_chunks(&f.data, redundancy)?;
+            for (addr, wire) in file_chunks {
                 let mut ab = [0u8; 32];
                 ab.copy_from_slice(addr.as_bytes());
                 if seen.insert(ab) {
-                    stamp_in.push((addr, wire_form(&chunk)));
+                    stamp_in.push((addr, wire));
                 }
             }
             entries.push(CollectionEntry {
@@ -2392,9 +2550,11 @@ impl UploadStreamer {
     }
 }
 
-/// Upload arbitrary-size content. Splits via nectar, stamps each chunk with
-/// the supplied batch + signer, and pushes every chunk via pushsync to the
-/// closest peer in the peerlist. Returns the root content address.
+/// Upload arbitrary-size content. Splits (erasure-coding at `redundancy`),
+/// stamps each chunk with the supplied batch + signer, and pushes every chunk
+/// via pushsync to the closest peer in the peerlist. Returns the root content
+/// address.
+#[allow(clippy::too_many_arguments)]
 pub async fn upload_bytes(
     transport: &Transport,
     peers: &PeerStore,
@@ -2403,6 +2563,7 @@ pub async fn upload_bytes(
     depth: u8,
     immutable: bool,
     data: &[u8],
+    redundancy: Level,
     max_retries_per_chunk: usize,
 ) -> Result<ChunkAddress, ClientError> {
     upload_bytes_ex(
@@ -2413,6 +2574,7 @@ pub async fn upload_bytes(
         depth,
         immutable,
         data,
+        redundancy,
         max_retries_per_chunk,
         DEFAULT_UPLOAD_CONCURRENCY,
         None,
@@ -2429,11 +2591,13 @@ pub async fn upload_bytes_ex(
     depth: u8,
     immutable: bool,
     data: &[u8],
+    redundancy: Level,
     max_retries_per_chunk: usize,
     concurrency: usize,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data)?;
+    let (root, work) =
+        prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data, redundancy)?;
     push_chunks_concurrent(
         transport,
         peers,
@@ -2458,11 +2622,13 @@ pub async fn upload_bytes_with_pool(
     depth: u8,
     immutable: bool,
     data: &[u8],
+    redundancy: Level,
     max_retries_per_chunk: usize,
     cache: Option<&crate::cache::ChunkCache>,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
-    let (root, work) = prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data)?;
+    let (root, work) =
+        prepare_upload_bytes(signer, batch_id_hex, depth, immutable, data, redundancy)?;
     if let Some(c) = cache {
         populate_cache(c, &work);
     }
@@ -3049,9 +3215,9 @@ fn populate_cache(cache: &crate::cache::ChunkCache, work: &[StampedChunk]) {
 /// single-entry mantaray manifest, whose root differs. Use
 /// [`prepare_upload_file_with_manifest`] (or just split + manifest) to
 /// derive that manifest root.
-pub fn bmt_root(data: &[u8]) -> Result<(ChunkAddress, usize), ClientError> {
-    let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
-    Ok((root, store.len()))
+pub fn bmt_root(data: &[u8], redundancy: Level) -> Result<(ChunkAddress, usize), ClientError> {
+    let (root, chunks) = split_chunks(data, redundancy)?;
+    Ok((root, chunks.len()))
 }
 
 /// Compute the multi-entry mantaray manifest root of a collection
@@ -3070,6 +3236,7 @@ pub fn collection_root(
     files: &[UploadFile],
     index_document: Option<&str>,
     error_document: Option<&str>,
+    redundancy: Level,
 ) -> Result<(ChunkAddress, usize), ClientError> {
     use crate::manifest::CollectionEntry;
 
@@ -3080,8 +3247,8 @@ pub fn collection_root(
     let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
     let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
     for f in files {
-        let (file_root, file_store) = split::<DEFAULT_BODY_SIZE>(&f.data)?;
-        for (addr, _chunk) in file_store.into_chunks() {
+        let (file_root, file_chunks) = split_chunks(&f.data, redundancy)?;
+        for (addr, _wire) in file_chunks {
             let mut addr_bytes = [0u8; 32];
             addr_bytes.copy_from_slice(addr.as_bytes());
             seen.insert(addr_bytes);
@@ -3111,20 +3278,15 @@ pub fn prepare_upload_bytes(
     depth: u8,
     immutable: bool,
     data: &[u8],
+    redundancy: Level,
 ) -> Result<(ChunkAddress, Vec<StampedChunk>), ClientError> {
     let batch_id = parse_batch_id(batch_id_hex)?;
 
-    let (root, store) = split::<DEFAULT_BODY_SIZE>(data)?;
-    info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {})",
-        data.len(), store.len(), root);
+    let (root, stamp_in) = split_chunks(data, redundancy)?;
+    info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {}, redundancy {})",
+        data.len(), stamp_in.len(), root, redundancy);
 
     let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
-
-    let snapshot = store.into_chunks();
-    let stamp_in: Vec<(ChunkAddress, Vec<u8>)> = snapshot
-        .iter()
-        .map(|(addr, chunk)| (*addr, wire_form(chunk)))
-        .collect();
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
     Ok((root, work))
 }
@@ -5762,7 +5924,8 @@ mod streamer_tests {
 
     /// UploadStreamer windows must yield exactly the same chunk set (by
     /// address) as the one-shot prepare, every stamp must validate to the
-    /// signer, and the root must match — across several window sizes.
+    /// signer, and the root must match — across several window sizes, at both
+    /// redundancy levels (erasure adds parity chunks to the same stream).
     #[test]
     fn streamer_raw_matches_oneshot() {
         let s = signer();
@@ -5771,36 +5934,80 @@ mod streamer_tests {
             .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
             .collect();
 
-        let (root_oneshot, work) = prepare_upload_bytes(&s, BATCH, 19, false, &data).unwrap();
-        let expected: std::collections::HashSet<[u8; 32]> = work.iter().map(|c| c.addr).collect();
+        for level in [Level::None, Level::Medium] {
+            let (root_oneshot, work) =
+                prepare_upload_bytes(&s, BATCH, 19, false, &data, level).unwrap();
+            let expected: std::collections::HashSet<[u8; 32]> =
+                work.iter().map(|c| c.addr).collect();
 
-        for window in [1usize, 7, 256, 100_000] {
-            let mut stream = UploadStreamer::new_raw(&s, BATCH, 19, false, &data).unwrap();
-            assert_eq!(
-                stream.total_chunks(),
-                work.len(),
-                "chunk count (window={window})"
-            );
-            assert_eq!(
-                hex::encode(stream.root().as_bytes()),
-                hex::encode(root_oneshot.as_bytes()),
-                "root (window={window})"
-            );
-            let mut got: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
-            loop {
-                let batch = stream.next_batch(window).unwrap();
-                if batch.is_empty() {
-                    break;
+            for window in [1usize, 7, 256, 100_000] {
+                let mut stream =
+                    UploadStreamer::new_raw(&s, BATCH, 19, false, &data, level).unwrap();
+                assert_eq!(
+                    stream.total_chunks(),
+                    work.len(),
+                    "chunk count ({level}, window={window})"
+                );
+                assert_eq!(
+                    hex::encode(stream.root().as_bytes()),
+                    hex::encode(root_oneshot.as_bytes()),
+                    "root ({level}, window={window})"
+                );
+                let mut got: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+                loop {
+                    let batch = stream.next_batch(window).unwrap();
+                    if batch.is_empty() {
+                        break;
+                    }
+                    for c in &batch {
+                        let vs =
+                            crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
+                        assert_eq!(vs.signer, *s.eth_address(), "stamp signer");
+                        got.insert(c.addr);
+                    }
                 }
-                for c in &batch {
-                    let vs = crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
-                    assert_eq!(vs.signer, *s.eth_address(), "stamp signer");
-                    got.insert(c.addr);
-                }
+                assert_eq!(got, expected, "chunk set ({level}, window={window})");
+                assert_eq!(stream.remaining(), 0);
             }
-            assert_eq!(got, expected, "chunk set (window={window})");
-            assert_eq!(stream.remaining(), 0);
         }
+    }
+
+    /// Erasure coding must reach the stamped output: a MEDIUM upload of the
+    /// same bytes carries strictly more chunks than a plain one, and a
+    /// different root (the level rides in the root chunk's span).
+    #[test]
+    fn erasure_upload_adds_parity_and_changes_root() {
+        let s = signer();
+        let data: Vec<u8> = (0..40_000u32)
+            .map(|i| (i.wrapping_mul(0x9E37_79B1) >> 11) as u8)
+            .collect();
+        let (plain_root, plain) =
+            prepare_upload_bytes(&s, BATCH, 19, false, &data, Level::None).expect("plain prepare");
+        let (ec_root, ec) = prepare_upload_bytes(&s, BATCH, 19, false, &data, Level::Medium)
+            .expect("erasure prepare");
+        assert_ne!(plain_root, ec_root);
+        assert!(ec.len() > plain.len(), "{} !> {}", ec.len(), plain.len());
+        // Every erasure chunk is still a validly stamped, correctly addressed
+        // chunk. `validate_delivery` is the exact check the retrieval path
+        // applies on the wire, and it has to pass for all three kinds this
+        // produces: content chunks, parity chunks (whose spans are RS output,
+        // not lengths) and the dispersed root replicas (single-owner chunks,
+        // addressed by `keccak256(id || owner)` rather than a BMT root).
+        let mut socs = 0usize;
+        for c in &ec {
+            let vs = crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
+            assert_eq!(vs.signer, *s.eth_address());
+            let addr = ChunkAddress::from(c.addr);
+            assert!(
+                validate_delivery(&c.wire, &addr),
+                "chunk must validate as a content or single-owner chunk"
+            );
+            if crate::erasure::wire_address(&c.wire) != Some(addr) {
+                socs += 1;
+            }
+        }
+        // MEDIUM stores two dispersed replicas of the root.
+        assert_eq!(socs, 2, "expected exactly the two root replicas as SOCs");
     }
 
     /// The manifest (single-file) streamer root must equal the one-shot
@@ -5809,9 +6016,20 @@ mod streamer_tests {
     fn streamer_file_root_matches_oneshot() {
         let s = signer();
         let data = b"hoverfly streaming upload manifest root check".repeat(50);
-        let (root_oneshot, _) =
-            prepare_upload_file_with_manifest(&s, BATCH, 19, false, &data, "f.bin", None).unwrap();
-        let stream = UploadStreamer::new_file(&s, BATCH, 19, false, &data, "f.bin", None).unwrap();
+        let (root_oneshot, _) = prepare_upload_file_with_manifest(
+            &s,
+            BATCH,
+            19,
+            false,
+            &data,
+            "f.bin",
+            None,
+            Level::Medium,
+        )
+        .unwrap();
+        let stream =
+            UploadStreamer::new_file(&s, BATCH, 19, false, &data, "f.bin", None, Level::Medium)
+                .unwrap();
         assert_eq!(
             hex::encode(stream.root().as_bytes()),
             hex::encode(root_oneshot.as_bytes())

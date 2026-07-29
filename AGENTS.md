@@ -270,18 +270,68 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
   recovery). Does NOT verify on-chain batch ownership (no RPC). Currently
   unused for ingestion; ready for a future chunk-ingestion path.
 - `src/manifest.rs` — mantaray encode/decode helpers.
-- `src/erasure/` — **erasure-coding-aware download** (Reed–Solomon). Since
+- `src/erasure/` — **Reed–Solomon erasure coding, both directions.** Since
   ~bee v2.8.1 gateway uploads are RS erasure coded by default, so a fresh
   upload's data chunks can be unretrievable for a forwarding-dependent light
   client while parity chunks let the file be reconstructed (ethersphere/bee
   #5541). `reedsolomon.rs` is a byte-exact port of klauspost's default matrix +
-  GF(2^8) reconstruction (golden-vector tested); `mod.rs` has the bee span/level
-  decode, per-level erasure tables, and `ReferenceCount`/`ChunkAddresses`
-  helpers; `joiner.rs` is a bee-compatible tree-walking joiner that fetches each
-  intermediate node's data children and RS-reconstructs any that time out from
-  the node's parity siblings. `client::join_target` detects a level-encoded root
-  span and routes to it, else falls back to nectar's plain `GenericJoiner`. All
-  download entry points (CLI/daemon/wasm) funnel through it.
+  GF(2^8) encode/reconstruct (golden-vector tested); `mod.rs` has the bee
+  span/level decode, per-level erasure tables, and
+  `ReferenceCount`/`ChunkAddresses` helpers.
+  - **Download** — `joiner.rs` is a bee-compatible tree-walking joiner that
+    fetches each intermediate node's data children and RS-reconstructs any that
+    time out from the node's parity siblings. `client::join_target` detects a
+    level-encoded root span and routes to it, else falls back to nectar's plain
+    `GenericJoiner`. All download entry points (CLI/daemon/wasm) funnel through
+    it.
+  - **Upload** — `encoder.rs` is a port of bee's `hashtrie` writer +
+    `redundancy.Params`: it emits the parity chunks and the level-encoded
+    intermediate nodes, so a hoverfly upload is byte-identical to a bee gateway
+    upload at the same level — same reference *and* same chunk set. Verified:
+    it reproduces the bee#5541 reference
+    `f9af765e…d1a478` (mfsbsd-mini-14.2 ISO, 40,491,008 B) exactly, and matches
+    bee's own `hashtrie.TestRedundancy` expectations for the carrier-chunk case.
+    Every upload path splits through `client::split_chunks`; `Level::None`
+    delegates to nectar and is unit-tested to be chunk-for-chunk identical.
+    **The default is MEDIUM**, matching bee's `DefaultUploadLevel` — so the
+    same bytes yield a *different* reference than a pre-erasure hoverfly (the
+    level rides in the root chunk's span). `--redundancy none` restores it.
+  - **Dispersed root replicas** — `replicas.rs` ports bee `pkg/replicas`. The
+    root is the one chunk no parity covers (it has no parent), so bee also
+    stores it as `GetReplicaCount(level)` single-owner chunks — 0/2/4/8/16 —
+    under the fixed public owner `dc5b2084…` (the address of private key
+    `0x01`+31 zeros), with `id = root_addr` but `id[0]` set to a *mined* byte,
+    so any retriever can derive the addresses from the root reference alone.
+    Dispersal is a search, not a count: candidate bytes are tried in order and
+    kept only when the resulting address falls in a neighbourhood (top `d` bits,
+    d = 1..4) no earlier replica occupies, claimed at the **coarsest** free
+    depth. Emitted for every non-NONE level, including objects too small to
+    carry parity (a one-chunk file at MEDIUM = 1 chunk + 2 replicas). nectar's
+    `SingleOwnerChunk::new_dispersed_replica` does the SOC construction and
+    signing; only the selection is ported here. Differential-tested against
+    `cmd/ecref -replicas` over 5 roots × 4 levels.
+    **Read side** (`recover_root`) is wired into `client::join_target` and, like
+    bee, applies to the root *only* — it is the only chunk that has replicas.
+    Two things differ from bee deliberately: (1) it is a **fallback**, run after
+    the direct root fetch fails, where bee races replicas alongside every root
+    fetch on a 300 ms timer — extra concurrent chunk requests are exactly what
+    the `joiner_concurrency` work showed we cannot afford here; (2) a replica is
+    accepted only if the chunk it wraps BMT-hashes to the root, because the
+    replica key is **public** and anyone can sign a valid SOC at a replica
+    address wrapping arbitrary content (bee's getter does not re-check this).
+    The download level is unknowable before you hold the root, so the search
+    assumes PARANOID; `narrower_levels_are_prefixes_of_wider_ones` verifies (64
+    roots) that a narrower upload's replicas are exactly the first entries of
+    the wider search, so they come up in the first batch.
+  - **Gotcha — parity chunks are not nectar chunks.** A parity shard's first
+    eight bytes are RS output over the data shards' *spans*, not a length, so
+    nectar's `ContentChunk` (which enforces `span == data.len()` below the body
+    size) rejects ~5% of them. Both directions therefore hash and carry raw wire
+    bytes: `erasure::wire_address` for addressing, `erasure::WireGet` (impl'd by
+    `NetworkedStore`) for retrieval. `NetworkedStore` caches wire bytes and
+    validates deliveries by BMT hash; `ChunkGet` is a parsing façade over that.
+    Before this, retrieval silently dropped those parity chunks as "address
+    mismatch" — losing exactly the parity the joiner needs.
 - `src/pushsched.rs` — **sans-I/O multi-lane push scheduler** (relay lanes,
   docs/pusher-design.md §7). No clock, no network, no env: the caller passes
   `now_ms`, does the HTTP, feeds acks back — so the native CLI (reqwest) and
