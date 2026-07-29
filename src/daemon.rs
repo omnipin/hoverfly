@@ -665,37 +665,9 @@ async fn handle_upload_streaming(
     drop(tx);
 
     // The upload future borrows `state`/`r`/`progress`; run it in place and
-    // interleave progress drains via `tokio::select!`. `run_upload` yields
-    // exactly once with the terminal result.
+    // interleave progress drains.
     let upload = run_upload(state, &r, progress.as_ref());
-    tokio::pin!(upload);
-
-    let result: Result<(String, usize), ClientError> = loop {
-        tokio::select! {
-            // Bias toward draining progress so the bar stays current even
-            // when the upload future is also ready.
-            biased;
-            maybe = rx.recv() => {
-                if let Some((done, total)) = maybe {
-                    // Best-effort: if the client hung up, stop streaming but
-                    // let the upload finish (its receipts are still worth
-                    // completing / caching).
-                    let _ = write_frame(stream, &Response::Progress { done, total }).await;
-                }
-                // `None` (all senders dropped) only happens once the upload
-                // future has resolved and been dropped, which the other arm
-                // catches first; nothing to do here.
-            }
-            res = &mut upload => break res,
-        }
-    };
-
-    // Drain any progress updates emitted between the final push and the
-    // upload future resolving, so the bar reaches 100% before the terminal
-    // frame. Non-blocking.
-    while let Ok((done, total)) = rx.try_recv() {
-        let _ = write_frame(stream, &Response::Progress { done, total }).await;
-    }
+    let result = drive_upload(upload, &mut rx, stream).await;
 
     let response = match result {
         Ok((root, bytes)) => Response::Uploaded { root, bytes },
@@ -704,6 +676,52 @@ async fn handle_upload_streaming(
         },
     };
     write_frame(stream, &response).await
+}
+
+/// Drive `upload` to completion, streaming each progress update to the client
+/// as it arrives.
+///
+/// The subtlety this exists to contain: the progress arm must be **disabled**
+/// once every sender is gone. A closed `recv()` is instantly ready with `None`,
+/// and under `biased;` an always-ready arm wins every poll — so leaving it
+/// enabled spins the loop forever and the `upload` future is never polled at
+/// all. That is not a rare edge: the channel starts closed whenever the client
+/// asked for no progress stream, which is every non-TTY caller (CI, scripts,
+/// anything piping stdout). Interactive use kept a sender alive via the
+/// progress callback and so never hit it.
+async fn drive_upload<W>(
+    upload: impl std::future::Future<Output = Result<(String, usize), ClientError>>,
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<(usize, usize)>,
+    stream: &mut W,
+) -> Result<(String, usize), ClientError>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    tokio::pin!(upload);
+    let mut progress_open = true;
+    let result = loop {
+        tokio::select! {
+            // Bias toward draining progress so the bar stays current even
+            // when the upload future is also ready.
+            biased;
+            maybe = rx.recv(), if progress_open => match maybe {
+                // Best-effort: if the client hung up, stop streaming but let
+                // the upload finish (its receipts are still worth caching).
+                Some((done, total)) => {
+                    let _ = write_frame(stream, &Response::Progress { done, total }).await;
+                }
+                None => progress_open = false,
+            },
+            res = &mut upload => break res,
+        }
+    };
+
+    // Drain updates emitted between the final push and the upload future
+    // resolving, so the bar reaches 100% before the terminal frame.
+    while let Ok((done, total)) = rx.try_recv() {
+        let _ = write_frame(stream, &Response::Progress { done, total }).await;
+    }
+    result
 }
 
 /// Core upload logic shared by streaming and (potential) non-streaming
@@ -1443,7 +1461,11 @@ async fn read_frame<T: for<'de> Deserialize<'de>>(
     Ok(Some(val))
 }
 
-async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> std::io::Result<()> {
+async fn write_frame<W, T>(stream: &mut W, value: &T) -> std::io::Result<()>
+where
+    W: tokio::io::AsyncWrite + Unpin,
+    T: Serialize,
+{
     let body = serde_json::to_vec(value)
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
     if body.len() > MAX_FRAME as usize {
@@ -1457,4 +1479,74 @@ async fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> std::i
     stream.write_all(&body).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod drive_upload_tests {
+    use super::*;
+
+    /// A client that asks for no progress stream leaves the channel closed
+    /// from the start. `drive_upload` must still run the upload to completion.
+    ///
+    /// Before the fix this hung forever: a closed `recv()` is instantly ready
+    /// with `None`, and under `biased;` it won every poll, so the upload future
+    /// was never polled once. It reproduced on every non-TTY caller — CI, or
+    /// anything piping stdout — while interactive terminal use worked, because
+    /// there the progress callback held a sender open.
+    #[tokio::test]
+    async fn completes_when_no_progress_requested() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+        drop(tx); // no progress callback => no senders, exactly as in `handle_upload_streaming`
+        let mut sink: Vec<u8> = Vec::new();
+
+        let upload = async {
+            // Yield a couple of times so the test fails if the future is
+            // merely polled once rather than actually driven.
+            tokio::task::yield_now().await;
+            tokio::task::yield_now().await;
+            Ok(("deadbeef".to_string(), 42usize))
+        };
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive_upload(upload, &mut rx, &mut sink),
+        )
+        .await
+        .expect("drive_upload must not spin forever when progress is disabled")
+        .expect("upload result");
+        assert_eq!(out, ("deadbeef".to_string(), 42));
+        assert!(sink.is_empty(), "no progress frames should be written");
+    }
+
+    /// With progress enabled every update reaches the client and the upload
+    /// still completes.
+    #[tokio::test]
+    async fn streams_progress_then_completes() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(usize, usize)>();
+        let mut sink: Vec<u8> = Vec::new();
+
+        let upload = async move {
+            for done in 1..=3usize {
+                tx.send((done, 3)).unwrap();
+                tokio::task::yield_now().await;
+            }
+            Ok(("cafe".to_string(), 3usize))
+        };
+
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            drive_upload(upload, &mut rx, &mut sink),
+        )
+        .await
+        .expect("must not hang")
+        .expect("upload result");
+        assert_eq!(out, ("cafe".to_string(), 3));
+        // Three length-prefixed Progress frames were written (the response
+        // enum is `#[serde(tag = "status")]`, so each frame carries
+        // `"status":"progress"`).
+        let frames = String::from_utf8_lossy(&sink)
+            .matches(r#""status":"progress""#)
+            .count();
+        assert_eq!(frames, 3, "expected one frame per progress update");
+    }
 }
