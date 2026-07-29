@@ -655,6 +655,7 @@ impl HoverflyClient {
         depth: u8,
         immutable: bool,
         max_retries: usize,
+        redundancy: Option<String>,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
         let buf = data.to_vec();
@@ -668,6 +669,7 @@ impl HoverflyClient {
             depth,
             immutable,
             &buf,
+            parse_redundancy(redundancy.as_deref())?,
             max_retries,
             UPLOAD_POOL,
             Some(&progress),
@@ -694,6 +696,7 @@ impl HoverflyClient {
         depth: u8,
         immutable: bool,
         max_retries: usize,
+        redundancy: Option<String>,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
         let buf = data.to_vec();
@@ -709,6 +712,7 @@ impl HoverflyClient {
             &buf,
             &path,
             content_type.as_deref(),
+            parse_redundancy(redundancy.as_deref())?,
             max_retries,
             UPLOAD_POOL,
             Some(&progress),
@@ -743,6 +747,7 @@ impl HoverflyClient {
         depth: u8,
         immutable: bool,
         max_retries: usize,
+        redundancy: Option<String>,
     ) -> Result<String, JsError> {
         let signer = self.upload_signer()?;
         let upload_files = parse_upload_files(&files)?;
@@ -761,6 +766,7 @@ impl HoverflyClient {
             upload_files,
             index_document.as_deref(),
             error_document.as_deref(),
+            parse_redundancy(redundancy.as_deref())?,
             max_retries,
             UPLOAD_POOL,
             Some(&progress),
@@ -786,11 +792,13 @@ impl HoverflyClient {
         depth: u8,
         immutable: bool,
         raw: bool,
+        redundancy: Option<String>,
     ) -> Result<UploadStream, JsError> {
         let signer = self.upload_signer()?;
         let buf = data.to_vec();
+        let level = parse_redundancy(redundancy.as_deref())?;
         let inner = if raw {
-            UploadStreamer::new_raw(&signer, &batch_id_hex, depth, immutable, &buf)
+            UploadStreamer::new_raw(&signer, &batch_id_hex, depth, immutable, &buf, level)
         } else {
             UploadStreamer::new_file(
                 &signer,
@@ -800,6 +808,7 @@ impl HoverflyClient {
                 &buf,
                 &path,
                 content_type.as_deref(),
+                level,
             )
         }
         .map_err(into_js_err)?;
@@ -818,6 +827,7 @@ impl HoverflyClient {
         batch_id_hex: String,
         depth: u8,
         immutable: bool,
+        redundancy: Option<String>,
     ) -> Result<UploadStream, JsError> {
         let signer = self.upload_signer()?;
         let upload_files = parse_upload_files(&files)?;
@@ -832,6 +842,7 @@ impl HoverflyClient {
             &upload_files,
             index_document.as_deref(),
             error_document.as_deref(),
+            parse_redundancy(redundancy.as_deref())?,
         )
         .map_err(into_js_err)?;
         Ok(UploadStream { inner })
@@ -904,6 +915,22 @@ impl HoverflyClient {
             .as_deref()
             .ok_or_else(|| JsError::new("client constructed without a private key"))?;
         SwarmSigner::from_hex(key, self.network_id).map_err(into_js_err)
+    }
+}
+
+/// Decode the optional `redundancy` argument every upload entry point takes.
+///
+/// `undefined`/`null` means bee's default upload level (MEDIUM), so a dApp that
+/// passes nothing gets the same erasure coding a bee gateway would apply to
+/// `POST /bzz` — the object stays readable when some of its data chunks are
+/// unretrievable, which is the normal state of a fresh upload for a
+/// forwarding-dependent client. Pass `"none"` to opt out (cheaper in postage,
+/// and a different reference).
+fn parse_redundancy(level: Option<&str>) -> Result<crate::erasure::Level, JsError> {
+    match level {
+        None => Ok(crate::erasure::DEFAULT_UPLOAD_LEVEL),
+        Some(s) if s.trim().is_empty() => Ok(crate::erasure::DEFAULT_UPLOAD_LEVEL),
+        Some(s) => s.parse().map_err(|e: String| JsError::new(&e)),
     }
 }
 

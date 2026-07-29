@@ -23,14 +23,13 @@
 //! recovered short last data chunk is truncated back to its span length.
 
 use futures::stream::{FuturesUnordered, StreamExt};
-use nectar_primitives::bmt::{DEFAULT_BODY_SIZE, SPAN_SIZE};
-use nectar_primitives::chunk::{AnyChunk, ChunkAddress};
-use nectar_primitives::store::ChunkGet;
+use nectar_primitives::bmt::SPAN_SIZE;
+use nectar_primitives::chunk::ChunkAddress;
 use tracing::{debug, info};
 
 use super::reedsolomon::{ReedSolomon, RsError};
 use super::{
-    CHUNK_SIZE, Level, chunk_addresses, chunk_payload_size, decode_span, is_level_encoded,
+    CHUNK_SIZE, Level, WireGet, chunk_addresses, chunk_payload_size, decode_span, is_level_encoded,
     reference_count,
 };
 
@@ -56,11 +55,20 @@ struct DecodedChunk {
 }
 
 impl DecodedChunk {
-    fn from_any(chunk: &AnyChunk<DEFAULT_BODY_SIZE>) -> Self {
-        DecodedChunk {
-            raw_span: chunk.span(),
-            data: chunk.data().to_vec(),
+    /// Split a chunk's wire form (`span_LE_8 || payload`) into span + payload.
+    ///
+    /// No span/length consistency check: a parity chunk's span is Reed–Solomon
+    /// output, not a length (see [`super::wire_address`]).
+    fn from_wire(wire: &[u8]) -> Result<Self, ErasureError> {
+        if wire.len() < SPAN_SIZE {
+            return Err(ErasureError::Malformed("chunk shorter than its span"));
         }
+        let mut span = [0u8; SPAN_SIZE];
+        span.copy_from_slice(&wire[..SPAN_SIZE]);
+        Ok(DecodedChunk {
+            raw_span: u64::from_le_bytes(span),
+            data: wire[SPAN_SIZE..].to_vec(),
+        })
     }
 
     /// The redundancy level and true length encoded in the span.
@@ -78,10 +86,15 @@ impl DecodedChunk {
 /// [`root_is_erasure_coded`]).
 pub async fn fetch_erasure_bytes<G>(store: &G, root: ChunkAddress) -> Result<Vec<u8>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
-    fetch_erasure_bytes_progress(store, root, None).await
+    fetch_erasure_bytes_progress(store, root, None, DEFAULT_IN_FLIGHT).await
 }
+
+/// Default number of sibling chunk fetches a node keeps in flight when the
+/// caller doesn't specify one. Matches `client::joiner_concurrency`'s floor,
+/// which is the budget the plain joiner has been tuned to.
+pub const DEFAULT_IN_FLIGHT: usize = 24;
 
 /// A byte-progress reporter for the erasure join, called with the running
 /// count of leaf bytes appended so far. `Send + Sync` so the boxed recursion
@@ -90,19 +103,22 @@ type EcProgress<'a> = &'a (dyn Fn(usize) + Send + Sync);
 
 /// Like [`fetch_erasure_bytes`], but drives an optional byte-progress callback
 /// as leaf data lands (the total is the file's decoded span, known up front).
+/// `in_flight` bounds how many of a node's siblings are fetched at once; see
+/// [`fetch_node_children`] for why that bound is the dominant throughput knob.
 pub async fn fetch_erasure_bytes_progress<G>(
     store: &G,
     root: ChunkAddress,
     progress: Option<&crate::client::ProgressFn>,
+    in_flight: usize,
 ) -> Result<Vec<u8>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
-    let root_chunk = store
-        .get(&root)
+    let root_wire = store
+        .get_wire(&root)
         .await
         .map_err(|e| ErasureError::Fetch(e.to_string()))?;
-    let root_dc = DecodedChunk::from_any(&root_chunk);
+    let root_dc = DecodedChunk::from_wire(&root_wire)?;
     let (level, span) = root_dc.level_and_len();
 
     let mut out = Vec::with_capacity(span as usize);
@@ -113,7 +129,8 @@ where
     };
     info!(
         target: "hoverfly::erasure",
-        "joining erasure-coded object: {span} bytes, level {level:?}, root node has {root_parity} parities"
+        "joining erasure-coded object: {span} bytes, level {level:?}, root node has {root_parity} parities, \
+         {in_flight} sibling fetches in flight"
     );
 
     // Wrap the caller's ProgressFn into a reporter closure that tracks total
@@ -135,6 +152,7 @@ where
         root_parity,
         &mut out,
         &*reporter,
+        in_flight.max(1),
     )
     .await?;
     // The recursion copies exactly `span` bytes of leaf data in order.
@@ -146,7 +164,7 @@ where
 /// Boxed recursion future. `Send` on native so a fetch can run inside a
 /// multi-thread `tokio::spawn` (the daemon does this); `!Send` on wasm where the
 /// store is `Rc`-backed. The actual Send-ness follows from the store `G`
-/// (`ChunkGet::get` is `Send` on native via `MaybeSend`), so this only relaxes
+/// (`WireGet::get_wire` is `Send` on native via `MaybeSend`), so this only relaxes
 /// the trait-object bound per target — identical to `MaybeSendWalk` in
 /// `client.rs`.
 #[cfg(not(target_arch = "wasm32"))]
@@ -169,9 +187,10 @@ fn read_node<'a, G>(
     parity: usize,
     out: &'a mut Vec<u8>,
     progress: EcProgress<'a>,
+    in_flight: usize,
 ) -> ReadNodeFut<'a>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
     Box::pin(async move {
         // Leaf data chunk: its payload IS the file bytes for this range.
@@ -191,7 +210,7 @@ where
         }
 
         // Fetch (and if necessary reconstruct) every DATA child of this node.
-        let children = fetch_node_children(store, &addrs, shard_cnt).await?;
+        let children = fetch_node_children(store, &addrs, shard_cnt, in_flight).await?;
 
         // Recurse into each data child in order. Each child re-derives its own
         // subtree span, level and parity from its own span.
@@ -207,11 +226,31 @@ where
             } else {
                 reference_count(child_span, child_level).1
             };
-            read_node(store, &child.data, child_span, child_parity, out, progress).await?;
+            read_node(
+                store,
+                &child.data,
+                child_span,
+                child_parity,
+                out,
+                progress,
+                in_flight,
+            )
+            .await?;
         }
 
         Ok(())
     })
+}
+
+/// One sibling fetch, tagged with its slot index. A named `async fn` rather
+/// than an inline `async move` block because the initial fill and the refill
+/// must produce the *same* future type for `FuturesUnordered` to hold both.
+async fn fetch_slot<G: WireGet>(
+    store: &G,
+    i: usize,
+    addr: ChunkAddress,
+) -> (usize, Result<Vec<u8>, G::Error>) {
+    (i, store.get_wire(&addr).await)
 }
 
 /// Fetch the data children of an intermediate node, reconstructing any that
@@ -221,23 +260,28 @@ where
 /// `addrs.len() - shard_cnt` parity refs. Returns the `shard_cnt` decoded data
 /// children (in order).
 ///
-/// Strategy mirrors bee's getter (`pkg/file/redundancy/getter`):
-/// - **Non-redundant node** (`parity_cnt == 0`): fetch all data children
-///   concurrently; a single failure is fatal (same as the plain joiner).
-/// - **Redundant node**: race *all* siblings — data **and** parity — at once
-///   (bee's RACE strategy). As soon as any `shard_cnt` of the `shard_cnt +
-///   parity_cnt` chunks land, cancel the rest and RS-reconstruct the missing
-///   data shards. Racing everything (rather than data-first-then-parity
-///   sequentially) is what makes recovery work on a flaky neighbourhood where
-///   an arbitrary subset of a node's children are unretrievable — the exact
-///   bee#5541 condition.
+/// Strategy mirrors bee's getter (`pkg/file/redundancy/getter`), with an
+/// in-flight bound of `in_flight` siblings in both cases:
+///
+/// - **Non-redundant node** (`parity_cnt == 0`): fetch the data children; a
+///   single failure is fatal (same as the plain joiner).
+/// - **Redundant node**: race siblings — data **and** parity — refilling the
+///   window as each lands. As soon as any `shard_cnt` of the `shard_cnt +
+///   parity_cnt` chunks are in hand, cancel the rest and RS-reconstruct the
+///   missing data shards. Racing siblings against each other (rather than
+///   walking them one at a time) is what makes recovery work on a flaky
+///   neighbourhood where an arbitrary subset of a node's children are
+///   unretrievable — the exact bee#5541 condition. Bounding *how many* race at
+///   once is what stops that from saturating the connection pool; see the
+///   comment on the window below.
 async fn fetch_node_children<G>(
     store: &G,
     addrs: &[[u8; 32]],
     shard_cnt: usize,
+    in_flight: usize,
 ) -> Result<Vec<DecodedChunk>, ErasureError>
 where
-    G: ChunkGet<DEFAULT_BODY_SIZE>,
+    G: WireGet,
 {
     let total = addrs.len();
     let parity_cnt = total - shard_cnt;
@@ -245,15 +289,21 @@ where
     // Fast path: no redundancy for this node. Fetch all data children
     // concurrently; a single failure is fatal.
     if parity_cnt == 0 {
+        let window = in_flight.clamp(1, shard_cnt.max(1));
+        let mut next = 0usize;
         let mut futs = FuturesUnordered::new();
-        for (i, a) in addrs.iter().take(shard_cnt).enumerate() {
-            let addr = ChunkAddress::from(*a);
-            futs.push(async move { (i, store.get(&addr).await) });
+        while next < window {
+            futs.push(fetch_slot(store, next, ChunkAddress::from(addrs[next])));
+            next += 1;
         }
         let mut slots: Vec<Option<DecodedChunk>> = (0..shard_cnt).map(|_| None).collect();
         while let Some((i, res)) = futs.next().await {
-            let ch = res.map_err(|e| ErasureError::Fetch(e.to_string()))?;
-            slots[i] = Some(DecodedChunk::from_any(&ch));
+            if next < shard_cnt {
+                futs.push(fetch_slot(store, next, ChunkAddress::from(addrs[next])));
+                next += 1;
+            }
+            let wire = res.map_err(|e| ErasureError::Fetch(e.to_string()))?;
+            slots[i] = Some(DecodedChunk::from_wire(&wire)?);
         }
         return Ok(slots.into_iter().map(|d| d.unwrap()).collect());
     }
@@ -269,16 +319,42 @@ where
     let mut present = 0usize;
     let mut failed = 0usize;
 
+    // Keep a BOUNDED number of sibling fetches in flight, refilling a slot each
+    // time one lands, rather than issuing all `total` at once.
+    //
+    // Racing every sibling simultaneously looks like the fastest route to
+    // `shard_cnt`, and it is what this did originally — but a node is up to 128
+    // chunks and each chunk request itself races several peers, so an unbounded
+    // node blows straight past the session pool's aggregate substream budget.
+    // The surplus does not queue politely; it comes back as `stream control` /
+    // timeout failures whose retries crowd out the requests that would have
+    // succeeded. Measured on the bee#5541 object (40 MB, MEDIUM, 150 s budget,
+    // both orderings): unbounded managed ~1800 chunk fetches with ~340
+    // stream-control failures, a window of 16-32 managed ~3400 with ~145 — a
+    // little under 2x the throughput for half the failures. Same lesson, and
+    // the same budget, as the plain joiner's `joiner_concurrency`.
+    //
+    // Refilling in index order also stops us paying for parity we don't need:
+    // data references come first, so the parity tail is only reached when data
+    // fetches actually fail, instead of always being fetched and discarded.
+    let window = in_flight.clamp(1, total);
+    let mut next = 0usize;
     let mut futs = FuturesUnordered::new();
-    for (i, a) in addrs.iter().enumerate() {
-        let addr = ChunkAddress::from(*a);
-        futs.push(async move { (i, store.get(&addr).await) });
+    while next < window {
+        futs.push(fetch_slot(store, next, ChunkAddress::from(addrs[next])));
+        next += 1;
     }
 
     while let Some((i, res)) = futs.next().await {
+        // Free slot → start the next sibling, so the window stays full for as
+        // long as there are siblings left to try.
+        if next < total {
+            futs.push(fetch_slot(store, next, ChunkAddress::from(addrs[next])));
+            next += 1;
+        }
         match res {
-            Ok(ch) => {
-                let dc = DecodedChunk::from_any(&ch);
+            Ok(wire) => {
+                let dc = DecodedChunk::from_wire(&wire)?;
                 rs_shards[i] = Some(to_wire_padded(&dc, shard_wire_size));
                 if i < shard_cnt {
                     decoded_data[i] = Some(dc);
@@ -397,11 +473,11 @@ pub fn root_is_erasure_coded(root_span: &[u8]) -> bool {
     is_level_encoded(root_span)
 }
 
-/// Convenience: given an already-fetched root chunk, report `(is_erasure,
-/// level, span_len)`.
+/// Convenience: given an already-fetched root chunk's raw span, report
+/// `(is_erasure, level, span_len)`.
 #[allow(dead_code)]
-pub fn inspect_root(root: &AnyChunk<DEFAULT_BODY_SIZE>) -> (bool, Level, u64) {
-    let raw = root.span().to_le_bytes();
+pub fn inspect_root(raw_span: u64) -> (bool, Level, u64) {
+    let raw = raw_span.to_le_bytes();
     let (level, len) = decode_span(&raw);
     (is_level_encoded(&raw), level, len)
 }
@@ -409,8 +485,7 @@ pub fn inspect_root(root: &AnyChunk<DEFAULT_BODY_SIZE>) -> (bool, Level, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nectar_primitives::Chunk as _;
-    use nectar_primitives::chunk::ContentChunk;
+    use crate::erasure::wire_address;
     use std::collections::HashMap;
     use std::sync::Mutex;
 
@@ -425,20 +500,14 @@ mod tests {
     #[error("not found")]
     struct NotFound;
 
-    impl ChunkGet<DEFAULT_BODY_SIZE> for MemStore {
+    impl WireGet for MemStore {
         type Error = NotFound;
-        async fn get(
-            &self,
-            address: &ChunkAddress,
-        ) -> Result<AnyChunk<DEFAULT_BODY_SIZE>, Self::Error> {
+        async fn get_wire(&self, address: &ChunkAddress) -> Result<Vec<u8>, Self::Error> {
             let key: [u8; 32] = (*address).into();
             if self.lost.lock().unwrap().contains(&key) {
                 return Err(NotFound);
             }
-            let wire = self.map.get(&key).ok_or(NotFound)?;
-            let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice())
-                .map_err(|_| NotFound)?;
-            Ok(AnyChunk::from(cc))
+            self.map.get(&key).cloned().ok_or(NotFound)
         }
     }
 
@@ -448,8 +517,7 @@ mod tests {
         let mut wire = Vec::with_capacity(SPAN_SIZE + payload.len());
         wire.extend_from_slice(&raw_span.to_le_bytes());
         wire.extend_from_slice(payload);
-        let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-        let addr: [u8; 32] = (*cc.address()).into();
+        let addr: [u8; 32] = wire_address(&wire).unwrap().into();
         (addr, wire)
     }
 
@@ -508,9 +576,9 @@ mod tests {
                 let wire = &shards[n_data + p];
                 // parity chunk is stored as a content chunk of the full padded
                 // wire (span is whatever the encode produced in the first 8
-                // bytes; store as-is).
-                let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-                let addr: [u8; 32] = (*cc.address()).into();
+                // bytes; store as-is — nectar's ContentChunk would reject it,
+                // which is precisely why the joiner reads wire bytes).
+                let addr: [u8; 32] = wire_address(wire).unwrap().into();
                 map.insert(addr, wire.clone());
                 parity_addrs.push(addr);
             }
@@ -594,8 +662,7 @@ mod tests {
             let mut parity_addrs: Vec<[u8; 32]> = Vec::new();
             for p in 0..parity_cnt {
                 let wire = &shards[n_data + p];
-                let cc = ContentChunk::<DEFAULT_BODY_SIZE>::try_from(wire.as_slice()).unwrap();
-                let addr: [u8; 32] = (*cc.address()).into();
+                let addr: [u8; 32] = wire_address(wire).unwrap().into();
                 map.insert(addr, wire.clone());
                 parity_addrs.push(addr);
             }

@@ -1,4 +1,10 @@
-//! Erasure-coding-aware download for Swarm content.
+//! Erasure coding (Reed–Solomon) for Swarm content — both directions.
+//!
+//! [`joiner`] is the read side (reconstruct unretrievable data chunks from
+//! their parity siblings); [`encoder`] is the write side (produce the parity
+//! chunks and level-encoded intermediate nodes in the first place, byte-exact
+//! with bee's upload pipeline). Everything below — the level tables, the span
+//! encoding, the per-node shard/parity split — is shared by both.
 //!
 //! ## Why this exists
 //!
@@ -45,23 +51,37 @@
 
 mod reedsolomon;
 
+pub mod encoder;
 pub mod joiner;
+pub mod replicas;
 
+pub use encoder::{EncodeError, SplitOutput, split_with_redundancy};
 pub use joiner::{ErasureError, fetch_erasure_bytes, fetch_erasure_bytes_progress};
+pub use replicas::dispersed_replicas;
 
-use nectar_primitives::bmt::{HASH_SIZE, SPAN_SIZE};
+use nectar_primitives::bmt::{DEFAULT_BODY_SIZE, HASH_SIZE, Hasher, SPAN_SIZE};
+use nectar_primitives::chunk::ChunkAddress;
+use nectar_primitives::store::{MaybeSend, MaybeSync};
 
 /// Bee `swarm.ChunkSize` — 4096 bytes of payload per content chunk.
 pub const CHUNK_SIZE: usize = 4096;
 /// Bee `swarm.Branches` — 128 references per full intermediate chunk (plain).
 pub const BRANCHES: usize = 128;
 
+/// Default redundancy level for uploads, matching bee's
+/// `redundancy.DefaultUploadLevel`. Every `POST /bytes` / `POST /bzz` a bee
+/// gateway serves is MEDIUM unless the client sends `Swarm-Redundancy-Level`,
+/// so hoverfly uploads default to it too: the whole point is that freshly
+/// uploaded content stays retrievable for forwarding-dependent light clients.
+pub const DEFAULT_UPLOAD_LEVEL: Level = Level::Medium;
+
 /// Redundancy level, mirroring bee `pkg/file/redundancy/level.go`.
 ///
 /// The numeric values are the on-wire encoding (stored in the span's top byte).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Level {
     /// No redundancy.
+    #[default]
     None = 0,
     /// ~1% expected chunk retrieval error rate (bee's default upload level).
     Medium = 1,
@@ -73,7 +93,44 @@ pub enum Level {
     Paranoid = 4,
 }
 
+impl std::fmt::Display for Level {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Level::None => "none",
+            Level::Medium => "medium",
+            Level::Strong => "strong",
+            Level::Insane => "insane",
+            Level::Paranoid => "paranoid",
+        })
+    }
+}
+
+impl std::str::FromStr for Level {
+    type Err = String;
+
+    /// Accepts bee's names (`none`/`medium`/`strong`/`insane`/`paranoid`,
+    /// case-insensitive) and the numeric wire values `0`–`4` that bee's
+    /// `Swarm-Redundancy-Level` header carries.
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "none" | "0" | "off" => Ok(Level::None),
+            "medium" | "1" => Ok(Level::Medium),
+            "strong" | "2" => Ok(Level::Strong),
+            "insane" | "3" => Ok(Level::Insane),
+            "paranoid" | "4" => Ok(Level::Paranoid),
+            other => Err(format!(
+                "invalid redundancy level `{other}` (expected none|medium|strong|insane|paranoid or 0-4)"
+            )),
+        }
+    }
+}
+
 impl Level {
+    /// Decode a numeric level as it appears on the wire / in an API header.
+    pub fn from_wire(v: u8) -> Option<Level> {
+        Level::from_u8(v)
+    }
+
     fn from_u8(v: u8) -> Option<Level> {
         Some(match v {
             0 => Level::None,
@@ -222,6 +279,62 @@ static PARANOID_ET: [(usize, usize); 37] = [
     (2, 23),
     (1, 19),
 ];
+
+/// BMT-hash a chunk in wire form (`span_LE_8 || payload`), returning its
+/// address. `None` if the body exceeds [`CHUNK_SIZE`].
+///
+/// Both erasure paths hash chunks here rather than through
+/// `nectar_primitives::chunk::ContentChunk`, because nectar enforces a rule bee
+/// does not: a body whose span is `<= BODY_SIZE` must have exactly `span` bytes
+/// of data. **Parity chunks routinely violate it.** A parity shard's first
+/// eight bytes are the Reed–Solomon combination of the *spans* of the data
+/// shards it covers; in a leaf codeword every data span is 4096 (or the file's
+/// final remainder), so bytes 2..8 are zero in every shard and therefore zero
+/// in the parity too — the parity "span" is a small 16-bit number, which lands
+/// at or below 4096 (and unequal to it) for ~5% of parity chunks, measured over
+/// a sweep of file sizes at MEDIUM. Bee accepts these without question: its
+/// `cac.Valid` only re-hashes the bytes. So do we.
+pub fn wire_address(wire: &[u8]) -> Option<ChunkAddress> {
+    if wire.len() < SPAN_SIZE || wire.len() - SPAN_SIZE > CHUNK_SIZE {
+        return None;
+    }
+    let mut span = [0u8; SPAN_SIZE];
+    span.copy_from_slice(&wire[..SPAN_SIZE]);
+    let mut hasher: Hasher<DEFAULT_BODY_SIZE> = Hasher::new();
+    hasher.set_span(u64::from_le_bytes(span));
+    hasher.update(&wire[SPAN_SIZE..]);
+    Some(ChunkAddress::from(<[u8; HASH_SIZE]>::from(hasher.sum())))
+}
+
+/// A chunk source that yields **raw wire bytes** (`span_LE_8 || payload`).
+///
+/// The erasure joiner reads through this rather than
+/// `nectar_primitives::store::ChunkGet` for the reason spelled out on
+/// [`wire_address`]: `ChunkGet` yields an `AnyChunk`, and nectar cannot
+/// construct one for a bee parity chunk whose span disagrees with its payload
+/// length — so a `ChunkGet`-based joiner silently loses ~5% of the parity
+/// chunks it is trying to reconstruct from.
+pub trait WireGet: MaybeSend + MaybeSync {
+    /// Retrieval failure (peer timeout, not found, address mismatch, ...).
+    type Error: std::fmt::Display;
+
+    /// Fetch the validated wire bytes of `address`.
+    fn get_wire(
+        &self,
+        address: &ChunkAddress,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend;
+}
+
+impl<T: WireGet + ?Sized> WireGet for &T {
+    type Error = T::Error;
+
+    fn get_wire(
+        &self,
+        address: &ChunkAddress,
+    ) -> impl std::future::Future<Output = Result<Vec<u8>, Self::Error>> + MaybeSend {
+        (**self).get_wire(address)
+    }
+}
 
 /// Decode the redundancy level from a chunk's raw 8-byte span and return the
 /// true byte-length with the level byte cleared.

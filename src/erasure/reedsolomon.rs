@@ -247,10 +247,8 @@ fn build_matrix(data_shards: usize, total_shards: usize) -> Option<Matrix> {
 /// A systematic Reed–Solomon codec matching bee's on-wire parity.
 pub struct ReedSolomon {
     data_shards: usize,
-    /// Number of parity shards. Only read by the test-only `encode` path (the
-    /// download path derives everything it needs from the present-shard set),
-    /// but kept as codec metadata.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Number of parity shards. Read by the `encode` (upload) path; the
+    /// download path derives everything it needs from the present-shard set.
     parity_shards: usize,
     total_shards: usize,
     /// Full encoding matrix (`total_shards` × `data_shards`); the top square is
@@ -393,10 +391,12 @@ impl ReedSolomon {
         Ok(())
     }
 
-    /// Encode: fill in the parity shards from the data shards. Used only by
-    /// tests to validate byte-exactness against bee's encoder; the download
-    /// path only reconstructs.
-    #[cfg(test)]
+    /// Encode: fill in the parity shards from the data shards.
+    ///
+    /// `shards[..data_shards]` must hold the data; `shards[data_shards..]` are
+    /// overwritten with parity. This is the upload path
+    /// ([`super::encoder`]); the download path only reconstructs. Tests also
+    /// use it to validate byte-exactness against bee's encoder.
     pub fn encode(&self, shards: &mut [Vec<u8>]) -> Result<(), RsError> {
         if shards.len() != self.total_shards {
             return Err(RsError::InvalidShardNumber);
