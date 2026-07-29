@@ -7,7 +7,7 @@ Experimental [Swarm][swarm] light client. Upload and download files to decentral
 ## Features
 
 - **Light node functionality.** End-to-end content upload and download.
-- **Browser-friendly.** upload files from your browser using the [demo](https://hoverfly.bzz.link) and integrate into your web app using [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) .
+- **Browser-friendly.** upload files from your browser using the [demo](https://hoverfly.bzz.link) and integrate into your web app with [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) .
 - **Collection support.** Upload, download and list content-addressable tarballs.
 - **Erasure coding.** Reed–Solomon redundancy on both upload and download, byte-compatible with bee — content stays retrievable when some of its chunks aren't.
 - **Onchain postage batch creation.** Buy storage straight from the CLI.
