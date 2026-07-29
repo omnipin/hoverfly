@@ -107,9 +107,18 @@ jobs:
           fi
 
       - name: Seed peers.json from committed seed
-        # Skip cold discover: peers.seed.json (committed, harvested
-        # from a long-running v15 daemon) gives the daemon a usable
-        # candidate set to dial immediately.
+        # peers.seed.json (committed, refreshed hourly by refresh-peers.yml)
+        # gives the daemon ~3k dial candidates so the session pool can fill
+        # without discovering them first.
+        #
+        # Note what this does NOT do: the daemon's "skip the pre-fill discover"
+        # fast path needs >= WARM_PEERLIST_MIN_KNOWN_GOOD (8) peers whose last
+        # successful dial is within KNOWN_GOOD_FRESHNESS_SECS (15 min). A seed
+        # that was committed to git can essentially never satisfy that — the
+        # refresh cron runs hourly, so by the time a bench starts the newest
+        # timestamps are typically 20-40 min old. The daemon therefore always
+        # takes the "peerlist not warm enough" branch and runs a pre-fill
+        # discover; see --discover-rounds below for why that is kept to 1.
         run: cp peers.seed.json peers.json
 
       - name: Start daemon
@@ -123,12 +132,17 @@ jobs:
             --pool-size ${{ inputs.pool_size }} \
             --listen /ip4/0.0.0.0/tcp/1635 \
             --identity "$BENCH_KEY" \
-            --discover-rounds 3 \
+            --discover-rounds 1 \
             -d \
             > /tmp/daemon.log 2>&1 &
 
-      - name: Wait for warm pool
-        # Pool fill on a cold GH runner is bandwidth-bound; cap at 8 min.
+      - name: Wait for daemon pool
+        # Despite the name this waits mostly on the pre-fill DISCOVER, not on
+        # the pool: measured on a GH runner, filling 64 sessions takes ~1.2 s,
+        # while discover took 4m17s at --discover-rounds 3 (round 3 alone was
+        # 3m34s, dialing 522 peers 16-at-a-time). At --discover-rounds 1 the
+        # bootnode round is ~11 s. The 8 min ceiling is only a backstop; the
+        # loop exits as soon as the daemon logs "warm pool".
         run: |
           for i in $(seq 1 96); do
             if grep -q "warm pool" /tmp/daemon.log 2>/dev/null; then
@@ -182,6 +196,7 @@ jobs:
           # emit a row per upload + median/best/worst summary.
           python3 - <<'PY' >> "$GITHUB_STEP_SUMMARY"
           import re
+          import sys
           rates = []
           row_idx = 0
           with open("/tmp/bench.results") as f:
@@ -203,6 +218,13 @@ jobs:
           else:
               print()
               print("**No successful uploads parsed from results.**")
+              # Fail loudly. The upload loop swallows per-run errors with
+              # `|| true` so one bad run doesn't abort the rest, and the grep
+              # only forwards success lines — so a run where EVERY upload
+              # failed still reported green. That is how an expired
+              # BENCH_BATCH went unnoticed across months of runs: the
+              # workflow passed while uploading nothing at all.
+              sys.exit(1)
           PY
 
           cat "$GITHUB_STEP_SUMMARY"
