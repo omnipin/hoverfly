@@ -439,6 +439,7 @@ mod tests {
     /// simulating the sparse neighbourhood a fresh upload lands in.
     struct MemStore {
         map: HashMap<[u8; 32], Vec<u8>>,
+        extra: Mutex<HashMap<[u8; 32], Vec<u8>>>,
         lost: Mutex<HashSet<[u8; 32]>>,
     }
 
@@ -450,8 +451,19 @@ mod tests {
             }
             MemStore {
                 map,
+                extra: Mutex::new(HashMap::new()),
                 lost: Mutex::new(HashSet::new()),
             }
+        }
+        /// Add a chunk under `addr`, overriding "lost" status.
+        fn insert(&self, addr: ChunkAddress, wire: Vec<u8>) {
+            let key = <[u8; 32]>::from(addr);
+            self.lost.lock().unwrap().remove(&key);
+            self.extra.lock().unwrap().insert(key, wire);
+        }
+        /// Replace the bytes served for `key` (used to forge a replica).
+        fn overwrite(&self, key: [u8; 32], wire: Vec<u8>) {
+            self.extra.lock().unwrap().insert(key, wire);
         }
         fn lose(&self, addrs: &[[u8; 32]]) {
             let mut l = self.lost.lock().unwrap();
@@ -465,6 +477,9 @@ mod tests {
         type Error = NotFound;
         async fn get_wire(&self, address: &ChunkAddress) -> Result<Vec<u8>, Self::Error> {
             let key: [u8; 32] = (*address).into();
+            if let Some(w) = self.extra.lock().unwrap().get(&key) {
+                return Ok(w.clone());
+            }
             if self.lost.lock().unwrap().contains(&key) {
                 return Err(NotFound);
             }
@@ -784,6 +799,74 @@ mod tests {
             .unwrap_or_else(|e| panic!("window={window}: {e}"));
             assert_eq!(got, data, "window={window}");
         }
+    }
+
+    /// The whole point of replicas: when the root chunk itself is
+    /// unretrievable, the object must still be recoverable from a replica.
+    /// Without this the tree's parity is worthless — the root is the one chunk
+    /// no parity covers.
+    #[test]
+    fn root_recovers_from_a_dispersed_replica() {
+        use crate::erasure::replicas::{DEFAULT_DOWNLOAD_LEVEL, recover_root};
+
+        let data = data_of(CHUNK_SIZE * 20);
+        let out = split_with_redundancy(&data, Level::Medium).unwrap();
+        assert_eq!(out.replica_chunks, 2);
+
+        let store = MemStore::new(&out);
+        // Lose the root itself.
+        store.lose(&[<[u8; 32]>::from(out.root)]);
+        assert!(
+            futures::executor::block_on(store.get_wire(&out.root)).is_err(),
+            "root must actually be gone"
+        );
+
+        // A downloader doesn't know the upload level, so it searches at the
+        // widest one — MEDIUM's two replicas are the first it tries.
+        let recovered =
+            futures::executor::block_on(recover_root(&store, out.root, DEFAULT_DOWNLOAD_LEVEL))
+                .expect("root recoverable from a replica");
+        assert_eq!(wire_address(&recovered), Some(out.root));
+
+        // And the whole object joins from it.
+        let store2 = MemStore::new(&out);
+        store2.lose(&[<[u8; 32]>::from(out.root)]);
+        store2.insert(out.root, recovered);
+        let got = futures::executor::block_on(fetch_erasure_bytes(&store2, out.root)).unwrap();
+        assert_eq!(got, data);
+    }
+
+    /// The replica signing key is **public** — anyone can mint a well-formed
+    /// SOC at a replica address wrapping whatever they like. The only thing
+    /// that makes a replica trustworthy is that the chunk it wraps hashes to
+    /// the root we asked for, so a forged replica must be rejected.
+    #[test]
+    fn forged_replica_is_rejected() {
+        use crate::erasure::replicas::{DEFAULT_DOWNLOAD_LEVEL, recover_root, replica_addresses};
+
+        let data = data_of(CHUNK_SIZE * 20);
+        let out = split_with_redundancy(&data, Level::Medium).unwrap();
+        let store = MemStore::new(&out);
+        store.lose(&[<[u8; 32]>::from(out.root)]);
+
+        // Replace every replica with a SOC-shaped blob wrapping *different*
+        // content, keeping the id/signature bytes so only the wrapped chunk is
+        // wrong. Signature validity is irrelevant — the key is public.
+        for addr in replica_addresses(out.root, DEFAULT_DOWNLOAD_LEVEL) {
+            let key = <[u8; 32]>::from(addr);
+            if let Some(orig) = store.map.get(&key) {
+                let mut forged = orig[..32 + 65].to_vec();
+                let evil = data_of(4096);
+                forged.extend_from_slice(&(evil.len() as u64).to_le_bytes());
+                forged.extend_from_slice(&evil);
+                store.overwrite(key, forged);
+            }
+        }
+        assert!(
+            futures::executor::block_on(recover_root(&store, out.root, DEFAULT_DOWNLOAD_LEVEL))
+                .is_none(),
+            "a replica wrapping the wrong chunk must not be accepted"
+        );
     }
 
     /// Chunk addresses are deduplicated: repeated content (and the identical

@@ -1104,6 +1104,24 @@ impl<'a> ChunkGet<DEFAULT_BODY_SIZE> for NetworkedStore<'a> {
 /// Raw-bytes view of the store, for the erasure joiner. Same retrieval loop,
 /// same caches — it just skips the nectar parse that a parity chunk can't
 /// survive (see [`validate_delivery`]).
+impl<'a> NetworkedStore<'a> {
+    /// Seed the content cache with a chunk we obtained by other means.
+    ///
+    /// Used when the root is recovered from a dispersed replica: the bytes are
+    /// the root's, but they arrived under the replica's address, so nothing has
+    /// them filed under the root. Seeding lets whichever joiner runs next find
+    /// the root for free instead of re-issuing the fetch that just failed.
+    ///
+    /// The caller is responsible for having verified the bytes hash to
+    /// `address` (see `erasure::replicas::recover_root`).
+    fn seed_wire(&self, address: ChunkAddress, wire: Vec<u8>) {
+        self.cache
+            .lock()
+            .unwrap()
+            .insert(address, std::sync::Arc::new(wire));
+    }
+}
+
 impl<'a> crate::erasure::WireGet for NetworkedStore<'a> {
     type Error = ChunkStoreError;
 
@@ -1423,6 +1441,23 @@ async fn join_target<'a>(
 ) -> Result<Vec<u8>, ClientError> {
     // Peek at the root span. `get` populates the store's in-memory cache, so
     // whichever joiner runs next re-reads the root for free.
+    //
+    // If the root can't be retrieved at all, fall back to its dispersed
+    // replicas before giving up (bee `pkg/replicas`, applied — as bee does —
+    // only to the root, which is the only chunk that has any). The upload level
+    // is unknowable without the root, so the search assumes the widest level;
+    // dispersal order means a narrower upload's replicas come up first.
+    if ChunkGet::get(store, &root).await.is_err()
+        && let Some(wire) = crate::erasure::replicas::recover_root(
+            store,
+            root,
+            crate::erasure::replicas::DEFAULT_DOWNLOAD_LEVEL,
+        )
+        .await
+    {
+        store.seed_wire(root, wire);
+    }
+
     if let Ok(root_chunk) = ChunkGet::get(store, &root).await {
         // `AnyChunk::span()` returns the raw little-endian span as a u64 with
         // the redundancy-level byte intact.
