@@ -175,6 +175,117 @@ impl Replicator {
     }
 }
 
+/// Default level assumed when *reading*, mirroring bee's
+/// `redundancy.DefaultDownloadLevel`.
+///
+/// A downloader cannot know the level an object was uploaded at until it holds
+/// the root chunk — which is the very chunk it is trying to recover. So the
+/// search assumes the widest level and walks its replicas in order. That is
+/// safe because dispersal claims the coarsest free bucket first: the first two
+/// addresses a PARANOID search yields are exactly the two a MEDIUM upload
+/// stored, the first four are STRONG's, and so on. A narrower upload is found
+/// in the early batches; the later addresses simply don't exist.
+pub const DEFAULT_DOWNLOAD_LEVEL: Level = Level::Paranoid;
+
+/// The dispersed replica addresses of `root`, in bee's dispersal order.
+pub fn replica_addresses(root: ChunkAddress, level: Level) -> Vec<ChunkAddress> {
+    if level == Level::None {
+        return Vec::new();
+    }
+    Replicator::new(root.into(), level)
+        .run()
+        .into_iter()
+        .map(|c| ChunkAddress::from(c.addr))
+        .collect()
+}
+
+/// One replica fetch. A named `async fn` so the initial fill and the refill
+/// produce the same future type for `FuturesUnordered`.
+async fn fetch_one<G: super::WireGet>(store: &G, addr: ChunkAddress) -> Option<Vec<u8>> {
+    store.get_wire(&addr).await.ok()
+}
+
+/// Recover a root chunk from its dispersed replicas after the direct fetch of
+/// `root` has failed. Returns the root's own wire form (`span || payload`),
+/// unwrapped from whichever replica answered first.
+///
+/// **Deviation from bee, deliberate.** bee's `replicas.Getter` races the direct
+/// fetch against expanding batches of replicas on a 300 ms timer, so every root
+/// retrieval issues two extra requests even when the direct one is about to
+/// succeed. That is cheap for a full node with a warm kademlia; it is not cheap
+/// here. Bounding in-flight chunk requests is the single biggest throughput
+/// lever this client has — an unbounded erasure node fetch cost ~2x throughput
+/// and ~5x the failures until it was capped — so replicas are a *fallback*,
+/// tried only once the direct fetch has actually failed, and then with the same
+/// kind of bounded window. The recovery path is slower than bee's; the common
+/// path is untouched.
+///
+/// Replicas are verified by re-hashing: the fixed replica key is **public**, so
+/// anyone can sign a well-formed SOC at a replica address wrapping arbitrary
+/// content. The only thing that makes a replica trustworthy is that the chunk
+/// it wraps BMT-hashes to the root we asked for.
+pub async fn recover_root<G>(store: &G, root: ChunkAddress, level: Level) -> Option<Vec<u8>>
+where
+    G: super::WireGet,
+{
+    use futures::stream::{FuturesUnordered, StreamExt};
+
+    let addrs = replica_addresses(root, level);
+    if addrs.is_empty() {
+        return None;
+    }
+    tracing::debug!(
+        target: "hoverfly::erasure",
+        "root {root} unretrievable; trying {} dispersed replica(s)", addrs.len()
+    );
+
+    // Ordered window: the early addresses are the ones a narrower upload would
+    // have stored, so they are worth trying first.
+    const WINDOW: usize = 4;
+    let mut next = 0usize;
+    let mut futs = FuturesUnordered::new();
+    while next < WINDOW.min(addrs.len()) {
+        futs.push(fetch_one(store, addrs[next]));
+        next += 1;
+    }
+    while let Some(res) = futs.next().await {
+        if next < addrs.len() {
+            futs.push(fetch_one(store, addrs[next]));
+            next += 1;
+        }
+        let Some(wire) = res else { continue };
+        match unwrap_replica(&wire, root) {
+            Some(inner) => {
+                tracing::info!(
+                    target: "hoverfly::erasure",
+                    "recovered root {root} from a dispersed replica"
+                );
+                return Some(inner);
+            }
+            None => continue,
+        }
+    }
+    None
+}
+
+/// Pull the wrapped chunk out of a replica's wire form, rejecting anything that
+/// doesn't actually hash to `root`.
+///
+/// A SOC on the wire is `id(32) || signature(65) || span(8) || payload`.
+fn unwrap_replica(wire: &[u8], root: ChunkAddress) -> Option<Vec<u8>> {
+    const SOC_PREFIX: usize = HASH_SIZE + 65;
+    if wire.len() <= SOC_PREFIX {
+        return None;
+    }
+    let inner = &wire[SOC_PREFIX..];
+    // The wrapped chunk must be the root itself. This is the whole security
+    // check: the replica owner key is public, so the signature proves nothing.
+    if super::wire_address(inner)? != root {
+        return None;
+    }
+    Some(inner.to_vec())
+}
+
 /// Build the dispersed replicas of a root chunk.
 ///
 /// `root_wire` is the root chunk in wire form (`span_LE_8 || payload`).
@@ -1000,6 +1111,53 @@ mod tests {
             want.sort();
             assert_eq!(got, want, "root {root_hex} at {level}");
         }
+    }
+
+    #[test]
+    fn narrower_levels_are_prefixes_of_wider_ones() {
+        for seed in 0u8..64 {
+            let root = [seed.wrapping_mul(37).wrapping_add(11); 32];
+            let wide = Replicator::new(root, Level::Paranoid).run();
+            for lvl in [Level::Medium, Level::Strong, Level::Insane] {
+                let narrow = Replicator::new(root, lvl).run();
+                let w: Vec<u8> = wide.iter().take(narrow.len()).map(|c| c.mined).collect();
+                let n: Vec<u8> = narrow.iter().map(|c| c.mined).collect();
+                assert_eq!(n, w, "seed={seed} {lvl}");
+            }
+        }
+    }
+
+    /// The read path derives replica addresses from the root and looks nowhere
+    /// else, so this pins a pair confirmed to exist **on mainnet**: the root of
+    /// a 33,545-byte object uploaded at MEDIUM, whose two replicas were then
+    /// fetched back from a bee gateway's `/chunks` endpoint (both 200, both
+    /// wrapping this root).
+    #[test]
+    fn matches_addresses_confirmed_on_mainnet() {
+        let root = ChunkAddress::from(hex!(
+            "1d31e218c1948758ae2be7fa0370db598d672cfcfaf1fe4c7ab413184a5d4303"
+        ));
+        let got: Vec<String> = replica_addresses(root, Level::Medium)
+            .iter()
+            .map(|a| alloy_primitives::hex::encode(a.as_bytes()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                "77b1d0c6e74779acb4c91f829fd4aaafedec7b3c89862ab06e9ab5e9e68ed31e".to_string(),
+                "89407a68eb715dad1cf05e379fb71d3701ac96b7bd3ddc953d70cde7206c1c57".to_string(),
+            ]
+        );
+        // And the wider search a downloader actually runs must start with them.
+        let wide = replica_addresses(root, DEFAULT_DOWNLOAD_LEVEL);
+        assert_eq!(wide.len(), 16);
+        assert_eq!(
+            wide[..2]
+                .iter()
+                .map(|a| alloy_primitives::hex::encode(a.as_bytes()))
+                .collect::<Vec<_>>(),
+            got
+        );
     }
 
     /// Dispersal is the whole point: replicas must land in *distinct*

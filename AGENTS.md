@@ -310,6 +310,19 @@ There is no test suite. `dev-dependencies = tokio-test` exists but no
     `SingleOwnerChunk::new_dispersed_replica` does the SOC construction and
     signing; only the selection is ported here. Differential-tested against
     `cmd/ecref -replicas` over 5 roots × 4 levels.
+    **Read side** (`recover_root`) is wired into `client::join_target` and, like
+    bee, applies to the root *only* — it is the only chunk that has replicas.
+    Two things differ from bee deliberately: (1) it is a **fallback**, run after
+    the direct root fetch fails, where bee races replicas alongside every root
+    fetch on a 300 ms timer — extra concurrent chunk requests are exactly what
+    the `joiner_concurrency` work showed we cannot afford here; (2) a replica is
+    accepted only if the chunk it wraps BMT-hashes to the root, because the
+    replica key is **public** and anyone can sign a valid SOC at a replica
+    address wrapping arbitrary content (bee's getter does not re-check this).
+    The download level is unknowable before you hold the root, so the search
+    assumes PARANOID; `narrower_levels_are_prefixes_of_wider_ones` verifies (64
+    roots) that a narrower upload's replicas are exactly the first entries of
+    the wider search, so they come up in the first batch.
   - **Gotcha — parity chunks are not nectar chunks.** A parity shard's first
     eight bytes are RS output over the data shards' *spans*, not a length, so
     nectar's `ContentChunk` (which enforces `span == data.len()` below the body
