@@ -69,6 +69,24 @@ pub mod daemon;
 pub mod inbound;
 
 #[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod challenge;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod inbound_limit;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod ledger;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod meter;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod metered;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+pub mod payer;
+
+#[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
 pub mod pusher;
 
 pub use cache::{CachedChunk, ChunkCache};

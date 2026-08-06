@@ -2710,7 +2710,13 @@ where
     // others — which is exactly what the previous all-or-nothing overlay
     // collection did.
     let infos: Vec<LaneInfo> =
-        futures::future::join_all(pusher_urls.iter().map(|u| fetch_lane_info(&http, u))).await;
+        futures::future::join_all(pusher_urls.iter().map(|u| {
+            // A lane quoting more than this is refused rather than paid.
+            // Priced off the shipped default so a lane cannot quietly
+            // charge an order of magnitude more than the design assumes.
+            fetch_lane_info(&http, u, crate::meter::PRICE_PLUR_PER_KIB * 8)
+        }))
+        .await;
     for (i, (u, info)) in pusher_urls.iter().zip(&infos).enumerate() {
         info!(target: "hoverfly::upload",
             "lane {i} {u}: pool={:?} batch_max={:?} inflight_max={:?} budget_gb={:?}",
@@ -2807,7 +2813,7 @@ where
                     "hedging {} straggler(s) onto lane {lane}", batch.len());
             }
             tokio::spawn(async move {
-                post_batch_streaming(&http, url.as_str(), batch_id, lane, &batch, &tx).await;
+                post_batch_streaming(&http, url.as_str(), batch_id, lane, &batch, &tx, None).await;
             });
         }
 
@@ -3035,6 +3041,10 @@ async fn post_batch_streaming(
     lane: usize,
     batch: &[StampedChunk],
     tx: &tokio::sync::mpsc::UnboundedSender<LaneEv>,
+    // Metered lanes only: the signed admission capability
+    // (`docs/pusher-incentives.md` §7.2). `None` on an `open` lane, which
+    // is every production lane today.
+    challenge: Option<&str>,
 ) {
     use crate::pushsched::BatchOutcome;
     use futures::StreamExt;
@@ -3053,7 +3063,11 @@ async fn post_batch_streaming(
         });
     };
 
-    let resp = match http.post(push_url).body(body).send().await {
+    let mut req = http.post(push_url).body(body);
+    if let Some(c) = challenge {
+        req = req.header(crate::metered::CHALLENGE_HEADER, c);
+    }
+    let resp = match req.send().await {
         Ok(r) => r,
         Err(e) => {
             warn!(target: "hoverfly::upload", "lane {push_url} POST failed: {e}");
@@ -3064,6 +3078,17 @@ async fn post_batch_streaming(
     if !resp.status().is_success() {
         let code = resp.status();
         let txt = resp.text().await.unwrap_or_default();
+        // A 402 is a bill, not a fault. Reporting it as `Failed` would
+        // charge lane health for a routine settlement and retire a healthy
+        // lane after five of them (§12); `PaymentRequired` pauses it
+        // instead, and `Scheduler::fund_lane` restores it once a cheque
+        // clears.
+        if code == reqwest::StatusCode::PAYMENT_REQUIRED {
+            info!(target: "hoverfly::upload",
+                "lane {push_url} requires payment: {}", txt.trim());
+            finish(BatchOutcome::PaymentRequired, 0);
+            return;
+        }
         warn!(target: "hoverfly::upload",
             "lane {push_url} rejected batch ({code}): {}", txt.trim());
         finish(BatchOutcome::Failed(format!("http {code}")), 0);
@@ -3130,7 +3155,11 @@ async fn post_batch_streaming(
 /// yields `LaneInfo::default()` and gets scheduled on priors rather than
 /// being excluded.
 #[cfg(not(target_arch = "wasm32"))]
-async fn fetch_lane_info(http: &reqwest::Client, base_url: &str) -> crate::pushsched::LaneInfo {
+async fn fetch_lane_info(
+    http: &reqwest::Client,
+    base_url: &str,
+    price_ceiling: u128,
+) -> crate::pushsched::LaneInfo {
     use crate::pushsched::LaneInfo;
     let url = format!("{}/v1/status", base_url.trim_end_matches('/'));
     // Generous: free-tier instances cold-start on the first request.
@@ -3151,8 +3180,34 @@ async fn fetch_lane_info(http: &reqwest::Client, base_url: &str) -> crate::pushs
         .and_then(|s| s.as_str())
         .and_then(|s| hex::decode(s.trim_start_matches("0x")).ok())
         .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok());
+    // The signed price quote (§7.3). Verified, never merely parsed: an
+    // unsigned or unverifiable price is repudiable in both directions, so a
+    // quote that does not check out leaves the lane looking unmetered rather
+    // than looking free.
+    let (price_plur_per_kib, hard_enforcement) = match v.get("payment") {
+        Some(pay) if !pay.is_null() => {
+            // The overlay cross-check is skipped here: it needs the
+            // network id, which this driver does not carry, and it is the
+            // *optional* half of verification. The signature and (where a
+            // caller supplies one) the pin are what establish identity;
+            // deriving the overlay only turns the lane's own `overlay`
+            // field from an assertion into a check. A caller that pins
+            // does the full version.
+            match crate::payer::PaymentQuote::verify(pay, None, 0, None, price_ceiling) {
+                Ok(q) => (Some(q.params.price_plur_per_kib), q.hard_enforcement),
+                Err(e) => {
+                    warn!(target: "hoverfly::upload",
+                        "lane {base_url}: payment quote rejected ({e}); treating as unmetered");
+                    (None, false)
+                }
+            }
+        }
+        _ => (None, false),
+    };
     LaneInfo {
         overlay,
+        price_plur_per_kib,
+        hard_enforcement,
         batch_max: v
             .get("batch_max")
             .and_then(|x| x.as_u64())

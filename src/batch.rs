@@ -655,14 +655,30 @@ struct EthRpc {
     http: reqwest::Client,
 }
 
+/// One process-wide HTTP client for every `eth_call`.
+///
+/// `EthRpc::new` is called per read (`read_batch`, `read_remaining_balance`,
+/// `read_last_price`, …), and building a fresh `reqwest::Client` each time
+/// means a fresh connection pool, so every read paid a full TLS handshake
+/// and none were ever reused. On the pusher's hot path that is one handshake
+/// per batch resolution; under a flood of unresolvable batch ids it was one
+/// per frame. `reqwest::Client` is an `Arc` internally, so cloning it shares
+/// the pool.
+fn shared_http() -> &'static reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(Duration::from_secs(30))
+            .build()
+            .expect("reqwest client")
+    })
+}
+
 impl EthRpc {
     fn new(url: String) -> Self {
         Self {
             url,
-            http: reqwest::Client::builder()
-                .timeout(Duration::from_secs(30))
-                .build()
-                .expect("reqwest client"),
+            http: shared_http().clone(),
         }
     }
 
@@ -1051,5 +1067,141 @@ mod tests {
         // 24h = 86400s; blocks = 86400 / 5 = 17280; with last_price=1
         // amount = 17280 + 10 (buffer)
         assert_eq!(amount_for_duration(1, 86400), U256::from(17290u64));
+    }
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Chequebook reads (metered relay — docs/pusher-incentives.md Stage 1)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    // ERC20SimpleSwap / SimpleSwapFactory, from
+    // github.com/ethersphere/swap-swear-and-swindle.
+    function issuer() external view returns (address);
+    function paidOut(address beneficiary) external view returns (uint256);
+    function bounced() external view returns (bool);
+    // NOT `balance()`. `liquidBalance() = balance() - totalHardDeposit`, and
+    // `liquidBalanceFor(b) = liquidBalance() + hardDeposits[b].amount`, which
+    // is what `_cashChequeInternal` actually pays against. Bee checks
+    // `balance()`, counting *other* beneficiaries' hard deposits as our
+    // coverage — unsound in general, invisible only because bee never places
+    // any (incentives §11.2).
+    function liquidBalanceFor(address beneficiary) external view returns (uint256);
+    function deployedContracts(address who) external view returns (bool);
+}
+
+/// Canonical `SimpleSwapFactory` per chain (`bee/pkg/config/chain.go:66,89`).
+/// **Hardcoded on purpose.** A factory address supplied by the client lets it
+/// present a contract that returns a forged `issuer()` and
+/// `liquidBalanceFor()` and implements `cashChequeBeneficiary` as a no-op —
+/// total compromise for one `eth_call` saved (incentives §6).
+pub const GNOSIS_SWAP_FACTORY: &str = "0xc2d5a532cf69aa9a1378737d8ccdef884b6e7420";
+pub const SEPOLIA_SWAP_FACTORY: &str = "0x0fF044F6bB4F684a5A149B46D7eC03ea659F98A1";
+
+/// The factory for a chain, or `None` if we have no vetted address for it —
+/// in which case metered mode must not run, rather than fall back to
+/// something the client names.
+pub fn swap_factory_for_chain(chain_id: u64) -> Option<Address> {
+    let s = match chain_id {
+        100 => GNOSIS_SWAP_FACTORY,
+        11155111 => SEPOLIA_SWAP_FACTORY,
+        _ => return None,
+    };
+    s.parse().ok()
+}
+
+/// What the relay needs to know about a chequebook to accept a cheque
+/// drawn on it.
+#[derive(Debug, Clone, Copy)]
+pub struct ChequebookState {
+    pub issuer: Address,
+    /// Everything this beneficiary could actually cash right now.
+    pub liquid_for_us: U256,
+    /// Already cashed by this beneficiary; the cheque's cumulative must
+    /// exceed it or there is nothing left to draw.
+    pub paid_out_to_us: U256,
+    /// Set permanently, contract-wide, the first time any cheque could not
+    /// be paid in full. Readable state rather than an event you had to have
+    /// been watching for (incentives §11.2).
+    pub bounced: bool,
+}
+
+/// Is this address a chequebook the canonical factory deployed?
+///
+/// Cache this forever per address on a `true`, and negative-cache a `false`
+/// — it is the first chain read an unauthenticated `/v1/pay` can reach, so
+/// an uncached miss is a one-RPC-per-request amplifier (incentives §11.6).
+pub async fn is_deployed_chequebook(
+    rpc_url: &str,
+    factory: Address,
+    chequebook: Address,
+) -> Result<bool, BatchError> {
+    EthRpc::new(rpc_url.to_string())
+        .call_view(factory, deployedContractsCall { who: chequebook })
+        .await
+}
+
+/// Read the four values that decide whether a cheque is worth anything.
+///
+/// `issuer` is cacheable per chequebook — it cannot change — but the balance
+/// and `paidOut` are not: they *are* the funding check, and caching them is
+/// what would let the withdraw race (§11.2) go unnoticed.
+pub async fn read_chequebook_state(
+    rpc_url: &str,
+    chequebook: Address,
+    beneficiary: Address,
+) -> Result<ChequebookState, BatchError> {
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let issuer = rpc.call_view(chequebook, issuerCall {}).await?;
+    let liquid_for_us = rpc
+        .call_view(
+            chequebook,
+            liquidBalanceForCall {
+                beneficiary,
+            },
+        )
+        .await?;
+    let paid_out_to_us = rpc
+        .call_view(chequebook, paidOutCall { beneficiary })
+        .await?;
+    let bounced = rpc.call_view(chequebook, bouncedCall {}).await?;
+    Ok(ChequebookState {
+        issuer,
+        liquid_for_us,
+        paid_out_to_us,
+        bounced,
+    })
+}
+
+#[cfg(test)]
+mod chequebook_binding_tests {
+    use super::*;
+
+    /// Selectors are what the node dispatches on, so a wrong one silently
+    /// reads a *different* function rather than failing. Pinned against
+    /// `keccak256(signature)[..4]`.
+    #[test]
+    fn selectors_match_the_solidity_signatures() {
+        use alloy_sol_types::SolCall;
+        for (got, sig) in [
+            (issuerCall::SELECTOR, "issuer()"),
+            (paidOutCall::SELECTOR, "paidOut(address)"),
+            (bouncedCall::SELECTOR, "bounced()"),
+            (liquidBalanceForCall::SELECTOR, "liquidBalanceFor(address)"),
+            (deployedContractsCall::SELECTOR, "deployedContracts(address)"),
+        ] {
+            let want: [u8; 32] = <sha3::Keccak256 as sha3::Digest>::digest(sig.as_bytes()).into();
+            assert_eq!(got, want[..4], "selector drift for {sig}");
+        }
+    }
+
+    /// A relay must never accept a factory address from the wire, and must
+    /// refuse to run metered on a chain it has no vetted factory for.
+    #[test]
+    fn only_known_chains_have_a_factory() {
+        assert!(swap_factory_for_chain(100).is_some(), "gnosis");
+        assert!(swap_factory_for_chain(11155111).is_some(), "sepolia");
+        assert!(swap_factory_for_chain(1).is_none(), "mainnet: no vetted factory");
+        assert!(swap_factory_for_chain(31337).is_none(), "local devnet");
     }
 }
