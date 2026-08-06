@@ -1,0 +1,681 @@
+//! Client-side payment for metered lanes — `docs/pusher-incentives.md`
+//! Stage 1, client half.
+//!
+//! Four jobs, in the order a client meets them:
+//!
+//! 1. **Pin the lane.** Parse and *verify* the signed quote from
+//!    `/v1/status`, checking it against the identity in config rather than
+//!    trusting what the lane says about itself (§7.3).
+//! 2. **Get admitted.** Fetch a challenge, sign it, and carry the header on
+//!    every `/v1/push` and `/v1/pay`.
+//! 3. **Size the POST.** The challenge returns the credit line; a body that
+//!    would exceed it is split rather than sent and refused (§7.2).
+//! 4. **Settle.** Track what is owed by the same arithmetic the relay uses,
+//!    and issue a cumulative cheque when it crosses `settle_every`.
+//!
+//! The client computes its bill from **bytes it sent**, not from anything
+//! the relay reports. That is the property §8 is built on, and it is why
+//! there is nothing here that verifies the relay's work: a disagreement is
+//! arithmetic, visible immediately, and settled by not paying.
+
+use crate::meter::Params;
+
+/// A lane's signed `payment` block, after verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaymentQuote {
+    pub beneficiary: [u8; 20],
+    /// Recovered from `sig`. **This is what a client pins**, not the
+    /// overlay — see [`PaymentQuote::verify`].
+    pub node_eth_address: [u8; 20],
+    pub overlay_nonce: [u8; 32],
+    pub origin: String,
+    pub chain_id: u64,
+    pub params: Params,
+    /// True when the relay enforces 402. Soft-mode lanes bill but serve.
+    pub hard_enforcement: bool,
+}
+
+/// What a client pins in config for a lane it is willing to pay.
+///
+/// `PUSHER_URLS` is already a hardcoded list, so carrying two more fields
+/// per entry costs nothing — and reading the beneficiary from `/v1/status`
+/// at runtime instead would mean paying whoever answers the URL.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LanePin {
+    pub node_eth_address: [u8; 20],
+    pub beneficiary: [u8; 20],
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum QuoteError {
+    #[error("quote field {0} missing or malformed")]
+    Field(&'static str),
+    #[error("quote signature does not verify: {0}")]
+    Signature(String),
+    #[error("quote signed by 0x{got} but this lane is pinned to 0x{want}")]
+    WrongSigner { got: String, want: String },
+    #[error("quote beneficiary 0x{got} is not the pinned 0x{want}")]
+    WrongBeneficiary { got: String, want: String },
+    #[error("advertised overlay does not derive from the signed identity")]
+    OverlayMismatch,
+    #[error("quote parameters are unusable: {0}")]
+    BadParams(String),
+    #[error("lane price {got} exceeds the client's ceiling {ceiling}")]
+    TooExpensive { got: u128, ceiling: u128 },
+}
+
+impl PaymentQuote {
+    /// Parse and verify a `/v1/status` `payment` block.
+    ///
+    /// `advertised_overlay` is the lane's own `overlay` field. Checking that
+    /// it derives from the *signed* identity is what makes the overlay
+    /// trustworthy at all: an overlay is
+    /// `keccak(eth_addr ‖ network_id_LE8 ‖ nonce)`, so a signature alone
+    /// yields the eth address while the nonce is neither transmitted nor
+    /// derivable — which is why "pin `(url, overlay)`" was never
+    /// implementable and the pin is on the address.
+    pub fn verify(
+        payment: &serde_json::Value,
+        advertised_overlay: Option<&[u8; 32]>,
+        network_id: u64,
+        pin: Option<&LanePin>,
+        price_ceiling_plur_per_kib: u128,
+    ) -> Result<Self, QuoteError> {
+        let sig_hex = payment
+            .get("sig")
+            .and_then(|s| s.as_str())
+            .ok_or(QuoteError::Field("sig"))?;
+        let sig = hex::decode(sig_hex.trim_start_matches("0x"))
+            .map_err(|e| QuoteError::Signature(e.to_string()))?;
+
+        // The relay signs the block *without* `sig`, and `serde_json`'s map
+        // is a `BTreeMap`, so re-serializing after removing that one field
+        // reproduces the signed bytes exactly.
+        let mut unsigned = payment.clone();
+        unsigned
+            .as_object_mut()
+            .ok_or(QuoteError::Field("payment"))?
+            .remove("sig");
+        let payload = unsigned.to_string();
+        let node_eth_address =
+            crate::signer::recover_eth_address_from_eip191(payload.as_bytes(), &sig)
+                .map_err(|e| QuoteError::Signature(e.to_string()))?;
+
+        let addr = |k: &'static str| -> Result<[u8; 20], QuoteError> {
+            let s = payment.get(k).and_then(|x| x.as_str()).ok_or(QuoteError::Field(k))?;
+            let raw = hex::decode(s.trim_start_matches("0x")).map_err(|_| QuoteError::Field(k))?;
+            <[u8; 20]>::try_from(raw.as_slice()).map_err(|_| QuoteError::Field(k))
+        };
+        let plur = |k: &'static str| -> Result<u128, QuoteError> {
+            payment
+                .get(k)
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or(QuoteError::Field(k))
+        };
+
+        let beneficiary = addr("beneficiary")?;
+        let claimed_node = addr("node_eth_address")?;
+        if claimed_node != node_eth_address {
+            return Err(QuoteError::WrongSigner {
+                got: hex::encode(node_eth_address),
+                want: hex::encode(claimed_node),
+            });
+        }
+        let overlay_nonce = {
+            let s = payment
+                .get("overlay_nonce")
+                .and_then(|x| x.as_str())
+                .ok_or(QuoteError::Field("overlay_nonce"))?;
+            let raw =
+                hex::decode(s.trim_start_matches("0x")).map_err(|_| QuoteError::Field("overlay_nonce"))?;
+            <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| QuoteError::Field("overlay_nonce"))?
+        };
+
+        // Pinning is the actual root of trust (§2): the lane URL over HTTPS
+        // plus an identity the client already knew.
+        if let Some(pin) = pin {
+            if pin.node_eth_address != node_eth_address {
+                return Err(QuoteError::WrongSigner {
+                    got: hex::encode(node_eth_address),
+                    want: hex::encode(pin.node_eth_address),
+                });
+            }
+            if pin.beneficiary != beneficiary {
+                return Err(QuoteError::WrongBeneficiary {
+                    got: hex::encode(beneficiary),
+                    want: hex::encode(pin.beneficiary),
+                });
+            }
+        }
+
+        if let Some(overlay) = advertised_overlay {
+            let derived = crate::signer::derive_overlay(&node_eth_address, network_id, &overlay_nonce);
+            if &derived != overlay {
+                return Err(QuoteError::OverlayMismatch);
+            }
+        }
+
+        let params = Params {
+            price_plur_per_kib: plur("price_plur_per_kib")?,
+            min_cheque_plur: plur("min_cheque_plur")?,
+            settle_every_plur: plur("settle_every_plur")?,
+            max_outstanding_plur: plur("max_outstanding_plur")?,
+            credit_ratio: payment
+                .get("credit_ratio")
+                .and_then(|x| x.as_u64())
+                .map(u128::from)
+                .ok_or(QuoteError::Field("credit_ratio"))?,
+        };
+        // A lane whose parameters violate §10.1's invariant would brick this
+        // client, so refuse it here rather than discovering it at the first
+        // 402 with no cheque able to clear it.
+        params.validate().map_err(QuoteError::BadParams)?;
+        if params.price_plur_per_kib > price_ceiling_plur_per_kib {
+            return Err(QuoteError::TooExpensive {
+                got: params.price_plur_per_kib,
+                ceiling: price_ceiling_plur_per_kib,
+            });
+        }
+
+        Ok(Self {
+            beneficiary,
+            node_eth_address,
+            overlay_nonce,
+            origin: payment
+                .get("origin")
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            chain_id: payment
+                .get("chain_id")
+                .and_then(|x| x.as_u64())
+                .ok_or(QuoteError::Field("chain_id"))?,
+            params,
+            hard_enforcement: payment.get("enforcement").and_then(|x| x.as_str()) == Some("hard"),
+        })
+    }
+}
+
+/// A challenge the relay issued, ready to sign.
+#[derive(Debug, Clone)]
+pub struct OfferedChallenge {
+    pub nonce: [u8; 32],
+    pub account: [u8; 20],
+    pub batch: [u8; 32],
+    pub origin: String,
+    pub expiry_unix: u64,
+    pub cap_plur: u128,
+}
+
+impl OfferedChallenge {
+    pub fn parse(v: &serde_json::Value) -> Result<Self, String> {
+        let fixed = |k: &str, n: usize| -> Result<Vec<u8>, String> {
+            let s = v
+                .get(k)
+                .and_then(|x| x.as_str())
+                .ok_or_else(|| format!("challenge: missing {k}"))?;
+            let raw = hex::decode(s.trim_start_matches("0x"))
+                .map_err(|e| format!("challenge {k}: {e}"))?;
+            if raw.len() != n {
+                return Err(format!("challenge {k}: want {n} bytes, got {}", raw.len()));
+            }
+            Ok(raw)
+        };
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&fixed("nonce", 32)?);
+        let mut account = [0u8; 20];
+        account.copy_from_slice(&fixed("account", 20)?);
+        let mut batch = [0u8; 32];
+        batch.copy_from_slice(&fixed("batch", 32)?);
+        Ok(Self {
+            nonce,
+            account,
+            batch,
+            origin: v
+                .get("origin")
+                .and_then(|x| x.as_str())
+                .ok_or("challenge: missing origin")?
+                .to_string(),
+            expiry_unix: v
+                .get("expiry")
+                .and_then(|x| x.as_u64())
+                .ok_or("challenge: missing expiry")?,
+            cap_plur: v
+                .get("max_outstanding_plur")
+                .and_then(|x| x.as_str())
+                .and_then(|s| s.parse().ok())
+                .ok_or("challenge: missing max_outstanding_plur")?,
+        })
+    }
+
+    /// Sign it and produce the header value.
+    ///
+    /// Signing binds `origin`, which is what makes this header useless at
+    /// any other relay even if it is observed in flight (§11.1).
+    pub fn sign(
+        &self,
+        signer: &crate::signer::SwarmSigner,
+        chain_id: u64,
+    ) -> Result<String, String> {
+        let sol = crate::signer::PushChallenge {
+            nonce: alloy_primitives::B256::from(self.nonce),
+            origin: self.origin.clone(),
+            account: alloy_primitives::Address::from(self.account),
+            batchId: alloy_primitives::B256::from(self.batch),
+            expiry: alloy_primitives::U256::from(self.expiry_unix),
+        };
+        let sig = signer
+            .sign_push_challenge(&sol, chain_id)
+            .map_err(|e| e.to_string())?;
+        let issued = crate::metered::IssuedChallenge {
+            fields: crate::challenge::ChallengeFields {
+                account: self.account,
+                batch: self.batch,
+                origin: self.origin.clone(),
+                expiry_unix: self.expiry_unix,
+                cap_plur: self.cap_plur,
+            },
+            nonce: self.nonce,
+        };
+        Ok(crate::metered::encode_challenge_header(&issued, &sig))
+    }
+
+    /// Re-fetch before this, rather than racing the expiry with a POST in
+    /// flight. A challenge is cheap; a mid-upload 401 is not.
+    pub fn stale_after(&self) -> u64 {
+        self.expiry_unix.saturating_sub(30)
+    }
+}
+
+/// Per-lane running total, tracked by the client from bytes it sent.
+#[derive(Debug, Clone)]
+pub struct LaneAccount {
+    pub params: Params,
+    pub beneficiary: [u8; 20],
+    /// Billed and not yet covered by a cheque.
+    owed_plur: u128,
+    /// Total already promised to this beneficiary. Cheques are cumulative,
+    /// so this only grows.
+    cumulative_plur: u128,
+}
+
+impl LaneAccount {
+    pub fn new(params: Params, beneficiary: [u8; 20]) -> Self {
+        Self {
+            params,
+            beneficiary,
+            owed_plur: 0,
+            cumulative_plur: 0,
+        }
+    }
+
+    /// Restore the cumulative from the on-disk store, so a second CLI run
+    /// does not issue a cheque the relay rejects as non-increasing.
+    pub fn with_cumulative(mut self, cumulative_plur: u128) -> Self {
+        self.cumulative_plur = cumulative_plur;
+        self
+    }
+
+    pub fn owed(&self) -> u128 {
+        self.owed_plur
+    }
+
+    pub fn cumulative(&self) -> u128 {
+        self.cumulative_plur
+    }
+
+    /// Record a POST body we sent. Same arithmetic as the relay's (§8), so
+    /// the two sides agree without exchanging anything.
+    pub fn record_sent(&mut self, body_bytes: u64) {
+        self.owed_plur = self
+            .owed_plur
+            .saturating_add(self.params.price_bytes(body_bytes));
+    }
+
+    /// A dedup hit costs nothing, so give it back when the ack says so
+    /// (§8.2). The relay's claim only ever lowers the bill, so believing it
+    /// is safe.
+    pub fn refund_dedup(&mut self, body_bytes: u64) {
+        self.owed_plur = self
+            .owed_plur
+            .saturating_sub(self.params.price_bytes(body_bytes));
+    }
+
+    pub fn should_settle(&self) -> bool {
+        self.owed_plur >= self.params.settle_every_plur
+    }
+
+    /// The cumulative for the next cheque, or `None` when what is owed is
+    /// still under the lane's dust floor and would be refused.
+    pub fn next_cumulative(&self) -> Option<u128> {
+        if self.owed_plur < self.params.min_cheque_plur {
+            return None;
+        }
+        Some(self.cumulative_plur.saturating_add(self.owed_plur))
+    }
+
+    /// Call once a cheque for `cumulative` has been accepted.
+    pub fn settled(&mut self, cumulative: u128) {
+        let credited = cumulative.saturating_sub(self.cumulative_plur);
+        self.cumulative_plur = cumulative;
+        self.owed_plur = self.owed_plur.saturating_sub(credited);
+    }
+
+    /// Largest body this lane will admit right now, in bytes.
+    ///
+    /// The client sizes its POST to fit rather than discovering the ceiling
+    /// as a 402 — which matters most for exactly the small batches §10.3
+    /// exists to keep, whose whole credit line is under one full POST.
+    pub fn max_body_bytes(&self, cap_plur: u128) -> u64 {
+        let headroom = cap_plur.saturating_sub(self.owed_plur);
+        let kib = headroom / self.params.price_plur_per_kib.max(1);
+        (kib.saturating_mul(1024)).min(u64::MAX as u128) as u64
+    }
+}
+
+/// Aggregate exposure across every beneficiary drawn on one chequebook.
+///
+/// Cumulative payouts are per `(chequebook, beneficiary)`, so N lanes are N
+/// independent claims on **one** balance. Without this a cheque to the
+/// second lane silently exceeds it and bounces — and §11.3's Sybil case is
+/// exactly one operator presenting several beneficiaries.
+#[derive(Debug, Default, Clone)]
+pub struct TotalIssued {
+    per_beneficiary: std::collections::BTreeMap<[u8; 20], u128>,
+}
+
+impl TotalIssued {
+    pub fn total(&self) -> u128 {
+        self.per_beneficiary.values().copied().sum()
+    }
+
+    pub fn issued_to(&self, beneficiary: &[u8; 20]) -> u128 {
+        self.per_beneficiary.get(beneficiary).copied().unwrap_or(0)
+    }
+
+    /// Would raising this beneficiary's cumulative to `cumulative` push the
+    /// total past the chequebook's balance?
+    pub fn would_exceed(&self, beneficiary: &[u8; 20], cumulative: u128, balance: u128) -> bool {
+        let others = self.total() - self.issued_to(beneficiary);
+        others.saturating_add(cumulative) > balance
+    }
+
+    pub fn record(&mut self, beneficiary: [u8; 20], cumulative: u128) {
+        let e = self.per_beneficiary.entry(beneficiary).or_insert(0);
+        // Cumulatives only grow; a lower value is a stale report, not a
+        // refund.
+        if cumulative > *e {
+            *e = cumulative;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::signer::SwarmSigner;
+
+    const KEY: &str = "0x4c0883a69102937d6231471b5dbb6204fe5129617082792ae468d01a3f362318";
+    const NONCE: [u8; 32] = [0u8; 32];
+
+    fn node() -> SwarmSigner {
+        SwarmSigner::from_hex_with_nonce(KEY, &format!("0x{}", hex::encode(NONCE)), 1).expect("key")
+    }
+
+    /// Build a quote exactly the way the relay does, so the test exercises
+    /// the real signed bytes rather than a hand-rolled approximation.
+    fn quote_json(beneficiary: [u8; 20]) -> serde_json::Value {
+        let n = node();
+        let p = Params::default();
+        let mut body = serde_json::json!({
+            "mode": "metered",
+            "enforcement": "soft",
+            "beneficiary": format!("0x{}", hex::encode(beneficiary)),
+            "node_eth_address": format!("0x{}", hex::encode(n.eth_address())),
+            "overlay_nonce": format!("0x{}", hex::encode(NONCE)),
+            "origin": "relay-a.example",
+            "chain_id": 100,
+            "factory": format!("0x{}", hex::encode([0u8; 20])),
+            "price_plur_per_kib": p.price_plur_per_kib.to_string(),
+            "min_cheque_plur": p.min_cheque_plur.to_string(),
+            "settle_every_plur": p.settle_every_plur.to_string(),
+            "max_outstanding_plur": p.max_outstanding_plur.to_string(),
+            "credit_ratio": p.credit_ratio as u64,
+            "challenge_ttl_secs": 300,
+        });
+        let sig = n.sign_eip191(body.to_string().as_bytes()).expect("sign");
+        body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
+        body
+    }
+
+    fn ceiling() -> u128 {
+        Params::default().price_plur_per_kib * 4
+    }
+
+    #[test]
+    fn a_signed_quote_verifies_and_yields_the_signing_identity() {
+        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling())
+            .expect("must verify");
+        assert_eq!(q.node_eth_address, *node().eth_address());
+        assert_eq!(q.beneficiary, [3u8; 20]);
+        assert_eq!(q.params, Params::default());
+        assert!(!q.hard_enforcement);
+    }
+
+    /// The reason the pin is on the address and the nonce is published:
+    /// the client can now check the lane's overlay claim instead of taking
+    /// it on faith.
+    #[test]
+    fn the_advertised_overlay_must_derive_from_the_signed_identity() {
+        let good = crate::signer::derive_overlay(node().eth_address(), 1, &NONCE);
+        PaymentQuote::verify(&quote_json([3u8; 20]), Some(&good), 1, None, ceiling())
+            .expect("a derivable overlay verifies");
+        assert_eq!(
+            PaymentQuote::verify(&quote_json([3u8; 20]), Some(&[9u8; 32]), 1, None, ceiling()),
+            Err(QuoteError::OverlayMismatch)
+        );
+    }
+
+    /// Tampering with any signed field must break the signature — otherwise
+    /// a lane could serve one price and bill another.
+    #[test]
+    fn tampering_with_the_quote_breaks_it() {
+        for field in ["price_plur_per_kib", "beneficiary", "origin", "chain_id"] {
+            let mut q = quote_json([3u8; 20]);
+            q[field] = match field {
+                "price_plur_per_kib" => serde_json::json!("1"),
+                "beneficiary" => serde_json::json!(format!("0x{}", hex::encode([0xAAu8; 20]))),
+                "origin" => serde_json::json!("evil.example"),
+                _ => serde_json::json!(1u64),
+            };
+            assert!(
+                PaymentQuote::verify(&q, None, 1, None, ceiling()).is_err(),
+                "tampering with {field} must be caught"
+            );
+        }
+    }
+
+    /// The root of trust: an identity the client already knew, not one the
+    /// lane asserts about itself.
+    #[test]
+    fn a_quote_from_an_unpinned_identity_is_refused() {
+        let pin = LanePin {
+            node_eth_address: [0xEE; 20],
+            beneficiary: [3u8; 20],
+        };
+        let e = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, Some(&pin), ceiling())
+            .expect_err("must refuse");
+        assert!(matches!(e, QuoteError::WrongSigner { .. }), "got {e:?}");
+    }
+
+    /// §11.3: a correctly-signed relay advertising someone else's
+    /// beneficiary must not be paid.
+    #[test]
+    fn a_quote_with_an_unpinned_beneficiary_is_refused() {
+        let pin = LanePin {
+            node_eth_address: *node().eth_address(),
+            beneficiary: [3u8; 20],
+        };
+        let e = PaymentQuote::verify(&quote_json([0xBB; 20]), None, 1, Some(&pin), ceiling())
+            .expect_err("must refuse");
+        assert!(matches!(e, QuoteError::WrongBeneficiary { .. }), "got {e:?}");
+    }
+
+    #[test]
+    fn an_overpriced_or_bricking_lane_is_refused() {
+        let e = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, 1)
+            .expect_err("price ceiling");
+        assert!(matches!(e, QuoteError::TooExpensive { .. }), "got {e:?}");
+
+        // A lane whose dust floor exceeds its settlement window would brick
+        // this client with no cheque able to clear the 402.
+        let n = node();
+        let mut body = quote_json([3u8; 20]);
+        body["min_cheque_plur"] =
+            serde_json::json!((Params::default().settle_every_plur * 87).to_string());
+        let mut unsigned = body.clone();
+        unsigned.as_object_mut().unwrap().remove("sig");
+        let sig = n.sign_eip191(unsigned.to_string().as_bytes()).expect("sign");
+        body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
+        let e = PaymentQuote::verify(&body, None, 1, None, ceiling()).expect_err("bricking lane");
+        assert!(matches!(e, QuoteError::BadParams(_)), "got {e:?}");
+    }
+
+    #[test]
+    fn a_challenge_round_trips_into_a_header_the_relay_accepts() {
+        use crate::ledger::Ledger;
+        use crate::metered::{MeterConfig, Metered};
+        let acct_signer = node();
+        let account = *acct_signer.eth_address();
+        let m = Metered::new(
+            MeterConfig {
+                origins: vec!["relay-a.example".into()],
+                beneficiary: [3u8; 20],
+                chain_id: 100,
+                factory: alloy_primitives::Address::ZERO,
+                params: Params::default(),
+                hard_mode: false,
+            },
+            Ledger::ephemeral(),
+        );
+        let issued = m
+            .issue(account, [7u8; 32], 6_200_000_000_000_000_000, "relay-a.example", 1000)
+            .expect("issue");
+        // Straight through the wire form the relay actually serves.
+        let offered = OfferedChallenge::parse(&issued.to_json()).expect("parse");
+        let header = offered.sign(&acct_signer, 100).expect("sign");
+        let v = m.verify_header(&header, 1000).expect("relay must accept");
+        assert_eq!(v.account, account);
+        assert_eq!(v.batch, [7u8; 32]);
+    }
+
+    #[test]
+    fn owed_tracks_bytes_sent_and_a_cheque_clears_it() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(32 * 1024 * 1024);
+        assert_eq!(a.owed(), p.price_bytes(32 * 1024 * 1024));
+        assert!(a.should_settle(), "32 MiB crosses the settlement window");
+        let c = a.next_cumulative().expect("above the dust floor");
+        a.settled(c);
+        assert_eq!(a.owed(), 0);
+        assert_eq!(a.cumulative(), c);
+    }
+
+    /// Cheques are cumulative, so a second upload adds to the same running
+    /// total rather than starting over — which is what a relay's
+    /// monotonicity check requires.
+    #[test]
+    fn a_second_upload_grows_the_same_cumulative() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(40 * 1024 * 1024);
+        let first = a.next_cumulative().expect("cheque");
+        a.settled(first);
+        a.record_sent(40 * 1024 * 1024);
+        let second = a.next_cumulative().expect("cheque");
+        assert!(second > first, "cumulative must increase: {second} > {first}");
+        assert_eq!(second - first, p.price_bytes(40 * 1024 * 1024));
+    }
+
+    #[test]
+    fn a_cumulative_restored_from_disk_keeps_increasing() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]).with_cumulative(5_000_000_000_000_000);
+        a.record_sent(40 * 1024 * 1024);
+        let c = a.next_cumulative().expect("cheque");
+        assert!(
+            c > 5_000_000_000_000_000,
+            "a fresh run must not re-issue below what a previous run already sent"
+        );
+    }
+
+    #[test]
+    fn dust_owings_do_not_produce_a_cheque_the_relay_would_refuse() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(1024);
+        assert!(!a.should_settle());
+        assert_eq!(a.next_cumulative(), None, "below the lane's dust floor");
+    }
+
+    #[test]
+    fn dedup_hits_are_refunded() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(100 * 4251);
+        let before = a.owed();
+        a.refund_dedup(10 * 4251);
+        assert!(a.owed() < before);
+    }
+
+    /// §7.2: size the POST to the credit line instead of discovering the
+    /// ceiling as a 402. A dust batch gets a small but usable body.
+    #[test]
+    fn post_size_is_bounded_by_the_credit_line() {
+        let p = Params::default();
+        let a = LaneAccount::new(p, [3u8; 20]);
+        let dust_cap = p.credit_line(100_000_000_000_000);
+        let max = a.max_body_bytes(dust_cap);
+        assert_eq!(max, 208 * 1024, "~208 KiB, matching the credit line");
+        assert!(max >= 4251, "and still enough for at least one frame");
+        // A rich batch is bounded by the global ceiling instead.
+        let rich = a.max_body_bytes(p.max_outstanding_plur);
+        assert!(rich > 512 * 4251, "a full POST fits comfortably");
+    }
+
+    #[test]
+    fn headroom_shrinks_as_debt_accrues() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        let cap = p.max_outstanding_plur;
+        let before = a.max_body_bytes(cap);
+        a.record_sent(64 * 1024 * 1024);
+        assert!(a.max_body_bytes(cap) < before, "unpaid debt eats the line");
+    }
+
+    /// N lanes are N claims on one balance. The client must see the sum, or
+    /// the second cheque bounces.
+    #[test]
+    fn total_issued_aggregates_across_beneficiaries() {
+        let mut t = TotalIssued::default();
+        t.record([1u8; 20], 600);
+        t.record([2u8; 20], 300);
+        assert_eq!(t.total(), 900);
+        assert!(!t.would_exceed(&[1u8; 20], 700, 1000), "700 + 300 fits");
+        assert!(t.would_exceed(&[1u8; 20], 800, 1000), "800 + 300 does not");
+        assert!(
+            !t.would_exceed(&[3u8; 20], 100, 1000),
+            "a new beneficiary is checked against the others' total"
+        );
+    }
+
+    #[test]
+    fn a_stale_cumulative_report_never_lowers_the_total() {
+        let mut t = TotalIssued::default();
+        t.record([1u8; 20], 600);
+        t.record([1u8; 20], 100);
+        assert_eq!(t.total(), 600, "cumulatives only grow");
+    }
+}

@@ -507,6 +507,70 @@ enum Commands {
             value_name = "URL"
         )]
         rpc_url: String,
+
+        // ── Metered mode (docs/pusher-incentives.md Stage 1) ──────────
+        /// Bill clients for relayed bytes with off-chain SWAP cheques.
+        /// Off by default: `open` is today's unmetered behaviour and is
+        /// what the production lanes run.
+        #[arg(long)]
+        meter: bool,
+
+        /// Hostname(s) this relay is reached at. **Required with
+        /// `--meter`.** The admission challenge binds the origin a client
+        /// dialled, and the relay compares it against *this* value — never
+        /// against the `Host` header, which the same client supplies and
+        /// which would make the check a no-op that silently reopens
+        /// cross-relay replay.
+        #[arg(long, value_name = "HOST")]
+        origin: Vec<String>,
+
+        /// EOA that cheques are made out to. The relay holds this address
+        /// only, never the key: cashing out happens elsewhere.
+        #[arg(long, value_name = "0xADDR")]
+        beneficiary: Option<String>,
+
+        /// Settlement chain. Pins the EIP-712 domain and selects the
+        /// hardcoded SimpleSwapFactory; a chain with no vetted factory
+        /// cannot run metered.
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chequebook_chain: u64,
+
+        /// Directory for the ledger and relay secret. **Required with
+        /// `--meter`**: without durable state a client re-presents its
+        /// last cheque after every restart and is credited the full
+        /// cumulative again, which is unlimited free service from one
+        /// signature.
+        #[arg(long, value_name = "DIR")]
+        state_dir: Option<std::path::PathBuf>,
+
+        /// PLUR per KiB of body admitted.
+        #[arg(long, value_name = "PLUR")]
+        price_plur_per_kib: Option<u128>,
+
+        /// Smallest cheque accepted, to bound RPC cost per unit of value.
+        #[arg(long, value_name = "PLUR")]
+        min_cheque_plur: Option<u128>,
+
+        /// Debt at which a client is expected to settle.
+        #[arg(long, value_name = "PLUR")]
+        settle_every_plur: Option<u128>,
+
+        /// Global ceiling on a credit line. The actual cap is per batch:
+        /// `min(batch_remaining_value / credit_ratio, this)`.
+        #[arg(long, value_name = "PLUR")]
+        max_outstanding_plur: Option<u128>,
+
+        /// Credit line = batch remaining on-chain value ÷ this. The Sybil
+        /// margin is this ratio by construction, independent of batch size.
+        #[arg(long, value_name = "N")]
+        credit_ratio: Option<u128>,
+
+        /// Enforce 402 when an account is over its cap. Default is soft
+        /// mode: meter, report, and serve anyway — which is what Stage 1
+        /// ships, so the overshoot rate can be measured against live
+        /// traffic before anyone is refused.
+        #[arg(long)]
+        meter_hard: bool,
     },
 
     /// Run a long-lived daemon that holds a warm session pool across
@@ -2063,6 +2127,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             peerlist,
             probe,
             rpc_url,
+            meter,
+            origin,
+            beneficiary,
+            chequebook_chain,
+            state_dir,
+            price_plur_per_kib,
+            min_cheque_plur,
+            settle_every_plur,
+            max_outstanding_plur,
+            credit_ratio,
+            meter_hard,
         } => {
             // Premined overlay nonce. On ephemeral-FS hosts (Render,
             // Lambda) there is no persistent `--nonce-file`, so a random
@@ -2092,6 +2167,49 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let node_identity = std::env::var("HOVERFLY_PUSHER_IDENTITY")
                 .ok()
                 .filter(|s| !s.trim().is_empty());
+            // Metered mode is all-or-nothing: every precondition is checked
+            // here and in `build_metered`, and a failure refuses to start
+            // rather than serving a half-configured meter that a paying
+            // client would discover the hard way.
+            let meter_opts = if meter {
+                let mut params = hoverfly::meter::Params::default();
+                if let Some(v) = price_plur_per_kib {
+                    params.price_plur_per_kib = v;
+                }
+                if let Some(v) = min_cheque_plur {
+                    params.min_cheque_plur = v;
+                }
+                if let Some(v) = settle_every_plur {
+                    params.settle_every_plur = v;
+                }
+                if let Some(v) = max_outstanding_plur {
+                    params.max_outstanding_plur = v;
+                }
+                if let Some(v) = credit_ratio {
+                    params.credit_ratio = v;
+                }
+                let beneficiary = beneficiary
+                    .as_deref()
+                    .ok_or("--meter requires --beneficiary")?;
+                let raw = hex::decode(beneficiary.trim_start_matches("0x"))
+                    .map_err(|e| format!("--beneficiary: {e}"))?;
+                if raw.len() != 20 {
+                    return Err("--beneficiary must be a 20-byte address".into());
+                }
+                let mut b = [0u8; 20];
+                b.copy_from_slice(&raw);
+                Some(hoverfly::pusher::MeterOpts {
+                    origins: origin,
+                    beneficiary: b,
+                    chain_id: chequebook_chain,
+                    params,
+                    state_dir: state_dir
+                        .ok_or("--meter requires --state-dir (durable state is mandatory)")?,
+                    hard_mode: meter_hard,
+                })
+            } else {
+                None
+            };
             hoverfly::pusher::run(hoverfly::pusher::PusherOpts {
                 listen,
                 peerlist,
@@ -2101,6 +2219,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 rpc_url,
                 node_identity,
                 transport: cfg,
+                meter: meter_opts,
             })
             .await?;
         }
