@@ -2765,6 +2765,29 @@ where
             _ => None,
         });
     }
+    // Size POSTs to the credit line before scheduling anything (§7.2). A
+    // body larger than the whole line can never be admitted however
+    // promptly we settle, so building one guarantees a 402 the client
+    // cannot pay its way out of — it would owe nothing, having had nothing
+    // accepted.
+    let mut infos = infos;
+    if let Some(pc) = payment {
+        for (i, payer) in payers.iter_mut().enumerate() {
+            let Some(payer) = payer.as_mut() else { continue };
+            if let Err(e) = payer.header(&http, pc).await {
+                warn!(target: "hoverfly::upload",
+                    "lane {i}: no challenge ({e}); scheduling it unpaid");
+                continue;
+            }
+            let fits = payer.max_frames();
+            let before = infos[i].batch_max.unwrap_or(usize::MAX);
+            if fits < before {
+                info!(target: "hoverfly::upload",
+                    "lane {i}: credit line allows {fits} frames/POST (was {before})");
+                infos[i].batch_max = Some(fits);
+            }
+        }
+    }
     let mut sched = Scheduler::new(infos, cfg);
     // Frames are held by address, not by index: `admit` de-duplicates, so an
     // index-parallel Vec would silently skew. Keying by address also lets a
@@ -2845,6 +2868,20 @@ where
             // anything.
             let mut challenge: Option<String> = None;
             if let (Some(pc), Some(payer)) = (payment, payers[lane].as_mut()) {
+                let body_bytes: u64 = batch
+                    .iter()
+                    .map(|c| (crate::pushframe::HEADER_LEN + c.wire.len()) as u64)
+                    .sum();
+                // Pay first if this body would not fit. Settling on the
+                // window alone is not enough: several POSTs dispatch
+                // concurrently, so the cap can be crossed before any of
+                // them completes and reports back.
+                if payer.would_exceed(body_bytes)
+                    && let Err(e) = payer.settle(&http, pc).await
+                {
+                    warn!(target: "hoverfly::upload",
+                        "lane {lane}: pre-dispatch settle failed: {e}");
+                }
                 match payer.header(&http, pc).await {
                     Ok(h) => challenge = Some(h.to_string()),
                     Err(e) => {
@@ -2858,8 +2895,6 @@ where
                         continue;
                     }
                 }
-                let body_bytes: u64 =
-                    batch.iter().map(|c| (crate::pushframe::HEADER_LEN + c.wire.len()) as u64).sum();
                 payer.account.record_sent(body_bytes);
             }
             tokio::spawn(async move {
@@ -3080,6 +3115,23 @@ pub async fn push_stream_via_pushers(
     mut streamer: UploadStreamer,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
+    push_stream_via_pushers_paid(pusher_urls, streamer, progress, None).await
+}
+
+/// As [`push_stream_via_pushers`], but able to pay metered lanes.
+///
+/// `payment` is `None` for every `open` lane, which is the default and the
+/// only thing production runs today. When present, the driver fetches a
+/// challenge per lane, bills itself by the same arithmetic the relay uses,
+/// and settles with a cumulative cheque when the lane's window is crossed
+/// or it answers 402 (`docs/pusher-incentives.md` §12).
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn push_stream_via_pushers_paid(
+    pusher_urls: &[String],
+    mut streamer: UploadStreamer,
+    progress: Option<&ProgressFn>,
+    payment: Option<&crate::payer::PaymentConfig>,
+) -> Result<ChunkAddress, ClientError> {
     let root = streamer.root();
     let total = streamer.total_chunks();
     drive_pushers(
@@ -3087,7 +3139,7 @@ pub async fn push_stream_via_pushers(
         total,
         move |want| streamer.next_batch(want),
         progress,
-        None,
+        payment,
     )
     .await?;
     Ok(root)

@@ -1205,3 +1205,209 @@ mod chequebook_binding_tests {
         assert!(swap_factory_for_chain(31337).is_none(), "local devnet");
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Chequebook deployment (docs/pusher-incentives.md §14)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    // SimpleSwapFactory.deploySimpleSwap(issuer, defaultHardDepositTimeoutDuration, salt)
+    function deploySimpleSwap(
+        address issuer,
+        uint256 defaultHardDepositTimeoutDuration,
+        bytes32 salt
+    ) external returns (address);
+
+    event SimpleSwapDeployed(address contractAddress);
+
+    function transfer(address to, uint256 amount) external returns (bool);
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployChequebookParams {
+    pub rpc_url: String,
+    pub chain_id: u64,
+    pub factory: Address,
+    /// Must be the **batch owner's** address (§6): a relay only accepts a
+    /// cheque whose chequebook `issuer()` equals the account it billed.
+    pub issuer: Address,
+    pub receipt_timeout: std::time::Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct DeployedChequebook {
+    pub address: Address,
+    pub tx: B256,
+    /// True when the address already held code before we sent anything —
+    /// the deploy is deterministic in `(issuer, timeout, salt)`, so a repeat
+    /// with the same salt would revert rather than make a second one.
+    pub already_deployed: bool,
+}
+
+/// Deploy a chequebook through bee's canonical factory.
+///
+/// **Deliberately its own command, never a side effect of an upload.**
+/// Deploying a contract is irreversible and spends real funds; an upload
+/// that did it silently because some lane quoted a price would fire on the
+/// first metered lane a user ever met, before they had decided they wanted
+/// to pay at all.
+///
+/// The hard-deposit timeout is **0**, matching what bee deploys
+/// (`init.go:169`). That means deposits are not actually locked — see
+/// §11.2 — but it keeps us byte-compatible with every bee chequebook, and
+/// a non-zero timeout can be set later per beneficiary via
+/// `setCustomHardDepositTimeout` if secured mode is ever wanted.
+pub async fn deploy_chequebook(
+    signer: &PrivateKeySigner,
+    params: DeployChequebookParams,
+) -> Result<DeployedChequebook, BatchError> {
+    let rpc = EthRpc::new(params.rpc_url.clone());
+
+    let mut salt_bytes = [0u8; 32];
+    getrandom::fill(&mut salt_bytes).map_err(|e| BatchError::Rpc(format!("getrandom: {e}")))?;
+    let salt = B256::from(salt_bytes);
+
+    let call = deploySimpleSwapCall {
+        issuer: params.issuer,
+        defaultHardDepositTimeoutDuration: U256::ZERO,
+        salt,
+    };
+
+    // Simulate first. The factory returns the address it *would* create, so
+    // a revert (bad issuer, salt collision) surfaces here for free instead
+    // of as a burnt transaction.
+    let predicted: Address = rpc.call_view(params.factory, call.clone()).await?;
+    let existing = rpc.code_len(predicted).await?;
+    if existing > 0 {
+        return Ok(DeployedChequebook {
+            address: predicted,
+            tx: B256::ZERO,
+            already_deployed: true,
+        });
+    }
+
+    let tx = rpc
+        .send_signed(signer, params.chain_id, params.factory, &call.abi_encode())
+        .await?;
+    rpc.wait_for_success(tx, params.receipt_timeout).await?;
+
+    // Trust the chain, not the simulation: read the address back out of the
+    // receipt's `SimpleSwapDeployed` log.
+    let deployed = rpc
+        .find_deployed_chequebook(tx)
+        .await?
+        .unwrap_or(predicted);
+
+    // The relay checks this before accepting any cheque (§6), so checking it
+    // here turns "your cheques are silently refused" into a deploy-time
+    // error.
+    let issuer: Address = rpc.call_view(deployed, issuerCall {}).await?;
+    if issuer != params.issuer {
+        return Err(BatchError::Rpc(format!(
+            "deployed chequebook {deployed} has issuer {issuer}, expected {}",
+            params.issuer
+        )));
+    }
+    Ok(DeployedChequebook {
+        address: deployed,
+        tx,
+        already_deployed: false,
+    })
+}
+
+/// Move BZZ into a chequebook. Plain ERC-20 transfer — the contract holds
+/// whatever balance the token says it does, and `liquidBalanceFor` is
+/// derived from it.
+pub async fn fund_chequebook(
+    signer: &PrivateKeySigner,
+    rpc_url: &str,
+    chain_id: u64,
+    bzz_token: Address,
+    chequebook: Address,
+    amount: U256,
+    receipt_timeout: std::time::Duration,
+) -> Result<B256, BatchError> {
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let from = signer.address();
+    let balance: U256 = rpc
+        .call_view(bzz_token, balanceOfCall { account: from })
+        .await?;
+    if balance < amount {
+        return Err(BatchError::InsufficientBalance {
+            have: balance,
+            need: amount,
+        });
+    }
+    // Refuse to fund something that is not a chequebook: a mistyped address
+    // sends BZZ somewhere unrecoverable.
+    let issuer: Address = rpc.call_view(chequebook, issuerCall {}).await.map_err(|e| {
+        BatchError::Rpc(format!(
+            "{chequebook} does not answer issuer() — is it a chequebook? ({e})"
+        ))
+    })?;
+    if issuer != from {
+        return Err(BatchError::Rpc(format!(
+            "chequebook {chequebook} is issued by {issuer}, not {from}: only the issuer \
+             can ever withdraw, so funding it would strand the deposit"
+        )));
+    }
+    let call = transferCall {
+        to: chequebook,
+        amount,
+    }
+    .abi_encode();
+    let tx = rpc
+        .send_signed(signer, chain_id, bzz_token, &call)
+        .await?;
+    rpc.wait_for_success(tx, receipt_timeout).await?;
+    Ok(tx)
+}
+
+impl EthRpc {
+    /// `eth_getCode` length, for "is there already a contract here".
+    async fn code_len(&self, addr: Address) -> Result<usize, BatchError> {
+        let hex_str: String = self
+            .raw("eth_getCode", (format!("0x{}", hex::encode(addr)), "latest"))
+            .await?;
+        Ok(hex_str.trim_start_matches("0x").len() / 2)
+    }
+
+    /// Pull the chequebook address out of a deploy receipt's logs.
+    async fn find_deployed_chequebook(&self, tx: B256) -> Result<Option<Address>, BatchError> {
+        let receipt: serde_json::Value = self
+            .raw(
+                "eth_getTransactionReceipt",
+                (format!("0x{}", hex::encode(tx)),),
+            )
+            .await?;
+        let topic = SimpleSwapDeployed::SIGNATURE_HASH;
+        let Some(logs) = receipt.get("logs").and_then(|l| l.as_array()) else {
+            return Ok(None);
+        };
+        for log in logs {
+            let topics: Vec<String> = log
+                .get("topics")
+                .and_then(|t| t.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|x| x.as_str().map(str::to_string))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if topics.first().map(|t| t.trim_start_matches("0x").to_lowercase())
+                != Some(hex::encode(topic))
+            {
+                continue;
+            }
+            // Non-indexed single address parameter: it is the data word.
+            if let Some(data) = log.get("data").and_then(|d| d.as_str()) {
+                let raw = hex::decode(data.trim_start_matches("0x"))
+                    .map_err(|e| BatchError::Rpc(format!("log data hex: {e}")))?;
+                if raw.len() >= 32 {
+                    return Ok(Some(Address::from_slice(&raw[12..32])));
+                }
+            }
+        }
+        Ok(None)
+    }
+}
