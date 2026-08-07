@@ -3037,6 +3037,7 @@ where
                 acked,
                 elapsed_ms,
                 outcome,
+                dedup_bytes,
             } => {
                 sched.on_batch_timing(lane, acked, elapsed_ms);
                 let needs_payment =
@@ -3058,6 +3059,9 @@ where
                     let reached_relay =
                         !matches!(outcome, crate::pushsched::BatchOutcome::PaymentRequired);
                     payer.account.record_answered(sent, reached_relay);
+                    if reached_relay && dedup_bytes > 0 {
+                        payer.account.refund_dedup(dedup_bytes);
+                    }
                 }
                 sched.on_batch_result(batch, outcome, now_ms());
                 // Settle when the relay asks (402) or when we have crossed
@@ -3264,6 +3268,9 @@ enum LaneEv {
         acked: usize,
         elapsed_ms: u64,
         outcome: crate::pushsched::BatchOutcome,
+        /// Body bytes the relay served from its recent-ack cache and billed
+        /// at zero (§8.2), so the client can subtract them and stay in step.
+        dedup_bytes: u64,
     },
 }
 
@@ -3293,13 +3300,15 @@ async fn post_batch_streaming(
     let body = crate::pushframe::encode_batch(batch);
     let mut acked = 0usize;
 
-    let finish = |outcome: BatchOutcome, acked: usize| {
+    let mut dedup_bytes: u64 = 0;
+    let finish = |outcome: BatchOutcome, acked: usize, dedup_bytes: u64| {
         let _ = tx.send(LaneEv::Done {
             batch: batch_id,
             lane,
             acked,
             elapsed_ms: t0.elapsed().as_millis() as u64,
             outcome,
+            dedup_bytes,
         });
     };
 
@@ -3311,7 +3320,7 @@ async fn post_batch_streaming(
         Ok(r) => r,
         Err(e) => {
             warn!(target: "hoverfly::upload", "lane {push_url} POST failed: {e}");
-            finish(BatchOutcome::Failed(e.to_string()), 0);
+            finish(BatchOutcome::Failed(e.to_string()), 0, 0);
             return;
         }
     };
@@ -3326,18 +3335,18 @@ async fn post_batch_streaming(
         if code == reqwest::StatusCode::PAYMENT_REQUIRED {
             info!(target: "hoverfly::upload",
                 "lane {push_url} requires payment: {}", txt.trim());
-            finish(BatchOutcome::PaymentRequired, 0);
+            finish(BatchOutcome::PaymentRequired, 0, 0);
             return;
         }
         warn!(target: "hoverfly::upload",
             "lane {push_url} rejected batch ({code}): {}", txt.trim());
-        finish(BatchOutcome::Failed(format!("http {code}")), 0);
+        finish(BatchOutcome::Failed(format!("http {code}")), 0, 0);
         return;
     }
 
     let mut stream = resp.bytes_stream();
     let mut buf = Vec::new();
-    let handle = |line: &[u8], acked: &mut usize| {
+    let handle = |line: &[u8], acked: &mut usize, dedup_bytes: &mut u64| {
         let Ok(v) = serde_json::from_slice::<serde_json::Value>(line) else {
             return;
         };
@@ -3357,6 +3366,14 @@ async fn post_batch_streaming(
         let po = v.get("po").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
         let best_po = v.get("bpo").and_then(|p| p.as_u64()).unwrap_or(0) as u8;
         let shallow = v.get("shallow").and_then(|s| s.as_bool()).unwrap_or(false);
+        // The relay served this from its recent-ack cache and billed zero
+        // for it (§8.2). Subtract the same bytes here or our total drifts
+        // above the relay's and the next cheque is refused.
+        if v.get("dedup").and_then(|d| d.as_bool()).unwrap_or(false)
+            && let Some(c) = batch.iter().find(|c| c.addr == addr)
+        {
+            *dedup_bytes += (crate::pushframe::HEADER_LEN + c.wire.len()) as u64;
+        }
         let _ = tx.send(LaneEv::Ack {
             lane,
             addr,
@@ -3373,20 +3390,20 @@ async fn post_batch_streaming(
                 buf.extend_from_slice(&bytes);
                 while let Some(nl) = buf.iter().position(|&b| b == b'\n') {
                     let line: Vec<u8> = buf.drain(..=nl).collect();
-                    handle(&line[..line.len() - 1], &mut acked);
+                    handle(&line[..line.len() - 1], &mut acked, &mut dedup_bytes);
                 }
             }
             Err(e) => {
                 warn!(target: "hoverfly::upload", "lane {push_url} stream error: {e}");
-                finish(BatchOutcome::Failed(e.to_string()), acked);
+                finish(BatchOutcome::Failed(e.to_string()), acked, dedup_bytes);
                 return;
             }
         }
     }
     if !buf.is_empty() {
-        handle(&buf, &mut acked);
+        handle(&buf, &mut acked, &mut dedup_bytes);
     }
-    finish(BatchOutcome::Answered, acked);
+    finish(BatchOutcome::Answered, acked, dedup_bytes);
 }
 
 /// Read a lane's `/v1/status` advertisement.

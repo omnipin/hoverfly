@@ -1562,6 +1562,17 @@ async fn run_push(
         }
         send_line(&v);
     };
+    let ack_dedup = |addr: &[u8; 32]| {
+        // A dedup hit did no push work and is billed at zero (§8.2). Say so
+        // explicitly: without a marker it is indistinguishable from a real
+        // push, so a paying client counts bytes the relay never charged
+        // for, and its next cheque is refused as an overpayment. The claim
+        // only ever *lowers* what is owed, so it is safe for the client to
+        // take at face value.
+        send_line(&serde_json::json!({
+            "a": hex::encode(addr), "s": "ok", "po": 0, "ms": 0, "dedup": true
+        }));
+    };
     let ack_ok = |addr: &[u8; 32], info: crate::client::PushInfo| {
         // `po` is the proximity order of the peer whose receipt we took —
         // i.e. how deep into the chunk's own neighborhood it actually
@@ -1672,15 +1683,7 @@ async fn run_push(
                     dedup_hits += 1;
                     tally.dedup(key, batch_value, frame_bytes);
                     billable_bytes = billable_bytes.saturating_sub(frame_bytes);
-                    ack_ok(
-                        &chunk.addr,
-                        crate::client::PushInfo {
-                            po: 0,
-                            ms: 0,
-                            shallow: false,
-                            best_po: 0,
-                        },
-                    );
+                    ack_dedup(&chunk.addr);
                 } else {
                     batch_of.insert(chunk.addr, batch_id);
                     accepted.push(chunk);

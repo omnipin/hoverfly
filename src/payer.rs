@@ -383,6 +383,14 @@ impl LaneAccount {
         Some(self.cumulative_plur.saturating_add(self.owed_plur))
     }
 
+    /// Drop debt the relay will not accept. See the caller in
+    /// [`LanePayer::settle`] — this is a divergence artifact, not a
+    /// discount, and it can only ever move in the client's favour by
+    /// removing an obligation the counterparty has already disclaimed.
+    pub fn forgive_phantom_debt(&mut self) {
+        self.owed_plur = 0;
+    }
+
     /// Call once a cheque for `cumulative` has been accepted.
     pub fn settled(&mut self, cumulative: u128) {
         let credited = cumulative.saturating_sub(self.cumulative_plur);
@@ -655,6 +663,16 @@ impl LanePayer {
         if !resp.status().is_success() {
             let code = resp.status();
             let text = resp.text().await.unwrap_or_default();
+            // The relay's ledger is authoritative for what it will accept.
+            // If it says nothing is owed, our extra is an artifact — bytes
+            // we charged ourselves for a POST whose completion we never
+            // saw, and which the relay therefore never billed. Carrying it
+            // forever would only eat our own headroom, since a cheque for
+            // it is refused every time.
+            if text.contains("nothing owed") {
+                self.account.forgive_phantom_debt();
+                return Ok(None);
+            }
             return Err(format!("pay {code}: {}", text.trim()));
         }
         // Record the cumulative *before* trusting the reply: we have
@@ -936,6 +954,21 @@ mod tests {
         }
         assert_eq!(a.outstanding(), p.price_bytes(64 * 1024) * 8);
         assert_eq!(a.owed(), 0);
+    }
+
+    /// A client can charge itself for a POST whose completion it never
+    /// saw; the relay never billed it, so it refuses the cheque. Carrying
+    /// that debt forever would slowly eat the client's own credit line.
+    #[test]
+    fn phantom_debt_can_be_dropped() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(4251);
+        a.record_answered(4251, true);
+        assert!(a.owed() > 0);
+        a.forgive_phantom_debt();
+        assert_eq!(a.owed(), 0);
+        assert_eq!(a.outstanding(), 0, "and it stops holding headroom");
     }
 
     #[test]
