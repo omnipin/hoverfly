@@ -802,6 +802,19 @@ enum Commands {
         action: BatchAction,
     },
 
+    /// Manage a SWAP chequebook — the contract that pays metered pusher
+    /// relays (`docs/pusher-incentives.md`).
+    ///
+    /// Deliberately its own command rather than something an upload does
+    /// for you: deploying a contract is irreversible and spends real funds,
+    /// and an upload that deployed one silently because a lane quoted a
+    /// price would fire before you had decided you wanted to pay at all.
+    #[cfg(unix)]
+    Chequebook {
+        #[command(subcommand)]
+        action: ChequebookAction,
+    },
+
     /// Bridge funds from another chain to xDAI + BZZ on Gnosis via Relay.
     ///
     /// Solves the setup chicken-and-egg: `batch create` needs the signer's
@@ -901,6 +914,67 @@ enum Commands {
 }
 
 #[cfg(unix)]
+#[derive(Subcommand)]
+#[cfg(unix)]
+enum ChequebookAction {
+    /// Deploy a chequebook through bee's canonical SimpleSwapFactory.
+    ///
+    /// The issuer is `--key`'s address, and it must be the **batch owner**:
+    /// a metered relay only accepts a cheque whose chequebook `issuer()`
+    /// equals the account it billed. The issuer is also the only address
+    /// that can ever `withdraw()`, so never deploy with a key you do not
+    /// exclusively control.
+    ///
+    /// Deploys with a hard-deposit timeout of 0, matching every bee
+    /// chequebook. Deposits are therefore not locked; see §11.2.
+    Deploy {
+        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        rpc_url: String,
+        /// Private key (hex, 32 bytes). Its address becomes the issuer.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        /// Seconds to wait for the deploy receipt.
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Deposit BZZ into an existing chequebook.
+    ///
+    /// Separate from `deploy` so topping up later does not mean pretending
+    /// to redeploy. Refuses to send to an address that does not answer
+    /// `issuer()`, or whose issuer is not `--key` — only the issuer can
+    /// withdraw, so funding someone else's chequebook strands the deposit.
+    Fund {
+        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        rpc_url: String,
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        #[arg(long, value_name = "ADDR")]
+        chequebook: String,
+        /// BZZ to deposit (decimal, e.g. `0.05`). BZZ has 16 decimals.
+        #[arg(long, value_name = "BZZ")]
+        amount: String,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+    /// Print a chequebook's on-chain state: issuer, balance liquid to a
+    /// given beneficiary, what it has already paid out, and whether it has
+    /// ever bounced.
+    Status {
+        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        rpc_url: String,
+        #[arg(long, value_name = "ADDR")]
+        chequebook: String,
+        /// Beneficiary to report liquidity for. Defaults to the zero
+        /// address, which reports the plain liquid balance.
+        #[arg(long, value_name = "ADDR")]
+        beneficiary: Option<String>,
+    },
+}
+
 #[derive(Subcommand)]
 enum BatchAction {
     /// Create a new postage stamp batch on-chain.
@@ -1846,9 +1920,61 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
                 let n_chunks = streamer.total_chunks();
                 let progress = make_progress_bar();
-                let root =
-                    hoverfly::client::push_stream_via_pushers(&pusher, streamer, progress.as_ref())
+                // Metered lanes: pay only when the user has explicitly given
+                // a chequebook. Without one we push exactly as before and a
+                // metered lane simply meters us in soft mode — nothing here
+                // deploys or funds anything on its own.
+                let pay_cfg = match cli.chequebook.as_ref() {
+                    Some(cb_hex) => {
+                        let cb = parse_address_hex(cb_hex)
+                            .map_err(|e| format!("--chequebook: {e}"))?;
+                        let bzz: alloy_primitives::Address = hoverfly::batch::MAINNET_BZZ_TOKEN
+                            .parse()
+                            .map_err(|e| format!("bzz token: {e}"))?;
+                        // The relay checks funding against `liquidBalanceFor`
+                        // at accept time; we check total issuance against the
+                        // same balance before signing, so we never hand over a
+                        // cheque that cannot be cashed.
+                        let st = hoverfly::batch::read_chequebook_state(
+                            &rpc_url,
+                            alloy_primitives::Address::from(cb),
+                            alloy_primitives::Address::ZERO,
+                        )
                         .await?;
+                        let store =
+                            hoverfly::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
+                                .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
+                        eprintln!(
+                            "metered: chequebook=0x{} liquid={} PLUR",
+                            hex::encode(cb),
+                            st.liquid_for_us
+                        );
+                        // `batch` is the hex string the user passed; the
+                        // challenge binds the raw 32 bytes.
+                        let batch_raw = hex::decode(batch.trim_start_matches("0x"))
+                            .map_err(|e| format!("--batch: {e}"))?;
+                        let batch_id: [u8; 32] = batch_raw
+                            .as_slice()
+                            .try_into()
+                            .map_err(|_| "--batch must be 32 bytes".to_string())?;
+                        Some(hoverfly::payer::PaymentConfig {
+                            signer: signer.clone(),
+                            batch: batch_id,
+                            chequebook: cb,
+                            chain_id: cli.chequebook_chain_id,
+                            cheques: std::sync::Arc::new(std::sync::Mutex::new(store)),
+                            balance_plur: u128::try_from(st.liquid_for_us).unwrap_or(u128::MAX),
+                        })
+                    }
+                    None => None,
+                };
+                let root = hoverfly::client::push_stream_via_pushers_paid(
+                    &pusher,
+                    streamer,
+                    progress.as_ref(),
+                    pay_cfg.as_ref(),
+                )
+                .await?;
                 drop(progress);
                 let elapsed = upload_started.elapsed();
                 let root_hex = hex::encode(root.as_bytes());
@@ -2647,6 +2773,108 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
+        #[cfg(unix)]
+        Commands::Chequebook { action } => match action {
+            ChequebookAction::Deploy {
+                rpc_url,
+                key,
+                chain_id,
+                timeout,
+            } => {
+                let signer = parse_signer(&key)?;
+                let issuer = signer.address();
+                let factory = hoverfly::batch::swap_factory_for_chain(chain_id).ok_or_else(|| {
+                    format!(
+                        "no vetted SimpleSwapFactory for chain {chain_id} — a factory address \
+                         must never be guessed, since a fake one can return a forged issuer()"
+                    )
+                })?;
+                println!("deploying chequebook: issuer 0x{}", hex::encode(issuer));
+                println!("  factory  0x{}", hex::encode(factory));
+                let out = hoverfly::batch::deploy_chequebook(
+                    &signer,
+                    hoverfly::batch::DeployChequebookParams {
+                        rpc_url,
+                        chain_id,
+                        factory,
+                        issuer,
+                        receipt_timeout: std::time::Duration::from_secs(timeout),
+                    },
+                )
+                .await?;
+                if out.already_deployed {
+                    println!("  already deployed at 0x{}", hex::encode(out.address));
+                } else {
+                    println!("  tx       0x{}", hex::encode(out.tx));
+                    println!("  deployed 0x{}", hex::encode(out.address));
+                }
+                println!();
+                println!("Fund it before it can pay anything:");
+                println!(
+                    "  hoverfly chequebook fund --key <KEY> --chequebook 0x{} --amount 0.05",
+                    hex::encode(out.address)
+                );
+            }
+            ChequebookAction::Fund {
+                rpc_url,
+                key,
+                chequebook,
+                amount,
+                chain_id,
+                timeout,
+            } => {
+                let signer = parse_signer(&key)?;
+                let cb: alloy_primitives::Address = chequebook
+                    .parse()
+                    .map_err(|e| format!("--chequebook: {e}"))?;
+                let plur = parse_bzz_amount(&amount)?;
+                let bzz: alloy_primitives::Address = hoverfly::batch::MAINNET_BZZ_TOKEN
+                    .parse()
+                    .map_err(|e| format!("bzz token: {e}"))?;
+                println!(
+                    "funding 0x{} with {amount} BZZ ({plur} PLUR)",
+                    hex::encode(cb)
+                );
+                let tx = hoverfly::batch::fund_chequebook(
+                    &signer,
+                    &rpc_url,
+                    chain_id,
+                    bzz,
+                    cb,
+                    plur,
+                    std::time::Duration::from_secs(timeout),
+                )
+                .await?;
+                println!("  tx 0x{}", hex::encode(tx));
+            }
+            ChequebookAction::Status {
+                rpc_url,
+                chequebook,
+                beneficiary,
+            } => {
+                let cb: alloy_primitives::Address = chequebook
+                    .parse()
+                    .map_err(|e| format!("--chequebook: {e}"))?;
+                let ben: alloy_primitives::Address = match beneficiary {
+                    Some(b) => b.parse().map_err(|e| format!("--beneficiary: {e}"))?,
+                    None => alloy_primitives::Address::ZERO,
+                };
+                let st = hoverfly::batch::read_chequebook_state(&rpc_url, cb, ben).await?;
+                println!("chequebook 0x{}", hex::encode(cb));
+                println!("  issuer            0x{}", hex::encode(st.issuer));
+                println!("  liquid for 0x{}  {}", hex::encode(ben), st.liquid_for_us);
+                println!("  paid out to it    {}", st.paid_out_to_us);
+                println!(
+                    "  bounced           {}{}",
+                    st.bounced,
+                    if st.bounced {
+                        "  <- a relay will refuse this chequebook"
+                    } else {
+                        ""
+                    }
+                );
+            }
+        },
         Commands::Batch { action } => match action {
             BatchAction::Create {
                 rpc_url,
@@ -2888,3 +3116,66 @@ fn whole_to_smallest_unit(whole: f64, decimals: u8) -> Option<alloy_primitives::
     }
     Some(alloy_primitives::U256::from(scaled as u128))
 }
+
+/// Parse a 32-byte hex private key into a signer.
+#[cfg(unix)]
+fn parse_signer(
+    key: &str,
+) -> Result<alloy_signer_local::PrivateKeySigner, Box<dyn std::error::Error>> {
+    let raw = hex::decode(key.trim_start_matches("0x"))?;
+    if raw.len() != 32 {
+        return Err(format!("key must be 32 bytes hex, got {}", raw.len()).into());
+    }
+    Ok(alloy_signer_local::PrivateKeySigner::from_slice(&raw)?)
+}
+
+/// Decimal BZZ → PLUR. BZZ has **16** decimals, not 18: getting this wrong
+/// by two orders of magnitude is the kind of mistake that silently deposits
+/// 100× too little and makes every cheque bounce.
+#[cfg(unix)]
+fn parse_bzz_amount(s: &str) -> Result<alloy_primitives::U256, Box<dyn std::error::Error>> {
+    const DECIMALS: usize = 16;
+    let s = s.trim();
+    let (whole, frac) = match s.split_once('.') {
+        Some((w, f)) => (w, f),
+        None => (s, ""),
+    };
+    if frac.len() > DECIMALS {
+        return Err(format!("BZZ has {DECIMALS} decimals; '{s}' has more").into());
+    }
+    if whole.is_empty() && frac.is_empty() {
+        return Err("empty amount".into());
+    }
+    let mut digits = String::from(whole);
+    digits.push_str(frac);
+    digits.push_str(&"0".repeat(DECIMALS - frac.len()));
+    if !digits.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!("'{s}' is not a decimal amount").into());
+    }
+    Ok(alloy_primitives::U256::from_str_radix(&digits, 10)?)
+}
+
+#[cfg(all(test, unix))]
+mod chequebook_cli_tests {
+    use super::*;
+
+    /// BZZ has 16 decimals. An 18-decimal assumption would under-fund by
+    /// 100×, and every cheque drawn on it would then fail the relay's
+    /// funding check for no visible reason.
+    #[test]
+    fn bzz_amounts_use_sixteen_decimals() {
+        let one = parse_bzz_amount("1").expect("1 BZZ");
+        assert_eq!(one.to_string(), "10000000000000000");
+        assert_eq!(parse_bzz_amount("0.05").expect("0.05").to_string(), "500000000000000");
+        assert_eq!(parse_bzz_amount("0.0001").expect("small").to_string(), "1000000000000");
+        assert_eq!(parse_bzz_amount("1.5").expect("1.5").to_string(), "15000000000000000");
+    }
+
+    #[test]
+    fn malformed_amounts_are_refused() {
+        for bad in ["", ".", "abc", "1.2.3", "-1", "0.00000000000000001"] {
+            assert!(parse_bzz_amount(bad).is_err(), "{bad} must be refused");
+        }
+    }
+}
+

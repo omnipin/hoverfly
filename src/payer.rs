@@ -518,6 +518,41 @@ impl LanePayer {
         self.account.max_body_bytes(self.cap_plur)
     }
 
+    /// Frames per POST this lane can ever afford, ignoring current debt.
+    ///
+    /// This is what the scheduler needs: a body larger than the *whole*
+    /// credit line can never be admitted no matter how promptly we settle,
+    /// so it must never be built. Computed against a full frame and then
+    /// walked down until it genuinely fits, because the relay bills a
+    /// KiB-rounded body and an off-by-one here is an unfixable 402 loop.
+    pub fn max_frames(&self) -> usize {
+        if self.cap_plur == 0 {
+            return usize::MAX;
+        }
+        let frame = crate::pushframe::MAX_FRAME_LEN as u128;
+        let mut n = (self.cap_plur / self.quote.params.price_plur_per_kib)
+            .saturating_mul(1024)
+            .checked_div(frame)
+            .unwrap_or(0)
+            .min(usize::MAX as u128) as usize;
+        while n > 1 && self.quote.params.price_bytes(n as u64 * frame as u64) > self.cap_plur {
+            n -= 1;
+        }
+        n.max(1)
+    }
+
+    /// Would dispatching `body_bytes` right now exceed the credit line?
+    /// The caller settles first if so, which is what keeps an upload from
+    /// ever reaching its cap rather than recovering from it.
+    pub fn would_exceed(&self, body_bytes: u64) -> bool {
+        self.cap_plur > 0
+            && self
+                .account
+                .owed()
+                .saturating_add(self.quote.params.price_bytes(body_bytes))
+                > self.cap_plur
+    }
+
     /// Settle if there is enough owed to be worth a cheque.
     ///
     /// Returns the amount accepted, or `None` when nothing was owed above
