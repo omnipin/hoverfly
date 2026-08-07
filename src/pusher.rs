@@ -604,6 +604,32 @@ fn admit_metered(
         .get(crate::metered::CHALLENGE_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
+    // **Soft mode never refuses** (§7.1). A request with no challenge is an
+    // unmetered request, served exactly as `open` mode serves it, with
+    // Stage 0 still shadow-counting it. That is the whole point of shipping
+    // soft first: a relay can be flipped to `--meter` while the existing
+    // fleet keeps working, because clients that predate the protocol simply
+    // do not send the header.
+    //
+    // Requiring it unconditionally would 401 every current client on the
+    // lane the moment metering was enabled — the opposite of a staged
+    // rollout. Hard mode does require it, because by then there is a 402 to
+    // enforce and a client that cannot present a capability cannot be
+    // billed.
+    //
+    // A header that is *present but invalid* is refused in both modes:
+    // claiming a capability you do not hold is not the same as not claiming
+    // one, and letting it through would make the check bypassable by
+    // corrupting a byte.
+    if raw.is_empty() {
+        if m.cfg.hard_mode {
+            return Err(Box::new(json_line_response(
+                StatusCode::UNAUTHORIZED,
+                "metered relay: a challenge is required (GET /v1/challenge)",
+            )));
+        }
+        return Ok(None);
+    }
     let verified = m
         .verify_header(raw, crate::challenge::now_unix())
         .map_err(|e| Box::new(json_line_response(StatusCode::UNAUTHORIZED, &e)))?;
@@ -884,15 +910,12 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
         Ok(a) => a,
         Err(e) => return json_line_response(StatusCode::BAD_REQUEST, &e.to_string()),
     };
-    let cb_state = match crate::batch::read_chequebook_state(
-        &state.opts.rpc_url,
-        alloy_primitives::Address::from(cheque.chequebook),
-        alloy_primitives::Address::from(m.cfg.beneficiary),
-    )
-    .await
+    let cb_state = match m
+        .chequebook_state(&state.opts.rpc_url, cheque.chequebook)
+        .await
     {
         Ok(s) => s,
-        Err(e) => return json_line_response(StatusCode::BAD_GATEWAY, &format!("chequebook: {e}")),
+        Err(e) => return json_line_response(StatusCode::BAD_GATEWAY, &e),
     };
     if cb_state.bounced {
         return json_line_response(
@@ -922,6 +945,9 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
     }
     match m.credit(verified.account, cheque.chequebook, cumulative) {
         Ok(accepted) => {
+            // We just consumed part of what that balance covered; the next
+            // cheque should not be judged against the pre-credit reading.
+            m.invalidate_chequebook(&cheque.chequebook);
             let l = m.ledger.lock().expect("ledger poisoned");
             json_response(
                 StatusCode::OK,

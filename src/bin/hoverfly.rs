@@ -1928,9 +1928,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     Some(cb_hex) => {
                         let cb = parse_address_hex(cb_hex)
                             .map_err(|e| format!("--chequebook: {e}"))?;
-                        let bzz: alloy_primitives::Address = hoverfly::batch::MAINNET_BZZ_TOKEN
-                            .parse()
-                            .map_err(|e| format!("bzz token: {e}"))?;
                         // The relay checks funding against `liquidBalanceFor`
                         // at accept time; we check total issuance against the
                         // same balance before signing, so we never hand over a

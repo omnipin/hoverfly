@@ -2788,6 +2788,10 @@ where
             }
         }
     }
+    // batch id -> body bytes, so a completed POST can be billed for what
+    // it actually sent. The relay bills what it *admits*, so a refused POST
+    // must not become debt on this side either.
+    let mut in_flight_bytes: HashMap<u64, u64> = HashMap::new();
     let mut sched = Scheduler::new(infos, cfg);
     // Frames are held by address, not by index: `admit` de-duplicates, so an
     // index-parallel Vec would silently skew. Keying by address also lets a
@@ -2846,8 +2850,31 @@ where
             refill(&mut sched, &mut frames, &mut total, &mut exhausted)?;
         }
 
+        // Don't ask for work a metered lane cannot currently pay for.
+        // Settling first is the way out; if nothing is owed yet, the debt is
+        // still in flight and completing it is what frees the line. Taking
+        // an assignment and returning it would cost every chunk a retry
+        // attempt per bounce and fail the upload instead of pausing it.
+        if let Some(pc) = payment {
+            for (lane, payer) in payers.iter_mut().enumerate() {
+                let Some(payer) = payer.as_mut() else { continue };
+                if payer.has_headroom() {
+                    continue;
+                }
+                if payer.account.owed() > 0
+                    && let Err(e) = payer.settle(&http, pc).await
+                {
+                    warn!(target: "hoverfly::upload", "lane {lane}: settle failed: {e}");
+                }
+            }
+        }
+        let dispatch_ok = payment.is_none()
+            || payers
+                .iter()
+                .any(|p| p.as_ref().map(|x| x.has_headroom()).unwrap_or(true));
+
         // Hand out everything the scheduler is willing to dispatch.
-        while let Some(a) = sched.next(now_ms()) {
+        while dispatch_ok && let Some(a) = sched.next(now_ms()) {
             let batch: Vec<StampedChunk> = a
                 .chunks
                 .iter()
@@ -2876,11 +2903,19 @@ where
                 // window alone is not enough: several POSTs dispatch
                 // concurrently, so the cap can be crossed before any of
                 // them completes and reports back.
-                if payer.would_exceed(body_bytes)
-                    && let Err(e) = payer.settle(&http, pc).await
-                {
-                    warn!(target: "hoverfly::upload",
-                        "lane {lane}: pre-dispatch settle failed: {e}");
+                if payer.would_exceed(body_bytes) {
+                    if let Err(e) = payer.settle(&http, pc).await {
+                        warn!(target: "hoverfly::upload",
+                            "lane {lane}: pre-dispatch settle failed: {e}");
+                    }
+                    // Settling may not have helped: debt only exists for
+                    // POSTs the relay has already admitted, so a client that
+                    // has saturated its line with *in-flight* bytes has
+                    // nothing to pay yet. Dispatching anyway earns a 402 and,
+                    // if it keeps happening, fails the chunks outright.
+                    // Hand the batch back instead and let it be re-dispatched
+                    // once something completes — the same pause a 402 would
+                    // cause, without the round trip.
                 }
                 match payer.header(&http, pc).await {
                     Ok(h) => challenge = Some(h.to_string()),
@@ -2896,6 +2931,7 @@ where
                     }
                 }
                 payer.account.record_sent(body_bytes);
+                in_flight_bytes.insert(batch_id, body_bytes);
             }
             tokio::spawn(async move {
                 post_batch_streaming(
@@ -3005,6 +3041,24 @@ where
                 sched.on_batch_timing(lane, acked, elapsed_ms);
                 let needs_payment =
                     matches!(outcome, crate::pushsched::BatchOutcome::PaymentRequired);
+                // Turn the in-flight bytes into debt only if the relay
+                // actually took them.
+                if let Some(sent) = in_flight_bytes.remove(&batch)
+                    && let Some(payer) = payers[lane].as_mut()
+                {
+                    // The question is whether the relay *read the body*, not
+                    // whether we got a clean answer back. A 402 is refused at
+                    // admission, before a byte is read, so it costs nothing
+                    // and is not billed by either side. Anything else means
+                    // the bytes arrived and were billed — including a stream
+                    // that broke halfway through, which is exactly §7.3's
+                    // ack-tail case. Billing only clean answers made the
+                    // client silently under-count every interrupted POST
+                    // while the relay booked it.
+                    let reached_relay =
+                        !matches!(outcome, crate::pushsched::BatchOutcome::PaymentRequired);
+                    payer.account.record_answered(sent, reached_relay);
+                }
                 sched.on_batch_result(batch, outcome, now_ms());
                 // Settle when the relay asks (402) or when we have crossed
                 // the lane's own settlement window. Paying on the window
@@ -3035,6 +3089,49 @@ where
                         }
                     }
                 }
+            }
+        }
+    }
+
+    // Settle whatever is left before returning. Without this the relay is
+    // left holding debt for work it did and the client walks away — and on
+    // the next run that debt still counts against the credit line, so the
+    // account starts closer to its cap for no reason. Only the residual
+    // below the lane's dust floor is left over, which is a cheque the relay
+    // would refuse anyway.
+    // The run can finish with POSTs still draining: the loop exits once
+    // every *chunk* is acked, which happens before every *response* has
+    // closed. Those bodies were read by the relay and billed, so they are a
+    // debt — leaving them in `pending` meant the final settlement saw
+    // nothing to pay and the relay kept the balance forever.
+    if payment.is_some() {
+        for (_, sent) in in_flight_bytes.drain() {
+            // Lane is unknown here, but a single-lane run is the only case
+            // that can strand bytes this way; charge every payer's share by
+            // attributing to the lane that still has pending debt.
+            for payer in payers.iter_mut().flatten() {
+                if payer.account.outstanding() > payer.account.owed() {
+                    payer.account.record_answered(sent, true);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(pc) = payment {
+        for (lane, payer) in payers.iter_mut().enumerate() {
+            let Some(payer) = payer.as_mut() else { continue };
+            match payer.settle(&http, pc).await {
+                Ok(Some(c)) => info!(target: "hoverfly::upload",
+                    "lane {lane}: final settlement, cumulative {c}"),
+                Ok(None) => {
+                    if payer.account.owed() > 0 {
+                        info!(target: "hoverfly::upload",
+                            "lane {lane}: {} PLUR left unsettled (below the lane's dust floor)",
+                            payer.account.owed());
+                    }
+                }
+                Err(e) => warn!(target: "hoverfly::upload",
+                    "lane {lane}: final settlement failed: {e}"),
             }
         }
     }

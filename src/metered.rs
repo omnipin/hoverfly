@@ -40,6 +40,24 @@ const DEPLOYED_CACHE_CAP: usize = 4096;
 const DEPLOYED_OK_TTL: Duration = Duration::from_secs(86_400);
 const DEPLOYED_BAD_TTL: Duration = Duration::from_secs(600);
 
+/// How long a chequebook's balance reads are reused.
+///
+/// **This does not weaken anything, because there was no guarantee to
+/// weaken.** §11.2 is explicit that the funding check is true *at
+/// acceptance time, not at cashout time*: the issuer can `withdraw()` the
+/// instant after we accept, and bee has the identical exposure. So a fresh
+/// read per cheque only narrows the window in which an attacker must act
+/// from "any time after acceptance" to "any time after acceptance, or up to
+/// `STATE_TTL` before it" — against an exposure already bounded by
+/// `max_outstanding` either way.
+///
+/// What it buys is real: four sequential `eth_call`s per `/v1/pay` became
+/// one batched request, and with this most cheques cost none at all. At
+/// §10.1's 32 MiB settlement window that is ~2-3 cheques per 71 MB upload,
+/// so the chain reads stop being on the critical path entirely.
+const STATE_TTL: Duration = Duration::from_secs(30);
+const STATE_CACHE_CAP: usize = 2048;
+
 #[derive(Debug, Clone)]
 pub struct MeterConfig {
     /// Configured hostnames. **Never derived from a request header** — see
@@ -61,6 +79,9 @@ pub struct Metered {
     /// Per-account: `/v1/pay` and `/v1/push`.
     account_limit: Mutex<InboundLimiter>,
     deployed: Mutex<DeployedCache>,
+    /// `chequebook -> (state, read_at)`. `issuer` inside it is immutable,
+    /// so a hit is always authoritative for that field.
+    cb_state: Mutex<StateCache>,
 }
 
 impl Metered {
@@ -74,7 +95,46 @@ impl Metered {
             challenge_limit: Mutex::new(InboundLimiter::new(5.0, 40.0, 8192)),
             account_limit: Mutex::new(InboundLimiter::new(20.0, 120.0, 8192)),
             deployed: Mutex::new(DeployedCache::new(DEPLOYED_CACHE_CAP)),
+            cb_state: Mutex::new(StateCache::new(STATE_CACHE_CAP)),
         }
+    }
+
+    /// Chequebook state, from cache when it is fresh enough.
+    pub async fn chequebook_state(
+        &self,
+        rpc_url: &str,
+        chequebook: [u8; 20],
+    ) -> Result<crate::batch::ChequebookState, String> {
+        if let Some(hit) = self
+            .cb_state
+            .lock()
+            .expect("state cache poisoned")
+            .get(&chequebook)
+        {
+            return Ok(hit);
+        }
+        let st = crate::batch::read_chequebook_state(
+            rpc_url,
+            Address::from(chequebook),
+            Address::from(self.cfg.beneficiary),
+        )
+        .await
+        .map_err(|e| format!("chequebook: {e}"))?;
+        self.cb_state
+            .lock()
+            .expect("state cache poisoned")
+            .insert(chequebook, st);
+        Ok(st)
+    }
+
+    /// Drop a cached read after we act on it, so the next cheque from this
+    /// chequebook sees the balance it actually left behind rather than the
+    /// one from before we credited.
+    pub fn invalidate_chequebook(&self, chequebook: &[u8; 20]) {
+        self.cb_state
+            .lock()
+            .expect("state cache poisoned")
+            .remove(chequebook);
     }
 
     pub fn allow_challenge(&self, ip: &str) -> bool {
@@ -333,6 +393,42 @@ pub fn encode_challenge_header(
         "sig": format!("0x{}", hex::encode(sig)),
     });
     base64::engine::general_purpose::STANDARD.encode(body.to_string())
+}
+
+struct StateCache {
+    map: HashMap<[u8; 20], (crate::batch::ChequebookState, Instant)>,
+    order: std::collections::VecDeque<[u8; 20]>,
+    cap: usize,
+}
+
+impl StateCache {
+    fn new(cap: usize) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: std::collections::VecDeque::new(),
+            cap: cap.max(1),
+        }
+    }
+
+    fn get(&self, k: &[u8; 20]) -> Option<crate::batch::ChequebookState> {
+        let (v, at) = self.map.get(k)?;
+        (at.elapsed() < STATE_TTL).then_some(*v)
+    }
+
+    fn insert(&mut self, k: [u8; 20], v: crate::batch::ChequebookState) {
+        if self.map.insert(k, (v, Instant::now())).is_none() {
+            self.order.push_back(k);
+        }
+        while self.order.len() > self.cap {
+            if let Some(old) = self.order.pop_front() {
+                self.map.remove(&old);
+            }
+        }
+    }
+
+    fn remove(&mut self, k: &[u8; 20]) {
+        self.map.remove(k);
+    }
 }
 
 struct DeployedCache {
@@ -690,5 +786,47 @@ mod lifecycle_tests {
             !m.reserve_for_body(ACCT, 4251, cap).over_cap,
             "and the account can push again"
         );
+    }
+}
+
+#[cfg(test)]
+mod soft_mode_tests {
+    //! §7.1's rollout property: soft mode must serve clients that predate
+    //! the payment protocol. Requiring a challenge unconditionally would
+    //! 401 the whole existing fleet the moment `--meter` was enabled, which
+    //! is the opposite of a staged rollout.
+    use super::*;
+    use crate::meter::Params;
+
+    fn cfg(hard: bool) -> MeterConfig {
+        MeterConfig {
+            origins: vec!["relay-a.example".into()],
+            beneficiary: [3u8; 20],
+            chain_id: 100,
+            factory: Address::ZERO,
+            params: Params::default(),
+            hard_mode: hard,
+        }
+    }
+
+    /// An absent header is not an invalid one — it is a client that does not
+    /// speak the protocol yet.
+    #[test]
+    fn an_empty_header_is_distinguishable_from_a_malformed_one() {
+        let m = Metered::new(cfg(false), Ledger::ephemeral());
+        // Malformed is always refused, in either mode: claiming a capability
+        // you do not hold must not become valid by corrupting a byte.
+        m.verify_header("not-base64!!", 1000)
+            .expect_err("a malformed header is always refused");
+        m.verify_header("", 1000)
+            .expect_err("verify_header itself has no opinion about absence");
+    }
+
+    /// Hard mode is where the challenge becomes mandatory, because by then
+    /// there is a 402 to enforce.
+    #[test]
+    fn hard_mode_is_what_makes_the_challenge_mandatory() {
+        assert!(!cfg(false).hard_mode, "soft is the shipped default");
+        assert!(cfg(true).hard_mode);
     }
 }

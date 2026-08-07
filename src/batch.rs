@@ -1141,36 +1141,115 @@ pub async fn is_deployed_chequebook(
         .await
 }
 
-/// Read the four values that decide whether a cheque is worth anything.
+/// Read the four values that decide whether a cheque is worth anything —
+/// in **one** JSON-RPC round trip.
 ///
-/// `issuer` is cacheable per chequebook — it cannot change — but the balance
-/// and `paidOut` are not: they *are* the funding check, and caching them is
-/// what would let the withdraw race (§11.2) go unnoticed.
+/// They used to be four sequential `eth_call`s, which put four round trips
+/// on the critical path of every `/v1/pay`. They are all reads against the
+/// same block, so there is no reason for them to be sequential: batching
+/// them makes the miss case one request, and the caller (`Metered`) caches
+/// on top so the honest path is usually zero.
 pub async fn read_chequebook_state(
     rpc_url: &str,
     chequebook: Address,
     beneficiary: Address,
 ) -> Result<ChequebookState, BatchError> {
     let rpc = EthRpc::new(rpc_url.to_string());
-    let issuer = rpc.call_view(chequebook, issuerCall {}).await?;
-    let liquid_for_us = rpc
-        .call_view(
-            chequebook,
-            liquidBalanceForCall {
-                beneficiary,
-            },
-        )
-        .await?;
-    let paid_out_to_us = rpc
-        .call_view(chequebook, paidOutCall { beneficiary })
-        .await?;
-    let bounced = rpc.call_view(chequebook, bouncedCall {}).await?;
+    let calls = [
+        issuerCall {}.abi_encode(),
+        liquidBalanceForCall { beneficiary }.abi_encode(),
+        paidOutCall { beneficiary }.abi_encode(),
+        bouncedCall {}.abi_encode(),
+    ];
+    let out = rpc.batch_call_view(chequebook, &calls).await?;
+    let dec = |i: usize| -> Result<&Vec<u8>, BatchError> {
+        out.get(i)
+            .ok_or_else(|| BatchError::Rpc("short batch response".into()))
+    };
     Ok(ChequebookState {
-        issuer,
-        liquid_for_us,
-        paid_out_to_us,
-        bounced,
+        issuer: issuerCall::abi_decode_returns(dec(0)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        liquid_for_us: liquidBalanceForCall::abi_decode_returns(dec(1)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        paid_out_to_us: paidOutCall::abi_decode_returns(dec(2)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
+        bounced: bouncedCall::abi_decode_returns(dec(3)?)
+            .map_err(|e| BatchError::AbiDecode(e.to_string()))?,
     })
+}
+
+impl EthRpc {
+    /// Several `eth_call`s to one contract in a single JSON-RPC batch.
+    ///
+    /// Results come back keyed by request id rather than in order — the
+    /// spec permits a server to reorder them, and some do — so they are
+    /// re-sorted before being returned.
+    async fn batch_call_view(
+        &self,
+        to: Address,
+        calls: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, BatchError> {
+        #[derive(Serialize)]
+        struct BatchReq<'a> {
+            jsonrpc: &'a str,
+            id: usize,
+            method: &'a str,
+            params: (CallObj, &'a str),
+        }
+        let to_hex = format!("0x{}", hex::encode(to));
+        let reqs: Vec<BatchReq> = calls
+            .iter()
+            .enumerate()
+            .map(|(i, data)| BatchReq {
+                jsonrpc: "2.0",
+                id: i,
+                method: "eth_call",
+                params: (
+                    CallObj {
+                        from: format!("0x{}", hex::encode(Address::ZERO)),
+                        to: to_hex.clone(),
+                        data: format!("0x{}", hex::encode(data)),
+                    },
+                    "latest",
+                ),
+            })
+            .collect();
+        let resp: Vec<serde_json::Value> = self
+            .http
+            .post(&self.url)
+            .json(&reqs)
+            .send()
+            .await?
+            .json()
+            .await?;
+        if resp.len() != calls.len() {
+            return Err(BatchError::Rpc(format!(
+                "batch eth_call: sent {} requests, got {} responses",
+                calls.len(),
+                resp.len()
+            )));
+        }
+        let mut out = vec![Vec::new(); calls.len()];
+        for item in resp {
+            if let Some(err) = item.get("error") {
+                return Err(BatchError::Rpc(format!("batch eth_call: {err}")));
+            }
+            let id = item
+                .get("id")
+                .and_then(|i| i.as_u64())
+                .ok_or_else(|| BatchError::Rpc("batch eth_call: missing id".into()))?
+                as usize;
+            let hex_str = item
+                .get("result")
+                .and_then(|r| r.as_str())
+                .ok_or_else(|| BatchError::Rpc("batch eth_call: missing result".into()))?;
+            let slot = out
+                .get_mut(id)
+                .ok_or_else(|| BatchError::Rpc(format!("batch eth_call: bad id {id}")))?;
+            *slot = hex::decode(hex_str.trim_start_matches("0x"))?;
+        }
+        Ok(out)
+    }
 }
 
 #[cfg(test)]
