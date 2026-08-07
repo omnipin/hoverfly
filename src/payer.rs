@@ -295,6 +295,12 @@ pub struct LaneAccount {
     pub beneficiary: [u8; 20],
     /// Billed and not yet covered by a cheque.
     owed_plur: u128,
+    /// Dispatched but not yet answered. Mirrors the relay's `reserved`:
+    /// bytes on the wire are not yet a debt, because the relay bills what
+    /// it *admits*, and a POST it refuses (402) or drops costs nothing.
+    /// Counting these as owed made the client sign cheques for several
+    /// times what the relay had booked.
+    pending_plur: u128,
     /// Total already promised to this beneficiary. Cheques are cumulative,
     /// so this only grows.
     cumulative_plur: u128,
@@ -306,6 +312,7 @@ impl LaneAccount {
             params,
             beneficiary,
             owed_plur: 0,
+            pending_plur: 0,
             cumulative_plur: 0,
         }
     }
@@ -321,16 +328,37 @@ impl LaneAccount {
         self.owed_plur
     }
 
+    /// Owed plus in-flight — the client's mirror of the relay's
+    /// `owed + reserved`, and what the credit line actually binds on.
+    pub fn outstanding(&self) -> u128 {
+        self.owed_plur.saturating_add(self.pending_plur)
+    }
+
     pub fn cumulative(&self) -> u128 {
         self.cumulative_plur
     }
 
-    /// Record a POST body we sent. Same arithmetic as the relay's (§8), so
-    /// the two sides agree without exchanging anything.
+    /// A POST is on the wire. Held as *pending*, not owed — see
+    /// [`Self::pending_plur`].
     pub fn record_sent(&mut self, body_bytes: u64) {
-        self.owed_plur = self
-            .owed_plur
+        self.pending_plur = self
+            .pending_plur
             .saturating_add(self.params.price_bytes(body_bytes));
+    }
+
+    /// A POST came back. `reached_relay` is false only when the relay
+    /// refused it at admission (402) — before reading a byte, so neither
+    /// side bills it. Any other outcome, *including a broken stream*, means
+    /// the body arrived and the relay billed it, so we must too.
+    ///
+    /// This mirrors the relay's reserve→commit exactly, which is what keeps
+    /// the two sides' arithmetic identical without them exchanging totals.
+    pub fn record_answered(&mut self, body_bytes: u64, reached_relay: bool) {
+        let price = self.params.price_bytes(body_bytes);
+        self.pending_plur = self.pending_plur.saturating_sub(price);
+        if reached_relay {
+            self.owed_plur = self.owed_plur.saturating_add(price);
+        }
     }
 
     /// A dedup hit costs nothing, so give it back when the ack says so
@@ -541,6 +569,24 @@ impl LanePayer {
         n.max(1)
     }
 
+    /// Is there room for a POST of any useful size right now?
+    ///
+    /// Checked *before* asking the scheduler for work: taking an assignment
+    /// and handing it back costs the chunks a retry attempt each time, so a
+    /// tight credit line would exhaust their budget and fail the upload
+    /// rather than merely pausing it.
+    pub fn has_headroom(&self) -> bool {
+        if self.cap_plur == 0 {
+            return true;
+        }
+        // One frame is the smallest thing worth dispatching.
+        let one_frame = self
+            .quote
+            .params
+            .price_bytes(crate::pushframe::MAX_FRAME_LEN as u64);
+        self.account.outstanding().saturating_add(one_frame) <= self.cap_plur
+    }
+
     /// Would dispatching `body_bytes` right now exceed the credit line?
     /// The caller settles first if so, which is what keeps an upload from
     /// ever reaching its cap rather than recovering from it.
@@ -548,7 +594,7 @@ impl LanePayer {
         self.cap_plur > 0
             && self
                 .account
-                .owed()
+                .outstanding()
                 .saturating_add(self.quote.params.price_bytes(body_bytes))
                 > self.cap_plur
     }
@@ -789,8 +835,10 @@ mod tests {
     fn owed_tracks_bytes_sent_and_a_cheque_clears_it() {
         let p = Params::default();
         let mut a = LaneAccount::new(p, [3u8; 20]);
-        a.record_sent(32 * 1024 * 1024);
-        assert_eq!(a.owed(), p.price_bytes(32 * 1024 * 1024));
+        let body = 32 * 1024 * 1024;
+        a.record_sent(body);
+        a.record_answered(body, true);
+        assert_eq!(a.owed(), p.price_bytes(body));
         assert!(a.should_settle(), "32 MiB crosses the settlement window");
         let c = a.next_cumulative().expect("above the dust floor");
         a.settled(c);
@@ -806,9 +854,11 @@ mod tests {
         let p = Params::default();
         let mut a = LaneAccount::new(p, [3u8; 20]);
         a.record_sent(40 * 1024 * 1024);
+        a.record_answered(40 * 1024 * 1024, true);
         let first = a.next_cumulative().expect("cheque");
         a.settled(first);
         a.record_sent(40 * 1024 * 1024);
+        a.record_answered(40 * 1024 * 1024, true);
         let second = a.next_cumulative().expect("cheque");
         assert!(second > first, "cumulative must increase: {second} > {first}");
         assert_eq!(second - first, p.price_bytes(40 * 1024 * 1024));
@@ -819,6 +869,7 @@ mod tests {
         let p = Params::default();
         let mut a = LaneAccount::new(p, [3u8; 20]).with_cumulative(5_000_000_000_000_000);
         a.record_sent(40 * 1024 * 1024);
+        a.record_answered(40 * 1024 * 1024, true);
         let c = a.next_cumulative().expect("cheque");
         assert!(
             c > 5_000_000_000_000_000,
@@ -835,11 +886,64 @@ mod tests {
         assert_eq!(a.next_cumulative(), None, "below the lane's dust floor");
     }
 
+    /// The divergence a live run found: recording debt at dispatch made the
+    /// client sign cheques for several times what the relay had booked,
+    /// because a 402'd POST is never billed on the relay side.
+    /// A POST whose response broke still cost the relay the bytes it read,
+    /// so it must still be billed — otherwise the client silently
+    /// under-pays for every interrupted stream (§7.3).
+    #[test]
+    fn an_interrupted_post_is_still_billed() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        let body = 64 * 1024;
+        a.record_sent(body);
+        a.record_answered(body, true); // stream broke, but the body arrived
+        assert_eq!(a.owed(), p.price_bytes(body));
+    }
+
+    #[test]
+    fn a_refused_post_never_becomes_debt() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(100 * 4251);
+        assert_eq!(a.owed(), 0, "in flight is not yet owed");
+        assert!(a.outstanding() > 0, "but it does count against the cap");
+        a.record_answered(100 * 4251, false); // 402
+        assert_eq!(a.owed(), 0, "a refused POST is never billed");
+        assert_eq!(a.outstanding(), 0, "and stops holding headroom");
+    }
+
+    #[test]
+    fn an_accepted_post_becomes_debt_exactly_once() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        let body = 100 * 4251;
+        a.record_sent(body);
+        a.record_answered(body, true);
+        assert_eq!(a.owed(), p.price_bytes(body));
+        assert_eq!(a.outstanding(), a.owed(), "nothing left in flight");
+    }
+
+    /// Several POSTs dispatch before any completes; the cap must see their
+    /// sum, or the client blows through it and 402s on the tail.
+    #[test]
+    fn concurrent_posts_all_count_against_the_cap() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        for _ in 0..8 {
+            a.record_sent(64 * 1024);
+        }
+        assert_eq!(a.outstanding(), p.price_bytes(64 * 1024) * 8);
+        assert_eq!(a.owed(), 0);
+    }
+
     #[test]
     fn dedup_hits_are_refunded() {
         let p = Params::default();
         let mut a = LaneAccount::new(p, [3u8; 20]);
         a.record_sent(100 * 4251);
+        a.record_answered(100 * 4251, true);
         let before = a.owed();
         a.refund_dedup(10 * 4251);
         assert!(a.owed() < before);
@@ -867,6 +971,7 @@ mod tests {
         let cap = p.max_outstanding_plur;
         let before = a.max_body_bytes(cap);
         a.record_sent(64 * 1024 * 1024);
+        a.record_answered(64 * 1024 * 1024, true);
         assert!(a.max_body_bytes(cap) < before, "unpaid debt eats the line");
     }
 

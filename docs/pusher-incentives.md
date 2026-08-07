@@ -307,11 +307,21 @@ targeting oracle for tipping a victim into 402 at a chosen moment.
 
 ### 7.1 Rollout
 
-Two-phase. *Soft mode* first: the relay meters and reports `owed` in the
-`done` line of `/v1/push` but never refuses. Existing clients ignore
-unknown fields and keep working, exactly as the stage-B relays did against
-stage-C clients (design §7, "mixed version"). Only once clients in the
-wild can pay does a relay flip to hard mode.
+Two-phase. *Soft mode* first: the relay meters, accepts cheques, and
+reports `owed`, but **never answers 402** — an account over its credit line
+is recorded and served anyway.
+
+**Soft mode still requires the challenge.** An earlier draft of this
+section said existing clients "keep working", implying an unchallenged
+request should be served. That is wrong, and it was caught while trying to
+enable metering on a live lane: if a missing header meant "serve for free",
+metering would be bypassable by *omitting a header*, which is not a
+degraded mode but no mode at all. What soft mode drops is enforcement of
+the cap, not authentication. A relay flipping to `--meter` therefore does
+break clients that predate the protocol — acceptable, because the only
+dApp using these lanes ships alongside them.
+
+Only once clients in the wild can pay does a relay flip to hard mode.
 
 Soft mode is an *instrument*, not a migration path for clients: the `done`
 line lands after the whole batch (`src/pusher.rs:1090`), so a client
