@@ -554,3 +554,79 @@ mod tests {
         assert_eq!(l.live_reservations(), 1);
     }
 }
+
+#[cfg(test)]
+mod leak_tests {
+    //! A reservation that is never committed must never survive.
+    //!
+    //! Found by review: four early-return paths in `push_response` (oversize
+    //! body, read timeout, frame-decode failure, empty batch) dropped the
+    //! admission without releasing, and nothing else lowers `reserved_plur`
+    //! — `credit` only touches `owed`. These pin the ledger-level invariants
+    //! the RAII guard in `pusher.rs` relies on.
+    use super::*;
+
+    const A: [u8; 20] = [1u8; 20];
+    const CB: [u8; 20] = [9u8; 20];
+
+    /// Paying does **not** clear a reservation. This is the property that
+    /// turns a leak into a permanent one, so it is worth stating outright.
+    #[test]
+    fn paying_a_cheque_does_not_release_a_reservation() {
+        let mut l = Ledger::ephemeral();
+        l.commit(A, 0, 1000);
+        l.reserve(A, 500, 100_000);
+        l.credit(A, CB, 1000).expect("pay off the debt");
+        assert_eq!(l.owed(&A), 0, "the debt is cleared");
+        assert_eq!(
+            l.reserved(&A),
+            500,
+            "but the reservation is untouched — only commit or release move it"
+        );
+    }
+
+    /// The ratchet: leaked reservations accumulate until `outstanding`
+    /// exceeds the cap, and no cheque can bring it back down.
+    #[test]
+    fn leaked_reservations_ratchet_an_account_past_its_cap_with_no_way_back() {
+        let mut l = Ledger::ephemeral();
+        let cap = 10_000u128;
+        for _ in 0..20 {
+            l.reserve(A, 1000, cap); // admitted, then dropped without commit
+        }
+        assert!(l.outstanding(&A) > cap, "the account is now over its cap");
+        // There is no debt to pay, so no cheque exists that could help.
+        assert_eq!(l.owed(&A), 0);
+        assert!(
+            matches!(l.credit(A, CB, 1), Err(LedgerError::Overpayment { .. })),
+            "with nothing owed, a cheque cannot clear the overshoot"
+        );
+        // Only releasing does.
+        for _ in 0..20 {
+            l.release(A, 1000);
+        }
+        assert_eq!(l.outstanding(&A), 0);
+    }
+
+    /// Releasing an unused reservation must leave no residue at all — this
+    /// is what every early-return path now does via `Drop`.
+    #[test]
+    fn releasing_an_unused_reservation_leaves_nothing_behind() {
+        let mut l = Ledger::ephemeral();
+        let adm = l.reserve(A, 4096, 100_000);
+        l.release(A, adm.reserved_plur);
+        assert_eq!(l.outstanding(&A), 0);
+        assert_eq!(l.live_reservations(), 0, "and frees its shed-cap slot");
+    }
+
+    /// Committing zero bytes is equivalent to releasing: a POST that
+    /// admitted nothing owes nothing and holds nothing.
+    #[test]
+    fn committing_nothing_is_equivalent_to_releasing() {
+        let mut l = Ledger::ephemeral();
+        let adm = l.reserve(A, 4096, 100_000);
+        l.commit(A, adm.reserved_plur, 0);
+        assert_eq!(l.outstanding(&A), 0);
+        assert_eq!(l.live_reservations(), 0);
+    }
+}
