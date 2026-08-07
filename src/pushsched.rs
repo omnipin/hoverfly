@@ -121,6 +121,10 @@ pub struct LaneInfo {
     pub price_plur_per_kib: Option<u128>,
     /// True when the lane enforces 402 rather than metering softly.
     pub hard_enforcement: bool,
+    /// The whole verified quote, when this lane advertised one. Carried so
+    /// the payment loop has the beneficiary and parameters without
+    /// re-fetching and re-verifying `/v1/status`.
+    pub quote: Option<crate::payer::PaymentQuote>,
 }
 
 /// Tunables. Defaults are the shipping configuration.

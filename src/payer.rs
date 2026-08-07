@@ -411,6 +411,186 @@ impl TotalIssued {
     }
 }
 
+// ──────────────────────────────────────────────────────────────────────
+// The payment loop (docs/pusher-incentives.md §12)
+// ──────────────────────────────────────────────────────────────────────
+
+/// Everything the client needs to pay a metered lane.
+///
+/// The account key is the **batch owner's** signer — the same key that
+/// stamps chunks (§6) — so a metered upload needs no extra credential and,
+/// in a browser, no wallet prompt.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct PaymentConfig {
+    pub signer: crate::signer::SwarmSigner,
+    pub batch: [u8; 32],
+    pub chequebook: [u8; 20],
+    pub chain_id: u64,
+    /// Shared across lanes: N beneficiaries are N claims on **one** balance
+    /// (§8.3), so the cumulative store has to be common.
+    pub cheques: std::sync::Arc<std::sync::Mutex<crate::cheques::ChequeStore>>,
+    /// On-chain liquid balance of the chequebook, read once at startup. A
+    /// cheque that would push total issuance past this is not signed — it
+    /// would be accepted and then fail at cashout, which looks like the
+    /// relay's fault and costs the lane's trust rather than ours.
+    pub balance_plur: u128,
+}
+
+/// Per-lane payment state: the verified quote, a cached capability, and the
+/// running total.
+#[cfg(not(target_arch = "wasm32"))]
+pub struct LanePayer {
+    pub base_url: String,
+    pub quote: PaymentQuote,
+    pub account: LaneAccount,
+    header: Option<String>,
+    header_stale_after: u64,
+    cap_plur: u128,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl LanePayer {
+    pub fn new(base_url: String, quote: PaymentQuote, cumulative: u128) -> Self {
+        let account = LaneAccount::new(quote.params, quote.beneficiary).with_cumulative(cumulative);
+        Self {
+            base_url,
+            quote,
+            account,
+            header: None,
+            header_stale_after: 0,
+            cap_plur: 0,
+        }
+    }
+
+    /// The credit line the relay last told us about, or 0 before the first
+    /// challenge. Used to size POSTs (§7.2).
+    pub fn cap_plur(&self) -> u128 {
+        self.cap_plur
+    }
+
+    /// A valid challenge header, fetching and signing one if needed.
+    ///
+    /// Re-fetched 30 s before expiry rather than on failure: racing the
+    /// expiry with a POST already in flight turns a cheap GET into a
+    /// mid-upload 401.
+    pub async fn header(
+        &mut self,
+        http: &reqwest::Client,
+        cfg: &PaymentConfig,
+    ) -> Result<&str, String> {
+        let now = crate::challenge::now_unix();
+        if self.header.is_none() || now >= self.header_stale_after {
+            let account = *cfg.signer.eth_address();
+            let url = format!(
+                "{}/v1/challenge?account=0x{}&batch=0x{}",
+                self.base_url.trim_end_matches('/'),
+                hex::encode(account),
+                hex::encode(cfg.batch),
+            );
+            let resp = http
+                .get(&url)
+                .timeout(std::time::Duration::from_secs(60))
+                .send()
+                .await
+                .map_err(|e| format!("challenge fetch: {e}"))?;
+            if !resp.status().is_success() {
+                let code = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(format!("challenge {code}: {}", body.trim()));
+            }
+            let v: serde_json::Value = resp
+                .json()
+                .await
+                .map_err(|e| format!("challenge json: {e}"))?;
+            let offered = OfferedChallenge::parse(&v)?;
+            self.cap_plur = offered.cap_plur;
+            self.header_stale_after = offered.stale_after();
+            self.header = Some(offered.sign(&cfg.signer, self.quote.chain_id)?);
+        }
+        Ok(self.header.as_deref().unwrap_or_default())
+    }
+
+    /// Largest POST body this lane will currently admit.
+    pub fn max_body_bytes(&self) -> u64 {
+        if self.cap_plur == 0 {
+            return u64::MAX;
+        }
+        self.account.max_body_bytes(self.cap_plur)
+    }
+
+    /// Settle if there is enough owed to be worth a cheque.
+    ///
+    /// Returns the amount accepted, or `None` when nothing was owed above
+    /// the lane's dust floor. Errors are the caller's cue to stop using the
+    /// lane, not to retry blindly — a rejected cheque usually means the two
+    /// sides disagree about the cumulative, which retrying cannot fix.
+    pub async fn settle(
+        &mut self,
+        http: &reqwest::Client,
+        cfg: &PaymentConfig,
+    ) -> Result<Option<u128>, String> {
+        let Some(cumulative) = self.account.next_cumulative() else {
+            return Ok(None);
+        };
+        // Aggregate exposure across every beneficiary drawn on this one
+        // chequebook (§8.3): the second lane's cheque is what silently
+        // bounces without this.
+        let key = crate::cheques::relay_key(&self.quote.beneficiary);
+        {
+            let store = cfg.cheques.lock().expect("cheque store poisoned");
+            if store.would_exceed_balance(&key, cumulative, cfg.balance_plur) {
+                return Err(format!(
+                    "cheque for {cumulative} would push total issuance past the chequebook's \
+                     {} balance across all lanes",
+                    cfg.balance_plur
+                ));
+            }
+        }
+        let sig = cfg
+            .signer
+            .sign_cheque(
+                &cfg.chequebook,
+                &self.quote.beneficiary,
+                alloy_primitives::U256::from(cumulative),
+                self.quote.chain_id,
+            )
+            .map_err(|e| format!("sign cheque: {e}"))?;
+        let body = crate::protocols::swap::encode_signed_cheque_json_pub(
+            &cfg.chequebook,
+            &self.quote.beneficiary,
+            alloy_primitives::U256::from(cumulative),
+            &sig,
+        );
+        let header = self.header(http, cfg).await?.to_string();
+        let resp = http
+            .post(format!("{}/v1/pay", self.base_url.trim_end_matches('/')))
+            .header(crate::metered::CHALLENGE_HEADER, header)
+            .header("content-type", "application/json")
+            .body(body)
+            .timeout(std::time::Duration::from_secs(120))
+            .send()
+            .await
+            .map_err(|e| format!("pay: {e}"))?;
+        if !resp.status().is_success() {
+            let code = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(format!("pay {code}: {}", text.trim()));
+        }
+        // Record the cumulative *before* trusting the reply: we have
+        // certainly issued it, and under-recording is what causes the next
+        // cheque to be rejected as non-increasing.
+        {
+            let mut store = cfg.cheques.lock().expect("cheque store poisoned");
+            store
+                .set_cumulative(&key, cumulative)
+                .map_err(|e| format!("cheque store: {e}"))?;
+            let _ = store.save();
+        }
+        self.account.settled(cumulative);
+        Ok(Some(cumulative))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

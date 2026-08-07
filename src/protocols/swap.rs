@@ -105,6 +105,18 @@ fn encode_signed_cheque_json(
     .into_bytes()
 }
 
+/// Public wrapper: the client needs to produce this body for a metered
+/// relay's `POST /v1/pay`, and it must be byte-identical to what bee's
+/// `json.Marshal` emits (see the encoder's own note on `*big.Int`).
+pub fn encode_signed_cheque_json_pub(
+    chequebook: &[u8; 20],
+    beneficiary: &[u8; 20],
+    cumulative_payout: U256,
+    signature: &[u8; 65],
+) -> Vec<u8> {
+    encode_signed_cheque_json(chequebook, beneficiary, cumulative_payout, signature)
+}
+
 /// Outbound `Handshake { Beneficiary }`. Called once per session by
 /// the connection-setup path. Caller exchanges empty headers first.
 pub async fn send_handshake<S>(stream: &mut S, beneficiary: &[u8; 20]) -> Result<(), SwapError>
