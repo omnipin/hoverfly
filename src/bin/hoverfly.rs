@@ -802,6 +802,50 @@ enum Commands {
         action: BatchAction,
     },
 
+    /// Cash cheques a metered relay has accepted.
+    ///
+    /// Reads the relay's ledger, prices each held cheque on-chain, and
+    /// presents the ones worth collecting. **Run this somewhere other than
+    /// the relay**: `cashChequeBeneficiary` must be sent *by* the
+    /// beneficiary, so it needs the beneficiary's private key — which is
+    /// exactly the key a relay box is designed never to hold. Copy the
+    /// ledger file (or point `--state-dir` at a snapshot of it) and run
+    /// this from a machine that does.
+    ///
+    /// A cheque is cumulative, so only the newest one per chequebook is
+    /// ever presented; gas is paid once per chequebook, not once per
+    /// cheque received.
+    #[cfg(unix)]
+    Cashout {
+        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        rpc_url: String,
+        /// The **beneficiary's** private key — the EOA cheques were made
+        /// out to, and the only address the contract will pay.
+        #[arg(long, value_name = "KEY")]
+        key: String,
+        /// Relay state directory containing `ledger.json`.
+        #[arg(long, value_name = "DIR")]
+        state_dir: std::path::PathBuf,
+        /// Where the BZZ should land. Defaults to the beneficiary.
+        #[arg(long, value_name = "ADDR")]
+        recipient: Option<String>,
+        /// Skip cheques worth less than this in BZZ. Cashing costs ~300k
+        /// gas whatever the amount, so tiny cheques are worth less than
+        /// collecting them (§9.3).
+        #[arg(long, default_value = "0.25", value_name = "BZZ")]
+        min_amount: String,
+        /// Only one chequebook, rather than everything in the ledger.
+        #[arg(long, value_name = "ADDR")]
+        chequebook: Option<String>,
+        /// Price everything and print it, sending nothing.
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long, default_value_t = 100, value_name = "ID")]
+        chain_id: u64,
+        #[arg(long, default_value_t = 300, value_name = "SECS")]
+        timeout: u64,
+    },
+
     /// Manage a SWAP chequebook — the contract that pays metered pusher
     /// relays (`docs/pusher-incentives.md`).
     ///
@@ -2770,6 +2814,98 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
+        #[cfg(unix)]
+        Commands::Cashout {
+            rpc_url,
+            key,
+            state_dir,
+            recipient,
+            min_amount,
+            chequebook,
+            dry_run,
+            chain_id,
+            timeout,
+        } => {
+            let signer = parse_signer(&key)?;
+            let beneficiary = signer.address();
+            let recipient: alloy_primitives::Address = match recipient {
+                Some(r) => r.parse().map_err(|e| format!("--recipient: {e}"))?,
+                None => beneficiary,
+            };
+            let floor = parse_bzz_amount(&min_amount)?;
+            let only: Option<alloy_primitives::Address> = match chequebook {
+                Some(c) => Some(c.parse().map_err(|e| format!("--chequebook: {e}"))?),
+                None => None,
+            };
+            let ledger_path = state_dir.join("ledger.json");
+            let ledger = hoverfly::ledger::Ledger::load_or_create(&ledger_path)
+                .map_err(|e| format!("reading {}: {e}", ledger_path.display()))?;
+            let held = ledger.held_cheques();
+            println!(
+                "beneficiary 0x{}  recipient 0x{}  ({} cheque(s) held)",
+                hex::encode(beneficiary),
+                hex::encode(recipient),
+                held.len()
+            );
+            if held.is_empty() {
+                println!("nothing to cash");
+                return Ok(());
+            }
+            let mut cashed = 0usize;
+            let mut skipped = 0usize;
+            for (account, cb, cheque) in held {
+                let cb_addr = alloy_primitives::Address::from(cb);
+                if only.is_some_and(|o| o != cb_addr) {
+                    continue;
+                }
+                let cumulative = alloy_primitives::U256::from(cheque.cumulative_plur);
+                let q = hoverfly::batch::quote_cashout(
+                    &rpc_url,
+                    cb_addr,
+                    alloy_primitives::Address::from(beneficiary),
+                    cumulative,
+                )
+                .await?;
+                println!();
+                println!("chequebook 0x{}  (account 0x{})", hex::encode(cb), hex::encode(account));
+                println!("  cumulative   {cheque_cumulative}", cheque_cumulative = cheque.cumulative_plur);
+                println!("  unclaimed    {}", q.requested_plur);
+                println!("  payable now  {}{}", q.payable_plur,
+                    if q.would_bounce { "   <- chequebook cannot cover the claim" } else { "" });
+                if q.already_bounced {
+                    println!("  NOTE: this chequebook has bounced before");
+                }
+                if cheque.signature == [0u8; 65] {
+                    println!("  SKIP: no stored signature (ledger predates signature persistence)");
+                    skipped += 1;
+                    continue;
+                }
+                if q.payable_plur < floor {
+                    println!("  SKIP: below --min-amount ({min_amount} BZZ); gas would cost more than this collects");
+                    skipped += 1;
+                    continue;
+                }
+                if dry_run {
+                    println!("  DRY RUN: would cash {}", q.payable_plur);
+                    continue;
+                }
+                let tx = hoverfly::batch::cash_cheque(
+                    &signer,
+                    &rpc_url,
+                    chain_id,
+                    cb_addr,
+                    recipient,
+                    cumulative,
+                    &cheque.signature,
+                    std::time::Duration::from_secs(timeout),
+                )
+                .await?;
+                println!("  CASHED  tx 0x{}", hex::encode(tx));
+                cashed += 1;
+            }
+            println!();
+            println!("{cashed} cashed, {skipped} skipped");
+        }
         #[cfg(unix)]
         Commands::Chequebook { action } => match action {
             ChequebookAction::Deploy {

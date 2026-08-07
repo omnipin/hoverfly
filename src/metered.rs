@@ -278,9 +278,10 @@ impl Metered {
         account: [u8; 20],
         chequebook: [u8; 20],
         cumulative: u128,
+        signature: [u8; 65],
     ) -> Result<u128, LedgerError> {
         let mut l = self.ledger.lock().expect("ledger poisoned");
-        let accepted = l.credit(account, chequebook, cumulative)?;
+        let accepted = l.credit(account, chequebook, cumulative, signature)?;
         // Persist immediately: the window between accepting a cheque and
         // durably recording its cumulative is exactly §11.4's replay hole.
         if let Err(e) = l.persist() {
@@ -722,14 +723,14 @@ mod lifecycle_tests {
         let first = p.price_bytes(40 * 1024 * 1024);
         m.ledger.lock().unwrap().commit(ACCT, 0, first);
 
-        let accepted = m.credit(ACCT, CB, first).expect("first cheque");
+        let accepted = m.credit(ACCT, CB, first, [27u8; 65]).expect("first cheque");
         assert_eq!(accepted, first);
         assert_eq!(m.ledger.lock().unwrap().owed(&ACCT), 0);
 
         let second = p.price_bytes(32 * 1024 * 1024);
         m.ledger.lock().unwrap().commit(ACCT, 0, second);
         // A cumulative cheque: the *total*, not the delta.
-        let accepted = m.credit(ACCT, CB, first + second).expect("second cheque");
+        let accepted = m.credit(ACCT, CB, first + second, [27u8; 65]).expect("second cheque");
         assert_eq!(accepted, second, "only the new debt is credited");
         assert_eq!(m.ledger.lock().unwrap().owed(&ACCT), 0);
     }
@@ -780,7 +781,7 @@ mod lifecycle_tests {
             owed >= p.min_cheque_plur,
             "what is owed must clear the dust floor, or there is no exit"
         );
-        m.credit(ACCT, CB, owed).expect("a cheque for exactly what is owed");
+        m.credit(ACCT, CB, owed, [27u8; 65]).expect("a cheque for exactly what is owed");
         assert_eq!(m.ledger.lock().unwrap().owed(&ACCT), 0);
         assert!(
             !m.reserve_for_body(ACCT, 4251, cap).over_cap,

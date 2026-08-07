@@ -75,7 +75,20 @@ struct Account {
     owed_plur: u128,
     /// Deliberately absent from the on-disk form. See the module docs.
     reserved_plur: u128,
-    last_cumulative: HashMap<[u8; 20], u128>,
+    last_cumulative: HashMap<[u8; 20], HeldCheque>,
+}
+
+/// The latest cheque accepted from one chequebook.
+///
+/// **The signature has to be kept.** Cheques are cumulative, so only the
+/// newest one is ever worth presenting (§7.2) — but without its signature
+/// the relay holds a number it can prove nothing about and can never cash.
+/// The first cut stored only the cumulative, which made the whole ledger a
+/// record of money that could not be collected.
+#[derive(Debug, Clone, Copy)]
+pub struct HeldCheque {
+    pub cumulative_plur: u128,
+    pub signature: [u8; 65],
 }
 
 impl Account {
@@ -110,7 +123,9 @@ struct OnDisk {
 struct OnDiskAccount {
     account: String,
     owed_plur: String,
-    last_cumulative: Vec<(String, String)>,
+    /// `(chequebook, cumulative, signature_hex)`. Version 1 files carry no
+    /// signature; they load, but nothing in them can be cashed.
+    last_cumulative: Vec<(String, String, String)>,
 }
 
 impl Ledger {
@@ -167,8 +182,24 @@ impl Ledger {
         for a in disk.accounts {
             let key = parse_addr(&a.account)?;
             let mut last_cumulative = HashMap::new();
-            for (cb, v) in a.last_cumulative {
-                last_cumulative.insert(parse_addr(&cb)?, parse_u128(&v)?);
+            for (cb, v, sig_hex) in a.last_cumulative {
+                let raw = hex::decode(sig_hex.trim_start_matches("0x"))
+                    .map_err(|e| StoreError::Io(format!("cheque signature hex: {e}")))?;
+                // A v1 entry has no signature. Keep the cumulative — losing
+                // it would let the client replay (§11.4) — but leave the
+                // signature zeroed so cashout skips it rather than
+                // submitting something the contract will reject.
+                let mut signature = [0u8; 65];
+                if raw.len() == 65 {
+                    signature.copy_from_slice(&raw);
+                }
+                last_cumulative.insert(
+                    parse_addr(&cb)?,
+                    HeldCheque {
+                        cumulative_plur: parse_u128(&v)?,
+                        signature,
+                    },
+                );
             }
             accounts.insert(
                 key,
@@ -205,10 +236,16 @@ impl Ledger {
             .iter()
             .filter(|(_, a)| a.owed_plur > 0 || !a.last_cumulative.is_empty())
             .map(|(k, a)| {
-                let mut last: Vec<(String, String)> = a
+                let mut last: Vec<(String, String, String)> = a
                     .last_cumulative
                     .iter()
-                    .map(|(cb, v)| (hex::encode(cb), v.to_string()))
+                    .map(|(cb, c)| {
+                        (
+                            hex::encode(cb),
+                            c.cumulative_plur.to_string(),
+                            hex::encode(c.signature),
+                        )
+                    })
                     .collect();
                 last.sort();
                 OnDiskAccount {
@@ -227,7 +264,7 @@ impl Ledger {
         binding.sort();
 
         let disk = OnDisk {
-            version: 1,
+            version: 2,
             secret_hex: hex::encode(self.secret),
             accounts,
             binding,
@@ -255,8 +292,21 @@ impl Ledger {
         self.accounts
             .get(account)
             .and_then(|a| a.last_cumulative.get(chequebook))
-            .copied()
+            .map(|c| c.cumulative_plur)
             .unwrap_or(0)
+    }
+
+    /// Every cheque the relay holds, newest per chequebook. This is what
+    /// `hoverfly cashout` presents on-chain.
+    pub fn held_cheques(&self) -> Vec<([u8; 20], [u8; 20], HeldCheque)> {
+        let mut out = Vec::new();
+        for (account, a) in &self.accounts {
+            for (cb, held) in &a.last_cumulative {
+                out.push((*account, *cb, *held));
+            }
+        }
+        out.sort_by_key(|(_, cb, _)| *cb);
+        out
     }
 
     /// Number of accounts holding a live reservation — the cardinality
@@ -312,6 +362,7 @@ impl Ledger {
         account: [u8; 20],
         chequebook: [u8; 20],
         cumulative_plur: u128,
+        signature: [u8; 65],
     ) -> Result<u128, LedgerError> {
         if cumulative_plur > MAX_CUMULATIVE_PLUR {
             return Err(LedgerError::Absurd(cumulative_plur));
@@ -325,7 +376,11 @@ impl Ledger {
             _ => {}
         }
         let a = self.accounts.entry(account).or_default();
-        let have = a.last_cumulative.get(&chequebook).copied().unwrap_or(0);
+        let have = a
+            .last_cumulative
+            .get(&chequebook)
+            .map(|c| c.cumulative_plur)
+            .unwrap_or(0);
         if cumulative_plur <= have {
             return Err(LedgerError::NotIncreasing {
                 got: cumulative_plur,
@@ -342,7 +397,13 @@ impl Ledger {
                 owed: a.owed_plur,
             });
         }
-        a.last_cumulative.insert(chequebook, cumulative_plur);
+        a.last_cumulative.insert(
+            chequebook,
+            HeldCheque {
+                cumulative_plur,
+                signature,
+            },
+        );
         a.owed_plur -= delta;
         self.binding.insert(chequebook, account);
         Ok(delta)
@@ -419,9 +480,9 @@ mod tests {
     fn a_cheque_credits_only_the_delta() {
         let mut l = Ledger::ephemeral();
         l.commit(A, 0, 1000);
-        assert_eq!(l.credit(A, CB, 400).expect("first"), 400);
+        assert_eq!(l.credit_test(A, CB, 400).expect("first"), 400);
         assert_eq!(l.owed(&A), 600);
-        assert_eq!(l.credit(A, CB, 900).expect("second"), 500);
+        assert_eq!(l.credit_test(A, CB, 900).expect("second"), 500);
         assert_eq!(l.owed(&A), 100);
     }
 
@@ -430,9 +491,9 @@ mod tests {
     fn a_re_presented_cheque_credits_nothing() {
         let mut l = Ledger::ephemeral();
         l.commit(A, 0, 1000);
-        l.credit(A, CB, 400).expect("first");
+        l.credit_test(A, CB, 400).expect("first");
         assert_eq!(
-            l.credit(A, CB, 400),
+            l.credit_test(A, CB, 400),
             Err(LedgerError::NotIncreasing {
                 got: 400,
                 have: 400
@@ -445,10 +506,10 @@ mod tests {
     fn a_chequebook_cannot_move_between_accounts() {
         let mut l = Ledger::ephemeral();
         l.commit(A, 0, 1000);
-        l.credit(A, CB, 100).expect("bind to A");
+        l.credit_test(A, CB, 100).expect("bind to A");
         l.commit(B, 0, 1000);
         assert!(matches!(
-            l.credit(B, CB, 500),
+            l.credit_test(B, CB, 500),
             Err(LedgerError::ChequebookBound { .. })
         ));
     }
@@ -458,14 +519,14 @@ mod tests {
         let mut l = Ledger::ephemeral();
         l.commit(A, 0, 100);
         assert!(matches!(
-            l.credit(A, CB, MAX_CUMULATIVE_PLUR + 1),
+            l.credit_test(A, CB, MAX_CUMULATIVE_PLUR + 1),
             Err(LedgerError::Absurd(_))
         ));
         assert!(matches!(
-            l.credit(A, CB, 101),
+            l.credit_test(A, CB, 101),
             Err(LedgerError::Overpayment { got: 101, owed: 100 })
         ));
-        l.credit(A, CB, 100).expect("paying exactly what is owed is fine");
+        l.credit_test(A, CB, 100).expect("paying exactly what is owed is fine");
         assert_eq!(l.owed(&A), 0);
     }
 
@@ -480,7 +541,7 @@ mod tests {
         let secret = {
             let mut l = Ledger::load_or_create(&path).expect("create");
             l.commit(A, 0, 5000);
-            l.credit(A, CB, 1200).expect("pay");
+            l.credit_test(A, CB, 1200).expect("pay");
             l.reserve(A, 900, 100_000);
             l.persist().expect("persist");
             *l.secret()
@@ -512,12 +573,12 @@ mod tests {
         {
             let mut l = Ledger::load_or_create(&path).expect("create");
             l.commit(A, 0, 5000);
-            l.credit(A, CB, 1200).expect("pay");
+            l.credit_test(A, CB, 1200).expect("pay");
             l.persist().expect("persist");
         }
         let mut l = Ledger::load_or_create(&path).expect("reload");
         assert!(
-            matches!(l.credit(A, CB, 1200), Err(LedgerError::NotIncreasing { .. })),
+            matches!(l.credit_test(A, CB, 1200), Err(LedgerError::NotIncreasing { .. })),
             "re-presenting the same cheque after a restart must credit nothing"
         );
         let _ = std::fs::remove_file(&path);
@@ -531,13 +592,13 @@ mod tests {
         {
             let mut l = Ledger::load_or_create(&path).expect("create");
             l.commit(A, 0, 500);
-            l.credit(A, CB, 100).expect("bind");
+            l.credit_test(A, CB, 100).expect("bind");
             l.persist().expect("persist");
         }
         let mut l = Ledger::load_or_create(&path).expect("reload");
         l.commit(B, 0, 500);
         assert!(
-            matches!(l.credit(B, CB, 200), Err(LedgerError::ChequebookBound { .. })),
+            matches!(l.credit_test(B, CB, 200), Err(LedgerError::ChequebookBound { .. })),
             "the chequebook binding must survive a restart"
         );
         let _ = std::fs::remove_file(&path);
@@ -576,7 +637,7 @@ mod leak_tests {
         let mut l = Ledger::ephemeral();
         l.commit(A, 0, 1000);
         l.reserve(A, 500, 100_000);
-        l.credit(A, CB, 1000).expect("pay off the debt");
+        l.credit_test(A, CB, 1000).expect("pay off the debt");
         assert_eq!(l.owed(&A), 0, "the debt is cleared");
         assert_eq!(
             l.reserved(&A),
@@ -598,7 +659,7 @@ mod leak_tests {
         // There is no debt to pay, so no cheque exists that could help.
         assert_eq!(l.owed(&A), 0);
         assert!(
-            matches!(l.credit(A, CB, 1), Err(LedgerError::Overpayment { .. })),
+            matches!(l.credit_test(A, CB, 1), Err(LedgerError::Overpayment { .. })),
             "with nothing owed, a cheque cannot clear the overshoot"
         );
         // Only releasing does.
@@ -628,5 +689,21 @@ mod leak_tests {
         l.commit(A, adm.reserved_plur, 0);
         assert_eq!(l.outstanding(&A), 0);
         assert_eq!(l.live_reservations(), 0);
+    }
+}
+
+#[cfg(test)]
+impl Ledger {
+    /// Test shim: cheques in unit tests carry a dummy signature, since the
+    /// ledger never inspects it — only `hoverfly cashout` does.
+    fn credit_test(
+        &mut self,
+        account: [u8; 20],
+        chequebook: [u8; 20],
+        cumulative_plur: u128,
+    ) -> Result<u128, LedgerError> {
+        let mut sig = [0u8; 65];
+        sig[64] = 27;
+        self.credit(account, chequebook, cumulative_plur, sig)
     }
 }

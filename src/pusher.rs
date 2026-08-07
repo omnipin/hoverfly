@@ -943,7 +943,12 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
             "chequebook cannot cover this cheque",
         );
     }
-    match m.credit(verified.account, cheque.chequebook, cumulative) {
+    match m.credit(
+        verified.account,
+        cheque.chequebook,
+        cumulative,
+        cheque.signature,
+    ) {
         Ok(accepted) => {
             // We just consumed part of what that balance covered; the next
             // cheque should not be judged against the pre-credit reading.
