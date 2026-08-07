@@ -526,10 +526,64 @@ async fn handle(
 
 /// What admission decided, carried into the push task so completion can
 /// convert the reservation into debt. `None` in open mode.
+///
+/// **This is an RAII guard, and it has to be.** A reservation is placed
+/// before the body is read, but half a dozen things between there and the
+/// push can fail — an oversize body, a read timeout, a frame-decode error,
+/// an empty batch. Every one of those returns without ever reaching
+/// `run_push`, which is the only place `commit` runs, and `commit` is the
+/// only thing besides `release` that lowers `reserved_plur`. Paying a
+/// cheque does not help: `Ledger::credit` reduces `owed`, never `reserved`.
+///
+/// So a leaked reservation is permanent until restart, and it ratchets:
+/// under hard mode the account eventually sits above its cap with **no
+/// cheque able to clear it** — precisely the no-exit failure §10.1's
+/// invariant exists to prevent — and under soft mode the leaks accumulate
+/// against `MAX_LIVE_RESERVATIONS` until the relay sheds real clients.
+///
+/// Releasing on drop makes every exit path correct by construction,
+/// including ones added later, which is the whole reason it is a guard
+/// rather than four hand-written `release` calls.
 pub struct Admitted {
+    state: Arc<State>,
     account: [u8; 20],
     batch: [u8; 32],
     reserved_plur: u128,
+    settled: bool,
+}
+
+impl Admitted {
+    /// Convert the reservation into debt for the bytes actually admitted,
+    /// releasing the remainder. Consumes the guard, so the `Drop` path
+    /// cannot double-release.
+    fn commit(mut self, billable_bytes: u64) {
+        let Some(m) = self.state.metered.as_ref() else {
+            return;
+        };
+        let billed = m.cfg.params.price_bytes(billable_bytes);
+        let mut l = m.ledger.lock().expect("ledger poisoned");
+        l.commit(self.account, self.reserved_plur, billed);
+        if let Err(e) = l.persist() {
+            // `owed` is written at batch completion, so a failed persist
+            // forfeits at most this batch — the safe direction (§10.2).
+            tracing::error!("ledger persist after commit failed: {e}");
+        }
+        self.settled = true;
+    }
+}
+
+impl Drop for Admitted {
+    fn drop(&mut self) {
+        if self.settled {
+            return;
+        }
+        if let Some(m) = self.state.metered.as_ref() {
+            m.ledger
+                .lock()
+                .expect("ledger poisoned")
+                .release(self.account, self.reserved_plur);
+        }
+    }
 }
 
 /// Metered admission for `/v1/push` (§7.2).
@@ -541,7 +595,7 @@ pub struct Admitted {
 fn admit_metered(
     state: &Arc<State>,
     req: &Request<hyper::body::Incoming>,
-) -> Result<Option<Admitted>, Response<RespBody>> {
+) -> Result<Option<Admitted>, Box<Response<RespBody>>> {
     let Some(m) = state.metered.as_ref() else {
         return Ok(None);
     };
@@ -552,17 +606,17 @@ fn admit_metered(
         .unwrap_or_default();
     let verified = m
         .verify_header(raw, crate::challenge::now_unix())
-        .map_err(|e| json_line_response(StatusCode::UNAUTHORIZED, &e))?;
+        .map_err(|e| Box::new(json_line_response(StatusCode::UNAUTHORIZED, &e)))?;
     if !m.allow_account(&verified.account) {
-        return Err(json_line_response(StatusCode::TOO_MANY_REQUESTS, "slow down"));
+        return Err(Box::new(json_line_response(StatusCode::TOO_MANY_REQUESTS, "slow down")));
     }
     // The reservation ledger is attacker-influenced (one entry per batch in
     // standing), so shed rather than grow without bound (§7.2).
     if m.shed_reservations() {
-        return Err(json_line_response(
+        return Err(Box::new(json_line_response(
             StatusCode::SERVICE_UNAVAILABLE,
             "too many accounts with live reservations",
-        ));
+        )));
     }
     // Bound the reservation by the *declared* body. Same quantity, same
     // arithmetic as the eventual bill (§8), so there is no estimate to be
@@ -574,16 +628,16 @@ fn admit_metered(
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse::<u64>().ok());
     let Some(declared) = declared else {
-        return Err(json_line_response(
+        return Err(Box::new(json_line_response(
             StatusCode::LENGTH_REQUIRED,
             "metered mode requires Content-Length so the reservation can be bounded",
-        ));
+        )));
     };
     if declared > PUSH_MAX_BODY as u64 {
-        return Err(json_line_response(
+        return Err(Box::new(json_line_response(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body exceeds limit",
-        ));
+        )));
     }
     let adm = m.reserve_for_body(verified.account, declared, verified.cap_plur);
     if adm.over_cap {
@@ -594,7 +648,7 @@ fn admit_metered(
                 .lock()
                 .expect("ledger poisoned")
                 .release(verified.account, adm.reserved_plur);
-            return Err(json_response(
+            return Err(Box::new(json_response(
                 StatusCode::PAYMENT_REQUIRED,
                 &serde_json::json!({
                     "error": "payment required",
@@ -602,7 +656,7 @@ fn admit_metered(
                     "max_outstanding_plur": adm.cap_plur.to_string(),
                     "settle_every_plur": m.cfg.params.settle_every_plur.to_string(),
                 }),
-            ));
+            )));
         }
         // Soft mode: record and serve anyway. This is the instrument Stage 0
         // could not provide — how often a real client *would* have been
@@ -615,9 +669,11 @@ fn admit_metered(
         );
     }
     Ok(Some(Admitted {
+        state: state.clone(),
         account: verified.account,
         batch: verified.batch,
         reserved_plur: adm.reserved_plur,
+        settled: false,
     }))
 }
 
@@ -921,6 +977,11 @@ async fn read_body_limited(
     use http_body_util::BodyExt;
     use hyper::body::Body as _;
     use std::time::Duration;
+    // Cheap rejection when the client declares an oversize body up front.
+    // This is an optimisation, NOT the bound: `size_hint().upper()` is
+    // `None` for a chunked body (and for HTTP/2, where length is unknown
+    // until END_STREAM), so a client that omits `Content-Length` skips it
+    // entirely.
     if let Some(len) = req.body().size_hint().upper()
         && len > max as u64
     {
@@ -929,9 +990,14 @@ async fn read_body_limited(
             "body too large",
         ));
     }
+    // The real bound. `Limited` enforces the cap *inside* `poll_frame`, so
+    // memory is held to `max` plus one frame. A bare `.collect()` would
+    // accumulate whatever the client streams until the timeout fires —
+    // ~30 s of link bandwidth per connection, times the connection cap —
+    // and only notice afterwards, which is no bound at all.
     match tokio::time::timeout(
         Duration::from_secs(HEADER_READ_TIMEOUT_SECS),
-        req.into_body().collect(),
+        Limited::new(req.into_body(), max).collect(),
     )
     .await
     {
@@ -945,9 +1011,9 @@ async fn read_body_limited(
             }
             Ok(b)
         }
-        Ok(Err(e)) => Err(json_line_response(
-            StatusCode::BAD_REQUEST,
-            &format!("body: {e}"),
+        Ok(Err(_)) => Err(json_line_response(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "body exceeds limit or read error",
         )),
         Err(_) => Err(json_line_response(StatusCode::REQUEST_TIMEOUT, "body read timed out")),
     }
@@ -1390,7 +1456,7 @@ async fn push_response(
     // which is the point of issuing it.
     let admitted = match admit_metered(&state, &req) {
         Ok(a) => a,
-        Err(resp) => return resp,
+        Err(resp) => return *resp,
     };
     // Bounded body read — a whole batch, not a stream. Bounded in *time* as
     // well as size: the size limit alone let a client dribble a body forever
@@ -1606,15 +1672,8 @@ async fn run_push(
     // release the rest (§10.2). Runs before the early return below, so a
     // POST that admitted nothing still gives its reservation back — leaking
     // it would ratchet the account toward a 402 it can never clear.
-    if let (Some(adm), Some(m)) = (&admitted, state.metered.as_ref()) {
-        let billed = m.cfg.params.price_bytes(billable_bytes);
-        let mut l = m.ledger.lock().expect("ledger poisoned");
-        l.commit(adm.account, adm.reserved_plur, billed);
-        if let Err(e) = l.persist() {
-            // `owed` is written at batch completion, so a failed persist
-            // forfeits at most this batch — the safe direction (§10.2).
-            tracing::error!("ledger persist after commit failed: {e}");
-        }
+    if let Some(adm) = admitted {
+        adm.commit(billable_bytes);
     }
 
     // One lock for the whole request. Runs before the early return below so
@@ -2299,6 +2358,54 @@ fn json_line_response(status: StatusCode, message: &str) -> Response<RespBody> {
     json_response(status, &serde_json::json!({"error": message}))
 }
 
+/// The signed `payment` block for `/v1/status` (incentives §7.3).
+///
+/// An unsigned price is repudiable in both directions: the relay can serve
+/// `P` and bill `10P`, the client can claim it saw `P/10`, and
+/// reconciliation can detect the mismatch but never attribute it.
+///
+/// It carries `node_eth_address` and `overlay_nonce` because
+/// "pin `(url, overlay)`" is not implementable — an overlay is
+/// `keccak(eth_addr ‖ network_id_LE8 ‖ nonce)`, so verifying a signature
+/// yields the *eth address* while the nonce is neither transmitted nor
+/// derivable. With both present a client can recompute the overlay and
+/// check it against what the relay advertises, and pin the triple
+/// `(url, node_eth_address, beneficiary)`.
+fn payment_quote(state: &State) -> Option<serde_json::Value> {
+    let m = state.metered.as_ref()?;
+    let push = state.push.as_ref()?;
+    let p = &m.cfg.params;
+    let mut body = serde_json::json!({
+        "mode": "metered",
+        "enforcement": if m.cfg.hard_mode { "hard" } else { "soft" },
+        "beneficiary": format!("0x{}", hex::encode(m.cfg.beneficiary)),
+        "node_eth_address": format!("0x{}", hex::encode(push.signer.eth_address())),
+        "overlay_nonce": format!("0x{}", hex::encode(state.opts.nonce)),
+        "origin": m.cfg.origins.first().cloned().unwrap_or_default(),
+        "chain_id": m.cfg.chain_id,
+        "factory": format!("0x{}", hex::encode(m.cfg.factory)),
+        "price_plur_per_kib": p.price_plur_per_kib.to_string(),
+        "min_cheque_plur": p.min_cheque_plur.to_string(),
+        "settle_every_plur": p.settle_every_plur.to_string(),
+        "max_outstanding_plur": p.max_outstanding_plur.to_string(),
+        "credit_ratio": p.credit_ratio,
+        "challenge_ttl_secs": crate::challenge::CHALLENGE_TTL_SECS,
+    });
+    // Sign the canonical serialization of the block itself, so what the
+    // client verifies is exactly what it read.
+    let payload = body.to_string();
+    match push.signer.sign_eip191(payload.as_bytes()) {
+        Ok(sig) => {
+            body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
+            Some(body)
+        }
+        Err(e) => {
+            tracing::error!("cannot sign payment quote: {e}");
+            None
+        }
+    }
+}
+
 #[cfg(test)]
 mod owner_cache_tests {
     use super::*;
@@ -2375,53 +2482,5 @@ mod owner_cache_tests {
             .expect("clock supports backdating");
         c.map.get_mut("stale").expect("present").1 = aged;
         assert!(c.get("stale").is_none(), "expired entry must not be served");
-    }
-}
-
-/// The signed `payment` block for `/v1/status` (incentives §7.3).
-///
-/// An unsigned price is repudiable in both directions: the relay can serve
-/// `P` and bill `10P`, the client can claim it saw `P/10`, and
-/// reconciliation can detect the mismatch but never attribute it.
-///
-/// It carries `node_eth_address` and `overlay_nonce` because
-/// "pin `(url, overlay)`" is not implementable — an overlay is
-/// `keccak(eth_addr ‖ network_id_LE8 ‖ nonce)`, so verifying a signature
-/// yields the *eth address* while the nonce is neither transmitted nor
-/// derivable. With both present a client can recompute the overlay and
-/// check it against what the relay advertises, and pin the triple
-/// `(url, node_eth_address, beneficiary)`.
-fn payment_quote(state: &State) -> Option<serde_json::Value> {
-    let m = state.metered.as_ref()?;
-    let push = state.push.as_ref()?;
-    let p = &m.cfg.params;
-    let mut body = serde_json::json!({
-        "mode": "metered",
-        "enforcement": if m.cfg.hard_mode { "hard" } else { "soft" },
-        "beneficiary": format!("0x{}", hex::encode(m.cfg.beneficiary)),
-        "node_eth_address": format!("0x{}", hex::encode(push.signer.eth_address())),
-        "overlay_nonce": format!("0x{}", hex::encode(state.opts.nonce)),
-        "origin": m.cfg.origins.first().cloned().unwrap_or_default(),
-        "chain_id": m.cfg.chain_id,
-        "factory": format!("0x{}", hex::encode(m.cfg.factory)),
-        "price_plur_per_kib": p.price_plur_per_kib.to_string(),
-        "min_cheque_plur": p.min_cheque_plur.to_string(),
-        "settle_every_plur": p.settle_every_plur.to_string(),
-        "max_outstanding_plur": p.max_outstanding_plur.to_string(),
-        "credit_ratio": p.credit_ratio,
-        "challenge_ttl_secs": crate::challenge::CHALLENGE_TTL_SECS,
-    });
-    // Sign the canonical serialization of the block itself, so what the
-    // client verifies is exactly what it read.
-    let payload = body.to_string();
-    match push.signer.sign_eip191(payload.as_bytes()) {
-        Ok(sig) => {
-            body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
-            Some(body)
-        }
-        Err(e) => {
-            tracing::error!("cannot sign payment quote: {e}");
-            None
-        }
     }
 }
