@@ -2668,6 +2668,7 @@ pub async fn push_via_pushers(
         total,
         move |_| Ok(once.take().unwrap_or_default()),
         progress,
+        None,
     )
     .await
 }
@@ -2684,6 +2685,10 @@ async fn drive_pushers<P>(
     total_hint: usize,
     mut produce: P,
     progress: Option<&ProgressFn>,
+    // Metered lanes only (`docs/pusher-incentives.md` §12). `None` means
+    // pay nothing, which is correct for every `open` lane and is what all
+    // callers pass until a lane actually advertises a price.
+    payment: Option<&crate::payer::PaymentConfig>,
 ) -> Result<(), ClientError>
 where
     P: FnMut(usize) -> Result<Vec<StampedChunk>, ClientError>,
@@ -2739,6 +2744,27 @@ where
         .iter()
         .map(|u| std::sync::Arc::new(format!("{}/v1/push", u.trim_end_matches('/'))))
         .collect();
+    // One payer per metered lane. Lanes that quote no price get none, so an
+    // `open` lane costs nothing and needs no special case below.
+    let mut payers: Vec<Option<crate::payer::LanePayer>> = Vec::with_capacity(pusher_urls.len());
+    for (i, url) in pusher_urls.iter().enumerate() {
+        let quote = payment.and_then(|_| infos.get(i).and_then(|inf: &LaneInfo| inf.quote.clone()));
+        payers.push(match (payment, quote) {
+            (Some(pc), Some(q)) => {
+                let key = crate::cheques::relay_key(&q.beneficiary);
+                let cumulative = pc
+                    .cheques
+                    .lock()
+                    .expect("cheque store poisoned")
+                    .cumulative(&key);
+                info!(target: "hoverfly::upload",
+                    "lane {i} is metered at {} PLUR/KiB; resuming cumulative {cumulative}",
+                    q.params.price_plur_per_kib);
+                Some(crate::payer::LanePayer::new(url.clone(), q, cumulative))
+            }
+            _ => None,
+        });
+    }
     let mut sched = Scheduler::new(infos, cfg);
     // Frames are held by address, not by index: `admit` de-duplicates, so an
     // index-parallel Vec would silently skew. Keying by address also lets a
@@ -2812,8 +2838,41 @@ where
                 debug!(target: "hoverfly::upload",
                     "hedging {} straggler(s) onto lane {lane}", batch.len());
             }
+            // Metered lane: attach the capability, and bill ourselves for
+            // the body by the same arithmetic the relay uses (§8). We count
+            // what we *send*; nothing the relay reports enters this number,
+            // which is why the two sides can agree without exchanging
+            // anything.
+            let mut challenge: Option<String> = None;
+            if let (Some(pc), Some(payer)) = (payment, payers[lane].as_mut()) {
+                match payer.header(&http, pc).await {
+                    Ok(h) => challenge = Some(h.to_string()),
+                    Err(e) => {
+                        warn!(target: "hoverfly::upload",
+                            "lane {lane}: cannot obtain a challenge ({e}); pausing it");
+                        sched.on_batch_result(
+                            batch_id,
+                            crate::pushsched::BatchOutcome::PaymentRequired,
+                            now_ms(),
+                        );
+                        continue;
+                    }
+                }
+                let body_bytes: u64 =
+                    batch.iter().map(|c| (crate::pushframe::HEADER_LEN + c.wire.len()) as u64).sum();
+                payer.account.record_sent(body_bytes);
+            }
             tokio::spawn(async move {
-                post_batch_streaming(&http, url.as_str(), batch_id, lane, &batch, &tx, None).await;
+                post_batch_streaming(
+                    &http,
+                    url.as_str(),
+                    batch_id,
+                    lane,
+                    &batch,
+                    &tx,
+                    challenge.as_deref(),
+                )
+                .await;
             });
         }
 
@@ -2909,7 +2968,38 @@ where
                 outcome,
             } => {
                 sched.on_batch_timing(lane, acked, elapsed_ms);
+                let needs_payment =
+                    matches!(outcome, crate::pushsched::BatchOutcome::PaymentRequired);
                 sched.on_batch_result(batch, outcome, now_ms());
+                // Settle when the relay asks (402) or when we have crossed
+                // the lane's own settlement window. Paying on the window
+                // keeps an upload from ever reaching its cap in the first
+                // place; paying on 402 is the recovery path when it does.
+                if let (Some(pc), Some(payer)) = (payment, payers[lane].as_mut())
+                    && (needs_payment || payer.account.should_settle())
+                {
+                    match payer.settle(&http, pc).await {
+                        Ok(Some(c)) => {
+                            info!(target: "hoverfly::upload",
+                                "lane {lane}: paid, cumulative now {c}");
+                            // Restores the lane to the health it had before
+                            // it ran out of credit — a 402 never charged the
+                            // failure streak, so this is not a re-warm.
+                            sched.fund_lane(lane);
+                        }
+                        Ok(None) if needs_payment => {
+                            // 402 with nothing owed above the dust floor
+                            // means the two sides disagree about the
+                            // ledger. Retrying cannot fix that.
+                            warn!(target: "hoverfly::upload",
+                                "lane {lane}: 402 but nothing is owed — ledger disagreement");
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            warn!(target: "hoverfly::upload", "lane {lane}: payment failed: {e}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -2997,6 +3087,7 @@ pub async fn push_stream_via_pushers(
         total,
         move |want| streamer.next_batch(want),
         progress,
+        None,
     )
     .await?;
     Ok(root)
@@ -3184,7 +3275,7 @@ async fn fetch_lane_info(
     // unsigned or unverifiable price is repudiable in both directions, so a
     // quote that does not check out leaves the lane looking unmetered rather
     // than looking free.
-    let (price_plur_per_kib, hard_enforcement) = match v.get("payment") {
+    let (price_plur_per_kib, hard_enforcement, quote) = match v.get("payment") {
         Some(pay) if !pay.is_null() => {
             // The overlay cross-check is skipped here: it needs the
             // network id, which this driver does not carry, and it is the
@@ -3194,20 +3285,21 @@ async fn fetch_lane_info(
             // field from an assertion into a check. A caller that pins
             // does the full version.
             match crate::payer::PaymentQuote::verify(pay, None, 0, None, price_ceiling) {
-                Ok(q) => (Some(q.params.price_plur_per_kib), q.hard_enforcement),
+                Ok(q) => (Some(q.params.price_plur_per_kib), q.hard_enforcement, Some(q)),
                 Err(e) => {
                     warn!(target: "hoverfly::upload",
                         "lane {base_url}: payment quote rejected ({e}); treating as unmetered");
-                    (None, false)
+                    (None, false, None)
                 }
             }
         }
-        _ => (None, false),
+        _ => (None, false, None),
     };
     LaneInfo {
         overlay,
         price_plur_per_kib,
         hard_enforcement,
+        quote,
         batch_max: v
             .get("batch_max")
             .and_then(|x| x.as_u64())

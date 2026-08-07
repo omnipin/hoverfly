@@ -1250,6 +1250,17 @@ tracking computed from bytes sent. `BatchOutcome::PaymentRequired` and a
 non-terminal `LaneHealth::Unfunded` are in `src/pushsched.rs`, and
 `src/cheques.rs` gained `total_issued` plus a `relay:` key namespace.
 
+**Chequebook deployment is an explicit user action, never automatic.** It
+belongs in its own command (`hoverfly chequebook deploy`, alongside
+`batch create`), not on the upload path. Deploying a contract is
+irreversible and spends real funds, so an upload that silently deployed one
+because some lane quoted a price would fire on the *first* metered lane a
+user ever met — before they had decided they wanted to pay at all. This is
+the same shape §14 Stage 3 gives the browser, where the wallet deploys the
+chequebook as a deliberate opt-in. hoverfly has no deploy path today: it
+consumes a chequebook via `--chequebook` and documents "already deployed by
+bee's official factory" as a precondition.
+
 Two things remain before hard mode: the driver does not yet *act* on a 402
 by issuing a cheque and calling `Scheduler::fund_lane` (the pieces exist
 and are tested; the loop that connects them does not), and the `/v1/pay`
