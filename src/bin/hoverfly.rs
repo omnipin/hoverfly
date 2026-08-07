@@ -2338,6 +2338,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // here and in `build_metered`, and a failure refuses to start
             // rather than serving a half-configured meter that a paying
             // client would discover the hard way.
+            // Env fallbacks so a deployed relay can be switched to metered
+            // without changing its start command — the same pattern
+            // HOVERFLY_PUSH_POOL and HOVERFLY_PUSHER_IDENTITY already use,
+            // and the only lever available on hosts where the command line
+            // is fixed by the platform.
+            let envs = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
+            let meter = meter || envs("HOVERFLY_METER").is_some_and(|v| v != "0");
+            let meter_hard =
+                meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| v != "0");
+            let origin = if origin.is_empty() {
+                envs("HOVERFLY_METER_ORIGIN")
+                    .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
+                    .unwrap_or_default()
+            } else {
+                origin
+            };
+            let beneficiary = beneficiary.or_else(|| envs("HOVERFLY_METER_BENEFICIARY"));
+            let state_dir = state_dir.or_else(|| envs("HOVERFLY_METER_STATE_DIR").map(Into::into));
+            let parse_env_plur = |k: &str| -> Result<Option<u128>, String> {
+                match envs(k) {
+                    Some(v) => v.parse().map(Some).map_err(|e| format!("{k}: {e}")),
+                    None => Ok(None),
+                }
+            };
+            let price_plur_per_kib =
+                price_plur_per_kib.or(parse_env_plur("HOVERFLY_METER_PRICE_PLUR_PER_KIB")?);
+            let min_cheque_plur =
+                min_cheque_plur.or(parse_env_plur("HOVERFLY_METER_MIN_CHEQUE_PLUR")?);
+            let settle_every_plur =
+                settle_every_plur.or(parse_env_plur("HOVERFLY_METER_SETTLE_EVERY_PLUR")?);
+            let max_outstanding_plur =
+                max_outstanding_plur.or(parse_env_plur("HOVERFLY_METER_MAX_OUTSTANDING_PLUR")?);
+            let credit_ratio = credit_ratio.or(parse_env_plur("HOVERFLY_METER_CREDIT_RATIO")?);
             let meter_opts = if meter {
                 let mut params = hoverfly::meter::Params::default();
                 if let Some(v) = price_plur_per_kib {
