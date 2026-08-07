@@ -1490,3 +1490,103 @@ impl EthRpc {
         Ok(None)
     }
 }
+
+// ──────────────────────────────────────────────────────────────────────
+// Cashing out (docs/pusher-incentives.md §14 Stage 2)
+// ──────────────────────────────────────────────────────────────────────
+
+sol! {
+    function cashChequeBeneficiary(
+        address recipient,
+        uint256 cumulativePayout,
+        bytes issuerSig
+    ) external;
+}
+
+/// What a cheque is actually worth right now, before spending gas on it.
+#[derive(Debug, Clone, Copy)]
+pub struct CashoutQuote {
+    /// `cumulative - paidOut(beneficiary)`: what is still unclaimed.
+    pub requested_plur: U256,
+    /// `min(requested, liquidBalanceFor(beneficiary))` — what the contract
+    /// would actually transfer.
+    pub payable_plur: U256,
+    /// True when the chequebook cannot cover the whole claim. The cashout
+    /// still succeeds and takes what is there — `_cashChequeInternal` does
+    /// not revert — but it sets `bounced` permanently.
+    pub would_bounce: bool,
+    pub already_bounced: bool,
+}
+
+/// Price a cheque without sending anything.
+///
+/// Worth doing first because gas is spent whether or not the cheque is
+/// worth cashing, and a cumulative at or below `paidOut` transfers nothing
+/// at all.
+pub async fn quote_cashout(
+    rpc_url: &str,
+    chequebook: Address,
+    beneficiary: Address,
+    cumulative_plur: U256,
+) -> Result<CashoutQuote, BatchError> {
+    let st = read_chequebook_state(rpc_url, chequebook, beneficiary).await?;
+    let requested_plur = cumulative_plur.saturating_sub(st.paid_out_to_us);
+    let payable_plur = requested_plur.min(st.liquid_for_us);
+    Ok(CashoutQuote {
+        requested_plur,
+        payable_plur,
+        would_bounce: payable_plur < requested_plur,
+        already_bounced: st.bounced,
+    })
+}
+
+/// Present a cheque on-chain.
+///
+/// **Must be sent by the beneficiary**: `cashChequeBeneficiary` passes
+/// `msg.sender` as the beneficiary into `_cashChequeInternal`, so the
+/// signing key here is the EOA the cheques were made out to — never the
+/// relay's, which is why this is a separate command run somewhere else
+/// (§6). `recipient` is where the BZZ lands and may differ.
+pub async fn cash_cheque(
+    beneficiary_signer: &PrivateKeySigner,
+    rpc_url: &str,
+    chain_id: u64,
+    chequebook: Address,
+    recipient: Address,
+    cumulative_plur: U256,
+    signature: &[u8; 65],
+    receipt_timeout: std::time::Duration,
+) -> Result<B256, BatchError> {
+    // The contract verifies through OpenZeppelin's ECDSA, which rejects
+    // high-s and v ∉ {27,28}. A non-canonical signature reverts and burns
+    // the gas, so refuse it here where it costs nothing.
+    crate::signer::check_canonical_signature(signature)
+        .map_err(|e| BatchError::Rpc(format!("stored cheque is not cashable: {e}")))?;
+    let rpc = EthRpc::new(rpc_url.to_string());
+    let call = cashChequeBeneficiaryCall {
+        recipient,
+        cumulativePayout: cumulative_plur,
+        issuerSig: signature.to_vec().into(),
+    }
+    .abi_encode();
+    let tx = rpc
+        .send_signed(beneficiary_signer, chain_id, chequebook, &call)
+        .await?;
+    rpc.wait_for_success(tx, receipt_timeout).await?;
+    Ok(tx)
+}
+
+#[cfg(test)]
+mod cashout_tests {
+    use super::*;
+
+    #[test]
+    fn the_cashout_selector_matches_the_contract() {
+        use alloy_sol_types::SolCall;
+        let want: [u8; 32] = <sha3::Keccak256 as sha3::Digest>::digest(
+            "cashChequeBeneficiary(address,uint256,bytes)".as_bytes(),
+        )
+        .into();
+        assert_eq!(cashChequeBeneficiaryCall::SELECTOR, want[..4]);
+    }
+}

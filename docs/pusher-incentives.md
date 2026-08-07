@@ -1323,8 +1323,27 @@ signature, POST sizing against the returned cap, lane pinning on
 `(url, node_eth_address, beneficiary)` (§7.3), and `total_issued` (§8.3).
 
 **Stage 2 — hard mode and cashout.** 402 enforcement; scheduler changes
-(§12); a standalone `hoverfly cashout` run from a machine holding the
-beneficiary key, never the relay. Cashout reads `bounced` and
+(§12).
+
+**`hoverfly cashout` shipped**, run from a machine holding the beneficiary
+key, never the relay. It reads the relay's ledger, prices each held cheque
+on-chain, and presents the ones worth collecting. Two things it forced:
+
+- **The ledger has to keep the signature.** The first cut stored only the
+  cumulative, which made the whole thing a record of money that could not
+  be collected — the relay could prove nothing about a number it held
+  alone. On-disk format is now version 2; a version 1 entry loads (losing
+  its cumulative would let the client replay, §11.4) but is skipped at
+  cashout rather than submitted for the contract to reject.
+- **Cashing is naturally idempotent**, because the contract tracks
+  `paidOut(beneficiary)`. A repeated run sees `unclaimed 0` and presents
+  nothing, which matters for a command that will be run on a timer.
+
+`--min-amount` defaults to 0.25 BZZ (§9.3's threshold): cashing costs ~300k
+gas whatever the amount, so a smaller cheque is worth less than collecting
+it. Verified on Gnosis mainnet — a 145,920,000,000 PLUR cheque presented,
+`paidOut` moved by exactly that, and the beneficiary's BZZ balance moved by
+exactly that. Cashout reads `bounced` and
 `liquidBalanceFor` rather than `balance` (§11.2), and optionally offers
 **secured mode** for high-volume accounts: the beneficiary signs a
 `setCustomHardDepositTimeout` for that client's chequebook, the client
