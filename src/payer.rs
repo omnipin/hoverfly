@@ -391,6 +391,36 @@ impl LaneAccount {
         self.owed_plur = 0;
     }
 
+    /// Adopt a larger debt figure the relay reports for us.
+    ///
+    /// The mirror of [`Self::forgive_phantom_debt`], and the half that is
+    /// load-bearing across *sessions*. The relay's ledger is durable and
+    /// ours is not: every run ends leaving the sub-dust residual unpaid
+    /// (see the final settle in `drive_pushers`), and the relay keeps
+    /// counting it against the credit line while a fresh client process
+    /// starts believing it owes nothing. Enough runs of that and the
+    /// account is over its cap with a client that cannot compute a cheque
+    /// to clear it — refused forever, having genuinely incurred the debt.
+    ///
+    /// `relay_owed` must be the relay's *owed*, never the `outstanding` in
+    /// a 402 body: that one is quoted with the just-refused reservation
+    /// already added, so adopting it over-pays by exactly the body that was
+    /// turned away and the next cheque is rejected as an overpayment.
+    /// Reservations are excluded for the same reason on our side — bytes
+    /// still in flight are already counted in `pending_plur`, and would be
+    /// billed twice when those POSTs land.
+    ///
+    /// Only ever raises. An under-count is safe and self-correcting (the
+    /// next settle picks up the rest); an over-count is a cheque the relay
+    /// refuses.
+    pub fn adopt_relay_debt(&mut self, relay_owed: u128) -> bool {
+        if relay_owed <= self.owed_plur {
+            return false;
+        }
+        self.owed_plur = relay_owed;
+        true
+    }
+
     /// Call once a cheque for `cumulative` has been accepted.
     pub fn settled(&mut self, cumulative: u128) {
         let credited = cumulative.saturating_sub(self.cumulative_plur);
@@ -403,8 +433,17 @@ impl LaneAccount {
     /// The client sizes its POST to fit rather than discovering the ceiling
     /// as a 402 — which matters most for exactly the small batches §10.3
     /// exists to keep, whose whole credit line is under one full POST.
+    ///
+    /// Measured against `outstanding`, not `owed`: the relay reserves each
+    /// body at admission, so concurrent POSTs hold credit that is not yet
+    /// debt. Sizing against `owed` alone hands every in-flight POST the
+    /// whole line as if it were the only one, and with several on the wire
+    /// their reservations sum past the cap — the relay 402s a client that
+    /// believes it has headroom, and nothing is owed that paying could
+    /// clear. `has_headroom` and `would_exceed` already bind on
+    /// `outstanding`; this is the same quantity.
     pub fn max_body_bytes(&self, cap_plur: u128) -> u64 {
-        let headroom = cap_plur.saturating_sub(self.owed_plur);
+        let headroom = cap_plur.saturating_sub(self.outstanding());
         let kib = headroom / self.params.price_plur_per_kib.max(1);
         (kib.saturating_mul(1024)).min(u64::MAX as u128) as u64
     }
@@ -482,6 +521,11 @@ pub struct LanePayer {
     header: Option<String>,
     header_stale_after: u64,
     cap_plur: u128,
+    /// Frames in a full POST to this lane, as the scheduler will actually
+    /// build it. Set once the lane's `batch_max` is known; see
+    /// [`Self::has_headroom`] for why the guard has to know the size of the
+    /// thing it is admitting.
+    post_frames: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -495,7 +539,14 @@ impl LanePayer {
             header: None,
             header_stale_after: 0,
             cap_plur: 0,
+            post_frames: 1,
         }
+    }
+
+    /// Tell the lane how large a POST the scheduler will build for it, so
+    /// the headroom guard can ask about the real body rather than a frame.
+    pub fn set_post_frames(&mut self, frames: usize) {
+        self.post_frames = frames.max(1);
     }
 
     /// The credit line the relay last told us about, or 0 before the first
@@ -587,12 +638,23 @@ impl LanePayer {
         if self.cap_plur == 0 {
             return true;
         }
-        // One frame is the smallest thing worth dispatching.
-        let one_frame = self
+        // Ask about the POST that will actually be built, not about one
+        // frame. Admitting on "a frame would fit" and then dispatching a
+        // full batch is how several concurrent POSTs each get waved
+        // through against the same headroom: the relay reserves every one
+        // of them, their sum crosses the line, and it answers 402 to a
+        // client whose own books say it had room. That refusal is not even
+        // payable — the bytes are in flight, so nothing is owed yet — so
+        // the batch comes back having spent an attempt per chunk.
+        //
+        // When the line is narrow enough to hold only one POST this
+        // serialises the lane, which is the honest answer: a credit line
+        // that fits 1.8 POSTs cannot have 8 in flight.
+        let body = self
             .quote
             .params
-            .price_bytes(crate::pushframe::MAX_FRAME_LEN as u64);
-        self.account.outstanding().saturating_add(one_frame) <= self.cap_plur
+            .price_bytes((self.post_frames * crate::pushframe::MAX_FRAME_LEN) as u64);
+        self.account.outstanding().saturating_add(body) <= self.cap_plur
     }
 
     /// Would dispatching `body_bytes` right now exceed the credit line?
@@ -605,6 +667,60 @@ impl LanePayer {
                 .outstanding()
                 .saturating_add(self.quote.params.price_bytes(body_bytes))
                 > self.cap_plur
+    }
+
+    /// Ask the relay what it thinks we owe, and adopt the figure if it is
+    /// larger than ours.
+    ///
+    /// Called only when a 402 arrives that our own books say we cannot pay
+    /// — the deadlock in [`LaneAccount::adopt_relay_debt`]. `/v1/account`
+    /// is used rather than the number in the 402 body because the body
+    /// quotes `owed + reserved` *including the refused request*, which is
+    /// not a payable amount.
+    ///
+    /// Returns whether the debt moved.
+    pub async fn reconcile(
+        &mut self,
+        http: &reqwest::Client,
+        cfg: &PaymentConfig,
+    ) -> Result<bool, String> {
+        let header = self.header(http, cfg).await?.to_string();
+        let resp = http
+            .get(format!("{}/v1/account", self.base_url.trim_end_matches('/')))
+            .header(crate::metered::CHALLENGE_HEADER, header)
+            .timeout(std::time::Duration::from_secs(60))
+            .send()
+            .await
+            .map_err(|e| format!("account fetch: {e}"))?;
+        if !resp.status().is_success() {
+            return Err(format!("account: http {}", resp.status()));
+        }
+        let v: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| format!("account decode: {e}"))?;
+        let owed: u128 = v
+            .get("owed_plur")
+            .and_then(|x| x.as_str())
+            .ok_or("account: missing owed_plur")?
+            .parse()
+            .map_err(|e| format!("account: bad owed_plur: {e}"))?;
+        // Bounded by the chequebook's balance, deliberately *not* by the
+        // credit line. The line caps what may be newly admitted, not what
+        // may stand: debt reaches the line by construction, and an operator
+        // who lowers the line leaves legitimately-incurred debt above it.
+        // Rejecting on that basis refuses to pay a real bill and keeps the
+        // deadlock this method exists to break. What genuinely bounds our
+        // exposure to an inflated figure is the funded balance, which
+        // `settle` enforces exactly across all lanes (§8.3); this is the
+        // same ceiling stated early for a legible error.
+        if owed > cfg.balance_plur {
+            return Err(format!(
+                "relay claims {owed} owed, more than the chequebook's {} balance",
+                cfg.balance_plur
+            ));
+        }
+        Ok(self.account.adopt_relay_debt(owed))
     }
 
     /// Settle if there is enough owed to be worth a cheque.
@@ -997,6 +1113,31 @@ mod tests {
         assert!(rich > 512 * 4251, "a full POST fits comfortably");
     }
 
+    /// Concurrent POSTs hold reservations on the relay before they are
+    /// debt. Sizing the next body against `owed` alone gave each in-flight
+    /// POST the whole line, so their reservations summed past the cap and
+    /// the relay 402'd a client with nothing to pay — an unpayable refusal
+    /// that only clears by waiting.
+    #[test]
+    fn post_size_accounts_for_bytes_already_in_flight() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        let cap = p.credit_line(100_000_000_000_000);
+        let whole_line = a.max_body_bytes(cap);
+        // Put half the line on the wire, unanswered: still pending, not owed.
+        let in_flight = whole_line / 2;
+        a.record_sent(in_flight);
+        assert_eq!(a.owed(), 0, "in-flight bytes are not debt yet");
+        let next = a.max_body_bytes(cap);
+        assert!(
+            next <= whole_line - in_flight,
+            "sized {next} with {in_flight} already on the wire against a {whole_line} line"
+        );
+        // And the two together must fit, which is the property the relay
+        // actually enforces.
+        assert!(a.outstanding().saturating_add(p.price_bytes(next)) <= cap);
+    }
+
     #[test]
     fn headroom_shrinks_as_debt_accrues() {
         let p = Params::default();
@@ -1006,6 +1147,50 @@ mod tests {
         a.record_sent(64 * 1024 * 1024);
         a.record_answered(64 * 1024 * 1024, true);
         assert!(a.max_body_bytes(cap) < before, "unpaid debt eats the line");
+    }
+
+    /// The relay's ledger outlives the client's. Every run ends leaving the
+    /// sub-dust residual unpaid, and a fresh process starts believing it
+    /// owes nothing — so the relay refuses service for debt the client
+    /// cannot compute a cheque for. Adopting the relay's figure is the only
+    /// way out, and it is what the 402 recovery path does.
+    #[test]
+    fn carried_debt_from_a_previous_run_is_adoptable() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        // Fresh process: no debt, and nothing to pay with.
+        assert_eq!(a.owed(), 0);
+        assert_eq!(a.next_cumulative(), None, "cannot pay what it does not know");
+
+        let carried = p.min_cheque_plur * 3;
+        assert!(a.adopt_relay_debt(carried), "relay knows more than we do");
+        assert_eq!(a.owed(), carried);
+        assert_eq!(
+            a.next_cumulative(),
+            Some(carried),
+            "now a cheque clears the refusal"
+        );
+    }
+
+    /// Only ever upward. The downward direction is `forgive_phantom_debt`,
+    /// which is reached from a rejected cheque — a relay reporting *less*
+    /// than we think must not silently shrink a debt we are still liable
+    /// for, and an over-count is a cheque the relay refuses outright.
+    #[test]
+    fn adopting_relay_debt_never_lowers_our_own() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        a.record_sent(1024 * 1024);
+        a.record_answered(1024 * 1024, true);
+        let owed = a.owed();
+        assert!(owed > 0);
+
+        assert!(!a.adopt_relay_debt(owed - 1), "a smaller figure is ignored");
+        assert_eq!(a.owed(), owed);
+        assert!(!a.adopt_relay_debt(0), "and zero especially so");
+        assert_eq!(a.owed(), owed);
+        assert!(a.adopt_relay_debt(owed + 1), "larger still wins");
+        assert_eq!(a.owed(), owed + 1);
     }
 
     /// N lanes are N claims on one balance. The client must see the sum, or
