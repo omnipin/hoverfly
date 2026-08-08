@@ -1533,3 +1533,87 @@ Receipts no longer carry money under this design, but they still carry the
 them could steer traffic. Checking at the protocol boundary means every
 `PushsyncReceipt` in the codebase carries exactly the 32 bytes that were
 pushed.
+
+## 17. Found by running a metered relay: two client-side bugs (both fixed)
+
+Neither is reachable from a single upload against a fresh relay, which is
+why both survived the test suite and the Stage 1 round-trip. They need a
+relay whose ledger *persists across client runs* — the shipped
+configuration — and enough concurrency to have several POSTs on the wire
+at once.
+
+### 17.1 Debt the relay carried across sessions could not be paid
+
+**Status: fixed** (`LaneAccount::adopt_relay_debt`, `LanePayer::reconcile`,
+with regression tests).
+
+§10.2's dust floor guarantees a run ends owing something: the residual
+below `min_cheque_plur` is left unpaid because a cheque for it would be
+refused. The relay is right to keep counting that against the credit line
+— forgiving it would make "stay under the floor" a way to be served for
+free. But the client's books are per-process, so the *next* run starts
+believing it owes nothing, and the relay's `owed` only ever grows.
+
+Once the carry crosses `max_outstanding_plur` the account is refused on
+its first POST, and the refusal is unpayable: `next_cumulative()` computes
+the cheque from the client's own `owed`, which is zero. Observed live as
+a second upload failing 151/151 against a relay carrying 290,400,000,000
+PLUR. With the shipped defaults the per-run residual is under 3.9e12
+against a 62.2e12 cap, so it takes roughly sixteen runs rather than two —
+a slow-motion deadlock, not a corner case.
+
+The fix is to ask rather than to remember: `GET /v1/account` already
+reports the relay's own figure, so a 402 the client cannot pay triggers a
+reconcile and it pays what the relay says it owes. Three things about
+which number, each of which was wrong in a draft:
+
+- **`owed`, not the `outstanding_plur` in the 402 body.** `reserve()`
+  adds the reservation *before* computing what it reports, so the body's
+  figure includes the request just refused. Adopting it over-pays by
+  exactly that body and the next cheque bounces as an overpayment.
+- **Reservations excluded on our side too**, for the same reason: bytes
+  still in flight are already held in `pending_plur` and would be billed
+  twice when those POSTs land. Under-counting is safe and self-correcting;
+  over-counting is a refused cheque.
+- **Bounded by the chequebook balance, not the credit line.** Debt reaches
+  the line by construction, and an operator who lowers the line leaves
+  legitimately-incurred debt above it. Rejecting on that basis refuses to
+  pay a real bill and preserves the deadlock. The funded balance is what
+  actually bounds exposure, and `settle` already enforces it exactly
+  across all lanes (§8.3).
+
+This makes the client trust a curated relay's arithmetic about its own
+receivable, which §2 already grants. The alternative — persisting the
+residual client-side — keeps better books but has no recovery when that
+state is lost, and a client permanently locked out of a relay with no way
+to clear it is the worse failure.
+
+### 17.2 The headroom guard admitted a frame, then sent a batch
+
+**Status: fixed** (`LanePayer::has_headroom` prices a real POST;
+`dispatch_ok` re-evaluated per dispatch).
+
+The pre-dispatch guard asked whether one more *frame* fit inside the
+credit line and then dispatched a full `batch_max` POST, and its answer
+was computed once for an unbounded run of dispatches. Several concurrent
+POSTs were each waved through against the same headroom; the relay
+reserved every one of them, their sum crossed the line, and it answered
+402 to a client whose own books said it had room.
+
+That refusal is the unpayable kind — the bytes are in flight, so nothing
+is owed yet and settling changes nothing — and the batch returns having
+spent an attempt per chunk, which is why handing batches back was
+measured to make things worse rather than better. §7.2's whole point is
+that the client sizes to fit instead of discovering the ceiling as a 402.
+
+The guard now prices the POST the scheduler will actually build. Where the
+line holds only one POST this serialises the lane, which is the honest
+answer: a credit line that fits 1.8 POSTs cannot have eight in flight.
+Measured on a hard-mode relay, per-upload 402s went 11 → 1 and unpayable
+refusals 6 → 0; the one remaining 402 is §17.1's carried debt, paid on
+reconcile.
+
+`LaneAccount::max_body_bytes` had the same confusion — sizing against
+`owed` while `has_headroom` and `would_exceed` both bind on `outstanding`.
+It is only reached from tests today, but it would have reintroduced the
+bug at its next caller.
