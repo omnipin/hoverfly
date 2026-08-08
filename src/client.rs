@@ -2786,6 +2786,9 @@ where
                     "lane {i}: credit line allows {fits} frames/POST (was {before})");
                 infos[i].batch_max = Some(fits);
             }
+            // The headroom guard admits whole POSTs, so it needs to know how
+            // big one is on this lane.
+            payer.set_post_frames(fits.min(before));
         }
     }
     // batch id -> body bytes, so a completed POST can be billed for what
@@ -2868,13 +2871,19 @@ where
                 }
             }
         }
-        let dispatch_ok = payment.is_none()
-            || payers
-                .iter()
-                .any(|p| p.as_ref().map(|x| x.has_headroom()).unwrap_or(true));
+        // Re-checked on every pass of the loop below, not once before it.
+        // Each dispatch adds its body to `pending`, so a single up-front
+        // answer authorises an unbounded run of POSTs against headroom that
+        // only the first of them actually had.
+        let dispatch_ok = |payers: &[Option<crate::payer::LanePayer>]| {
+            payment.is_none()
+                || payers
+                    .iter()
+                    .any(|p| p.as_ref().map(|x| x.has_headroom()).unwrap_or(true))
+        };
 
         // Hand out everything the scheduler is willing to dispatch.
-        while dispatch_ok && let Some(a) = sched.next(now_ms()) {
+        while dispatch_ok(&payers) && let Some(a) = sched.next(now_ms()) {
             let batch: Vec<StampedChunk> = a
                 .chunks
                 .iter()
@@ -3083,9 +3092,41 @@ where
                         Ok(None) if needs_payment => {
                             // 402 with nothing owed above the dust floor
                             // means the two sides disagree about the
-                            // ledger. Retrying cannot fix that.
-                            warn!(target: "hoverfly::upload",
-                                "lane {lane}: 402 but nothing is owed — ledger disagreement");
+                            // ledger, and retrying the POST cannot fix it.
+                            // Almost always this is debt carried from an
+                            // earlier run: the relay's ledger is durable
+                            // and ours is not, so it is still counting a
+                            // residual we settled below the dust floor and
+                            // then forgot. Ask what it thinks we owe and
+                            // pay that.
+                            match payer.reconcile(&http, pc).await {
+                                Ok(true) => match payer.settle(&http, pc).await {
+                                    Ok(Some(c)) => {
+                                        info!(target: "hoverfly::upload",
+                                            "lane {lane}: reconciled with relay ledger, \
+                                             paid cumulative {c}");
+                                        sched.fund_lane(lane);
+                                    }
+                                    Ok(None) => {
+                                        warn!(target: "hoverfly::upload",
+                                            "lane {lane}: relay reports debt below its own \
+                                             dust floor yet refuses service");
+                                    }
+                                    Err(e) => {
+                                        warn!(target: "hoverfly::upload",
+                                            "lane {lane}: payment after reconcile failed: {e}");
+                                    }
+                                },
+                                Ok(false) => {
+                                    warn!(target: "hoverfly::upload",
+                                        "lane {lane}: 402 but neither side reports debt \
+                                         — ledger disagreement");
+                                }
+                                Err(e) => {
+                                    warn!(target: "hoverfly::upload",
+                                        "lane {lane}: reconcile failed: {e}");
+                                }
+                            }
                         }
                         Ok(None) => {}
                         Err(e) => {
