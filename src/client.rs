@@ -2791,6 +2791,23 @@ where
             // must clamp to it and never raise a lane above what it
             // advertised.
             lane_frame_ceiling[i] = fits.min(before);
+            // Learn any debt carried from an earlier run *before* sizing the
+            // first POST. The relay's ledger outlives ours (§17.1), so a
+            // fresh process starts believing it owes nothing and builds a
+            // body against the whole credit line — while the relay is
+            // already holding part of it. The first POST is then refused,
+            // and if the carried debt happens to sit below the dust floor
+            // the refusal cannot be paid off either. Reconciling here costs
+            // one GET per lane and makes every later size correct.
+            match payer.reconcile(&http, pc).await {
+                Ok(true) => info!(target: "hoverfly::upload",
+                    "lane {i}: relay carries {} PLUR from an earlier run",
+                    payer.account.owed()),
+                Ok(false) => {}
+                Err(e) => warn!(target: "hoverfly::upload",
+                    "lane {i}: could not read carried debt ({e}); \
+                     sizing may be optimistic until the first 402"),
+            }
         }
     }
     // batch id -> body bytes, so a completed POST can be billed for what
@@ -2869,31 +2886,48 @@ where
                 {
                     warn!(target: "hoverfly::upload", "lane {lane}: settle failed: {e}");
                 }
-                // Size the next POST to what the lane can afford *now*.
-                // Without this the body is built from a ceiling computed
-                // before any debt existed, so concurrent POSTs are each
-                // sized as if they were the only one in flight and the
-                // relay refuses their sum — a 402 nothing can pay, since
-                // the bytes are still on the wire and nothing is owed yet.
-                let affordable = payer.affordable_frames();
-                if affordable > 0 {
-                    sched.set_lane_batch_max(lane, affordable.min(lane_frame_ceiling[lane]));
-                }
+                // POST sizing happens per dispatch, in the loop below.
             }
         }
-        // Re-checked on every pass of the loop below, not once before it.
-        // Each dispatch adds its body to `pending`, so a single up-front
-        // answer authorises an unbounded run of POSTs against headroom that
-        // only the first of them actually had.
-        let dispatch_ok = |payers: &[Option<crate::payer::LanePayer>]| {
-            payment.is_none()
-                || payers
-                    .iter()
-                    .any(|p| p.as_ref().map(|x| x.has_headroom()).unwrap_or(true))
-        };
-
-        // Hand out everything the scheduler is willing to dispatch.
-        while dispatch_ok(&payers) && let Some(a) = sched.next(now_ms()) {
+        // Hand out everything the scheduler is willing to dispatch, resizing
+        // each metered lane to its *live* headroom immediately before every
+        // single assignment.
+        //
+        // Both halves have to happen per dispatch, not per pass of the outer
+        // loop. Each POST adds its body to `pending`, so one up-front answer
+        // authorises a whole run of them against headroom only the first
+        // actually had — and since the body is built from the lane's
+        // `batch_max`, a stale ceiling means the second and third POSTs are
+        // each sized as if they were alone on the lane. That is what earns a
+        // 402 the client cannot pay: the bytes are in flight, so nothing is
+        // owed yet and no cheque changes anything.
+        while let Some(a) = {
+            let mut anyone_can_take_work = payment.is_none();
+            if payment.is_some() {
+                for (lane, p) in payers.iter().enumerate() {
+                    let Some(p) = p.as_ref() else {
+                        // Unmetered lane in a metered run: nothing to size.
+                        anyone_can_take_work = true;
+                        continue;
+                    };
+                    let affordable = p.affordable_frames();
+                    if affordable > 0 {
+                        sched.set_lane_batch_max(
+                            lane,
+                            affordable.min(lane_frame_ceiling[lane]),
+                        );
+                    }
+                    if p.has_headroom() {
+                        anyone_can_take_work = true;
+                    }
+                }
+            }
+            if anyone_can_take_work {
+                sched.next(now_ms())
+            } else {
+                None
+            }
+        } {
             let batch: Vec<StampedChunk> = a
                 .chunks
                 .iter()

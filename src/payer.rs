@@ -421,6 +421,24 @@ impl LaneAccount {
         self.owed_plur = 0;
     }
 
+    /// Take the relay's figure as ours outright, in whichever direction.
+    ///
+    /// Only correct after it has **rejected** a cheque: nothing was issued,
+    /// so there is no cumulative to be inconsistent with, and the relay has
+    /// just told us what it is prepared to accept.
+    ///
+    /// The divergence this repairs is §7.3's ack-tail. A POST whose
+    /// response stream breaks was still read, so the client bills it — but
+    /// if the relay's task is cancelled before it commits, its `Admitted`
+    /// guard releases the reservation and it never books those bytes. The
+    /// client cannot tell the two apart from its side, so it over-counts,
+    /// and every subsequent cheque is refused as an overpayment until
+    /// somebody yields. The relay is the party deciding what to accept, so
+    /// it yields to the relay.
+    pub fn sync_relay_debt(&mut self, relay_owed: u128) {
+        self.owed_plur = relay_owed;
+    }
+
     /// Adopt a larger debt figure the relay reports for us.
     ///
     /// The mirror of [`Self::forgive_phantom_debt`], and the half that is
@@ -739,21 +757,16 @@ impl LanePayer {
                 > self.cap_plur
     }
 
-    /// Ask the relay what it thinks we owe, and adopt the figure if it is
-    /// larger than ours.
+    /// What the relay's ledger says this account owes, from `/v1/account`.
     ///
-    /// Called only when a 402 arrives that our own books say we cannot pay
-    /// — the deadlock in [`LaneAccount::adopt_relay_debt`]. `/v1/account`
-    /// is used rather than the number in the 402 body because the body
-    /// quotes `owed + reserved` *including the refused request*, which is
-    /// not a payable amount.
-    ///
-    /// Returns whether the debt moved.
-    pub async fn reconcile(
+    /// The relay is authoritative here — it is the party deciding what to
+    /// accept — so this is the number both the upward reconcile and a
+    /// rejected cheque correct themselves against.
+    async fn relay_owed(
         &mut self,
         http: &reqwest::Client,
         cfg: &PaymentConfig,
-    ) -> Result<bool, String> {
+    ) -> Result<u128, String> {
         let header = self.header(http, cfg).await?.to_string();
         let resp = http
             .get(format!("{}/v1/account", self.base_url.trim_end_matches('/')))
@@ -769,12 +782,29 @@ impl LanePayer {
             .json()
             .await
             .map_err(|e| format!("account decode: {e}"))?;
-        let owed: u128 = v
-            .get("owed_plur")
+        v.get("owed_plur")
             .and_then(|x| x.as_str())
             .ok_or("account: missing owed_plur")?
             .parse()
-            .map_err(|e| format!("account: bad owed_plur: {e}"))?;
+            .map_err(|e| format!("account: bad owed_plur: {e}"))
+    }
+
+    /// Ask the relay what it thinks we owe, and adopt the figure if it is
+    /// larger than ours.
+    ///
+    /// Called only when a 402 arrives that our own books say we cannot pay
+    /// — the deadlock in [`LaneAccount::adopt_relay_debt`]. `/v1/account`
+    /// is used rather than the number in the 402 body because the body
+    /// quotes `owed + reserved` *including the refused request*, which is
+    /// not a payable amount.
+    ///
+    /// Returns whether the debt moved.
+    pub async fn reconcile(
+        &mut self,
+        http: &reqwest::Client,
+        cfg: &PaymentConfig,
+    ) -> Result<bool, String> {
+        let owed = self.relay_owed(http, cfg).await?;
         // Bounded by the chequebook's balance, deliberately *not* by the
         // credit line. The line caps what may be newly admitted, not what
         // may stand: debt reaches the line by construction, and an operator
@@ -807,6 +837,21 @@ impl LanePayer {
         let Some(cumulative) = self.account.next_cumulative() else {
             return Ok(None);
         };
+        self.pay(http, cfg, cumulative, true).await
+    }
+
+    /// Sign and present one cheque.
+    ///
+    /// `correct_once` allows a single re-present against the relay's own
+    /// figure when it rejects ours as an overpayment; the retry passes
+    /// `false` so a relay that keeps refusing cannot loop us.
+    async fn pay(
+        &mut self,
+        http: &reqwest::Client,
+        cfg: &PaymentConfig,
+        cumulative: u128,
+        correct_once: bool,
+    ) -> Result<Option<u128>, String> {
         // Aggregate exposure across every beneficiary drawn on this one
         // chequebook (§8.3): the second lane's cheque is what silently
         // bounces without this.
@@ -858,6 +903,20 @@ impl LanePayer {
             if text.contains("nothing owed") {
                 self.account.forgive_phantom_debt();
                 return Ok(None);
+            }
+            // Same divergence, partial rather than total: the relay booked
+            // *less* than we billed ourselves, so our cumulative overshoots
+            // and it refuses. Nothing was issued, so we can simply take its
+            // figure and re-present. Without this the overshoot is
+            // permanent — every later cheque carries it and is refused for
+            // the same reason, and the lane never settles again.
+            if correct_once && text.contains("is owed") {
+                let relay = self.relay_owed(http, cfg).await?;
+                self.account.sync_relay_debt(relay);
+                let Some(corrected) = self.account.next_cumulative() else {
+                    return Ok(None);
+                };
+                return Box::pin(self.pay(http, cfg, corrected, false)).await;
             }
             return Err(format!("pay {code}: {}", text.trim()));
         }
@@ -1285,6 +1344,39 @@ mod tests {
             a.next_cumulative(),
             Some(carried),
             "now a cheque clears the refusal"
+        );
+    }
+
+    /// §7.3's ack-tail leaves the two sides disagreeing in the *other*
+    /// direction, and the client must yield.
+    ///
+    /// A POST whose response stream breaks was still read, so the client
+    /// bills it — but if the relay's task is cancelled before it commits,
+    /// the `Admitted` guard releases the reservation and it books nothing.
+    /// The overshoot then rides on every later cheque, each refused for the
+    /// same reason, and the lane never settles again. Seen over a real
+    /// proxy: `credits 212640000000 but only 148800000000 is owed`.
+    #[test]
+    fn a_relay_that_booked_less_than_we_billed_is_taken_at_its_word() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+        // Large enough that both figures clear the dust floor, so the
+        // assertion is about the correction and not about §10.2.
+        let sent = 16 * 1024 * 1024u64;
+        a.record_sent(sent);
+        a.record_answered(sent, true);
+        let ours = a.owed();
+        assert!(ours > p.min_cheque_plur);
+
+        // The relay booked less than we billed ourselves.
+        let theirs = ours - p.price_bytes(133 * 1024);
+        assert!(theirs > p.min_cheque_plur);
+        a.sync_relay_debt(theirs);
+        assert_eq!(a.owed(), theirs, "the relay decides what it will accept");
+        assert_eq!(
+            a.next_cumulative(),
+            Some(theirs),
+            "and the corrected cheque is exactly its figure"
         );
     }
 
