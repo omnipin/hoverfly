@@ -1534,7 +1534,7 @@ them could steer traffic. Checking at the protocol boundary means every
 `PushsyncReceipt` in the codebase carries exactly the 32 bytes that were
 pushed.
 
-## 17. Found by running a metered relay: four bugs (all fixed)
+## 17. Found by running a metered relay: six bugs (all fixed)
 
 None of these is reachable from a single upload against a fresh relay,
 which is why all three survived the test suite and the Stage 1 round-trip.
@@ -1696,7 +1696,57 @@ the cheque was refused as an overpayment (`credits 535680000000 but only
 Under-adopting is safe — the remainder is still owed and the next settle
 collects it.
 
-After all four fixes, uploads of 128 KiB through 4 MiB against a hard-mode
+### 17.5 A broken response stream made every later cheque bounce
+
+**Status: fixed** (`LaneAccount::sync_relay_debt`, one bounded re-present
+in `LanePayer::pay`).
+
+§7.3's ack-tail cuts both ways. A POST whose response stream breaks was
+still *read*, so the client bills it — but if the relay's task is
+cancelled before it commits, the `Admitted` guard releases the reservation
+and it books nothing. The client cannot tell that case from a clean one,
+so it over-counts.
+
+The overshoot is not self-correcting: it rides on the cumulative, so every
+later cheque carries it and is refused for the same reason, and the lane
+never settles again. Seen the first time the relay was reached through a
+real reverse proxy — two broken streams, then `cheque credits
+212640000000 but only 148800000000 is owed`.
+
+The relay is the party deciding what it will accept, so the client yields
+to it: on a rejection naming a smaller figure, re-read `/v1/account`, take
+that number, and re-present once. Nothing was issued, so there is no
+cumulative to be inconsistent with. The retry is bounded to a single
+attempt, so a relay that keeps refusing cannot loop the client.
+
+This is the same yielding as §17.1 in the opposite direction, and
+`forgive_phantom_debt` was already the total-loss case of it.
+
+### 17.6 The first POST of a run was sized before the debt was known
+
+**Status: fixed** (reconcile once per lane at setup).
+
+§17.1 made carried debt *recoverable*, via a 402 the client answers by
+reconciling. It did not stop the client from walking into it. A fresh
+process starts believing it owes nothing, so it sizes its first POST
+against the entire credit line while the relay is already holding part of
+it — and is refused immediately.
+
+Worse, the recovery could land in a hole: if the carried debt happens to
+sit below the dust floor, the client reconciles, finds it cannot write an
+acceptable cheque, and stops with the lane over its cap. Observed at 16 of
+567 frames with 152,160,000,000 carried against a 416,771,800,039 line.
+
+Reading `/v1/account` once per lane at setup costs one GET and makes every
+subsequent size correct, so the refusal never happens. §17.1's path
+remains as the recovery for debt that appears mid-run.
+
+The same run showed that POST sizing has to be recomputed per *dispatch*
+rather than per pass of the driver loop: the inner loop hands out several
+assignments in a row, and a ceiling refreshed only on the outer pass sizes
+the second and third of them as if each were alone on the lane.
+
+After all six fixes, uploads of 128 KiB through 4 MiB against a hard-mode
 relay complete every frame, with no unpayable refusals and no rejected
 cheques:
 
@@ -1711,3 +1761,18 @@ cheques:
 
 The remaining 402s are the intended kind: the line genuinely fills, the
 client pays or waits, and the lane resumes.
+
+Repeated over public HTTPS through a reverse proxy, with §17.6 in place so
+the client knows its carried debt before sizing anything, the 402s go away
+entirely — the client never reaches its cap because it never builds a body
+that would cross it:
+
+| run | payload | frames acked | 402s | rejected cheques |
+|----:|--------:|-------------:|-----:|-----------------:|
+|   1 |   2 MiB |      567/567 |    0 |                0 |
+|   2 |   2 MiB |      567/567 |    0 |                0 |
+|   3 |   2 MiB |      567/567 |    0 |                0 |
+
+Each run settles to `owed: 0` on the relay, so the next carries nothing.
+That is the intended steady state: 402 is the recovery path, not the
+mechanism.
