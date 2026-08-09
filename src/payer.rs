@@ -334,6 +334,12 @@ impl LaneAccount {
         self.owed_plur
     }
 
+    /// Bytes dispatched but not yet answered, priced. Not debt yet — see
+    /// [`Self::adopt_relay_debt`] for why the distinction matters.
+    pub fn pending(&self) -> u128 {
+        self.pending_plur
+    }
+
     /// Owed plus in-flight — the client's mirror of the relay's
     /// `owed + reserved`, and what the credit line actually binds on.
     pub fn outstanding(&self) -> u128 {
@@ -434,14 +440,23 @@ impl LaneAccount {
     /// still in flight are already counted in `pending_plur`, and would be
     /// billed twice when those POSTs land.
     ///
-    /// Only ever raises. An under-count is safe and self-correcting (the
-    /// next settle picks up the rest); an over-count is a cheque the relay
-    /// refuses.
+    /// Only ever raises, and only by what is not already accounted for in
+    /// flight. An under-count is safe and self-correcting (the next settle
+    /// picks up the rest); an over-count is a cheque the relay refuses.
     pub fn adopt_relay_debt(&mut self, relay_owed: u128) -> bool {
-        if relay_owed <= self.owed_plur {
+        // Deduct what is still on the wire. A POST the relay has finished
+        // reading is already in the figure it just reported, while locally
+        // it is still `pending` until its response closes — so adopting the
+        // raw number and then letting `record_answered` move those same
+        // bytes into `owed` counts them twice. That surfaces as a cheque
+        // the relay rejects for overpayment, which jams settlement for the
+        // rest of the run. Under-adopting is safe: the remainder is still
+        // owed, and the next settle collects it.
+        let adopt = relay_owed.saturating_sub(self.pending_plur);
+        if adopt <= self.owed_plur {
             return false;
         }
-        self.owed_plur = relay_owed;
+        self.owed_plur = adopt;
         true
     }
 
@@ -1273,6 +1288,37 @@ mod tests {
         );
     }
 
+    /// Reconciling mid-flight must not bill the same POST twice.
+    ///
+    /// Regression: the relay finishes reading a body and books it, so its
+    /// reported `owed` already covers a POST the client still has in
+    /// `pending`. Adopting that figure raw and then letting
+    /// `record_answered` move the same bytes into `owed` over-counted by
+    /// one POST, and the run ended with `cheque credits 535680000000 but
+    /// only 510240000000 is owed` — settlement jammed for the rest of it.
+    #[test]
+    fn adopting_relay_debt_does_not_double_count_bytes_in_flight() {
+        let p = Params::default();
+        let mut a = LaneAccount::new(p, [3u8; 20]);
+
+        let body = 64 * 1024u64;
+        let priced = p.price_bytes(body);
+        a.record_sent(body);
+        assert_eq!(a.pending(), priced, "on the wire, not yet debt");
+
+        // The relay has read that body and reports it as owed, while our
+        // response has not closed yet.
+        a.adopt_relay_debt(priced);
+        // Now it closes.
+        a.record_answered(body, true);
+
+        assert_eq!(
+            a.owed(),
+            priced,
+            "billed once, not twice: adopted {priced} then answered the same body"
+        );
+    }
+
     /// Only ever upward. The downward direction is `forgive_phantom_debt`,
     /// which is reached from a rejected cheque — a relay reporting *less*
     /// than we think must not silently shrink a debt we are still liable
@@ -1286,6 +1332,7 @@ mod tests {
         let owed = a.owed();
         assert!(owed > 0);
 
+        assert_eq!(a.pending(), 0, "nothing in flight, so nothing to deduct");
         assert!(!a.adopt_relay_debt(owed - 1), "a smaller figure is ignored");
         assert_eq!(a.owed(), owed);
         assert!(!a.adopt_relay_debt(0), "and zero especially so");

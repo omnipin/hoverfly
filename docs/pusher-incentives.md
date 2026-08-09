@@ -1534,7 +1534,7 @@ them could steer traffic. Checking at the protocol boundary means every
 `PushsyncReceipt` in the codebase carries exactly the 32 bytes that were
 pushed.
 
-## 17. Found by running a metered relay: three bugs (all fixed)
+## 17. Found by running a metered relay: four bugs (all fixed)
 
 None of these is reachable from a single upload against a fresh relay,
 which is why all three survived the test suite and the Stage 1 round-trip.
@@ -1665,3 +1665,49 @@ this safe: cheques are cumulative, so a small one now does not force a
 small cash-out later, and `hoverfly cashout --min-amount` already declines
 to spend gas on a claim that is not worth collecting. The dust floor
 belongs at redemption, where the gas is, not at acceptance.
+
+### 17.4 A lane refused for bytes in flight was parked for good
+
+**Status: fixed** (`unpayable_402` in the driver).
+
+The relay refuses on `owed + reserved`, but only `owed` is payable —
+reservations are bodies it is still reading. A lane can therefore be over
+its line while its *debt* is under the dust floor, and that is neither a
+disagreement nor something a cheque fixes: those bytes simply have to
+land.
+
+A 402 marks the lane `Unfunded`, and only a successful settle re-funds it
+(§12). With nothing payable there is no settle, so the lane stayed parked
+and the upload ended with chunks pending and the relay reporting `err=0` —
+2 MiB stopping at 311 of 567 frames. The bigger the upload, the more
+certain this is, because more POSTs are in flight when the line fills.
+
+The driver now distinguishes the two cases. Bytes in flight means busy:
+re-fund the lane and let it resume when they clear. Nothing in flight and
+nothing payable is the genuine disagreement, and still warns. Re-funding
+cannot spin, because `has_headroom` binds on `outstanding` and so
+dispatches nothing until the in-flight bytes actually clear.
+
+The same run surfaced the mirror of §17.1 in the reconcile itself:
+adopting the relay's `owed` while a POST it had already booked was still
+`pending` locally counted that body twice once the response closed, and
+the cheque was refused as an overpayment (`credits 535680000000 but only
+510240000000 is owed`). Reconciliation now deducts what is in flight.
+Under-adopting is safe — the remainder is still owed and the next settle
+collects it.
+
+After all four fixes, uploads of 128 KiB through 4 MiB against a hard-mode
+relay complete every frame, with no unpayable refusals and no rejected
+cheques:
+
+| payload | frames acked | 402s | stuck | rejected cheques |
+|--------:|-------------:|-----:|------:|-----------------:|
+|  128 KiB |      43/43 |    0 |     0 |                0 |
+|  256 KiB |      76/76 |    0 |     0 |                0 |
+|  512 KiB |    151/151 |    0 |     0 |                0 |
+|    1 MiB |    290/290 |    2 |     0 |                0 |
+|    2 MiB |    567/567 |    2 |     0 |                0 |
+|    4 MiB |  1122/1122 |    4 |     0 |                0 |
+
+The remaining 402s are the intended kind: the line genuinely fills, the
+client pays or waits, and the lane resumes.

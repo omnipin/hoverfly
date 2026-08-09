@@ -3118,9 +3118,7 @@ where
                                         sched.fund_lane(lane);
                                     }
                                     Ok(None) => {
-                                        warn!(target: "hoverfly::upload",
-                                            "lane {lane}: relay reports debt below its own \
-                                             dust floor yet refuses service");
+                                        unpayable_402(&mut sched, lane, payer);
                                     }
                                     Err(e) => {
                                         warn!(target: "hoverfly::upload",
@@ -3128,9 +3126,7 @@ where
                                     }
                                 },
                                 Ok(false) => {
-                                    warn!(target: "hoverfly::upload",
-                                        "lane {lane}: 402 but neither side reports debt \
-                                         — ledger disagreement");
+                                    unpayable_402(&mut sched, lane, payer);
                                 }
                                 Err(e) => {
                                     warn!(target: "hoverfly::upload",
@@ -3268,6 +3264,38 @@ pub async fn push_stream_via_pushers(
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     push_stream_via_pushers_paid(pusher_urls, streamer, progress, None).await
+}
+
+/// A 402 arrived that no cheque can clear. Decide whether the lane is
+/// merely busy or genuinely stuck.
+///
+/// The relay refuses on `owed + reserved`, and only `owed` is payable —
+/// reservations are bodies it is still reading. So a lane can be over its
+/// line with a debt below the dust floor, which is not a disagreement and
+/// not something paying fixes: those bytes simply have to land. Leaving
+/// the lane `Unfunded` in that case parks it for good, because only a
+/// successful settle re-funds it and no settle is possible. That is an
+/// upload that stops with chunks pending and the relay reporting no errors.
+///
+/// Re-funding is safe against a busy loop: `has_headroom` binds on
+/// `outstanding`, so nothing is dispatched until the in-flight bytes
+/// actually clear.
+#[cfg(not(target_arch = "wasm32"))]
+fn unpayable_402(
+    sched: &mut crate::pushsched::Scheduler,
+    lane: usize,
+    payer: &crate::payer::LanePayer,
+) {
+    if payer.account.pending() > 0 {
+        debug!(target: "hoverfly::upload",
+            "lane {lane}: over its line on bytes in flight, not debt; \
+             resuming once they land");
+        sched.fund_lane(lane);
+        return;
+    }
+    warn!(target: "hoverfly::upload",
+        "lane {lane}: 402 with nothing in flight and nothing payable — \
+         ledger disagreement");
 }
 
 /// As [`push_stream_via_pushers`], but able to pay metered lanes.
