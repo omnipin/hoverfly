@@ -700,11 +700,88 @@ impl Params {
     pub fn price_bytes(&self, bytes: u64) -> u128 {
         u128::from(bytes.div_ceil(1024)) * self.price_plur_per_kib
     }
+
+    /// The settlement thresholds that actually apply to an account whose
+    /// credit line is `cap`.
+    ///
+    /// `validate` checks §10.1's invariant against `max_outstanding_plur`,
+    /// but that is only the *ceiling* on a credit line — the line that
+    /// binds is per batch, `min(remaining_value / credit_ratio, ceiling)`
+    /// (§10.3). For any batch smaller than
+    /// `min_cheque_plur * credit_ratio` the configured floor sits *above*
+    /// everything that account can ever owe, and the invariant quietly
+    /// stops holding: it accrues to its cap, is refused, and cannot write
+    /// a cheque large enough to be accepted. Service stops permanently,
+    /// for a batch that is paid up and behaving.
+    ///
+    /// Observed live with the shipped defaults: a credit line of
+    /// 679,783,122,862 against a 3,900,000,000,000 floor — 5.7× short —
+    /// which is §10.3's small batch, the case the scaled line exists to
+    /// keep serving.
+    ///
+    /// Both sides derive this from `(params, cap)` and `cap` is already in
+    /// the challenge, so the two agree without exchanging anything new.
+    /// Settling at half the line leaves the other half as the working
+    /// headroom a POST is dispatched into.
+    pub fn effective(&self, cap: u128) -> EffectiveParams {
+        let settle_every = self.settle_every_plur.min(cap / 2);
+        EffectiveParams {
+            // Preserves `min_cheque <= settle_every` — the half of §10.1
+            // that makes a 402 clearable — at any credit line.
+            min_cheque_plur: self.min_cheque_plur.min(settle_every),
+            settle_every_plur: settle_every,
+        }
+    }
+}
+
+/// §10.1's thresholds resolved against a particular credit line. See
+/// [`Params::effective`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EffectiveParams {
+    pub min_cheque_plur: u128,
+    pub settle_every_plur: u128,
 }
 
 #[cfg(test)]
 mod param_tests {
     use super::*;
+
+    /// §10.1's invariant is checked against `max_outstanding_plur`, but the
+    /// line that binds is per batch. A small batch gets a line far under
+    /// the configured floor, and then no cheque it can write is acceptable
+    /// — it accrues to its cap and is refused for good. Seen live at a
+    /// 679,783,122,862 line against a 3,900,000,000,000 floor.
+    #[test]
+    fn a_credit_line_below_the_dust_floor_can_still_settle() {
+        let p = Params::default();
+        let line = 679_783_122_862u128;
+        assert!(
+            line < p.min_cheque_plur,
+            "this is the case: the whole line is under the configured floor"
+        );
+
+        let e = p.effective(line);
+        assert!(
+            e.min_cheque_plur <= e.settle_every_plur,
+            "a 402 must be clearable by the cheque the client is told to write"
+        );
+        assert!(
+            e.settle_every_plur < line,
+            "and settlement must trigger before the line is full, or the \
+             account is refused before it is ever asked to pay"
+        );
+        assert!(e.min_cheque_plur > 0, "some cheque must be acceptable");
+    }
+
+    /// A line with room to spare must keep the configured thresholds —
+    /// scaling down is for the batches that need it, not a general discount.
+    #[test]
+    fn a_generous_credit_line_keeps_the_configured_thresholds() {
+        let p = Params::default();
+        let e = p.effective(p.max_outstanding_plur);
+        assert_eq!(e.min_cheque_plur, p.min_cheque_plur);
+        assert_eq!(e.settle_every_plur, p.settle_every_plur);
+    }
 
     #[test]
     fn the_shipped_defaults_satisfy_the_invariant() {

@@ -2771,6 +2771,7 @@ where
     // cannot pay its way out of — it would owe nothing, having had nothing
     // accepted.
     let mut infos = infos;
+    let mut lane_frame_ceiling: Vec<usize> = vec![usize::MAX; infos.len()];
     if let Some(pc) = payment {
         for (i, payer) in payers.iter_mut().enumerate() {
             let Some(payer) = payer.as_mut() else { continue };
@@ -2786,9 +2787,10 @@ where
                     "lane {i}: credit line allows {fits} frames/POST (was {before})");
                 infos[i].batch_max = Some(fits);
             }
-            // The headroom guard admits whole POSTs, so it needs to know how
-            // big one is on this lane.
-            payer.set_post_frames(fits.min(before));
+            // Remember the lane's own ceiling: the per-dispatch resize below
+            // must clamp to it and never raise a lane above what it
+            // advertised.
+            lane_frame_ceiling[i] = fits.min(before);
         }
     }
     // batch id -> body bytes, so a completed POST can be billed for what
@@ -2861,13 +2863,21 @@ where
         if let Some(pc) = payment {
             for (lane, payer) in payers.iter_mut().enumerate() {
                 let Some(payer) = payer.as_mut() else { continue };
-                if payer.has_headroom() {
-                    continue;
-                }
-                if payer.account.owed() > 0
+                if !payer.has_headroom()
+                    && payer.account.owed() > 0
                     && let Err(e) = payer.settle(&http, pc).await
                 {
                     warn!(target: "hoverfly::upload", "lane {lane}: settle failed: {e}");
+                }
+                // Size the next POST to what the lane can afford *now*.
+                // Without this the body is built from a ceiling computed
+                // before any debt existed, so concurrent POSTs are each
+                // sized as if they were the only one in flight and the
+                // relay refuses their sum — a 402 nothing can pay, since
+                // the bytes are still on the wire and nothing is owed yet.
+                let affordable = payer.affordable_frames();
+                if affordable > 0 {
+                    sched.set_lane_batch_max(lane, affordable.min(lane_frame_ceiling[lane]));
                 }
             }
         }
@@ -3254,7 +3264,7 @@ pub async fn push_via_pusher(
 #[cfg(not(target_arch = "wasm32"))]
 pub async fn push_stream_via_pushers(
     pusher_urls: &[String],
-    mut streamer: UploadStreamer,
+    streamer: UploadStreamer,
     progress: Option<&ProgressFn>,
 ) -> Result<ChunkAddress, ClientError> {
     push_stream_via_pushers_paid(pusher_urls, streamer, progress, None).await

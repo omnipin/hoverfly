@@ -304,6 +304,11 @@ pub struct LaneAccount {
     /// Total already promised to this beneficiary. Cheques are cumulative,
     /// so this only grows.
     cumulative_plur: u128,
+    /// This account's credit line, once a challenge has reported one.
+    /// §10.1's thresholds are resolved against it — see
+    /// [`Params::effective`] — because the configured floor can sit above
+    /// everything a small batch is able to owe.
+    cap_plur: u128,
 }
 
 impl LaneAccount {
@@ -314,6 +319,7 @@ impl LaneAccount {
             owed_plur: 0,
             pending_plur: 0,
             cumulative_plur: 0,
+            cap_plur: 0,
         }
     }
 
@@ -370,14 +376,32 @@ impl LaneAccount {
             .saturating_sub(self.params.price_bytes(body_bytes));
     }
 
+    /// The credit line the relay reported. Setting it is what lets the
+    /// thresholds below scale down to a small batch.
+    pub fn set_cap(&mut self, cap: u128) {
+        self.cap_plur = cap;
+    }
+
+    /// §10.1's thresholds as they apply to this account. Falls back to the
+    /// configured values before any challenge has reported a line.
+    fn thresholds(&self) -> crate::meter::EffectiveParams {
+        if self.cap_plur == 0 {
+            return crate::meter::EffectiveParams {
+                min_cheque_plur: self.params.min_cheque_plur,
+                settle_every_plur: self.params.settle_every_plur,
+            };
+        }
+        self.params.effective(self.cap_plur)
+    }
+
     pub fn should_settle(&self) -> bool {
-        self.owed_plur >= self.params.settle_every_plur
+        self.owed_plur >= self.thresholds().settle_every_plur
     }
 
     /// The cumulative for the next cheque, or `None` when what is owed is
     /// still under the lane's dust floor and would be refused.
     pub fn next_cumulative(&self) -> Option<u128> {
-        if self.owed_plur < self.params.min_cheque_plur {
+        if self.owed_plur < self.thresholds().min_cheque_plur {
             return None;
         }
         Some(self.cumulative_plur.saturating_add(self.owed_plur))
@@ -521,11 +545,6 @@ pub struct LanePayer {
     header: Option<String>,
     header_stale_after: u64,
     cap_plur: u128,
-    /// Frames in a full POST to this lane, as the scheduler will actually
-    /// build it. Set once the lane's `batch_max` is known; see
-    /// [`Self::has_headroom`] for why the guard has to know the size of the
-    /// thing it is admitting.
-    post_frames: usize,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -539,20 +558,20 @@ impl LanePayer {
             header: None,
             header_stale_after: 0,
             cap_plur: 0,
-            post_frames: 1,
         }
-    }
-
-    /// Tell the lane how large a POST the scheduler will build for it, so
-    /// the headroom guard can ask about the real body rather than a frame.
-    pub fn set_post_frames(&mut self, frames: usize) {
-        self.post_frames = frames.max(1);
     }
 
     /// The credit line the relay last told us about, or 0 before the first
     /// challenge. Used to size POSTs (§7.2).
     pub fn cap_plur(&self) -> u128 {
         self.cap_plur
+    }
+
+    /// The credit line normally arrives with a challenge, which needs a
+    /// relay; sizing is pure arithmetic and worth testing without one.
+    #[cfg(test)]
+    pub(crate) fn set_cap_for_test(&mut self, cap: u128) {
+        self.cap_plur = cap;
     }
 
     /// A valid challenge header, fetching and signing one if needed.
@@ -591,6 +610,9 @@ impl LanePayer {
                 .map_err(|e| format!("challenge json: {e}"))?;
             let offered = OfferedChallenge::parse(&v)?;
             self.cap_plur = offered.cap_plur;
+            // §10.1's thresholds scale with the line, so the account needs
+            // it too — see `Params::effective`.
+            self.account.set_cap(offered.cap_plur);
             self.header_stale_after = offered.stale_after();
             self.header = Some(offered.sign(&cfg.signer, self.quote.chain_id)?);
         }
@@ -613,16 +635,55 @@ impl LanePayer {
     /// walked down until it genuinely fits, because the relay bills a
     /// KiB-rounded body and an off-by-one here is an unfixable 402 loop.
     pub fn max_frames(&self) -> usize {
+        // A zero cap is "no credit line known", i.e. an open lane — not a
+        // lane that can afford nothing.
         if self.cap_plur == 0 {
             return usize::MAX;
         }
+        self.frames_within(self.cap_plur)
+    }
+
+    /// Frames per POST affordable *right now*, with current debt and
+    /// in-flight bytes deducted.
+    ///
+    /// This is what each dispatch must be sized by. Gating instead on
+    /// whether a *full* POST would fit stalls the lane outright whenever
+    /// the leftover debt cannot be settled: a residual under
+    /// `min_cheque_plur` is unpayable by construction (§10.2), so if a
+    /// full-size POST needs the whole line, no cheque can ever restore the
+    /// headroom the guard is waiting for and the upload fails with chunks
+    /// still pending. Observed exactly that way against a batch whose
+    /// credit line had decayed to roughly one POST.
+    ///
+    /// Returns 0 when not even one frame fits, which is the caller's cue to
+    /// settle or wait rather than to dispatch.
+    pub fn affordable_frames(&self) -> usize {
+        if self.cap_plur == 0 {
+            return usize::MAX;
+        }
+        let headroom = self.cap_plur.saturating_sub(self.account.outstanding());
+        let frame = crate::pushframe::MAX_FRAME_LEN as u64;
+        if self.quote.params.price_bytes(frame) > headroom {
+            return 0;
+        }
+        self.frames_within(headroom)
+    }
+
+    /// Largest frame count whose KiB-rounded body prices at or under
+    /// `budget`. Estimated, then walked down until it genuinely fits: the
+    /// relay bills a rounded body, and an off-by-one here is an unfixable
+    /// 402 loop.
+    fn frames_within(&self, budget: u128) -> usize {
+        if budget == 0 {
+            return 0;
+        }
         let frame = crate::pushframe::MAX_FRAME_LEN as u128;
-        let mut n = (self.cap_plur / self.quote.params.price_plur_per_kib)
+        let mut n = (budget / self.quote.params.price_plur_per_kib)
             .saturating_mul(1024)
             .checked_div(frame)
             .unwrap_or(0)
             .min(usize::MAX as u128) as usize;
-        while n > 1 && self.quote.params.price_bytes(n as u64 * frame as u64) > self.cap_plur {
+        while n > 1 && self.quote.params.price_bytes(n as u64 * frame as u64) > budget {
             n -= 1;
         }
         n.max(1)
@@ -634,27 +695,21 @@ impl LanePayer {
     /// and handing it back costs the chunks a retry attempt each time, so a
     /// tight credit line would exhaust their budget and fail the upload
     /// rather than merely pausing it.
+    /// One frame is the smallest thing worth dispatching, so that is what
+    /// this asks about. It is *not* a licence to then send a full batch:
+    /// the body is sized separately by [`Self::affordable_frames`], and the
+    /// two must be read together. Asking here about a full POST instead
+    /// looks safer and is not — see `affordable_frames` for the stall it
+    /// causes when the leftover debt is under the dust floor.
     pub fn has_headroom(&self) -> bool {
         if self.cap_plur == 0 {
             return true;
         }
-        // Ask about the POST that will actually be built, not about one
-        // frame. Admitting on "a frame would fit" and then dispatching a
-        // full batch is how several concurrent POSTs each get waved
-        // through against the same headroom: the relay reserves every one
-        // of them, their sum crosses the line, and it answers 402 to a
-        // client whose own books say it had room. That refusal is not even
-        // payable — the bytes are in flight, so nothing is owed yet — so
-        // the batch comes back having spent an attempt per chunk.
-        //
-        // When the line is narrow enough to hold only one POST this
-        // serialises the lane, which is the honest answer: a credit line
-        // that fits 1.8 POSTs cannot have 8 in flight.
-        let body = self
+        let one_frame = self
             .quote
             .params
-            .price_bytes((self.post_frames * crate::pushframe::MAX_FRAME_LEN) as u64);
-        self.account.outstanding().saturating_add(body) <= self.cap_plur
+            .price_bytes(crate::pushframe::MAX_FRAME_LEN as u64);
+        self.account.outstanding().saturating_add(one_frame) <= self.cap_plur
     }
 
     /// Would dispatching `body_bytes` right now exceed the credit line?
@@ -1147,6 +1202,52 @@ mod tests {
         a.record_sent(64 * 1024 * 1024);
         a.record_answered(64 * 1024 * 1024, true);
         assert!(a.max_body_bytes(cap) < before, "unpaid debt eats the line");
+    }
+
+    /// A lane whose credit line is about one POST wide must keep making
+    /// progress, in smaller POSTs.
+    ///
+    /// Regression: gating dispatch on whether a *full* POST fits stalled
+    /// the upload outright here. The leftover debt is under
+    /// `min_cheque_plur`, so it cannot be settled (§10.2) and the headroom
+    /// the guard waited for could never come back — 60 of 76 chunks were
+    /// left unacked against a live relay.
+    #[test]
+    fn a_line_barely_wider_than_one_post_still_makes_progress() {
+        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let p = q.params;
+        let mut payer = LanePayer::new("http://lane".into(), q, 0);
+
+        // A line that fits one full POST and very little more — the shape a
+        // batch decays into as its remaining value is spent down.
+        let full_post = p.price_bytes((512 * crate::pushframe::MAX_FRAME_LEN) as u64);
+        payer.set_cap_for_test(full_post + full_post / 20);
+
+        let first = payer.affordable_frames();
+        assert!(first > 0, "a fresh lane can dispatch");
+
+        // Send one small POST and leave the debt unsettleable.
+        let sent = 16 * crate::pushframe::MAX_FRAME_LEN as u64;
+        payer.account.record_sent(sent);
+        payer.account.record_answered(sent, true);
+        assert!(payer.account.owed() > 0);
+        assert!(
+            payer.account.next_cumulative().is_none(),
+            "this residual is below the dust floor, so no cheque can clear it"
+        );
+
+        let next = payer.affordable_frames();
+        assert!(
+            next > 0,
+            "must still dispatch a smaller POST; a lane that can never settle \
+             and never send has stalled the upload"
+        );
+        // And whatever it sizes must actually fit, or the relay 402s it.
+        let body = p.price_bytes((next * crate::pushframe::MAX_FRAME_LEN) as u64);
+        assert!(
+            payer.account.outstanding().saturating_add(body) <= payer.cap_plur(),
+            "sized {next} frames but that does not fit the remaining line"
+        );
     }
 
     /// The relay's ledger outlives the client's. Every run ends leaving the
