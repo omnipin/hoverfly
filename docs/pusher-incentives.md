@@ -1534,13 +1534,19 @@ them could steer traffic. Checking at the protocol boundary means every
 `PushsyncReceipt` in the codebase carries exactly the 32 bytes that were
 pushed.
 
-## 17. Found by running a metered relay: two client-side bugs (both fixed)
+## 17. Found by running a metered relay: three bugs (all fixed)
 
-Neither is reachable from a single upload against a fresh relay, which is
-why both survived the test suite and the Stage 1 round-trip. They need a
-relay whose ledger *persists across client runs* — the shipped
-configuration — and enough concurrency to have several POSTs on the wire
-at once.
+None of these is reachable from a single upload against a fresh relay,
+which is why all three survived the test suite and the Stage 1 round-trip.
+They need a relay whose ledger *persists across client runs* — the shipped
+configuration — enough concurrency to have several POSTs on the wire at
+once, and a batch that has been spent down far enough for its credit line
+to bind.
+
+The last of those is the one to take seriously as a *method* point: §17.3
+is not a coding mistake but an invariant checked against the wrong
+quantity, and nothing short of running a real batch until its value
+decayed would have surfaced it.
 
 ### 17.1 Debt the relay carried across sessions could not be paid
 
@@ -1617,3 +1623,45 @@ reconcile.
 `owed` while `has_headroom` and `would_exceed` both bind on `outstanding`.
 It is only reached from tests today, but it would have reintroduced the
 bug at its next caller.
+
+The first attempt at this fix gated dispatch on whether a *full* POST
+would fit, which is worse: see §17.3, which it caused.
+
+### 17.3 §10.1's invariant does not hold at the line that binds
+
+**Status: fixed** (`Params::effective`, applied on both sides, with tests).
+
+`Params::validate` checks `min_cheque <= settle_every < max_outstanding`.
+But `max_outstanding_plur` is only the *ceiling* on a credit line; the
+line that actually binds an account is per batch,
+`min(remaining_value / credit_ratio, ceiling)` (§10.3). For any batch
+whose remaining value is under `min_cheque_plur * credit_ratio` — about
+0.39 BZZ at the shipped defaults — the configured floor sits above
+everything that account can ever owe, and the invariant quietly stops
+holding.
+
+What follows is a permanent refusal. The account accrues to its cap, is
+answered 402, and cannot write a cheque large enough to be accepted:
+`next_cumulative()` returns `None` below the floor, and `/v1/pay` rejects
+anything below it as dust. Nothing on either side is broken or dishonest
+— the parameters simply cannot be satisfied. Observed live at a credit
+line of 679,783,122,862 against a 3,900,000,000,000 floor, 5.7× short,
+which halted an upload at 16 of 219 chunks with the relay reporting
+`err=0`.
+
+This is exactly §10.3's small batch — the case the value-scaled credit
+line exists to keep serving — so refusing it defeats the purpose of
+scaling the line at all.
+
+The thresholds are now resolved against the line before they are applied:
+settle at half of it, and never demand a cheque larger than that. Both
+sides derive this from `(params, cap)`, and `cap` is already in the
+challenge, so they agree without exchanging anything new. A generous line
+keeps the configured values unchanged; only a line that cannot reach them
+scales them down.
+
+Accepting a smaller cheque costs the relay nothing, which is what makes
+this safe: cheques are cumulative, so a small one now does not force a
+small cash-out later, and `hoverfly cashout --min-amount` already declines
+to spend gas on a claim that is not worth collecting. The dust floor
+belongs at redemption, where the gas is, not at acceptance.

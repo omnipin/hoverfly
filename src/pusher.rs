@@ -878,13 +878,17 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
             &format!("cheque cumulative {cumulative} does not exceed the {have} already accepted"),
         );
     }
-    if cumulative - have < m.cfg.params.min_cheque_plur {
+    // Against the floor this account can actually reach, not the configured
+    // one: a batch whose credit line is below `min_cheque_plur` would
+    // otherwise be refused for a cheque it is structurally incapable of
+    // writing (§10.1, `Params::effective`).
+    let floor = m.cfg.params.effective(verified.cap_plur).min_cheque_plur;
+    if cumulative - have < floor {
         return json_line_response(
             StatusCode::BAD_REQUEST,
             &format!(
-                "cheque credits {} but the dust floor is {}",
+                "cheque credits {} but the dust floor is {floor}",
                 cumulative - have,
-                m.cfg.params.min_cheque_plur
             ),
         );
     }
@@ -1573,24 +1577,6 @@ async fn run_push(
             "a": hex::encode(addr), "s": "ok", "po": 0, "ms": 0, "dedup": true
         }));
     };
-    let ack_ok = |addr: &[u8; 32], info: crate::client::PushInfo| {
-        // `po` is the proximity order of the peer whose receipt we took —
-        // i.e. how deep into the chunk's own neighborhood it actually
-        // landed. This is the measurement that decides whether client-side
-        // proximity routing to a relay's overlay is worth anything at all
-        // (docs/pusher-design.md §7); without it that question can only be
-        // guessed at.
-        let mut v = serde_json::json!({
-            "a": hex::encode(addr),
-            "s": "ok",
-            "po": info.po,
-            "ms": info.ms,
-        });
-        if info.shallow {
-            v["shallow"] = serde_json::Value::Bool(true);
-        }
-        send_line(&v);
-    };
 
     // The stamp's batch_id must match the on-chain owner the signature
     // recovers to. All chunks in one upload share a batch; verify the
@@ -1760,6 +1746,13 @@ async fn run_push(
         Arc::new(move |addr: &[u8; 32], res| {
             let v = match &res {
                 Ok(info) => {
+                    // `po` is the proximity order of the peer whose receipt
+                    // we took — how deep into the chunk's own neighborhood
+                    // it actually landed. This is the measurement that
+                    // decides whether client-side proximity routing to a
+                    // relay's overlay is worth anything at all
+                    // (docs/pusher-design.md §7); without it that question
+                    // can only be guessed at.
                     let mut v = serde_json::json!({
                         "a": hex::encode(addr), "s": "ok", "po": info.po, "ms": info.ms,
                         // Best proximity the dispatcher could reach for this

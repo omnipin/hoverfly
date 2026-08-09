@@ -772,6 +772,20 @@ impl Scheduler {
         }
     }
 
+    /// Re-clamp a lane's frames-per-POST between dispatches.
+    ///
+    /// A metered lane's affordable body shrinks as debt and in-flight bytes
+    /// accumulate and grows back as cheques clear, so the ceiling set at
+    /// startup goes stale immediately. Sizing the assignment here is what
+    /// keeps the client from building a body the relay will refuse — §7.2
+    /// wants the POST sized to fit rather than the ceiling discovered as a
+    /// 402.
+    pub fn set_lane_batch_max(&mut self, lane: usize, max: usize) {
+        if let Some(l) = self.lanes.get_mut(lane) {
+            l.info.batch_max = Some(max.max(1));
+        }
+    }
+
     /// Lanes currently paused for payment, so the driver knows which ones a
     /// cheque would unblock.
     pub fn unfunded_lanes(&self) -> Vec<usize> {
