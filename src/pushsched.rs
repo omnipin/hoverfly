@@ -128,7 +128,7 @@ pub struct LaneInfo {
     /// The whole verified quote, when this lane advertised one. Carried so
     /// the payment loop has the beneficiary and parameters without
     /// re-fetching and re-verifying `/v1/status`.
-    #[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub quote: Option<crate::payer::PaymentQuote>,
 }
 

@@ -3455,7 +3455,7 @@ async fn post_batch_streaming(
 
     let mut req = http.post(push_url).body(body);
     if let Some(c) = challenge {
-        req = req.header(crate::metered::CHALLENGE_HEADER, c);
+        req = req.header(crate::challenge::CHALLENGE_HEADER, c);
     }
     let resp = match req.send().await {
         Ok(r) => r,

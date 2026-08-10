@@ -815,7 +815,10 @@ enum Commands {
     /// A cheque is cumulative, so only the newest one per chequebook is
     /// ever presented; gas is paid once per chequebook, not once per
     /// cheque received.
-    #[cfg(unix)]
+    ///
+    /// Behind the `pusher` feature because it reads the *relay's* ledger:
+    /// without a relay there are no cheques to cash.
+    #[cfg(all(unix, feature = "pusher"))]
     Cashout {
         #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
         rpc_url: String,
@@ -2847,7 +2850,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
 
         #[cfg(unix)]
-        #[cfg(unix)]
+        #[cfg(all(unix, feature = "pusher"))]
         Commands::Cashout {
             rpc_url,
             key,
