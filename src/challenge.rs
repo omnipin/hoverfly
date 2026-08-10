@@ -154,6 +154,119 @@ pub fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
+// ---- the header, on the wire ----
+//
+// Both ends of the challenge need this codec: the relay issues and decodes,
+// the client encodes and presents. It lives here rather than in `metered.rs`
+// because `metered.rs` is the relay's state machine — reserving, billing,
+// crediting — and a client that pays a relay must be buildable without it.
+
+/// Header carrying the capability plus the client's proof it holds the
+/// account key. One custom header, so the CORS preflight allow-list grows
+/// by exactly one entry (§7.2's browser blocker).
+pub const CHALLENGE_HEADER: &str = "x-hoverfly-challenge";
+
+/// Cap on the header itself. The fields are fixed-width apart from
+/// `origin`, so anything larger is not a challenge.
+pub const MAX_CHALLENGE_HEADER: usize = 2048;
+
+/// A capability the relay minted: the authorised fields plus our MAC over
+/// them.
+pub struct IssuedChallenge {
+    pub fields: ChallengeFields,
+    pub nonce: [u8; 32],
+}
+
+impl IssuedChallenge {
+    pub fn to_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "nonce": format!("0x{}", hex::encode(self.nonce)),
+            "account": format!("0x{}", hex::encode(self.fields.account)),
+            "batch": format!("0x{}", hex::encode(self.fields.batch)),
+            "origin": self.fields.origin,
+            "expiry": self.fields.expiry_unix,
+            "max_outstanding_plur": self.fields.cap_plur.to_string(),
+            "expires_ms": self.fields.expiry_unix.saturating_mul(1000),
+        })
+    }
+}
+
+/// What the client sends back: the capability it was issued plus its
+/// signature over the same fields.
+pub struct PresentedChallenge {
+    pub fields: ChallengeFields,
+    pub nonce: [u8; 32],
+    pub sig: [u8; 65],
+}
+
+impl PresentedChallenge {
+    /// `base64(json)` in one header, so the CORS allow-list grows by one.
+    pub fn decode(raw: &str) -> Result<Self, String> {
+        use base64::Engine;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(raw.trim())
+            .map_err(|e| format!("challenge header base64: {e}"))?;
+        let v: serde_json::Value =
+            serde_json::from_slice(&bytes).map_err(|e| format!("challenge header json: {e}"))?;
+        let get = |k: &str| -> Result<String, String> {
+            v.get(k)
+                .and_then(|x| x.as_str())
+                .map(|s| s.to_string())
+                .ok_or_else(|| format!("challenge header: missing {k}"))
+        };
+        let fixed = |k: &str, n: usize| -> Result<Vec<u8>, String> {
+            let raw = hex::decode(get(k)?.trim_start_matches("0x"))
+                .map_err(|e| format!("challenge {k} hex: {e}"))?;
+            if raw.len() != n {
+                return Err(format!("challenge {k} must be {n} bytes, got {}", raw.len()));
+            }
+            Ok(raw)
+        };
+        let mut account = [0u8; 20];
+        account.copy_from_slice(&fixed("account", 20)?);
+        let mut batch = [0u8; 32];
+        batch.copy_from_slice(&fixed("batch", 32)?);
+        let mut nonce = [0u8; 32];
+        nonce.copy_from_slice(&fixed("nonce", 32)?);
+        let mut sig = [0u8; 65];
+        sig.copy_from_slice(&fixed("sig", 65)?);
+        let expiry_unix = v
+            .get("expiry")
+            .and_then(|x| x.as_u64())
+            .ok_or("challenge header: missing expiry")?;
+        let cap_plur: u128 = get("max_outstanding_plur")?
+            .parse()
+            .map_err(|e| format!("challenge cap: {e}"))?;
+        Ok(Self {
+            fields: ChallengeFields {
+                account,
+                batch,
+                origin: get("origin")?,
+                expiry_unix,
+                cap_plur,
+            },
+            nonce,
+            sig,
+        })
+    }
+}
+
+/// Encode a challenge plus signature into the header value. Client side,
+/// and used by the tests to drive the relay path end to end.
+pub fn encode_challenge_header(issued: &IssuedChallenge, sig: &[u8; 65]) -> String {
+    use base64::Engine;
+    let body = serde_json::json!({
+        "nonce": format!("0x{}", hex::encode(issued.nonce)),
+        "account": format!("0x{}", hex::encode(issued.fields.account)),
+        "batch": format!("0x{}", hex::encode(issued.fields.batch)),
+        "origin": issued.fields.origin,
+        "expiry": issued.fields.expiry_unix,
+        "max_outstanding_plur": issued.fields.cap_plur.to_string(),
+        "sig": format!("0x{}", hex::encode(sig)),
+    });
+    base64::engine::general_purpose::STANDARD.encode(body.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

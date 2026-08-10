@@ -601,7 +601,7 @@ fn admit_metered(
     };
     let raw = req
         .headers()
-        .get(crate::metered::CHALLENGE_HEADER)
+        .get(crate::challenge::CHALLENGE_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     // **Soft mode never refuses** (§7.1). A request with no challenge is an
@@ -832,7 +832,7 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
     };
     let header = req
         .headers()
-        .get(crate::metered::CHALLENGE_HEADER)
+        .get(crate::challenge::CHALLENGE_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string();
@@ -982,7 +982,7 @@ fn account_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespB
         return json_line_response(StatusCode::NOT_FOUND, "relay is not metered");
     };
     let raw = headers
-        .get(crate::metered::CHALLENGE_HEADER)
+        .get(crate::challenge::CHALLENGE_HEADER)
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     let verified = match m.verify_header(raw, crate::challenge::now_unix()) {

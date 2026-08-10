@@ -1270,12 +1270,20 @@ vetoed metering outright. Bytes-admitted removes the dependency.)*
 **Stage 1 — the relay can be paid (native client only), soft mode.**
 **Relay side shipped.** Enabled with `--meter --origin <host> --beneficiary
 <0x…> --state-dir <dir>`; without `--meter` nothing below is reachable and
-the relay behaves exactly as it does today. Modules: `src/challenge.rs`,
-`src/ledger.rs`, `src/metered.rs`, `src/inbound_limit.rs`, plus cheque
-recovery in `src/signer.rs`, a `SignedCheque` decoder in
-`src/protocols/swap.rs` and chequebook bindings in `src/batch.rs`.
-Endpoints: `GET /v1/challenge`, `GET /v1/account`, `POST /v1/pay`, and
-metered admission on `POST /v1/push`.
+the relay behaves exactly as it does today. Modules: `src/ledger.rs`,
+`src/metered.rs`, `src/inbound_limit.rs`, plus cheque recovery in
+`src/signer.rs`, a `SignedCheque` decoder in `src/protocols/swap.rs` and
+chequebook bindings in `src/batch.rs`. Endpoints: `GET /v1/challenge`,
+`GET /v1/account`, `POST /v1/pay`, and metered admission on
+`POST /v1/push`.
+
+Those four sit behind the `pusher` cargo feature, which exists to pull in
+hyper — it is the *relay*. The shared and client-side pieces
+(`src/challenge.rs`, `src/meter.rs`, `src/payer.rs`) deliberately do not:
+a client that pays a metered relay needs the challenge wire format, the
+pricing arithmetic and the payer, but no server. `challenge.rs` owns the
+whole challenge protocol including the `x-hoverfly-challenge` codec, so
+the two ends cannot drift on a format only one of them defines.
 
 **Client side shipped** (`src/payer.rs`): signed-quote verification with
 lane pinning on `(url, node_eth_address, beneficiary)`, challenge parsing

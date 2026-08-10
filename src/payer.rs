@@ -268,7 +268,7 @@ impl OfferedChallenge {
         let sig = signer
             .sign_push_challenge(&sol, chain_id)
             .map_err(|e| e.to_string())?;
-        let issued = crate::metered::IssuedChallenge {
+        let issued = crate::challenge::IssuedChallenge {
             fields: crate::challenge::ChallengeFields {
                 account: self.account,
                 batch: self.batch,
@@ -278,7 +278,7 @@ impl OfferedChallenge {
             },
             nonce: self.nonce,
         };
-        Ok(crate::metered::encode_challenge_header(&issued, &sig))
+        Ok(crate::challenge::encode_challenge_header(&issued, &sig))
     }
 
     /// Re-fetch before this, rather than racing the expiry with a POST in
@@ -770,7 +770,7 @@ impl LanePayer {
         let header = self.header(http, cfg).await?.to_string();
         let resp = http
             .get(format!("{}/v1/account", self.base_url.trim_end_matches('/')))
-            .header(crate::metered::CHALLENGE_HEADER, header)
+            .header(crate::challenge::CHALLENGE_HEADER, header)
             .timeout(std::time::Duration::from_secs(60))
             .send()
             .await
@@ -884,7 +884,7 @@ impl LanePayer {
         let header = self.header(http, cfg).await?.to_string();
         let resp = http
             .post(format!("{}/v1/pay", self.base_url.trim_end_matches('/')))
-            .header(crate::metered::CHALLENGE_HEADER, header)
+            .header(crate::challenge::CHALLENGE_HEADER, header)
             .header("content-type", "application/json")
             .body(body)
             .timeout(std::time::Duration::from_secs(120))
@@ -1066,7 +1066,11 @@ mod tests {
         assert!(matches!(e, QuoteError::BadParams(_)), "got {e:?}");
     }
 
+    // The only test here that needs the relay half, to prove the two ends
+    // of the header agree. Everything else about paying is testable without
+    // a server, which is the point of building the client half separately.
     #[test]
+    #[cfg(feature = "pusher")]
     fn a_challenge_round_trips_into_a_header_the_relay_accepts() {
         use crate::ledger::Ledger;
         use crate::metered::{MeterConfig, Metered};
