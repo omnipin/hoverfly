@@ -64,8 +64,12 @@ interface UploadSession {
   readonly failed: number
   readonly hedges: number
   readonly done: boolean
-  /** Feed a lane's /v1/status JSON (pool size, batch_max, budget, overlay). */
-  setLaneStatus: (lane: number, status: unknown) => void
+  /**
+   * Feed a lane's /v1/status JSON (pool size, batch_max, budget, overlay).
+   * False when the lane was retired instead of scheduled — it enforces
+   * payment and this build has no chequebook.
+   */
+  setLaneStatus: (lane: number, status: unknown) => boolean
   /** Next POST to issue, or undefined if nothing is dispatchable now. */
   nextRequest: (nowMs: number) => PushRequest | undefined
   /** One streamed NDJSON ack. Idempotent per address (hedges rely on this). */
@@ -375,10 +379,23 @@ async function pushSession (session: UploadSession, lanes: string[]): Promise<st
   // Warm the scheduler with each lane's advertisement (pool size, batch_max,
   // budget) before the first dispatch, so weights start from measurements
   // rather than priors. Lanes that don't answer are simply left on defaults.
+  //
+  // `setLaneStatus` returns false for a lane it retired rather than
+  // scheduled — a relay that *enforces* payment, which this build cannot
+  // make (the chequebook lives in the native client; the browser only
+  // stamps). Paying is optional across the fleet, so free, soft-metered and
+  // hard lanes can all sit in PUSHER_URLS and each client uses the subset it
+  // can actually be served by.
+  let usable = 0
   await Promise.all(lanes.map(async (u, i) => {
     const st = await fetchLaneStatus(u)
-    if (st !== undefined) session.setLaneStatus(i, st)
+    if (st === undefined) { usable++; return } // asleep, not refusing — keep it
+    if (session.setLaneStatus(i, st)) usable++
+    else log(`Pusher ${u} requires payment; skipping it (browser uploads are unpaid).`)
   }))
+  if (usable === 0) {
+    throw new Error('every relay in PUSHER_URLS requires payment — the browser cannot pay')
+  }
 
   const pushUrls = lanes.map(u => `${u.replace(/\/+$/, '')}/v1/push`)
   let lastPost = 0

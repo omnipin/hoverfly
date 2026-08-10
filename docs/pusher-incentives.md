@@ -164,13 +164,37 @@ Explicit non-goals, each with its reason:
 
 A relay runs in exactly one of two modes, advertised in `/v1/status`:
 
-- **`open`** — today's behaviour, unmetered. The four production lanes in
-  `apps/upload/src/config.ts:18-25` keep running this. Auth stays "stamp
-  signer is the live batch's on-chain owner" and nothing is billed.
+- **`open`** — today's behaviour, unmetered. The four free-tier lanes in
+  `apps/upload/src/config.ts` keep running this. Auth stays "stamp signer is
+  the live batch's on-chain owner" and nothing is billed.
 - **`metered`** — every byte admitted is billed (§8). There is no free
-  allowance.
+  allowance. `pusher.browserbzz.link` is the first production lane running
+  it, with hard enforcement.
 
-Four consequences worth stating up front:
+**Mode is per relay, and paying is optional for the client.** A fleet mixes
+freely: the same `PUSHER_URLS` holds four `open` lanes and one hard-metered
+one, and each client uses the subset it can be served by. The rule is
+symmetric on both sides of the wire:
+
+| relay mode | client has a chequebook | client does not |
+| --- | --- | --- |
+| `open` | used, nothing billed | used, nothing billed |
+| `metered`, soft | used, billed, settles | used, billed, served anyway |
+| `metered`, hard | used, billed, settles | **lane retired at startup** |
+
+Retiring is the load-bearing case. A hard lane answers a push without a
+challenge header with 401, and a 401 is not a 402 — it counts against lane
+health, so scheduling one anyway spends a retry per chunk rediscovering
+something the lane advertised in `/v1/status` before the first byte moved.
+Both drivers therefore drop it up front: `src/client.rs` (native) when no
+`--chequebook` is configured, and `UploadSession::set_lane_status`
+(`src/wasm.rs`) unconditionally, since the browser only stamps and the
+chequebook lives in the native client. Soft-metered lanes are *kept* by
+both — they bill and serve, so an unpaying client is served exactly as on
+`open`. A run whose every lane is hard-metered fails immediately with that
+reason rather than stalling.
+
+Four further consequences worth stating up front:
 
 **Metering subsumes the deferred `--push-quota`.** Design §6 proposed
 capping each batch at its own effective volume per TTL. Under metering the

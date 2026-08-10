@@ -2771,6 +2771,31 @@ where
     // cannot pay its way out of — it would owe nothing, having had nothing
     // accepted.
     let mut infos = infos;
+    // Paying is optional, so a lane that *requires* payment we cannot make is
+    // simply not ours to use. Scheduling it anyway means every chunk sent
+    // there is refused for a missing capability, and since that is not a 402
+    // it counts against lane health — so the fleet spends one attempt per
+    // chunk discovering, repeatedly, something the lane advertised up front.
+    //
+    // Soft-metered lanes are kept: they bill and serve, so an unpaying client
+    // is served exactly like an `open` one.
+    let unusable: Vec<usize> = (0..pusher_urls.len())
+        .filter(|&i| {
+            infos.get(i).is_some_and(|inf: &LaneInfo| inf.hard_enforcement) && payers[i].is_none()
+        })
+        .collect();
+    for &i in &unusable {
+        warn!(target: "hoverfly::upload",
+            "lane {i} {} enforces payment and this client has none configured; skipping it",
+            pusher_urls[i]);
+    }
+    if !unusable.is_empty() && unusable.len() == pusher_urls.len() {
+        return Err(ClientError::Pusher(
+            "every lane requires payment and no chequebook is configured — \
+             pass --chequebook, or use a fleet with free lanes"
+                .into(),
+        ));
+    }
     let mut lane_frame_ceiling: Vec<usize> = vec![usize::MAX; infos.len()];
     if let Some(pc) = payment {
         for (i, payer) in payers.iter_mut().enumerate() {
@@ -2815,6 +2840,9 @@ where
     // must not become debt on this side either.
     let mut in_flight_bytes: HashMap<u64, u64> = HashMap::new();
     let mut sched = Scheduler::new(infos, cfg);
+    for &i in &unusable {
+        sched.retire_lane(i);
+    }
     // Frames are held by address, not by index: `admit` de-duplicates, so an
     // index-parallel Vec would silently skew. Keying by address also lets a
     // frame be dropped the moment its chunk is acked, which is what keeps a
