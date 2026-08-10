@@ -120,10 +120,15 @@ pub struct LaneInfo {
     /// simply not paid and not scheduled for payment.
     pub price_plur_per_kib: Option<u128>,
     /// True when the lane enforces 402 rather than metering softly.
+    ///
+    /// Deliberately *not* behind the `pusher` feature: a client that cannot
+    /// pay still has to recognise a lane that will refuse it, and the
+    /// browser build compiles without the payment stack entirely.
     pub hard_enforcement: bool,
     /// The whole verified quote, when this lane advertised one. Carried so
     /// the payment loop has the beneficiary and parameters without
     /// re-fetching and re-verifying `/v1/status`.
+    #[cfg(all(feature = "pusher", not(target_arch = "wasm32")))]
     pub quote: Option<crate::payer::PaymentQuote>,
 }
 
@@ -769,6 +774,18 @@ impl Scheduler {
             } else {
                 LaneHealth::Warming
             };
+        }
+    }
+
+    /// Take a lane out of rotation permanently.
+    ///
+    /// For lanes that are unusable by configuration rather than by
+    /// behaviour — a lane enforcing payment this client cannot make — where
+    /// there is nothing to discover by trying and every attempt costs the
+    /// chunks one of their retries.
+    pub fn retire_lane(&mut self, lane: usize) {
+        if let Some(l) = self.lanes.get_mut(lane) {
+            l.health = LaneHealth::Retired;
         }
     }
 

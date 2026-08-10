@@ -741,3 +741,31 @@ fn work_on_an_unfunded_lane_fails_over_rather_than_stalling() {
     let other = s.next(10).expect("work must not strand on a paused lane");
     assert_ne!(other.lane, lane, "it fails over to the funded lane");
 }
+
+/// Paying is optional (§2): a fleet may mix `open`, soft-metered and
+/// hard-metered lanes, and a client with no chequebook must keep using the
+/// ones it can.
+///
+/// A retired lane is out of rotation for good — the point is that nothing
+/// is ever dispatched to it, since a lane that refuses for a missing
+/// capability is not a 402 and would charge lane health once per chunk.
+#[test]
+fn a_retired_lane_never_receives_work() {
+    let infos: Vec<LaneInfo> = (0..3).map(|_| LaneInfo::default()).collect();
+    let mut sched = Scheduler::new(infos, Config::default());
+    sched.admit(addrs(600, 7));
+
+    // Lane 1 is the one this client cannot pay.
+    sched.retire_lane(1);
+
+    let mut seen = [0usize; 3];
+    while let Some(a) = sched.next(0) {
+        seen[a.lane] += 1;
+        sched.on_batch_result(a.batch, BatchOutcome::Answered, 0);
+    }
+    assert_eq!(seen[1], 0, "retired lane took {} assignments", seen[1]);
+    assert!(
+        seen[0] > 0 && seen[2] > 0,
+        "the payable lanes must still carry the upload: {seen:?}"
+    );
+}
