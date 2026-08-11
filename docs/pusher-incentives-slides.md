@@ -5,6 +5,14 @@ paginate: true
 header: 'Paying for relay — an incentive layer for hoverfly pushers'
 ---
 
+<!-- This file is the source. `marp-cli` renders it to PDF as-is; the
+     self-contained HTML deck is built with:
+       python3 docs/deck/build.py docs/pusher-incentives-slides.md -o deck.html
+     Directives (<!-- title -->, part:, eyebrow:, hazard) are documented
+     in docs/deck/build.py. -->
+
+<!-- title -->
+
 # Paying for relay
 
 ## An incentive layer for hoverfly pushers, reusing parts of SWAP
@@ -12,6 +20,8 @@ header: 'Paying for relay — an incentive layer for hoverfly pushers'
 *docs/pusher-incentives.md · Stages 0–1 shipped · one metered lane in production*
 
 ---
+
+<!-- eyebrow: Problem -->
 
 # The relay pays for traffic it did not cause
 
@@ -23,9 +33,13 @@ price(po) = (32 − po) × 10 000   accounting units
 
 Put a relay in the middle and that debt moves **wholesale to the relay** — it is the peer bee sees, so it is the peer bee charges. The browser client that caused the traffic pays **nothing but postage**.
 
+<!-- hazard -->
+
 > Booked today as accepted risk: *“worst case = the platform's free egress for the month burned, $0 lost.”*
 
 ---
+
+<!-- eyebrow: Problem -->
 
 # What changes
 
@@ -41,9 +55,13 @@ The relay still pays bee nothing, because credit was never what limited it. Bee 
 
 ---
 
-# Part One — Theory
+<!-- part: Part one -->
+
+# Theory
 
 ---
+
+<!-- eyebrow: Theory · trust model -->
 
 # Who has to trust whom
 
@@ -54,6 +72,8 @@ A relay is just an HTTP service. Anyone can run one, and there is no registry or
 So every defence *the relay* has points at the client: *a client cannot obtain service without paying, and cannot lie about what it owes.*
 
 ---
+
+<!-- eyebrow: Theory · trust model -->
 
 # What protects the client, then
 
@@ -68,7 +88,11 @@ Not cryptography. Four bounds, none of which need the relay to be trustworthy:
 
 ---
 
+<!-- eyebrow: Theory · trust model -->
+
 # What the previous design got wrong
+
+<!-- hazard -->
 
 > The design was building **two-sided cryptographic verification** for a **one-sided trust relationship.**
 
@@ -79,6 +103,8 @@ About half of it protected the client from the relay — from relays we run ours
 - **One unmeasured number could have killed the project**: how many receipt signers are actually staked. Nobody had checked.
 
 ---
+
+<!-- eyebrow: Theory · what we reuse -->
 
 # What we borrow from SWAP
 
@@ -92,6 +118,8 @@ About half of it protected the client from the relay — from relays we run ours
 | Payee-only role | The beneficiary is a plain EOA. A payee needs no contract. |
 
 ---
+
+<!-- eyebrow: Theory · what we reuse -->
 
 # What we drop
 
@@ -107,6 +135,8 @@ About half of it protected the client from the relay — from relays we run ours
 
 ---
 
+<!-- eyebrow: Theory · identity -->
+
 # The account is the batch owner
 
 Relays already know who is uploading. Every chunk carries a stamp, and its signature has to match the address the postage contract lists as the batch's owner.
@@ -116,6 +146,8 @@ Relays already know who is uploading. Every chunk carries a stamp, and its signa
 So there is nothing to add: no logins, no sign-up, no extra message. In a browser the key that owns the batch is already loaded, so cheques get signed with **no wallet pop-ups at all**.
 
 ---
+
+<!-- eyebrow: Theory · the central decision -->
 
 # Bill bytes admitted
 
@@ -132,6 +164,8 @@ Both numbers are known to both parties *before* any push work happens.
 
 ---
 
+<!-- eyebrow: Theory · the central decision -->
+
 # What that replaced
 
 The earlier draft billed per **verified pushsync receipt**. To make a *third party's* signature into a billing input it needed:
@@ -145,6 +179,8 @@ The earlier draft billed per **verified pushsync receipt**. To make a *third par
 
 ---
 
+<!-- eyebrow: Theory · the central decision -->
+
 # Bytes, not successful pushes
 
 Bytes are what actually costs the relay money. It sends every chunk to three peers at once and retries the ones that go nowhere, and that traffic goes out whether or not the chunk ends up stored. Charging only for successes would leave the relay paying for every failure.
@@ -156,6 +192,8 @@ Bytes are what actually costs the relay money. It sends every chunk to three pee
 
 ---
 
+<!-- eyebrow: Theory · the central decision -->
+
 # Dedup hits are billed at zero
 
 If the relay already pushed the same chunk moments ago, it does no work the second time, so those bytes come off the bill. This is the **only** part of the bill that rests on the relay's own word.
@@ -164,15 +202,21 @@ If the relay already pushed the same chunk moments ago, it does no work the seco
 
 ---
 
+<!-- eyebrow: Theory · settlement -->
+
 # Cumulative cheques
 
 - **Losing one costs nothing.** Every cheque is a running total, so if a payment fails the next one covers it anyway. No retry logic needed.
 - **Old cheques are worthless.** Each must be larger than the last, so sending an old one again pays nothing.
 - **Gas is paid once per customer, not once per cheque.** The relay only ever cashes the newest total, so every earlier cheque costs nothing to collect.
 
+<!-- hazard -->
+
 > A cheque per chunk was rejected: 137 bytes and a signature on every 4 KiB, and — worse — running totals have to go in order, so chunks would have to be sent one at a time. That would remove the parallel uploads the scheduler relies on for speed.
 
 ---
+
+<!-- eyebrow: Theory · settlement -->
 
 # Cheques are per payee, not per relay
 
@@ -188,6 +232,8 @@ relay applies ErrChequeNotIncreasing → rejected, forever
 
 ---
 
+<!-- eyebrow: Theory · wire protocol -->
+
 # Payment happens outside the upload
 
 | Endpoint | Shape |
@@ -202,15 +248,21 @@ The upload format is **unchanged**. Payment stays off the upload path, so a paym
 
 ---
 
+<!-- eyebrow: Theory · admission -->
+
 # Why a challenge at all
 
 The tempting answer is that refusing is easy, because the relay picks its response code before it looks at any chunk. That is true, and it is exactly the **problem** — at that moment it does not yet know **whose account to check**.
 
 Working out who is paying means checking the stamp and looking up the batch owner, and both happen later — after the response has already gone out.
 
+<!-- hazard -->
+
 > Doing those checks first means up to 512 signature recoveries (~40 ms) and a chain lookup **before the relay can answer at all** — cheap for an attacker to trigger, expensive for the relay to serve. Exactly the shape the design spends a section trying to avoid.
 
 ---
+
+<!-- eyebrow: Theory · admission -->
 
 # The permission slip proves the checks were already done
 
@@ -228,15 +280,21 @@ The relay keeps no list of the slips it has issued, so handing them out for free
 
 ---
 
+<!-- eyebrow: Theory · admission -->
+
 # Two ways to make the check do nothing
 
 **1. Glue the fields together carelessly and two different inputs look identical.** The hostname varies in length, so `("host.a","bc")` and `("host.ab","c")` run together into the same bytes — one slip that works for two different hostnames.
 
 **2. The relay must know its own name from its config, not from the request.** The obvious version compares the slip against the `Host` header — which does nothing, because the attacker sends both.
 
+<!-- hazard -->
+
 > An attacker reusing a victim's signature at relay B just sends `Host: relay-b.example`. The check passes, and the attack works again — **while the code looks like it is preventing it.**
 
 ---
+
+<!-- eyebrow: Theory · sybil bound -->
 
 # Credit scales with what the batch is worth
 
@@ -250,6 +308,8 @@ max_outstanding(A,B) = min(remaining_value_plur(B) ÷ credit_ratio,
 > An attacker now gets **a thousandth of what they funded, whatever they buy.** There is no cheap way in, because what is fixed is the *ratio* — not an amount someone can undercut.
 
 ---
+
+<!-- eyebrow: Theory · parameters -->
 
 # The rule the three thresholds must satisfy
 
@@ -266,15 +326,21 @@ An early draft set the minimum cheque **87× larger** than the point where you a
 
 ---
 
+<!-- eyebrow: Theory · concurrency -->
+
 # Counting is not enough when uploads overlap
 
 Just adding up what is owed is **not** enough. Uploads run in parallel on purpose, so several can each check the balance before any of them has been charged. Even a well-behaved client sending the 8 the relay itself recommends will blow past the limit.
 
 The fix: set the money aside up front, based on the size the client declared, and give back whatever was not used when the upload finishes.
 
+<!-- hazard -->
+
 > But the set-aside amounts must not be saved to disk. Each one belongs to an upload in progress, and no upload survives a restart — so nothing would ever release it. Save what is owed and the running total; start the set-aside amounts at zero.
 
 ---
+
+<!-- eyebrow: Theory · pricing -->
 
 # The cost basis
 
@@ -290,6 +356,8 @@ The fix: set the money aside up front, based on the size the client declared, an
 
 ---
 
+<!-- eyebrow: Theory · pricing -->
+
 # On per-GB-billed hosts, metering loses money
 
 At 3.7 GiB of real egress per GiB of payload:
@@ -304,6 +372,8 @@ At 3.7 GiB of real egress per GiB of payload:
 
 ---
 
+<!-- eyebrow: Theory · pricing -->
+
 # Revenue per account vs. cashout gas
 
 Issuing a cheque sends no transaction. Only cashing out touches the chain: ≈ **$0.0005** on Gnosis.
@@ -317,6 +387,8 @@ Issuing a cheque sends no transaction. Only cashing out touches the chain: ≈ *
 
 ---
 
+<!-- eyebrow: Theory · attack surface -->
+
 # Three attacks worth knowing about
 
 - **Someone else's stamps, billed to them** *(new)* — stamps are public, and a relay has a copy of every one it has forwarded. Send a victim's stamps to a paid relay and the victim's account picks up the bill, at no cost to the attacker. Fixed: the client must sign the challenge with the batch owner's key, and every chunk in a request must belong to the batch named in it.
@@ -325,9 +397,13 @@ Issuing a cheque sends no transaction. Only cashing out touches the chain: ≈ *
 
 ---
 
-# Part Two — Practice
+<!-- part: Part two -->
+
+# Practice
 
 ---
+
+<!-- eyebrow: Practice · modes -->
 
 # Paying is optional, per lane
 
@@ -341,6 +417,8 @@ Issuing a cheque sends no transaction. Only cashing out touches the chain: ≈ *
 
 ---
 
+<!-- eyebrow: Practice · rollout -->
+
 # What soft mode does and does not drop
 
 Soft mode meters, reports and accepts cheques, but **never answers 402**.
@@ -353,6 +431,8 @@ A relay flipping to `--meter` therefore does break clients that predate the prot
 
 ---
 
+<!-- eyebrow: Practice · what running it found -->
+
 # Six bugs only a running relay could find
 
 None is reachable from a single upload against a fresh relay. All six survived the full test suite **and** the Stage 1 round-trip. Reaching them needed, simultaneously:
@@ -364,6 +444,8 @@ None is reachable from a single upload against a fresh relay. All six survived t
 > The one to learn from is §17.3. It is not a coding mistake — it is a **rule checked against the wrong number**, and it only shows up once a real batch has been worn down below about 0.39 BZZ.
 
 ---
+
+<!-- eyebrow: Practice · what running it found -->
 
 # The six bugs
 
@@ -378,15 +460,21 @@ None is reachable from a single upload against a fresh relay. All six survived t
 
 ---
 
+<!-- eyebrow: Practice · §17.1 -->
+
 # Debt carried over, and could not be paid
 
 Because there is a minimum cheque size, every upload ends owing a little too small to pay. The relay is **right** to keep counting it — writing it off would make staying under the minimum a way to be served for free.
 
 But the client forgets when it exits. The next run starts thinking it owes **nothing**, while the relay's total keeps growing. Eventually the very first upload is refused — and the client **cannot pay**, because it writes cheques from its own figure, which is zero.
 
+<!-- hazard -->
+
 > Observed live: a second upload failing **151/151** against a relay carrying 290,400,000,000 PLUR.
 
 ---
+
+<!-- eyebrow: Practice · §17.1 -->
 
 # Three ways to get the fix wrong
 
@@ -395,6 +483,8 @@ But the client forgets when it exits. The next run starts thinking it owes **not
 - **Cap it at the limit the relay signed up to.** Not the batch's current limit — that falls as the batch is used up, so it can drop below a bill you honestly ran up, and refusing to pay that keeps you stuck. And not the chequebook balance either: that lets any relay you point at ask for everything you have.
 
 ---
+
+<!-- eyebrow: Practice · §17.3 -->
 
 # The invariant was checked against the wrong quantity
 
@@ -406,9 +496,13 @@ min(remaining_value / credit_ratio, ceiling)
 
 Once a batch is worth less than about 0.39 BZZ, the minimum cheque is **bigger than anything that account is allowed to owe**. It runs up to its limit and can never write a cheque the relay will take.
 
+<!-- hazard -->
+
 > The account is refused from then on. Nothing is broken and nothing logs an error — it just stops working. Both sides now compare against the limit that actually applies.
 
 ---
+
+<!-- eyebrow: Practice · results -->
 
 # After all six fixes
 
@@ -422,6 +516,8 @@ Once a batch is worth less than about 0.39 BZZ, the minimum cheque is **bigger t
 > The remaining 402s are the *intended* kind: the line genuinely fills, the client pays or waits, the lane resumes.
 
 ---
+
+<!-- eyebrow: Practice · results -->
 
 # Over public HTTPS, with §17.6 in place
 
@@ -437,6 +533,8 @@ Each run settles to `owed: 0` on the relay, so the next carries nothing.
 
 ---
 
+<!-- eyebrow: Practice · settlement -->
+
 # It settles on-chain
 
 - The relay counts what you owe. You sign a cheque for the running total. The relay checks it and marks you paid.
@@ -448,6 +546,8 @@ Each run settles to `owed: 0` on the relay, so the next carries nothing.
 
 ---
 
+<!-- eyebrow: Practice · deployment -->
+
 # What is actually deployed
 
 **Four free relays** — on hosts whose disks are wiped on restart, so they have to stay free — plus **one paid relay** that enforces payment.
@@ -458,6 +558,8 @@ The browser app lists all five and **skips the paid one automatically**, because
 
 ---
 
+<!-- eyebrow: Practice · retrospective -->
+
 # Net effect on the design
 
 - **Removed:** five mechanisms and every attack on them, just by billing bytes instead of receipts — the staking check, the list-shaped bill, the spot-check audit, the log sweep on both sides, and the shared receipt-checking code.
@@ -467,6 +569,8 @@ The browser app lists all five and **skips the paid one automatically**, because
 > Found by running it: six bugs no test suite reached — five needed a ledger that outlives the client.
 
 ---
+
+<!-- eyebrow: Practice · open questions -->
 
 # Still open
 
