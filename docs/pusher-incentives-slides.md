@@ -2,14 +2,12 @@
 marp: true
 theme: default
 paginate: true
-header: 'Paying for relay — SWAP cheques for hoverfly pushers'
+header: 'Paying for relay — an incentive layer for hoverfly pushers'
 ---
 
 # Paying for relay
 
-## SWAP cheques for hoverfly pushers
-
-Theory, and what happened when we ran it
+## An incentive layer for hoverfly pushers, reusing parts of SWAP
 
 <br>
 
@@ -17,7 +15,7 @@ Theory, and what happened when we ran it
 
 ---
 
-# The problem: the relay eats a cost it did not incur
+# The problem: the relay pays for traffic it did not cause
 
 In a **native** upload, your own machine opens the pushsync streams. Bee debits *you*:
 
@@ -33,7 +31,7 @@ The browser client that caused the traffic pays **nothing but postage**.
 
 ---
 
-# What changes, precisely
+# What changes
 
 | | open (today) | metered |
 |---|---|---|
