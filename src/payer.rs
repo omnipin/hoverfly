@@ -805,22 +805,55 @@ impl LanePayer {
         cfg: &PaymentConfig,
     ) -> Result<bool, String> {
         let owed = self.relay_owed(http, cfg).await?;
-        // Bounded by the chequebook's balance, deliberately *not* by the
-        // credit line. The line caps what may be newly admitted, not what
-        // may stand: debt reaches the line by construction, and an operator
-        // who lowers the line leaves legitimately-incurred debt above it.
-        // Rejecting on that basis refuses to pay a real bill and keeps the
-        // deadlock this method exists to break. What genuinely bounds our
-        // exposure to an inflated figure is the funded balance, which
-        // `settle` enforces exactly across all lanes (§8.3); this is the
-        // same ceiling stated early for a legible error.
-        if owed > cfg.balance_plur {
+        self.check_reported_debt(owed, cfg.balance_plur)?;
+        Ok(self.account.adopt_relay_debt(owed))
+    }
+
+    /// Is a debt figure the relay reports one it could legitimately hold,
+    /// and one we could pay?
+    ///
+    /// Split out of [`Self::reconcile`] because it is the only part of the
+    /// reconcile that *decides* anything, and it should be testable without
+    /// standing up a server.
+    ///
+    /// Two ceilings, and the tighter one binds.
+    ///
+    /// The first is the quote's global `max_outstanding_plur`. The relay
+    /// refuses admission whenever `outstanding + reserve > cap`, and §10.3
+    /// makes every per-batch cap `min(value / ratio, ceiling)` — never above
+    /// the ceiling. So no debt can *legitimately* stand above it, whatever
+    /// our own books say.
+    ///
+    /// Deliberately not the per-batch credit line, which §17.1 rejected for
+    /// a reason that still holds: the line shrinks as the batch is spent
+    /// down, so it can fall below debt properly incurred when the batch was
+    /// worth more, and refusing on that basis preserves the very deadlock
+    /// this reconcile exists to break. The ceiling is a constant of the
+    /// signed quote and does not move.
+    ///
+    /// Why bound at all, when the relay is the one keeping the ledger: a
+    /// relay is not a curated identity. It is an HTTP service the client
+    /// chose and pinned (§7.3) — anyone can run one, and there is no
+    /// registry to be admitted to. Pinning buys the right to trust its
+    /// arithmetic *within the credit it granted*. Trusting it past that puts
+    /// the entire chequebook behind one JSON field.
+    fn check_reported_debt(&self, owed: u128, balance_plur: u128) -> Result<(), String> {
+        let ceiling = self.quote.params.max_outstanding_plur;
+        if owed > ceiling {
             return Err(format!(
-                "relay claims {owed} owed, more than the chequebook's {} balance",
-                cfg.balance_plur
+                "relay claims {owed} owed, above the {ceiling} ceiling it signed \
+                 — it cannot have admitted that much"
             ));
         }
-        Ok(self.account.adopt_relay_debt(owed))
+        // Then what we can actually pay. `settle` enforces this exactly
+        // across all lanes (§8.3); stating it here turns a confusing failure
+        // at signing time into a legible one at reconcile time.
+        if owed > balance_plur {
+            return Err(format!(
+                "relay claims {owed} owed, more than the chequebook's {balance_plur} balance"
+            ));
+        }
+        Ok(())
     }
 
     /// Settle if there is enough owed to be worth a cheque.
@@ -1290,6 +1323,60 @@ mod tests {
     /// `min_cheque_plur`, so it cannot be settled (§10.2) and the headroom
     /// the guard waited for could never come back — 60 of 76 chunks were
     /// left unacked against a live relay.
+    /// A relay's reported debt is trusted only up to the ceiling it signed.
+    ///
+    /// Reconcile adopts the relay's own figure (§17.1), which is sound
+    /// *within the credit it granted*: admission refuses above the cap, and
+    /// every per-batch cap is `min(value / ratio, ceiling)`. Above the
+    /// ceiling there is no story in which the debt was legitimately
+    /// incurred, so the figure is refused rather than signed for.
+    ///
+    /// This matters because a relay is not a curated identity — it is an
+    /// HTTP service the client pinned. Bounding only by the chequebook
+    /// balance, as an earlier version did, let any lane a client pointed at
+    /// name the whole balance and be paid it.
+    #[test]
+    fn a_relay_cannot_claim_more_debt_than_the_ceiling_it_signed() {
+        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let cap = q.params.max_outstanding_plur;
+        let payer = LanePayer::new("http://lane".into(), q, 0);
+        // A chequebook far richer than the credit line, which is the normal
+        // case and exactly what made the old bound useless.
+        let balance = cap * 1000;
+
+        payer
+            .check_reported_debt(cap, balance)
+            .expect("debt exactly at the ceiling is legitimate");
+        payer
+            .check_reported_debt(cap - 1, balance)
+            .expect("and anything under it");
+
+        let e = payer
+            .check_reported_debt(cap + 1, balance)
+            .expect_err("one PLUR above the ceiling cannot have been admitted");
+        assert!(e.contains("ceiling"), "got {e}");
+
+        let e = payer
+            .check_reported_debt(balance, balance)
+            .expect_err("and the whole chequebook certainly cannot");
+        assert!(e.contains("ceiling"), "got {e}");
+    }
+
+    /// The balance still bounds, for a chequebook too thin to cover a
+    /// legitimate debt — caught here rather than as a confusing failure at
+    /// signing time.
+    #[test]
+    fn debt_within_the_ceiling_but_over_the_balance_is_refused() {
+        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let cap = q.params.max_outstanding_plur;
+        let payer = LanePayer::new("http://lane".into(), q, 0);
+
+        let e = payer
+            .check_reported_debt(cap, cap / 2)
+            .expect_err("we cannot sign for more than the chequebook holds");
+        assert!(e.contains("balance"), "got {e}");
+    }
+
     #[test]
     fn a_line_barely_wider_than_one_post_still_makes_progress() {
         let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");

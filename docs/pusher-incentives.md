@@ -16,13 +16,12 @@ cheque format*, not its protocol.
 **This is a rewrite.** Three rounds of adversarial review went into the
 previous version, and the third round's most important finding was
 structural rather than local: the doc was building *two-sided*
-cryptographic verification for a *one-sided* trust relationship. Relays
-are a curated, pinned set (`PUSHER_URLS`, `apps/upload/src/config.ts:18-25`
-— four URLs, all ours); clients are anonymous. Roughly half the old
-document defended the client against the relay, which meant defending our
-own infrastructure from itself, and it paid for that with a forgeable
-billing unit, an unbounded residual, and a ship-blocking measurement
-nobody had taken.
+cryptographic verification for a *one-sided* trust relationship. A client
+**chooses and pins** its relay before sending a byte; a relay gets whoever
+POSTs. Roughly half the old document defended the client against the
+relay — a party it had already vetted — and it paid for that with a
+forgeable billing unit, an unbounded residual, and a ship-blocking
+measurement nobody had taken.
 
 This version points every defence in one direction — **the relay is what
 gets protected, from the client** — and picks a billing unit the client
@@ -63,19 +62,44 @@ profit.
 
 Every design decision below follows from one asymmetry.
 
-> **Relays are known. Clients are anonymous.**
+> **The client chose its relay. The relay did not choose its client.**
 >
-> A relay is an entry in a hardcoded list, run by a named operator, pinned
-> by URL over HTTPS. A client is whoever POSTs. Defences point *from* the
-> relay *at* the client. The security goal is: **a client cannot obtain
-> relay service without paying for it, and cannot lie to the relay about
-> what it owes.**
+> A client verifies the signed quote and pins
+> `(url, node_eth_address, beneficiary)` (§7.3) before it sends a byte. A
+> relay is whatever URL it was pointed at, and a client is whoever POSTs.
+> Defences point *from* the relay *at* the client. The security goal is:
+> **a client cannot obtain relay service without paying for it, and cannot
+> lie to the relay about what it owes.**
 
-The inverse — a relay defrauding a client — is explicitly **out of scope
-for this iteration**. Not because it is impossible, but because it is
-governed socially rather than cryptographically: a lane that misbehaves is
-removed from `PUSHER_URLS`. If the federation ever opens to unvetted
-operators that becomes a real problem and §14 records what it would take.
+**The asymmetry is pinning, not curation, and the difference is not
+cosmetic.** A relay is a plain HTTP service: there is no registry, no
+discovery mechanism, and no list anyone has to be admitted to. Anyone can
+run `hoverfly pusher`, and any client can point `--pusher` at any URL.
+`PUSHER_URLS` is one client's default fleet — the dApp's — not a
+federation roster.
+
+So "relays are known" is only true of a relay a given client has already
+chosen. The property the design can actually lean on is that **a client
+only ever pays a relay it configured and pinned**, which is a decision it
+made with the signed quote in hand.
+
+The inverse — a relay defrauding a client — is still **out of scope for
+cryptographic treatment**, but it does not follow that the client is
+unprotected. Four bounds hold without the relay being trustworthy:
+
+- **The client computes its own bill** from bytes it sent (§8.4), so an
+  over-reported `kib_admitted` is immediately visible and attributable.
+- **The price is pinned** from a signed quote and echoed verbatim in every
+  402 (§7.3), so it cannot move under the client.
+- **Exposure per lane is capped at the credit line** — `max_outstanding`
+  at most, and `remaining_value ÷ credit_ratio` for a small batch.
+- **Outcomes are measured.** A lane that takes bytes and delivers poorly is
+  deweighted by the scheduler's existing EWMA.
+
+The one place a relay's own assertion could exceed that cap is §17.1's
+reconcile, where the client adopts the relay's `owed`. It is bounded by
+the ceiling in the relay's *signed quote* precisely so that this list stays
+true; see `LanePayer::check_reported_debt`.
 
 Three consequences worth stating so they don't get re-litigated:
 
@@ -516,8 +540,9 @@ recovered address and the pinned overlay are values in different spaces.
 The signed block therefore carries `node_eth_address` and `overlay_nonce`,
 so any client can recompute `overlay` and check it against what
 `/v1/status` advertises, and clients pin
-**`(url, node_eth_address, beneficiary)`**. `PUSHER_URLS` is already a
-hardcoded list, so extending each entry costs nothing.
+**`(url, node_eth_address, beneficiary)`**. A client already names its
+relays somewhere — `PUSHER_URLS` in the dApp, `--pusher` on the CLI — so
+carrying two more fields alongside a URL it already had costs nothing.
 
 ```jsonc
 // GET /v1/status → new field (the whole object is covered by `sig`)
@@ -660,8 +685,11 @@ many bytes it sent. There is nothing to dispute.
 
 A relay over-reporting `kib_admitted` is therefore immediately visible and
 attributable. The client's response is to withhold the next cheque and
-deweight the lane, which is §2's social enforcement rather than a protocol
-mechanism, and is adequate for a pinned lane set.
+deweight the lane. That is not social enforcement — it needs no operator,
+no list and no reputation — it is simply the client declining to sign for
+a number it can check itself. What it costs the client to detect the
+disagreement is bounded by the credit line, since nothing above that can
+be admitted before the next settlement.
 
 ## 9. Pricing
 
@@ -1415,10 +1443,12 @@ Carried knowingly:
 - **§11.5** — griefing by aiming at badly-covered arcs still forces the
   relay to spend more than the attacker pays, even though the attacker now
   pays. Bounded by attempt caps, not eliminated.
-- **A relay can take payment and drop chunks.** Out of scope by §2 and
-  governed socially: lanes are pinned in `PUSHER_URLS` and a
-  misbehaving one is removed. This is adequate for a curated set and
-  **not** adequate for an open one.
+- **A relay can take payment and drop chunks.** Out of scope for
+  cryptographic treatment by §2. What bounds it is that the client pinned
+  the lane, caps its exposure at one credit line, and deweights a lane
+  whose acks do not arrive — so the loss is at most `max_outstanding` and
+  is detected within one settlement window. Adequate for a lane a client
+  chose; **not** a proof of delivery, which pushsync cannot give us.
 
 Open:
 
@@ -1613,15 +1643,26 @@ which number, each of which was wrong in a draft:
   still in flight are already held in `pending_plur` and would be billed
   twice when those POSTs land. Under-counting is safe and self-correcting;
   over-counting is a refused cheque.
-- **Bounded by the chequebook balance, not the credit line.** Debt reaches
-  the line by construction, and an operator who lowers the line leaves
-  legitimately-incurred debt above it. Rejecting on that basis refuses to
-  pay a real bill and preserves the deadlock. The funded balance is what
-  actually bounds exposure, and `settle` already enforces it exactly
-  across all lanes (§8.3).
+- **Bounded by the quote's ceiling, not by the per-batch credit line — and
+  then by the chequebook balance.** The line is the wrong bound: it shrinks
+  as the batch is spent down, so it falls below debt properly incurred when
+  the batch was worth more, and rejecting on that basis refuses a real bill
+  and preserves the deadlock. `max_outstanding_plur` from the *signed* quote
+  is the right one: admission refuses above the per-batch cap, and every cap
+  is `min(value / ratio, ceiling)`, so a figure above the ceiling describes
+  debt that cannot have been incurred. The balance check stays as a second,
+  looser gate — `settle` enforces it exactly across all lanes (§8.3), and
+  stating it here turns a confusing failure at signing time into a legible
+  one at reconcile time.
 
-This makes the client trust a curated relay's arithmetic about its own
-receivable, which §2 already grants. The alternative — persisting the
+This makes the client trust the relay's arithmetic about its own
+receivable, but only within the credit that relay granted — which is what
+pinning buys (§2). The first version bounded on the chequebook balance
+alone, which would let any lane a client pointed at name the whole balance
+and be signed for it. That is not something §2 grants: a relay is pinned,
+not vetted, and there is no list to be thrown off.
+
+The alternative — persisting the
 residual client-side — keeps better books but has no recovery when that
 state is lost, and a client permanently locked out of a relay with no way
 to clear it is the worse failure.
