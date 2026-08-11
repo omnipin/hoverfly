@@ -80,6 +80,11 @@
     overflow: hidden;
   }
   .slide.on { display: flex; }
+  /* Children must not shrink. A column flexbox squeezes its items to fit by
+     default, which makes the slide's scrollHeight equal its clientHeight even
+     when the content is visibly crushed — and the auto-fit below then
+     concludes, wrongly, that everything fits. */
+  .slide > * { flex: none; }
 
   /* ── Slide furniture ───────────────────────────────────────────────── */
   .eyebrow {
@@ -134,7 +139,7 @@
   .body { font-size: calc(1.82cqw * var(--fit, 1)); line-height: 1.5; }
 
   p { margin: 0; max-width: 62ch; }
-  p + p { margin-top: 1.2cqh; }
+  p + p { margin-top: calc(1.2cqh * var(--fit, 1)); }
 
   .lede { font-size: 2.15cqw; line-height: 1.4; color: var(--ink); max-width: 54ch; }
   .sub  { color: var(--ink-2); }
@@ -183,7 +188,7 @@
     font-weight: 400;
     text-transform: uppercase;
     letter-spacing: .1em;
-    font-size: 1.14cqw;
+    font-size: calc(1.14cqw * var(--fit, 1));
     border-bottom: 1px solid var(--rule);
   }
   /* md2html emits GFM column alignment as an attribute, not a class. */
