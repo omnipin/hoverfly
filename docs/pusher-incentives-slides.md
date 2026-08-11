@@ -67,10 +67,10 @@ The client's protections are different in kind — arithmetic and exposure limit
 
 Not cryptography. Four bounds, none of which need the relay to be trustworthy:
 
-- **It bills itself.** `owed` is computed from bytes the client sent, so a relay over-reporting `kib_admitted` is immediately visible and attributable (§8.4).
-- **It pinned the price.** `price_plur_per_kib` comes from a quote signed by the node identity, echoed verbatim in every 402.
-- **Exposure is capped at the credit line** — ~$0.0024 at the global ceiling, and `remaining_value ÷ 1000` for a small batch.
-- **It measures outcomes.** A lane that takes bytes and delivers poorly is deweighted by the scheduler's existing EWMA.
+- **It works out the bill itself.** The client adds up the bytes it sent. If the relay reports a bigger number, the client sees it immediately — and knows the relay is the one that is wrong (§8.4).
+- **The price is fixed in advance.** It arrives in a quote the relay signs, and the same signed quote comes back with every refusal — so the price cannot move mid-upload.
+- **The most it can lose is one credit limit** — about $0.0024 at the maximum, and far less on a small batch, which gets a thousandth of whatever it is still worth.
+- **It watches whether chunks actually arrive.** A relay that takes bytes and delivers badly gets sent less work, using the running average that already picks between relays today.
 
 > The curated-set premise was hiding a gap in the fourth: on an unpayable 402 the client **adopts the relay's own `owed`**, and that used to be bounded only by the chequebook balance. It is now bounded by `max_outstanding_plur` from the quote the relay signed — the credit it granted is the most it can claim.
 
@@ -84,9 +84,9 @@ Three rounds of adversarial review. The most important finding was structural, n
 
 Roughly half of it defended the client against the relay — against lanes we run ourselves. Three concrete costs:
 
-- **Billing unit was a third party's signature** (a pushsync receipt), so it was forgeable and needed a staking-registry anchor
-- **Unbounded residual** — the invoice was set-valued, with no bound on retained receipts
-- **A kill criterion nobody had measured**: the staked fraction of receipt signers, which could have vetoed the whole thing
+- **The bill was built on someone else's signature** — a receipt from a bee node. Those are easy to fake, so every one had to be checked against the on-chain list of staked nodes.
+- **The bill was a list, not a number**, and nothing limited how long that list could get.
+- **One unmeasured number could have killed the project**: how many receipt signers are actually staked. Nobody had checked.
 
 ---
 
@@ -141,10 +141,10 @@ That is the whole billing rule. One property matters more than everything else i
 
 > **The client cannot lie about it — the client produced the bytes and the relay counted them.**
 
-- No third-party attestation to forge
-- No signature to replay
-- No chain state to disagree about
-- No relay assertion taken on faith
+- Nothing to forge — no outside signature is part of the bill
+- Nothing to replay — the relay counts arrivals, not tokens
+- Nothing to look up on chain
+- Nothing the client has to take on the relay's word
 
 Both numbers are known to both parties *before* any push work happens.
 
@@ -154,11 +154,11 @@ Both numbers are known to both parties *before* any push work happens.
 
 The earlier draft billed per **verified pushsync receipt**. To make a *third party's* signature into a billing input, it needed:
 
-- a staking-registry anchor (to stop trivial forgery)
-- a set-valued invoice (to stop self-replay)
-- a sampled retrieval audit (to catch fabrication)
-- a staked-set log sweep on both sides
-- a shared predicate module, byte-identical on both sides, **with no adjudicator if it drifted**
+- check every receipt signer against the on-chain staking list, or faking one is trivial
+- make the bill a list instead of a number, or the same receipt gets submitted twice
+- spot-check by fetching chunks back, to catch receipts for work never done
+- sweep the staking logs on both sides, and keep them in step
+- share one piece of code that decides whether a receipt counts — and **if the two copies ever disagree, nobody can settle it**
 
 Changing the unit **deleted the entire apparatus and every attack against it.**
 
@@ -201,9 +201,9 @@ A relay has no incentive to make it falsely, and a client that disagrees is disa
 
 A cheque is a running total for one `(chequebook, beneficiary)` pair. Three properties fall out:
 
-- **Loss-tolerant** — a dropped `/v1/pay` costs nothing; the next cheque supersedes it. No retry state machine.
-- **Replay-proof** — strict monotonicity means a re-presented cheque credits zero.
-- **Gas-amortizing by construction** — the relay cashes only the *latest* cumulative, so gas is paid once per **account**, not per cheque.
+- **Losing one costs nothing.** Every cheque is a running total, so if a payment fails the next one covers it anyway. No retry logic needed.
+- **Old cheques are worthless.** Each must be larger than the last, so sending an old one again pays nothing.
+- **Gas is paid once per customer, not once per cheque.** The relay only ever cashes the newest total, so every earlier cheque costs nothing to collect.
 
 **Per-chunk cheques are rejected:** ~137 B per 4 KiB chunk, an EIP-712 signature on the hot path, and cumulative payouts are *serial* per `(issuer, beneficiary)` pair — which forces a total order on chunks within a lane, removing the concurrent multi-POST pipelining the scheduler depends on.
 
@@ -430,9 +430,9 @@ None is reachable from a single upload against a fresh relay. All six survived t
 
 Reaching them needed, simultaneously:
 
-- a relay whose ledger **persists across client runs**
-- enough concurrency to have several POSTs on the wire at once
-- a batch **spent down far enough that its credit line binds**
+- a relay that **remembers what you owe between runs**, so debt carries over
+- several uploads in flight at the same time, not one after another
+- a batch **used up far enough that the credit limit is what stops you**, rather than anything else
 
 > §17.3 is the one to generalise from: it is not a coding error but an **invariant checked against the wrong quantity**, and it only becomes reachable once a real batch's value has decayed below ~0.39 BZZ.
 
@@ -469,11 +469,11 @@ Fix: **ask rather than remember** — reconcile against `GET /v1/account`.
 
 Each of these was wrong in a draft:
 
-- **Use `owed`, not the 402 body's `outstanding_plur`.** `reserve()` adds the reservation *before* computing what it reports, so the body includes the request just refused. Adopting it over-pays by exactly that body — and the next cheque bounces as an **overpayment**.
+- **Ask what you owe. Don't read it off the refusal.** The refusal already counts the request it is turning down, so paying that number overpays by exactly one request — and the next cheque bounces for being too big.
 
-- **Exclude reservations on our side too.** Bytes still in flight are already held in `pending`, and would be billed twice when those POSTs land. *Under*-counting is safe and self-correcting; *over*-counting is a refused cheque.
+- **Don't count bytes still on the wire.** The client is already tracking those, so counting them again bills them twice. Guessing low is safe and fixes itself on the next round; guessing high gets the cheque rejected.
 
-- **Bound by the quote's signed ceiling** — not the per-batch line, and not the balance. The line shrinks as the batch decays, so it falls below debt properly incurred earlier, and rejecting on that basis **preserves the deadlock**. The balance is far too loose: it lets any lane a client points at name the whole chequebook. Admission refuses above the cap and every cap is `min(value ÷ ratio, ceiling)`, so above the ceiling the debt cannot exist.
+- **Cap it at the limit the relay signed up to.** Not the batch's current limit — that falls as the batch is used up, so it can drop below a bill you honestly ran up, and refusing to pay that **keeps you stuck**. And not the chequebook balance either: that lets any relay you point at ask for everything you have.
 
 ---
 
@@ -530,11 +530,11 @@ Each run settles to **`owed: 0`** on the relay, so the next carries nothing.
 
 The loop closes end to end on Gnosis mainnet:
 
-- Relay accrues `owed`, client signs a **cumulative** cheque, relay verifies and credits
-- Relay holds the latest cumulative — currently **21,366,720,000,000 PLUR**
-- Cashed from a **separate machine**, because `cashChequeBeneficiary` must be sent *by* the beneficiary
+- The relay counts what you owe. You sign a cheque for the running total. The relay checks it and marks you paid.
+- The relay is holding a cheque for **21,366,720,000,000 PLUR** right now.
+- Cashing it happens on a **different machine**. Only the payee can cash a cheque, and the relay must never hold that key.
 
-Observed cashout: **status 1, gasUsed 75,378** — well under the 300,000 budget.
+It worked: the transaction succeeded and used **75,378 gas**, against a 300,000 budget.
 
 > The relay box never holds spendable key material. It needs the beneficiary's **address** only. The property that makes today's pusher safe survives metering intact.
 
@@ -554,14 +554,14 @@ A native client with `--chequebook` uses all five.
 
 # Net effect on the design
 
-**Removed** by changing the billing unit from receipts to bytes — five mechanisms, and every attack against them: staking-registry anchor, set-valued invoice, sampled retrieval audit, two-sided staked-set log sweep, shared predicate module.
+**Removed:** five mechanisms and every attack on them, just by billing bytes instead of receipts — the staking check, the list-shaped bill, the spot-check audit, the log sweep on both sides, and the shared receipt-checking code.
 
-**Added** — three, all cheap: one MAC per challenge, one `eth_call` per batch per TTL, one atomic reservation per POST.
+**Added:** three, all cheap — one signature check when a client asks permission, one chain lookup per batch every half hour, and one amount set aside per upload.
 
-**Properties that now hold by construction rather than by assumption:**
+**Now guaranteed rather than hoped for:**
 
-- Sybil margin is exactly `credit_ratio` = 1000×, at any batch size
-- Credit decays as the batch is spent down, with no expiry logic
+- An attacker gets credit worth a thousandth of what they actually funded, whatever size batch they buy
+- Credit shrinks by itself as a batch is used up, with no expiry code to get wrong
 - The relay holds no key that can move money
 
 **Found by running it:** six bugs no test suite reached; five needed a ledger outliving the client.
@@ -570,10 +570,10 @@ A native client with `--chequebook` uses all five.
 
 # Still open
 
-- **Stage 0 data gates Stage 2 pricing.** `accounts_reaching_cashout` is the number that decides whether metering funds anything at all.
-- **One account = one batch owner = one chequebook.** A client uploading under several owners needs a chequebook per owner.
-- **The withdraw race is inherited and unfixed.** Bee has it too; it is inherent to SimpleSwap-as-deployed.
-- **A malicious relay is out of scope.** If the federation opens to unvetted operators, that assumption breaks first.
+- **We don't yet know if this pays for itself.** The number to watch is how many accounts ever build up enough debt to be worth cashing. If it stays at zero, metering funds nothing.
+- **One chequebook per batch owner.** If you upload using batches owned by different addresses, each one needs its own chequebook.
+- **The empty-the-chequebook problem has no fix.** Bee has it too — it comes from how the chequebook contract is deployed, not from anything here.
+- **Nothing stops a relay taking your money and dropping chunks.** You lose at most one credit limit and then stop using it — that bounds the damage, but it is not a guarantee of service.
 
 <br>
 
