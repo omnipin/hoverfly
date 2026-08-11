@@ -21,9 +21,15 @@
   // line, shrink that slide's type until it fits. Slides with room to spare
   // are untouched, so the designed sizes hold wherever they can.
   function fit(s) {
+    if (!s) return;
     s.style.setProperty('--fit', '1');
-    for (let k = 1; k > 0.62 && s.scrollHeight > s.clientHeight + 1; k -= 0.02) {
-      s.style.setProperty('--fit', String(k));
+    // Measure the tallest overflow, not just the slide's own: a wide table or a
+    // long line can spill out of its own box while the slide still measures as
+    // fitting.
+    const over = () => s.scrollHeight > s.clientHeight + 1
+      || Array.from(s.children).some(c => c.scrollHeight > c.clientHeight + 1);
+    for (let k = 1; k > 0.55 && over(); k -= 0.02) {
+      s.style.setProperty('--fit', k.toFixed(2));
     }
   }
 
@@ -55,4 +61,8 @@
 
   const start = parseInt(location.hash.slice(1), 10);
   show(Number.isFinite(start) && start > 0 ? start - 1 : 0);
+  // Re-measure once layout has settled, and again when the fonts land — the
+  // first pass can run against fallback metrics and under-shrink.
+  requestAnimationFrame(() => fit(slides[i]));
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(() => fit(slides[i]));
 </script>
