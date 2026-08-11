@@ -76,7 +76,7 @@
     padding: 5.2cqw 6cqw 6.4cqw;
     display: none;
     flex-direction: column;
-    gap: 2.2cqh;
+    gap: calc(2.2cqh * var(--fit, 1));
     overflow: hidden;
   }
   .slide.on { display: flex; }
@@ -120,7 +120,7 @@
     text-wrap: balance;
   }
   h2 {
-    font-size: 3.1cqw;
+    font-size: calc(3.1cqw * var(--fit, 1));
     line-height: 1.1;
     margin: 0;
     font-weight: 600;
@@ -131,7 +131,7 @@
   h2 .q { color: var(--accent); }
   h2 .hz { color: var(--hazard); }
 
-  .body { font-size: 1.82cqw; line-height: 1.5; }
+  .body { font-size: calc(1.82cqw * var(--fit, 1)); line-height: 1.5; }
 
   p { margin: 0; max-width: 62ch; }
   p + p { margin-top: 1.2cqh; }
@@ -139,7 +139,7 @@
   .lede { font-size: 2.15cqw; line-height: 1.4; color: var(--ink); max-width: 54ch; }
   .sub  { color: var(--ink-2); }
 
-  ul { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: 1.1cqh; max-width: 66ch; }
+  ul { margin: 0; padding-left: 1.4em; display: flex; flex-direction: column; gap: calc(1.1cqh * var(--fit, 1)); max-width: 66ch; }
   li::marker { color: var(--accent); }
 
   strong { font-weight: 600; }
@@ -157,7 +157,7 @@
   .claim {
     border-left: 3px solid var(--accent);
     padding: .3cqw 0 .3cqw 1.6cqw;
-    font-size: 2.05cqw;
+    font-size: calc(2.05cqw * var(--fit, 1));
     line-height: 1.38;
     max-width: 58ch;
   }
@@ -168,7 +168,7 @@
   table {
     border-collapse: collapse;
     font-family: var(--mono);
-    font-size: 1.42cqw;
+    font-size: calc(1.42cqw * var(--fit, 1));
     width: 100%;
     font-variant-numeric: tabular-nums;
   }
@@ -194,7 +194,7 @@
 
   pre {
     font-family: var(--mono);
-    font-size: 1.42cqw;
+    font-size: calc(1.42cqw * var(--fit, 1));
     line-height: 1.5;
     margin: 0;
     padding: 1.2cqw 1.5cqw;
