@@ -13,7 +13,12 @@ header: 'Paying for relay — an incentive layer for hoverfly pushers'
 
      Keep slides sparse: a heading, ONE block (a short table, up to four
      bullets, or two short paragraphs), and ONE callout. The detail lives in
-     docs/pusher-incentives.md. -->
+     docs/pusher-incentives.md.
+
+     Headings name the mechanism and nothing else — "Trust model", not "Who
+     has to trust whom". The claim about that mechanism goes in the body,
+     where there is room to say it precisely. Eyebrows mark the act (the
+     problem / theory / practice), so they never restate the heading. -->
 
 <!-- title -->
 
@@ -25,9 +30,9 @@ header: 'Paying for relay — an incentive layer for hoverfly pushers'
 
 ---
 
-<!-- eyebrow: 1 · the problem -->
+<!-- eyebrow: the problem -->
 
-# The relay pays for traffic it did not cause
+# Unpaid relay bandwidth
 
 Upload directly and bee bills you. Put a relay in the middle and bee bills the relay — it is the peer bee sees. The client pays only postage.
 
@@ -40,11 +45,11 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 
 ---
 
-<!-- eyebrow: 2 · trust -->
+<!-- eyebrow: theory -->
 
-# Who has to trust whom
+# Trust model
 
-A relay is just an HTTP service — no registry, no list to get onto.
+Trust runs one way. A relay is just an HTTP service — no registry, no list to get onto.
 
 - The **client** picks one and checks its signed quote
 - The **relay** gets whoever shows up
@@ -53,9 +58,9 @@ A relay is just an HTTP service — no registry, no list to get onto.
 
 ---
 
-<!-- eyebrow: 3 · the central decision -->
+<!-- eyebrow: theory -->
 
-# Bill bytes, not receipts
+# The billing unit
 
 ```
 owed = KiB the relay accepted × price per KiB
@@ -63,13 +68,13 @@ owed = KiB the relay accepted × price per KiB
 
 > The client cannot lie about it. It produced the bytes; the relay counted them.
 
-Billing per delivery receipt meant trusting a **third party's signature**, which took five mechanisms to make safe. Changing the unit removed all five.
+Bytes admitted, not delivery receipts. Billing per receipt meant trusting a **third party's signature**, which took five mechanisms to make safe. Changing the unit removed all five.
 
 ---
 
-<!-- eyebrow: 4 · admission -->
+<!-- eyebrow: theory -->
 
-# Getting in: a permission slip
+# Admission control
 
 The relay must accept or refuse **before** reading an upload — but at that moment it does not know whose account to check.
 
@@ -80,9 +85,9 @@ So the chain lookups happen **once**, when a slip is issued, and the credit limi
 
 ---
 
-<!-- eyebrow: 5 · credit -->
+<!-- eyebrow: theory -->
 
-# How much a client may owe
+# The credit limit
 
 The cheapest live batch costs a fraction of a cent, so "owns a batch" proves nothing. The limit tracks what the batch is worth:
 
@@ -94,11 +99,11 @@ credit limit = batch's remaining value ÷ 1000
 
 ---
 
-<!-- eyebrow: 6 · settlement -->
+<!-- eyebrow: theory -->
 
-# Cheques are running totals
+# Settlement
 
-Each says "you have now paid me *this much in total*".
+A cheque is a running total: "you have now paid me *this much in total*".
 
 - **Losing one costs nothing** — the next covers it
 - **Old ones are worthless** — each must exceed the last
@@ -109,9 +114,9 @@ Each says "you have now paid me *this much in total*".
 
 ---
 
-<!-- eyebrow: 7 · economics -->
+<!-- eyebrow: practice -->
 
-# What it costs
+# Unit economics
 
 A 4 KiB chunk costs ~15 KiB of real bandwidth — three peers at once, plus retries.
 
@@ -125,9 +130,11 @@ A 4 KiB chunk costs ~15 KiB of real bandwidth — three peers at once, plus retr
 
 ---
 
-<!-- eyebrow: 8 · in production -->
+<!-- eyebrow: practice -->
 
-# Paying is optional, per relay
+# Deployment
+
+Paying is optional, and each relay sets its own mode.
 
 | Relay | Client can pay | Client cannot |
 |---|---|---|
@@ -139,9 +146,9 @@ A 4 KiB chunk costs ~15 KiB of real bandwidth — three peers at once, plus retr
 
 ---
 
-<!-- eyebrow: 9 · what running it found -->
+<!-- eyebrow: practice -->
 
-# Six bugs no test suite reached
+# Bugs found in production
 
 | § | Bug |
 |---|---|
@@ -152,13 +159,13 @@ A 4 KiB chunk costs ~15 KiB of real bandwidth — three peers at once, plus retr
 | 17.5 | One broken stream bounced every later cheque |
 | 17.6 | The first upload was sized before the debt was known |
 
-> All six needed the same three things at once: debt surviving restarts, parallel uploads, and a nearly-spent batch.
+> No test suite reached any of them. All six needed the same three things at once: debt surviving restarts, parallel uploads, and a nearly-spent batch.
 
 ---
 
-<!-- eyebrow: 10 · where it stands -->
+<!-- eyebrow: practice -->
 
-# Where it stands
+# Results
 
 | Run | Payload | Delivered | Refusals | Rejected cheques |
 |---|---|---:|---:|---:|
