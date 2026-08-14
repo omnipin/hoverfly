@@ -41,7 +41,7 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 | client → relay | nothing | 4.8e8 PLUR per KiB |
 | relay → bee | nothing | still nothing |
 
-> 100 GB of traffic a month earns about **$0.54**. This works on repeat and bulk uploads, or not at all.
+> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills about **$0.54**.
 
 ---
 
@@ -49,12 +49,9 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 
 # Trust model
 
-Trust runs one way. A relay is just an HTTP service — no registry, no list to get onto.
+A relay is a standalone HTTP service — no registry, no list to get onto. Trust runs one way: the client checks a signed quote before sending a byte; the relay gets whoever shows up.
 
-- The **client** picks one and checks its signed quote
-- The **relay** gets whoever shows up
-
-> So the relay's defences point at the client. The client's protection is arithmetic: it counts its own bytes, and risks at most one credit limit — about **$0.0024**.
+> So every relay-side defence points at the client, and the client needs none — it counts its own bytes and risks at most one credit limit, about **$0.0024**.
 
 ---
 
