@@ -41,7 +41,7 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 | client → relay | nothing | 4.8e8 PLUR per KiB |
 | relay → bee | nothing | still nothing |
 
-> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills about **$0.54**.
+> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills **$1.14–1.63**.
 
 ---
 
@@ -115,15 +115,14 @@ A cheque is a running total: "you have now paid me *this much in total*".
 
 # Unit economics
 
-A 4 KiB chunk costs ~15 KiB of real bandwidth — three peers at once, plus retries.
+Relaying earns **$0.02 per GiB** admitted. On a host you already pay for, the only cost is cashout gas — 110k gas, a fraction of a microcent.
 
-|  | per GiB of payload |
-|---|---:|
-| AWS egress | −$0.33 |
-| revenue at $0.02/GiB | +$0.02 |
-| **net** | **−$0.31** |
+| egress per byte relayed | fits under a 2 TB/mo cap | earns |
+|---|---:|---:|
+| 3.7× modelled | 503 GiB | $10 |
+| 1.15× measured | 1.58 TiB | $33 |
 
-> Only viable on flat-rate bandwidth, and only on customers who return: one 71 MB upload earns $0.0014 against $0.0005 of gas.
+> So the ceiling is the bandwidth allowance, not the cost. Past the cap, egress runs $0.11 per GiB against $0.02 of revenue and it inverts.
 
 ---
 
@@ -164,12 +163,12 @@ Paying is optional, and each relay sets its own mode.
 
 # Results
 
-| Run | Payload | Delivered | Refusals | Rejected cheques |
-|---|---|---:|---:|---:|
-| 1 | 2 MiB | 567/567 | 0 | 0 |
-| 2 | 2 MiB | 567/567 | 0 | 0 |
-| 3 | 2 MiB | 567/567 | 0 | 0 |
+Three runs of 2 MiB, 567/567 chunks delivered, no refusals, no rejected cheques, each settling to zero owed. Cheques cash from a separate machine — the relay must never hold that key.
 
-Each run settles to zero owed. Cheques are cashed from a different machine — the relay must never hold that key.
+| | to date |
+|---|---:|
+| billed | $0.0003 |
+| cashed on-chain | $0.00006 |
+| paying clients | 1, and it was me |
 
-> Two things still open: whether it ever pays for itself, and that nothing stops a relay taking payment and dropping chunks.
+> The mechanism works; nobody is paying it. The browser dApp is the only real traffic and it signs stamps, not cheques. Nothing yet stops a relay billing for chunks it drops.
