@@ -1071,11 +1071,17 @@ fn full_post_kib() -> u64 {
     (PUSH_BATCH_MAX * pushframe::MAX_FRAME_LEN).div_ceil(1024) as u64
 }
 
-/// Total per-stream push attempts since boot. Incentives §9.1's egress
-/// multiplier is this over frames admitted — the counters are bumped per
-/// stream rather than per chunk (`src/client.rs:5361-5363`), so losing
-/// racers and shallow retries are both included, which is exactly the cost
-/// the relay actually pays.
+/// Completed per-stream push outcomes since boot.
+///
+/// Incentives §9.1 reads this over frames admitted as an egress multiplier,
+/// and **it undercounts**: the counters are bumped after the await inside
+/// the racing future (`src/client.rs:5818-5870`), and the dispatcher
+/// cancels the losing racers as soon as it takes a receipt
+/// (`src/client.rs:4806-4809`). A cancelled racer has already put its
+/// Delivery on the wire — the relay pays that egress — but never reaches
+/// the increment. Shallow retries and errors are counted; concurrent
+/// losers are not, so the ratio floors near 1.0 whenever the race is won
+/// promptly. Counting at dispatch, beside `inflight_pushes`, would fix it.
 fn stream_attempts() -> u64 {
     use crate::transport::diag;
     use std::sync::atomic::Ordering;

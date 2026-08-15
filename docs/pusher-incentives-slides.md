@@ -41,7 +41,7 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 | client → relay | nothing | 4.8e8 PLUR per KiB |
 | relay → bee | nothing | still nothing |
 
-> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills **$1.14–1.63**.
+> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills **$0.35–0.51**.
 
 ---
 
@@ -115,14 +115,14 @@ A cheque is a running total: "you have now paid me *this much in total*".
 
 # Unit economics
 
-Relaying earns **$0.02 per GiB** admitted. On a host you already pay for, the only cost is cashout gas — 110k gas, a fraction of a microcent.
+Relaying earns **$0.02 per GiB** admitted. On a host you already pay for, the only cost is cashout gas — 110k gas, a ten-billionth of a dollar.
 
-| egress per byte relayed | fits under a 2 TB/mo cap | earns |
-|---|---:|---:|
-| 3.7× modelled | 503 GiB | $10 |
-| 1.15× measured | 1.58 TiB | $33 |
+| | per month |
+|---|---:|
+| payload under a 2 TB egress cap | 503 GiB |
+| billed at $0.02/GiB | **$10** |
 
-> So the ceiling is the bandwidth allowance, not the cost. Past the cap, egress runs $0.11 per GiB against $0.02 of revenue and it inverts.
+> So the ceiling is the bandwidth allowance, not the cost. Past the cap egress runs $0.36 per GiB against $0.02 of revenue, and it inverts.
 
 ---
 
