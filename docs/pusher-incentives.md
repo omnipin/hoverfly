@@ -53,10 +53,14 @@ Metering is the answer to both. It puts the cost back on the party that
 caused it, converts §6's accepted quota-drain risk into a priced one, and
 makes running a dedicated-IP relay a rational act rather than a donation.
 
-Nobody gets rich. §9's economics are thin and §9.3 is explicit that a
-single small upload does not cover its own cashout gas. The target is a
-self-sustaining lane federation funded by repeat and bulk traffic, not
-profit.
+Nobody gets rich. §9's economics are thin: at $0.02/GiB and §9.1's 3.7×
+egress, a relay saturating a 2 TB/month bandwidth allowance bills about
+**$10**. On hardware whose cost is already sunk — a box running other
+things, bandwidth already included — that is close to all margin, since
+§9.3's gas turns out to be negligible and the *client* funds the
+chequebook, not the relay. But the allowance is a ceiling and crossing it
+inverts the economics in one step (§9.2), so what this funds is a
+self-sustaining lane federation, not a business.
 
 ## 2. Trust model — read this before anything else
 
@@ -713,6 +717,29 @@ Real cost per 4 KiB chunk relayed:
 | **Egress per chunk relayed** | **≈ 15 KiB** |
 | **Egress per GiB of payload** | **≈ 3.7 GiB** (262 144 chunks/GiB) |
 
+**The Stage 0 counter does not check this, and currently cannot.**
+`/v1/meter` → `egress.attempts_per_frame` exists to test the ×3.45 model
+against reality, and the production relay reports **1.077**. That is not a
+refutation of the model, it is an instrument fault. `PUSH_OUTCOME_*` is
+incremented *after* the await inside the racing future
+(`src/client.rs:5818-5870`), and the dispatcher cancels the losing racers
+the moment it accepts a receipt — `src/client.rs:4806-4809` says so in as
+many words. A cancelled racer has already written its Delivery to the
+wire, so the relay pays that egress, and then the future is dropped before
+it ever reaches the counter.
+
+The relay's own diagnostics show the shape plainly: `ok = 3756` against
+`frames_admitted = 3756` — exactly one counted success per chunk, with
+only 285 shallow retries and 4 errors above it. A metric that counts
+completions cannot see a race it loses on purpose, so it floors near 1.0
+by construction.
+
+Counting at *dispatch* (where `inflight_pushes` is already incremented,
+`src/client.rs:4818-4820`) rather than at completion would fix it. Until
+then §9.1's model stands unverified in both directions, and **nothing here
+should be repriced on `attempts_per_frame`** — which was the one job Stage
+0 was supposed to do for §9.2.
+
 ### 9.2 Price
 
 | | per GiB of payload |
@@ -750,22 +777,39 @@ parties measure it directly.
 
 ### 9.3 Gas, and who is actually profitable
 
-Cashout is `GetGasLimitWithDefault(ctx, 300_000)` (`cashout.go:145`) ≈
-**$0.0005** on Gnosis. Issuing a cheque costs nothing
+Cashout's gas *limit* is `GetGasLimitWithDefault(ctx, 300_000)`
+(`cashout.go:145`), but a limit is not a spend. The two real
+`cashChequeBeneficiary` calls on Gnosis mainnet used **75 378** and
+**109 590** gas at **169** and **1 292** wei/gas — fees of `1.3e-11` and
+`1.4e-10` xDAI:
+
+| | gas used | gas price | fee |
+|---|---:|---:|---:|
+| 2026-08-07 | 75 378 | 169 wei | 1.3e-11 xDAI |
+| 2026-08-08 | 109 590 | 1 292 wei | 1.4e-10 xDAI |
+
+An earlier draft of this section carried **$0.0005**, assuming the full
+300 k limit at gwei-scale prices. Gnosis base fee during these runs was
+50–1 300 wei, so that estimate was high by roughly **six orders of
+magnitude**. Issuing a cheque still costs nothing
 (`chequebook.go:190-250` sends no transaction); only cashing out touches
-the chain. Because cheques are cumulative, gas is paid **once per
-account**, whenever the relay decides to cash.
+the chain, and because cheques are cumulative that gas is paid **once per
+account**.
 
-Suggested cashout threshold **0.25 BZZ ≈ $0.10 ≈ 5 GiB relayed by one
-account**, which puts gas at ~0.5 % of realized revenue.
+**This removes the gas floor, not the price floor.** At ~`1e-10` xDAI a
+cashout, essentially any non-zero cheque is worth collecting. Design §11's
+flagship 71 MB browser upload is worth `71/1024 × $0.02 ≈ $0.0014`, which
+clears its own settlement fee by about seven orders of magnitude. The
+conclusion this section used to draw — *"a one-shot user is not
+profitable"* — was an artifact of the stale gas number and is withdrawn.
 
-The uncomfortable corollary: **a one-shot user is not profitable.** Design
-§11's flagship metric is a 71 MB browser upload, worth
-`71/1024 × $0.02 ≈ $0.0014` — about 3× the cashout gas, and only if it is
-ever cashed. Accounts below the threshold that never return are written
-off. Metered relay economics work on repeat and bulk accounts; cumulative
-cheques are what make a returning user amortize. A relay whose traffic is
-entirely one-shot browser users should run `open`.
+What survives is an *operational* floor rather than an economic one: an
+RPC round trip, a pending transaction to watch, and a chequebook that has
+to stay funded. So read the 0.25 BZZ threshold as a batching convenience,
+not as a break-even point — and note that Gnosis gas is not permanently
+this cheap. A floor computed from `eth_gasPrice` at cashout time holds
+under a price spike in a way a hardcoded constant does not, in either
+direction.
 
 ## 10. Credit and settlement
 
@@ -1285,11 +1329,13 @@ accounts**, reported as `credit.batches_below_one_full_post` and the
 specifically, what fraction of real users would be capped below the global
 ceiling, and whether §7.2's POST-sizing interaction bites in practice.
 
-Stage 0 also settles §9.1's cost basis, which the doc currently *models*
+Stage 0 was also meant to settle §9.1's cost basis, which the doc *models*
 rather than measures: `egress.attempts_per_frame` against the modelled
-3.45, since the push path counts every per-stream attempt including losing
-racers and shallow retries (`src/client.rs:5361-5363`). A materially
-different number moves the price in §9.2.
+3.45. **It does not, and the claim that justified it was wrong.** The
+counter was believed to see every per-stream attempt including losing
+racers; it is bumped after the await inside a future the dispatcher
+cancels, so it sees completions only. §9.1 has the detail. This gate is
+**not met** and needs the counter moved to dispatch before any repricing.
 
 *(The previous design had four gating measurements including a kill
 criterion — the staked fraction of receipt signers, which could have
@@ -1399,9 +1445,13 @@ on-chain, and presents the ones worth collecting. Two things it forced:
   `paidOut(beneficiary)`. A repeated run sees `unclaimed 0` and presents
   nothing, which matters for a command that will be run on a timer.
 
-`--min-amount` defaults to 0.25 BZZ (§9.3's threshold): cashing costs ~300k
-gas whatever the amount, so a smaller cheque is worth less than collecting
-it. Verified on Gnosis mainnet — a 145,920,000,000 PLUR cheque presented,
+`--min-amount` defaults to 0.25 BZZ (§9.3's threshold). The reasoning it
+was given — cashing costs ~300k gas whatever the amount, so a smaller
+cheque is worth less than collecting it — does not survive §9.3's measured
+fees; at ~`1e-10` xDAI the amount that is *not* worth collecting is far
+below any cheque this system will produce. Keep the default as batching
+convenience, and see §9.3 on deriving it from live gas. Verified on Gnosis
+mainnet — a 145,920,000,000 PLUR cheque presented,
 `paidOut` moved by exactly that, and the beneficiary's BZZ balance moved by
 exactly that. Cashout reads `bounced` and
 `liquidBalanceFor` rather than `balance` (§11.2), and optionally offers
@@ -1419,8 +1469,7 @@ an opt-in dApp flow where the wallet deploys a chequebook with
 `issuer = sessionKey` and funds it — two transactions on top of today's
 approve + `createBatch`, ≈ $0.001 of Gnosis gas, one-time per user and
 reused across every upload and lane. The dApp's four public lanes stay in
-`open` mode throughout, so §9.3's one-shot-user problem does not bite
-them.
+`open` mode throughout, so nothing here is on the settlement path at all.
 
 One Stage 3 hazard Stage 1 does not have: **a session-key chequebook can
 strand funds permanently.** `withdraw()` is issuer-only, and the issuer

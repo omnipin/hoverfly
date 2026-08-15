@@ -17,12 +17,13 @@
 //!    which is fine; a population where most batches are in that state means
 //!    the ratio is wrong.
 //!
-//! It also measures §9.1's egress multiplier, which the doc currently
-//! *estimates* at ×3 racing × 1.15 shallow ≈ 3.45 attempts per chunk. That
-//! number sets the whole cost basis and has never been observed. The push
-//! path already counts every per-stream attempt
-//! (`src/client.rs:5361-5363`), so the multiplier is that total over the
-//! frames this module admitted.
+//! It also reports §9.1's egress multiplier, which the doc *estimates* at
+//! ×3 racing × 1.15 shallow ≈ 3.45 attempts per chunk — the number that
+//! sets the whole cost basis. **The reported figure is not yet a valid
+//! measurement of it.** It divides completed push outcomes by frames
+//! admitted, and the racing dispatcher cancels losing racers before they
+//! complete, so their egress is spent but uncounted (see `stream_attempts`
+//! in `src/pusher.rs`). Treat it as a floor, not an observation.
 //!
 //! **Hot path cost is one lock per POST.** A request accumulates into a
 //! [`PostTally`] on its own stack and merges once at completion, so N
@@ -422,9 +423,12 @@ impl Meter {
     }
 }
 
-/// §9.1's cost basis, observed rather than estimated. The doc's model is
-/// ×3 peer race × 1.15 shallow retries ≈ 3.45 stream attempts per chunk; a
-/// materially different number moves the price in §9.2.
+/// §9.1's cost basis. The doc's model is ×3 peer race × 1.15 shallow
+/// retries ≈ 3.45 stream attempts per chunk.
+///
+/// `attempts` counts *completed* outcomes, so this is a lower bound rather
+/// than the observation §9.2 needs — cancelled racers are missing. Do not
+/// reprice on it until the counter moves to dispatch.
 fn egress(frames: u64, billable_kib: u64, attempts: u64) -> serde_json::Value {
     if frames == 0 {
         return json!({"frames": 0, "stream_attempts": attempts});
