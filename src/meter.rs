@@ -9,8 +9,9 @@
 //!
 //! 1. **Is anyone consuming enough to justify metering?** Per-account bytes
 //!    admitted, what they would owe at §9.2's candidate price, and how many
-//!    accounts would ever cross the cashout threshold — below which an
-//!    account costs more in gas than it yields (§9.3).
+//!    accounts would ever cross the cashout threshold — not a profitability
+//!    line (§9.3's gas is negligible), but the volume at which cashing out
+//!    is worth an operator's round trip at all.
 //! 2. **Is `credit_ratio = 1000` right?** For every batch actually seen, the
 //!    credit line §10.3 would have granted it, against the size of a full
 //!    POST. A batch whose line is under one POST has to split its uploads,
@@ -52,7 +53,11 @@ pub const PRICE_PLUR_PER_KIB: u128 = 480_000_000;
 pub const SETTLE_EVERY_PLUR: u128 = 15_600_000_000_000;
 /// ~127 MiB — the global ceiling on a credit line.
 pub const MAX_OUTSTANDING_PLUR: u128 = 62_200_000_000_000;
-/// 0.25 BZZ ≈ 5 GiB — below this an account never repays its cashout gas.
+/// 0.25 BZZ ≈ 5 GiB. Not a break-even: §9.3's measured cashout gas is ~1e-10
+/// xDAI, so any non-zero cheque repays it. This is a batching convenience —
+/// how much value to let accumulate before spending an RPC round trip and a
+/// pending transaction on it — and should be derived from `eth_gasPrice`
+/// rather than pinned, since Gnosis gas will not stay this cheap.
 pub const CASHOUT_THRESHOLD_PLUR: u128 = 2_500_000_000_000_000;
 /// Credit line = batch remaining value ÷ this (§10.3).
 pub const CREDIT_RATIO: u128 = 1_000;
