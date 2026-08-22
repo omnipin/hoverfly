@@ -479,9 +479,7 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
             // streamed probe and push responses are unaffected.
             let _ = hyper::server::conn::http1::Builder::new()
                 .timer(hyper_util::rt::TokioTimer::new())
-                .header_read_timeout(std::time::Duration::from_secs(
-                    HEADER_READ_TIMEOUT_SECS,
-                ))
+                .header_read_timeout(std::time::Duration::from_secs(HEADER_READ_TIMEOUT_SECS))
                 .serve_connection(io, svc)
                 .await;
         });
@@ -514,8 +512,14 @@ async fn handle(
         (&Method::POST, "/v1/probe") => probe_response(state, req.uri().query()),
         (&Method::POST, "/v1/tcpcheck") => tcpcheck_response(state, req.uri().query()),
         (&Method::POST, "/v1/push") => push_response(state, req).await,
-        (_, "/v1/probe") | (_, "/v1/status") | (_, "/v1/tcpcheck") | (_, "/v1/push")
-        | (_, "/v1/meter") | (_, "/v1/challenge") | (_, "/v1/pay") | (_, "/v1/account") => {
+        (_, "/v1/probe")
+        | (_, "/v1/status")
+        | (_, "/v1/tcpcheck")
+        | (_, "/v1/push")
+        | (_, "/v1/meter")
+        | (_, "/v1/challenge")
+        | (_, "/v1/pay")
+        | (_, "/v1/account") => {
             json_line_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
         }
         _ => json_line_response(StatusCode::NOT_FOUND, "not found"),
@@ -634,7 +638,10 @@ fn admit_metered(
         .verify_header(raw, crate::challenge::now_unix())
         .map_err(|e| Box::new(json_line_response(StatusCode::UNAUTHORIZED, &e)))?;
     if !m.allow_account(&verified.account) {
-        return Err(Box::new(json_line_response(StatusCode::TOO_MANY_REQUESTS, "slow down")));
+        return Err(Box::new(json_line_response(
+            StatusCode::TOO_MANY_REQUESTS,
+            "slow down",
+        )));
     }
     // The reservation ledger is attacker-influenced (one entry per batch in
     // standing), so shed rather than grow without bound (§7.2).
@@ -732,8 +739,8 @@ fn build_metered(opts: &PusherOpts) -> Result<Option<crate::metered::Metered>, S
     }
     std::fs::create_dir_all(&m.state_dir)
         .map_err(|e| format!("--state-dir {}: {e}", m.state_dir.display()))?;
-    let ledger = crate::ledger::Ledger::load_or_create(m.state_dir.join("ledger.json"))
-        .map_err(|e| {
+    let ledger =
+        crate::ledger::Ledger::load_or_create(m.state_dir.join("ledger.json")).map_err(|e| {
             format!(
                 "ledger at {}: {e} — metered mode requires durable state, because losing \
                  last_cumulative turns one signature into unlimited free service (§11.4)",
@@ -826,7 +833,10 @@ async fn challenge_response(
 /// spend a single `eth_call`. Without those, every "free" check passes for
 /// a cheque an attacker synthesizes at zero cost and each garbage POST buys
 /// one `deployedContracts` call.
-async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) -> Response<RespBody> {
+async fn pay_response(
+    state: Arc<State>,
+    req: Request<hyper::body::Incoming>,
+) -> Response<RespBody> {
     let Some(m) = state.metered.as_ref() else {
         return json_line_response(StatusCode::NOT_FOUND, "relay is not metered");
     };
@@ -847,7 +857,11 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
     // client always has debt by the time it settles, so this costs nothing
     // legitimate and makes the endpoint useless to anyone who has not first
     // done billable work.
-    let owed = m.ledger.lock().expect("ledger poisoned").owed(&verified.account);
+    let owed = m
+        .ledger
+        .lock()
+        .expect("ledger poisoned")
+        .owed(&verified.account);
     if owed == 0 {
         return json_line_response(StatusCode::BAD_REQUEST, "nothing owed on this account");
     }
@@ -865,7 +879,9 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
     }
     let cumulative: u128 = match u128::try_from(cheque.cumulative_payout) {
         Ok(v) if v <= crate::ledger::MAX_CUMULATIVE_PLUR => v,
-        _ => return json_line_response(StatusCode::BAD_REQUEST, "cumulative payout is implausible"),
+        _ => {
+            return json_line_response(StatusCode::BAD_REQUEST, "cumulative payout is implausible");
+        }
     };
     let have = m
         .ledger
@@ -928,7 +944,10 @@ async fn pay_response(state: Arc<State>, req: Request<hyper::body::Incoming>) ->
         );
     }
     if cb_state.issuer.into_array() != recovered {
-        return json_line_response(StatusCode::BAD_REQUEST, "cheque was not signed by the issuer");
+        return json_line_response(
+            StatusCode::BAD_REQUEST,
+            "cheque was not signed by the issuer",
+        );
     }
     if cb_state.issuer.into_array() != verified.account {
         return json_line_response(
@@ -1050,7 +1069,10 @@ async fn read_body_limited(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body exceeds limit or read error",
         )),
-        Err(_) => Err(json_line_response(StatusCode::REQUEST_TIMEOUT, "body read timed out")),
+        Err(_) => Err(json_line_response(
+            StatusCode::REQUEST_TIMEOUT,
+            "body read timed out",
+        )),
     }
 }
 
@@ -1130,11 +1152,12 @@ fn meter_response(state: &State, headers: &hyper::HeaderMap) -> Response<RespBod
             return json_line_response(StatusCode::UNAUTHORIZED, "unauthorized");
         }
     }
-    let body = state
-        .meter
-        .lock()
-        .expect("meter poisoned")
-        .detail(full_post_kib(), stream_attempts(), 100);
+    let body =
+        state
+            .meter
+            .lock()
+            .expect("meter poisoned")
+            .detail(full_post_kib(), stream_attempts(), 100);
     json_response(StatusCode::OK, &body)
 }
 
@@ -1517,10 +1540,7 @@ async fn push_response(
             );
         }
         Err(_) => {
-            return json_line_response(
-                StatusCode::REQUEST_TIMEOUT,
-                "body read timed out",
-            );
+            return json_line_response(StatusCode::REQUEST_TIMEOUT, "body read timed out");
         }
     };
     let chunks = match pushframe::decode_batch(&bytes, PUSH_BATCH_MAX) {

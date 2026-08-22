@@ -2714,14 +2714,13 @@ where
     // *itself* a default-weighted start, never degrade routing for the
     // others — which is exactly what the previous all-or-nothing overlay
     // collection did.
-    let infos: Vec<LaneInfo> =
-        futures::future::join_all(pusher_urls.iter().map(|u| {
-            // A lane quoting more than this is refused rather than paid.
-            // Priced off the shipped default so a lane cannot quietly
-            // charge an order of magnitude more than the design assumes.
-            fetch_lane_info(&http, u, crate::meter::PRICE_PLUR_PER_KIB * 8)
-        }))
-        .await;
+    let infos: Vec<LaneInfo> = futures::future::join_all(pusher_urls.iter().map(|u| {
+        // A lane quoting more than this is refused rather than paid.
+        // Priced off the shipped default so a lane cannot quietly
+        // charge an order of magnitude more than the design assumes.
+        fetch_lane_info(&http, u, crate::meter::PRICE_PLUR_PER_KIB * 8)
+    }))
+    .await;
     for (i, (u, info)) in pusher_urls.iter().zip(&infos).enumerate() {
         info!(target: "hoverfly::upload",
             "lane {i} {u}: pool={:?} batch_max={:?} inflight_max={:?} budget_gb={:?}",
@@ -2781,7 +2780,10 @@ where
     // is served exactly like an `open` one.
     let unusable: Vec<usize> = (0..pusher_urls.len())
         .filter(|&i| {
-            infos.get(i).is_some_and(|inf: &LaneInfo| inf.hard_enforcement) && payers[i].is_none()
+            infos
+                .get(i)
+                .is_some_and(|inf: &LaneInfo| inf.hard_enforcement)
+                && payers[i].is_none()
         })
         .collect();
     for &i in &unusable {
@@ -2799,7 +2801,9 @@ where
     let mut lane_frame_ceiling: Vec<usize> = vec![usize::MAX; infos.len()];
     if let Some(pc) = payment {
         for (i, payer) in payers.iter_mut().enumerate() {
-            let Some(payer) = payer.as_mut() else { continue };
+            let Some(payer) = payer.as_mut() else {
+                continue;
+            };
             if let Err(e) = payer.header(&http, pc).await {
                 warn!(target: "hoverfly::upload",
                     "lane {i}: no challenge ({e}); scheduling it unpaid");
@@ -2907,7 +2911,9 @@ where
         // attempt per bounce and fail the upload instead of pausing it.
         if let Some(pc) = payment {
             for (lane, payer) in payers.iter_mut().enumerate() {
-                let Some(payer) = payer.as_mut() else { continue };
+                let Some(payer) = payer.as_mut() else {
+                    continue;
+                };
                 if !payer.has_headroom()
                     && payer.account.owed() > 0
                     && let Err(e) = payer.settle(&http, pc).await
@@ -2940,10 +2946,7 @@ where
                     };
                     let affordable = p.affordable_frames();
                     if affordable > 0 {
-                        sched.set_lane_batch_max(
-                            lane,
-                            affordable.min(lane_frame_ceiling[lane]),
-                        );
+                        sched.set_lane_batch_max(lane, affordable.min(lane_frame_ceiling[lane]));
                     }
                     if p.has_headroom() {
                         anyone_can_take_work = true;
@@ -3232,7 +3235,9 @@ where
     }
     if let Some(pc) = payment {
         for (lane, payer) in payers.iter_mut().enumerate() {
-            let Some(payer) = payer.as_mut() else { continue };
+            let Some(payer) = payer.as_mut() else {
+                continue;
+            };
             match payer.settle(&http, pc).await {
                 Ok(Some(c)) => info!(target: "hoverfly::upload",
                     "lane {lane}: final settlement, cumulative {c}"),
@@ -3592,7 +3597,11 @@ async fn fetch_lane_info(
             // field from an assertion into a check. A caller that pins
             // does the full version.
             match crate::payer::PaymentQuote::verify(pay, None, 0, None, price_ceiling) {
-                Ok(q) => (Some(q.params.price_plur_per_kib), q.hard_enforcement, Some(q)),
+                Ok(q) => (
+                    Some(q.params.price_plur_per_kib),
+                    q.hard_enforcement,
+                    Some(q),
+                ),
                 Err(e) => {
                     warn!(target: "hoverfly::upload",
                         "lane {base_url}: payment quote rejected ({e}); treating as unmetered");

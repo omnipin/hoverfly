@@ -261,7 +261,11 @@ impl Metered {
     }
 
     pub fn shed_reservations(&self) -> bool {
-        self.ledger.lock().expect("ledger poisoned").live_reservations() >= MAX_LIVE_RESERVATIONS
+        self.ledger
+            .lock()
+            .expect("ledger poisoned")
+            .live_reservations()
+            >= MAX_LIVE_RESERVATIONS
     }
 
     /// Apply a cheque. Every free check runs before this is called; this is
@@ -344,7 +348,11 @@ impl DeployedCache {
 
     fn get(&self, k: &[u8; 20]) -> Option<bool> {
         let (v, at) = self.map.get(k)?;
-        let ttl = if *v { DEPLOYED_OK_TTL } else { DEPLOYED_BAD_TTL };
+        let ttl = if *v {
+            DEPLOYED_OK_TTL
+        } else {
+            DEPLOYED_BAD_TTL
+        };
         (at.elapsed() < ttl).then_some(*v)
     }
 
@@ -392,7 +400,13 @@ mod tests {
         let s = signer();
         let account = *s.eth_address();
         let issued = m
-            .issue(account, [5u8; 32], 6_200_000_000_000_000_000, "relay-a.example", now)
+            .issue(
+                account,
+                [5u8; 32],
+                6_200_000_000_000_000_000,
+                "relay-a.example",
+                now,
+            )
             .expect("issue");
         let sol = crate::signer::PushChallenge {
             nonce: alloy_primitives::B256::from(issued.nonce),
@@ -426,7 +440,13 @@ mod tests {
         let m = metered();
         let victim = *signer().eth_address();
         let issued = m
-            .issue(victim, [5u8; 32], 1_000_000_000_000_000, "relay-a.example", 1000)
+            .issue(
+                victim,
+                [5u8; 32],
+                1_000_000_000_000_000,
+                "relay-a.example",
+                1000,
+            )
             .expect("issue");
         let attacker = SwarmSigner::from_hex_with_nonce(
             "0x1111111111111111111111111111111111111111111111111111111111111111",
@@ -457,7 +477,13 @@ mod tests {
 
         let s = signer();
         let issued = a
-            .issue(*s.eth_address(), [5u8; 32], 1_000_000_000_000_000, "relay-a.example", 1000)
+            .issue(
+                *s.eth_address(),
+                [5u8; 32],
+                1_000_000_000_000_000,
+                "relay-a.example",
+                1000,
+            )
             .expect("issue");
         let sol = crate::signer::PushChallenge {
             nonce: alloy_primitives::B256::from(issued.nonce),
@@ -480,7 +506,13 @@ mod tests {
         // Same issue instant, far-future presentation.
         let s = signer();
         let issued = m
-            .issue(*s.eth_address(), [5u8; 32], 1_000_000_000_000_000, "relay-a.example", 1000)
+            .issue(
+                *s.eth_address(),
+                [5u8; 32],
+                1_000_000_000_000_000,
+                "relay-a.example",
+                1000,
+            )
             .expect("issue");
         let sol = crate::signer::PushChallenge {
             nonce: alloy_primitives::B256::from(issued.nonce),
@@ -504,7 +536,13 @@ mod tests {
         let m = metered();
         let s = signer();
         let mut issued = m
-            .issue(*s.eth_address(), [5u8; 32], 100_000_000_000_000, "relay-a.example", 1000)
+            .issue(
+                *s.eth_address(),
+                [5u8; 32],
+                100_000_000_000_000,
+                "relay-a.example",
+                1000,
+            )
             .expect("issue");
         let honest_cap = issued.fields.cap_plur;
         issued.fields.cap_plur = honest_cap * 1_000_000;
@@ -592,11 +630,17 @@ mod lifecycle_tests {
 
         // Only 100 frames actually got admitted.
         let billed = p.price_bytes(100 * 4251);
-        m.ledger.lock().unwrap().commit(ACCT, adm.reserved_plur, billed);
+        m.ledger
+            .lock()
+            .unwrap()
+            .commit(ACCT, adm.reserved_plur, billed);
         let l = m.ledger.lock().unwrap();
         assert_eq!(l.reserved(&ACCT), 0, "the reservation is fully released");
         assert_eq!(l.owed(&ACCT), billed, "only admitted bytes are billed");
-        assert!(billed < adm.reserved_plur, "and it is less than was reserved");
+        assert!(
+            billed < adm.reserved_plur,
+            "and it is less than was reserved"
+        );
     }
 
     /// A POST that admits nothing must still hand its reservation back —
@@ -626,7 +670,9 @@ mod lifecycle_tests {
         let second = p.price_bytes(32 * 1024 * 1024);
         m.ledger.lock().unwrap().commit(ACCT, 0, second);
         // A cumulative cheque: the *total*, not the delta.
-        let accepted = m.credit(ACCT, CB, first + second, [27u8; 65]).expect("second cheque");
+        let accepted = m
+            .credit(ACCT, CB, first + second, [27u8; 65])
+            .expect("second cheque");
         assert_eq!(accepted, second, "only the new debt is credited");
         assert_eq!(m.ledger.lock().unwrap().owed(&ACCT), 0);
     }
@@ -677,7 +723,8 @@ mod lifecycle_tests {
             owed >= p.min_cheque_plur,
             "what is owed must clear the dust floor, or there is no exit"
         );
-        m.credit(ACCT, CB, owed, [27u8; 65]).expect("a cheque for exactly what is owed");
+        m.credit(ACCT, CB, owed, [27u8; 65])
+            .expect("a cheque for exactly what is owed");
         assert_eq!(m.ledger.lock().unwrap().owed(&ACCT), 0);
         assert!(
             !m.reserve_for_body(ACCT, 4251, cap).over_cap,

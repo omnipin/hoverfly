@@ -525,8 +525,8 @@ mod tests {
         let s = m.summary(2126, 0);
         assert_eq!(s["kib_admitted"], (FRAME * 10).div_ceil(1024));
         assert_eq!(s["kib_dedup"], (FRAME * 3).div_ceil(1024));
-        let billable = s["kib_admitted"].as_u64().expect("u64")
-            - s["kib_dedup"].as_u64().expect("u64");
+        let billable =
+            s["kib_admitted"].as_u64().expect("u64") - s["kib_dedup"].as_u64().expect("u64");
         assert_eq!(
             s["owed_plur"].as_str().expect("string"),
             (billable as u128 * PRICE_PLUR_PER_KIB).to_string()
@@ -794,7 +794,9 @@ mod param_tests {
 
     #[test]
     fn the_shipped_defaults_satisfy_the_invariant() {
-        Params::default().validate().expect("defaults must be valid");
+        Params::default()
+            .validate()
+            .expect("defaults must be valid");
     }
 
     /// The exact misconfiguration an early draft published: a dust floor 87×
@@ -815,7 +817,8 @@ mod param_tests {
             max_outstanding_plur: SETTLE_EVERY_PLUR,
             ..Params::default()
         };
-        p.validate().expect_err("cap must exceed the settlement window");
+        p.validate()
+            .expect_err("cap must exceed the settlement window");
     }
 
     #[test]
@@ -857,7 +860,11 @@ mod param_tests {
     #[test]
     fn a_body_is_priced_by_rounding_up_once() {
         let p = Params::default();
-        assert_eq!(p.price_bytes(1), p.price_plur_per_kib, "a partial KiB is a KiB");
+        assert_eq!(
+            p.price_bytes(1),
+            p.price_plur_per_kib,
+            "a partial KiB is a KiB"
+        );
         assert_eq!(p.price_bytes(1024), p.price_plur_per_kib);
         assert_eq!(p.price_bytes(1025), 2 * p.price_plur_per_kib);
         // One full frame, priced once rather than per-frame.

@@ -218,7 +218,10 @@ impl PresentedChallenge {
             let raw = hex::decode(get(k)?.trim_start_matches("0x"))
                 .map_err(|e| format!("challenge {k} hex: {e}"))?;
             if raw.len() != n {
-                return Err(format!("challenge {k} must be {n} bytes, got {}", raw.len()));
+                return Err(format!(
+                    "challenge {k} must be {n} bytes, got {}",
+                    raw.len()
+                ));
             }
             Ok(raw)
         };
@@ -403,7 +406,10 @@ mod tests {
             verify(&SECRET, &f, &long, 1, &origins()),
             Err(ChallengeError::BadMac)
         );
-        assert_eq!(verify(&SECRET, &f, &[], 1, &origins()), Err(ChallengeError::BadMac));
+        assert_eq!(
+            verify(&SECRET, &f, &[], 1, &origins()),
+            Err(ChallengeError::BadMac)
+        );
     }
 
     #[test]

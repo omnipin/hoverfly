@@ -1267,7 +1267,10 @@ mod chequebook_binding_tests {
             (paidOutCall::SELECTOR, "paidOut(address)"),
             (bouncedCall::SELECTOR, "bounced()"),
             (liquidBalanceForCall::SELECTOR, "liquidBalanceFor(address)"),
-            (deployedContractsCall::SELECTOR, "deployedContracts(address)"),
+            (
+                deployedContractsCall::SELECTOR,
+                "deployedContracts(address)",
+            ),
         ] {
             let want: [u8; 32] = <sha3::Keccak256 as sha3::Digest>::digest(sig.as_bytes()).into();
             assert_eq!(got, want[..4], "selector drift for {sig}");
@@ -1280,7 +1283,10 @@ mod chequebook_binding_tests {
     fn only_known_chains_have_a_factory() {
         assert!(swap_factory_for_chain(100).is_some(), "gnosis");
         assert!(swap_factory_for_chain(11155111).is_some(), "sepolia");
-        assert!(swap_factory_for_chain(1).is_none(), "mainnet: no vetted factory");
+        assert!(
+            swap_factory_for_chain(1).is_none(),
+            "mainnet: no vetted factory"
+        );
         assert!(swap_factory_for_chain(31337).is_none(), "local devnet");
     }
 }
@@ -1372,10 +1378,7 @@ pub async fn deploy_chequebook(
 
     // Trust the chain, not the simulation: read the address back out of the
     // receipt's `SimpleSwapDeployed` log.
-    let deployed = rpc
-        .find_deployed_chequebook(tx)
-        .await?
-        .unwrap_or(predicted);
+    let deployed = rpc.find_deployed_chequebook(tx).await?.unwrap_or(predicted);
 
     // The relay checks this before accepting any cheque (§6), so checking it
     // here turns "your cheques are silently refused" into a deploy-time
@@ -1419,11 +1422,14 @@ pub async fn fund_chequebook(
     }
     // Refuse to fund something that is not a chequebook: a mistyped address
     // sends BZZ somewhere unrecoverable.
-    let issuer: Address = rpc.call_view(chequebook, issuerCall {}).await.map_err(|e| {
-        BatchError::Rpc(format!(
-            "{chequebook} does not answer issuer() — is it a chequebook? ({e})"
-        ))
-    })?;
+    let issuer: Address = rpc
+        .call_view(chequebook, issuerCall {})
+        .await
+        .map_err(|e| {
+            BatchError::Rpc(format!(
+                "{chequebook} does not answer issuer() — is it a chequebook? ({e})"
+            ))
+        })?;
     if issuer != from {
         return Err(BatchError::Rpc(format!(
             "chequebook {chequebook} is issued by {issuer}, not {from}: only the issuer \
@@ -1435,9 +1441,7 @@ pub async fn fund_chequebook(
         amount,
     }
     .abi_encode();
-    let tx = rpc
-        .send_signed(signer, chain_id, bzz_token, &call)
-        .await?;
+    let tx = rpc.send_signed(signer, chain_id, bzz_token, &call).await?;
     rpc.wait_for_success(tx, receipt_timeout).await?;
     Ok(tx)
 }
@@ -1446,7 +1450,10 @@ impl EthRpc {
     /// `eth_getCode` length, for "is there already a contract here".
     async fn code_len(&self, addr: Address) -> Result<usize, BatchError> {
         let hex_str: String = self
-            .raw("eth_getCode", (format!("0x{}", hex::encode(addr)), "latest"))
+            .raw(
+                "eth_getCode",
+                (format!("0x{}", hex::encode(addr)), "latest"),
+            )
             .await?;
         Ok(hex_str.trim_start_matches("0x").len() / 2)
     }
@@ -1473,7 +1480,9 @@ impl EthRpc {
                         .collect()
                 })
                 .unwrap_or_default();
-            if topics.first().map(|t| t.trim_start_matches("0x").to_lowercase())
+            if topics
+                .first()
+                .map(|t| t.trim_start_matches("0x").to_lowercase())
                 != Some(hex::encode(topic))
             {
                 continue;
