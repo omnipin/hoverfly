@@ -755,7 +755,7 @@ the user already paid for postage it is a rounding error.
 
 **Read that AWS row as a constraint, not a favourable comparison.** At
 §9.1's 3.7 GiB of real egress per GiB of payload, per-GB-billed clouds
-cost the relay ~$0.33/GiB against $0.02 of revenue. Metered mode is only
+cost the relay ~$0.36/GiB against $0.02 of revenue. Metered mode is only
 rational on **flat-rate or included bandwidth** — the same class of host
 §5 already requires for durable storage, and the same class §1 says
 metering exists to fund. A relay on metered egress should run `open` and
@@ -785,8 +785,12 @@ Cashout's gas *limit* is `GetGasLimitWithDefault(ctx, 300_000)`
 
 | | gas used | gas price | fee |
 |---|---:|---:|---:|
-| 2026-08-07 | 75 378 | 169 wei | 1.3e-11 xDAI |
-| 2026-08-08 | 109 590 | 1 292 wei | 1.4e-10 xDAI |
+| 2026-08-07 | 109 590 | 1 292 wei | 1.4e-10 xDAI |
+| 2026-08-08 | 75 378 | 169 wei | 1.3e-11 xDAI |
+
+Both are `cashChequeBeneficiary` on chequebook
+`0x17c89DE40f5ec07343AB095bfDa9dE1A5c095Fc1` (txs `0xb33bd199…` and
+`0x9d4a8b29…`), settling `1.46e12` PLUR in total to the relay beneficiary.
 
 An earlier draft of this section carried **$0.0005**, assuming the full
 300 k limit at gwei-scale prices. Gnosis base fee during these runs was
@@ -1486,7 +1490,12 @@ Carried knowingly:
 - **§11.2** — cheques are unsecured claims, bounded by the per-account cap.
   Hard deposits work but are inert as bee deploys them; secured mode costs
   a cold-key signature per client chequebook.
-- **§9.3** — one-shot users do not cover their own cashout gas.
+- **§9.3** — the cashout threshold is a hardcoded constant sized against a
+  gas cost that no longer holds. At today's Gnosis prices it is a batching
+  convenience, not a break-even, and a gas spike moves the real floor
+  without moving the constant. Deriving it from `eth_gasPrice` at cashout
+  time is the fix; until then the number is stale in whichever direction
+  gas has drifted.
 - **§11.3** — aggregate exposure across beneficiaries is invisible to the
   client until `total_issued` ships.
 - **§11.5** — griefing by aiming at badly-covered arcs still forces the
@@ -1648,7 +1657,7 @@ pushed.
 ## 17. Found by running a metered relay: six bugs (all fixed)
 
 None of these is reachable from a single upload against a fresh relay,
-which is why all three survived the test suite and the Stage 1 round-trip.
+which is why all six survived the test suite and the Stage 1 round-trip.
 They need a relay whose ledger *persists across client runs* — the shipped
 configuration — enough concurrency to have several POSTs on the wire at
 once, and a batch that has been spent down far enough for its credit line

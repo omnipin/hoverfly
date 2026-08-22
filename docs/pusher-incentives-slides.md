@@ -34,14 +34,14 @@ header: 'Paying for relay — an incentive layer for hoverfly pushers'
 
 # Unpaid relay bandwidth
 
-Upload directly and bee bills you. Put a relay in the middle and bee bills the relay — it is the peer bee sees. The client pays only postage.
+Upload directly and bee debits your own node for every chunk. Put a relay in the middle and that debt moves to it — the relay is the peer bee sees. Pseudosettle pays it in time rather than money, so what a relay actually spends is bandwidth, and nothing prices that.
 
 |  | free | paid |
 |---|---|---|
 | client → relay | nothing | 4.8e8 PLUR per KiB |
-| relay → bee | nothing | still nothing |
+| relay → bee | time, not money | unchanged |
 
-> A relay absorbs 70–100 GB of egress a month. Metered, that same month bills **$0.35–0.51**.
+> A free tier hands a relay 70–100 GB of egress a month. Burn all of it under metering and it bills **$0.35–0.51**.
 
 ---
 
@@ -51,7 +51,7 @@ Upload directly and bee bills you. Put a relay in the middle and bee bills the r
 
 A relay is a standalone HTTP service — no registry, no list to get onto. Trust runs one way: the client checks a signed quote before sending a byte; the relay gets whoever shows up.
 
-> So every relay-side defence points at the client, and the client needs none — it counts its own bytes and risks at most one credit limit, about **$0.0024**.
+> So every defence here points from the relay at the client. The other direction gets no cryptography, only bounds: the client computes its own bill, and risks at most one credit limit per lane — about **$0.0024**.
 
 ---
 
@@ -89,10 +89,10 @@ So the chain lookups happen **once**, when a slip is issued, and the credit limi
 The cheapest live batch costs a fraction of a cent, so "owns a batch" proves nothing. The limit tracks what the batch is worth:
 
 ```
-credit limit = batch's remaining value ÷ 1000
+credit limit = min(batch's remaining value ÷ 1000, a global ceiling)
 ```
 
-> An attacker gets back **a thousandth of what they funded**, at any batch size. The ratio is what is fixed, so there is no cheap corner to aim at.
+> An attacker gets back **at most a thousandth of what they funded**, and less once the ceiling binds. The ratio is what is fixed, so there is no cheap corner to aim at.
 
 ---
 
@@ -122,7 +122,7 @@ Relaying earns **$0.02 per GiB** admitted. On a host you already pay for, the on
 | payload under a 2 TB egress cap | 503 GiB |
 | billed at $0.02/GiB | **$10** |
 
-> So the ceiling is the bandwidth allowance, not the cost. Past the cap egress runs $0.36 per GiB against $0.02 of revenue, and it inverts.
+> So the ceiling is the allowance, not the cost — and only on bandwidth nobody bills by the gigabyte. Billed per GB, the same traffic costs **$0.36 per GiB** against $0.02 of revenue, and that relay should run free.
 
 ---
 
@@ -151,11 +151,11 @@ Paying is optional, and each relay sets its own mode.
 | 17.1 | Carried-over debt could not be paid |
 | 17.2 | Headroom measured one chunk, then sent a batch |
 | 17.3 | A rule checked against the wrong number |
-| 17.4 | A relay refused for bytes in flight was parked forever |
+| 17.4 | A lane refused for bytes in flight was parked forever |
 | 17.5 | One broken stream bounced every later cheque |
 | 17.6 | The first upload was sized before the debt was known |
 
-> No test suite reached any of them. All six needed the same three things at once: debt surviving restarts, parallel uploads, and a nearly-spent batch.
+> No test suite reached any of them, and none is reachable from one upload against a fresh relay. Between them they needed debt surviving restarts, several POSTs in flight, and a batch spent down far enough to bind.
 
 ---
 
