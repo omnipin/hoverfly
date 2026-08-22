@@ -718,7 +718,11 @@ fn an_unfunded_lane_is_paused_then_restored_by_paying() {
     let (b, lane) = dispatch_one(&mut s, 0);
     s.on_batch_result(b, BatchOutcome::PaymentRequired, 0);
 
-    assert_eq!(s.unfunded_lanes(), vec![lane], "the driver must see what to pay");
+    assert_eq!(
+        s.unfunded_lanes(),
+        vec![lane],
+        "the driver must see what to pay"
+    );
     for _ in 0..8 {
         assert_ne!(
             s.next(20).map(|a| a.lane),

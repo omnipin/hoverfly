@@ -124,7 +124,10 @@ mod tests {
         for i in 0..5 {
             assert!(l.allow_at(b"a", t0), "burst request {i} must pass");
         }
-        assert!(!l.allow_at(b"a", t0), "the 6th in the same instant must not");
+        assert!(
+            !l.allow_at(b"a", t0),
+            "the 6th in the same instant must not"
+        );
     }
 
     #[test]
@@ -146,7 +149,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(l.allow_at(b"a", t0));
         assert!(!l.allow_at(b"a", t0));
-        assert!(l.allow_at(b"b", t0), "one key's flood must not throttle another");
+        assert!(
+            l.allow_at(b"b", t0),
+            "one key's flood must not throttle another"
+        );
     }
 
     /// The bypass this design exists to close: an attacker cycling keys must
@@ -176,7 +182,10 @@ mod tests {
         let t0 = Instant::now();
         assert!(l.allow_at(b"a", t0));
         assert!(l.allow_at(b"b", t0));
-        assert!(!l.allow_at(b"c", t0), "must refuse rather than evict a live limit");
+        assert!(
+            !l.allow_at(b"c", t0),
+            "must refuse rather than evict a live limit"
+        );
     }
 
     /// …but a bucket that has refilled to full is free to drop, so the map

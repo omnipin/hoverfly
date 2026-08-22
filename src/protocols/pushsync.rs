@@ -252,7 +252,8 @@ mod tests {
     fn missized_addresses_are_rejected_not_panicked_on() {
         for bad in [vec![], vec![1u8; 31], vec![1u8; 33], vec![1u8; 64]] {
             let n = bad.len();
-            let err = push_against(receipt_for(bad)).expect_err("missized address must be rejected");
+            let err =
+                push_against(receipt_for(bad)).expect_err("missized address must be rejected");
             assert!(
                 matches!(&err, PushsyncError::Peer(m) if m.contains("address mismatch")),
                 "unexpected error for {n}-byte address: {err}"

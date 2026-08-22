@@ -820,7 +820,11 @@ enum Commands {
     /// without a relay there are no cheques to cash.
     #[cfg(all(unix, feature = "pusher"))]
     Cashout {
-        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
         rpc_url: String,
         /// The **beneficiary's** private key — the EOA cheques were made
         /// out to, and the only address the contract will pay.
@@ -975,7 +979,11 @@ enum ChequebookAction {
     /// Deploys with a hard-deposit timeout of 0, matching every bee
     /// chequebook. Deposits are therefore not locked; see §11.2.
     Deploy {
-        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
         rpc_url: String,
         /// Private key (hex, 32 bytes). Its address becomes the issuer.
         #[arg(long, value_name = "KEY")]
@@ -993,7 +1001,11 @@ enum ChequebookAction {
     /// `issuer()`, or whose issuer is not `--key` — only the issuer can
     /// withdraw, so funding someone else's chequebook strands the deposit.
     Fund {
-        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
         rpc_url: String,
         #[arg(long, value_name = "KEY")]
         key: String,
@@ -1011,7 +1023,11 @@ enum ChequebookAction {
     /// given beneficiary, what it has already paid out, and whether it has
     /// ever bounced.
     Status {
-        #[arg(long, default_value = "https://rpc.gnosischain.com", value_name = "URL")]
+        #[arg(
+            long,
+            default_value = "https://rpc.gnosischain.com",
+            value_name = "URL"
+        )]
         rpc_url: String,
         #[arg(long, value_name = "ADDR")]
         chequebook: String,
@@ -1973,8 +1989,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // deploys or funds anything on its own.
                 let pay_cfg = match cli.chequebook.as_ref() {
                     Some(cb_hex) => {
-                        let cb = parse_address_hex(cb_hex)
-                            .map_err(|e| format!("--chequebook: {e}"))?;
+                        let cb =
+                            parse_address_hex(cb_hex).map_err(|e| format!("--chequebook: {e}"))?;
                         // The relay checks funding against `liquidBalanceFor`
                         // at accept time; we check total issuance against the
                         // same balance before signing, so we never hand over a
@@ -1985,9 +2001,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             alloy_primitives::Address::ZERO,
                         )
                         .await?;
-                        let store =
-                            hoverfly::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
-                                .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
+                        let store = hoverfly::cheques::ChequeStore::load_or_create(
+                            &cli.cheques_file,
+                            cb,
+                        )
+                        .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
                         eprintln!(
                             "metered: chequebook=0x{} liquid={} PLUR",
                             hex::encode(cb),
@@ -2348,8 +2366,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // is fixed by the platform.
             let envs = |k: &str| std::env::var(k).ok().filter(|s| !s.trim().is_empty());
             let meter = meter || envs("HOVERFLY_METER").is_some_and(|v| v != "0");
-            let meter_hard =
-                meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| v != "0");
+            let meter_hard = meter_hard || envs("HOVERFLY_METER_HARD").is_some_and(|v| v != "0");
             let origin = if origin.is_empty() {
                 envs("HOVERFLY_METER_ORIGIN")
                     .map(|v| v.split(',').map(|s| s.trim().to_string()).collect())
@@ -2903,11 +2920,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 )
                 .await?;
                 println!();
-                println!("chequebook 0x{}  (account 0x{})", hex::encode(cb), hex::encode(account));
-                println!("  cumulative   {cheque_cumulative}", cheque_cumulative = cheque.cumulative_plur);
+                println!(
+                    "chequebook 0x{}  (account 0x{})",
+                    hex::encode(cb),
+                    hex::encode(account)
+                );
+                println!(
+                    "  cumulative   {cheque_cumulative}",
+                    cheque_cumulative = cheque.cumulative_plur
+                );
                 println!("  unclaimed    {}", q.requested_plur);
-                println!("  payable now  {}{}", q.payable_plur,
-                    if q.would_bounce { "   <- chequebook cannot cover the claim" } else { "" });
+                println!(
+                    "  payable now  {}{}",
+                    q.payable_plur,
+                    if q.would_bounce {
+                        "   <- chequebook cannot cover the claim"
+                    } else {
+                        ""
+                    }
+                );
                 if q.already_bounced {
                     println!("  NOTE: this chequebook has bounced before");
                 }
@@ -2917,7 +2948,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     continue;
                 }
                 if q.payable_plur < floor {
-                    println!("  SKIP: below --min-amount ({min_amount} BZZ); gas would cost more than this collects");
+                    println!(
+                        "  SKIP: below --min-amount ({min_amount} BZZ); gas would cost more than this collects"
+                    );
                     skipped += 1;
                     continue;
                 }
@@ -2952,12 +2985,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let signer = parse_signer(&key)?;
                 let issuer = signer.address();
-                let factory = hoverfly::batch::swap_factory_for_chain(chain_id).ok_or_else(|| {
-                    format!(
-                        "no vetted SimpleSwapFactory for chain {chain_id} — a factory address \
+                let factory =
+                    hoverfly::batch::swap_factory_for_chain(chain_id).ok_or_else(|| {
+                        format!(
+                            "no vetted SimpleSwapFactory for chain {chain_id} — a factory address \
                          must never be guessed, since a fake one can return a forged issuer()"
-                    )
-                })?;
+                        )
+                    })?;
                 println!("deploying chequebook: issuer 0x{}", hex::encode(issuer));
                 println!("  factory  0x{}", hex::encode(factory));
                 let out = hoverfly::batch::deploy_chequebook(
@@ -3335,9 +3369,18 @@ mod chequebook_cli_tests {
     fn bzz_amounts_use_sixteen_decimals() {
         let one = parse_bzz_amount("1").expect("1 BZZ");
         assert_eq!(one.to_string(), "10000000000000000");
-        assert_eq!(parse_bzz_amount("0.05").expect("0.05").to_string(), "500000000000000");
-        assert_eq!(parse_bzz_amount("0.0001").expect("small").to_string(), "1000000000000");
-        assert_eq!(parse_bzz_amount("1.5").expect("1.5").to_string(), "15000000000000000");
+        assert_eq!(
+            parse_bzz_amount("0.05").expect("0.05").to_string(),
+            "500000000000000"
+        );
+        assert_eq!(
+            parse_bzz_amount("0.0001").expect("small").to_string(),
+            "1000000000000"
+        );
+        assert_eq!(
+            parse_bzz_amount("1.5").expect("1.5").to_string(),
+            "15000000000000000"
+        );
     }
 
     #[test]
@@ -3347,4 +3390,3 @@ mod chequebook_cli_tests {
         }
     }
 }
-

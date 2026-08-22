@@ -269,8 +269,7 @@ fn json_address(v: &serde_json::Value, field: &str) -> Result<[u8; 20], SwapErro
         .and_then(|x| x.as_str())
         .ok_or_else(|| SwapError::Json(format!("missing {field}")))?;
     let hex_str = s.trim_start_matches("0x").trim_start_matches("0X");
-    let raw =
-        hex::decode(hex_str).map_err(|e| SwapError::Json(format!("{field} not hex: {e}")))?;
+    let raw = hex::decode(hex_str).map_err(|e| SwapError::Json(format!("{field} not hex: {e}")))?;
     if raw.len() != 20 {
         return Err(SwapError::Json(format!(
             "{field} must be 20 bytes, got {}",

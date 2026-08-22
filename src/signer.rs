@@ -707,7 +707,11 @@ mod metered_tests {
         let amount = alloy_primitives::U256::from(7u64);
         let sig = s.sign_cheque(&cb, &bn, amount, 100).expect("sign");
         let other = recover_cheque_issuer(&cb, &bn, amount, 11155111, &sig).expect("recovers");
-        assert_ne!(other, *s.eth_address(), "wrong chain must not recover the issuer");
+        assert_ne!(
+            other,
+            *s.eth_address(),
+            "wrong chain must not recover the issuer"
+        );
     }
 
     /// Changing any signed field must move the recovered address, or the

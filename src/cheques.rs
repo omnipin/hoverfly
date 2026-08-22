@@ -209,7 +209,10 @@ impl ChequeStore {
     /// exceeds it and bounces. Mirrors bee's `reserveTotalIssued`
     /// (`chequebook.go:163-178`) on the issuing side.
     pub fn total_issued(&self) -> u128 {
-        self.payouts.values().copied().fold(0u128, u128::saturating_add)
+        self.payouts
+            .values()
+            .copied()
+            .fold(0u128, u128::saturating_add)
     }
 
     /// Would raising `key` to `cumulative` push the total past `balance`?
@@ -219,9 +222,7 @@ impl ChequeStore {
     /// the relay's fault and costs the lane's trust rather than the
     /// client's.
     pub fn would_exceed_balance(&self, key: &str, cumulative: u128, balance: u128) -> bool {
-        let others = self
-            .total_issued()
-            .saturating_sub(self.cumulative(key));
+        let others = self.total_issued().saturating_sub(self.cumulative(key));
         others.saturating_add(cumulative) > balance
     }
 

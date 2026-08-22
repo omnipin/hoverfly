@@ -524,9 +524,13 @@ mod tests {
         ));
         assert!(matches!(
             l.credit_test(A, CB, 101),
-            Err(LedgerError::Overpayment { got: 101, owed: 100 })
+            Err(LedgerError::Overpayment {
+                got: 101,
+                owed: 100
+            })
         ));
-        l.credit_test(A, CB, 100).expect("paying exactly what is owed is fine");
+        l.credit_test(A, CB, 100)
+            .expect("paying exactly what is owed is fine");
         assert_eq!(l.owed(&A), 0);
     }
 
@@ -578,7 +582,10 @@ mod tests {
         }
         let mut l = Ledger::load_or_create(&path).expect("reload");
         assert!(
-            matches!(l.credit_test(A, CB, 1200), Err(LedgerError::NotIncreasing { .. })),
+            matches!(
+                l.credit_test(A, CB, 1200),
+                Err(LedgerError::NotIncreasing { .. })
+            ),
             "re-presenting the same cheque after a restart must credit nothing"
         );
         let _ = std::fs::remove_file(&path);
@@ -598,7 +605,10 @@ mod tests {
         let mut l = Ledger::load_or_create(&path).expect("reload");
         l.commit(B, 0, 500);
         assert!(
-            matches!(l.credit_test(B, CB, 200), Err(LedgerError::ChequebookBound { .. })),
+            matches!(
+                l.credit_test(B, CB, 200),
+                Err(LedgerError::ChequebookBound { .. })
+            ),
             "the chequebook binding must survive a restart"
         );
         let _ = std::fs::remove_file(&path);
@@ -659,7 +669,10 @@ mod leak_tests {
         // There is no debt to pay, so no cheque exists that could help.
         assert_eq!(l.owed(&A), 0);
         assert!(
-            matches!(l.credit_test(A, CB, 1), Err(LedgerError::Overpayment { .. })),
+            matches!(
+                l.credit_test(A, CB, 1),
+                Err(LedgerError::Overpayment { .. })
+            ),
             "with nothing owed, a cheque cannot clear the overshoot"
         );
         // Only releasing does.

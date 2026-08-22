@@ -102,7 +102,10 @@ impl PaymentQuote {
                 .map_err(|e| QuoteError::Signature(e.to_string()))?;
 
         let addr = |k: &'static str| -> Result<[u8; 20], QuoteError> {
-            let s = payment.get(k).and_then(|x| x.as_str()).ok_or(QuoteError::Field(k))?;
+            let s = payment
+                .get(k)
+                .and_then(|x| x.as_str())
+                .ok_or(QuoteError::Field(k))?;
             let raw = hex::decode(s.trim_start_matches("0x")).map_err(|_| QuoteError::Field(k))?;
             <[u8; 20]>::try_from(raw.as_slice()).map_err(|_| QuoteError::Field(k))
         };
@@ -127,8 +130,8 @@ impl PaymentQuote {
                 .get("overlay_nonce")
                 .and_then(|x| x.as_str())
                 .ok_or(QuoteError::Field("overlay_nonce"))?;
-            let raw =
-                hex::decode(s.trim_start_matches("0x")).map_err(|_| QuoteError::Field("overlay_nonce"))?;
+            let raw = hex::decode(s.trim_start_matches("0x"))
+                .map_err(|_| QuoteError::Field("overlay_nonce"))?;
             <[u8; 32]>::try_from(raw.as_slice()).map_err(|_| QuoteError::Field("overlay_nonce"))?
         };
 
@@ -150,7 +153,8 @@ impl PaymentQuote {
         }
 
         if let Some(overlay) = advertised_overlay {
-            let derived = crate::signer::derive_overlay(&node_eth_address, network_id, &overlay_nonce);
+            let derived =
+                crate::signer::derive_overlay(&node_eth_address, network_id, &overlay_nonce);
             if &derived != overlay {
                 return Err(QuoteError::OverlayMismatch);
             }
@@ -769,7 +773,10 @@ impl LanePayer {
     ) -> Result<u128, String> {
         let header = self.header(http, cfg).await?.to_string();
         let resp = http
-            .get(format!("{}/v1/account", self.base_url.trim_end_matches('/')))
+            .get(format!(
+                "{}/v1/account",
+                self.base_url.trim_end_matches('/')
+            ))
             .header(crate::challenge::CHALLENGE_HEADER, header)
             .timeout(std::time::Duration::from_secs(60))
             .send()
@@ -1076,7 +1083,10 @@ mod tests {
         };
         let e = PaymentQuote::verify(&quote_json([0xBB; 20]), None, 1, Some(&pin), ceiling())
             .expect_err("must refuse");
-        assert!(matches!(e, QuoteError::WrongBeneficiary { .. }), "got {e:?}");
+        assert!(
+            matches!(e, QuoteError::WrongBeneficiary { .. }),
+            "got {e:?}"
+        );
     }
 
     #[test]
@@ -1093,7 +1103,9 @@ mod tests {
             serde_json::json!((Params::default().settle_every_plur * 87).to_string());
         let mut unsigned = body.clone();
         unsigned.as_object_mut().unwrap().remove("sig");
-        let sig = n.sign_eip191(unsigned.to_string().as_bytes()).expect("sign");
+        let sig = n
+            .sign_eip191(unsigned.to_string().as_bytes())
+            .expect("sign");
         body["sig"] = serde_json::Value::String(format!("0x{}", hex::encode(sig)));
         let e = PaymentQuote::verify(&body, None, 1, None, ceiling()).expect_err("bricking lane");
         assert!(matches!(e, QuoteError::BadParams(_)), "got {e:?}");
@@ -1121,7 +1133,13 @@ mod tests {
             Ledger::ephemeral(),
         );
         let issued = m
-            .issue(account, [7u8; 32], 6_200_000_000_000_000_000, "relay-a.example", 1000)
+            .issue(
+                account,
+                [7u8; 32],
+                6_200_000_000_000_000_000,
+                "relay-a.example",
+                1000,
+            )
             .expect("issue");
         // Straight through the wire form the relay actually serves.
         let offered = OfferedChallenge::parse(&issued.to_json()).expect("parse");
@@ -1160,7 +1178,10 @@ mod tests {
         a.record_sent(40 * 1024 * 1024);
         a.record_answered(40 * 1024 * 1024, true);
         let second = a.next_cumulative().expect("cheque");
-        assert!(second > first, "cumulative must increase: {second} > {first}");
+        assert!(
+            second > first,
+            "cumulative must increase: {second} > {first}"
+        );
         assert_eq!(second - first, p.price_bytes(40 * 1024 * 1024));
     }
 
@@ -1337,7 +1358,8 @@ mod tests {
     /// name the whole balance and be paid it.
     #[test]
     fn a_relay_cannot_claim_more_debt_than_the_ceiling_it_signed() {
-        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let q =
+            PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
         let cap = q.params.max_outstanding_plur;
         let payer = LanePayer::new("http://lane".into(), q, 0);
         // A chequebook far richer than the credit line, which is the normal
@@ -1367,7 +1389,8 @@ mod tests {
     /// signing time.
     #[test]
     fn debt_within_the_ceiling_but_over_the_balance_is_refused() {
-        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let q =
+            PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
         let cap = q.params.max_outstanding_plur;
         let payer = LanePayer::new("http://lane".into(), q, 0);
 
@@ -1379,7 +1402,8 @@ mod tests {
 
     #[test]
     fn a_line_barely_wider_than_one_post_still_makes_progress() {
-        let q = PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
+        let q =
+            PaymentQuote::verify(&quote_json([3u8; 20]), None, 1, None, ceiling()).expect("quote");
         let p = q.params;
         let mut payer = LanePayer::new("http://lane".into(), q, 0);
 
@@ -1426,7 +1450,11 @@ mod tests {
         let mut a = LaneAccount::new(p, [3u8; 20]);
         // Fresh process: no debt, and nothing to pay with.
         assert_eq!(a.owed(), 0);
-        assert_eq!(a.next_cumulative(), None, "cannot pay what it does not know");
+        assert_eq!(
+            a.next_cumulative(),
+            None,
+            "cannot pay what it does not know"
+        );
 
         let carried = p.min_cheque_plur * 3;
         assert!(a.adopt_relay_debt(carried), "relay knows more than we do");
