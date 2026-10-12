@@ -382,7 +382,11 @@ pub enum BatchError {
     Hex(#[from] hex::FromHexError),
     #[error("transaction reverted (status=0) — check approve/balance/depth")]
     Reverted,
-    #[error("insufficient BZZ balance: have {have} PLUR, need {need} PLUR")]
+    #[error(
+        "insufficient BZZ balance: have {} BZZ, need {} BZZ",
+        format_bzz(.have),
+        format_bzz(.need)
+    )]
     InsufficientBalance { have: U256, need: U256 },
     #[error("initial balance per chunk too low for 24h validity: have {have}, need >= {need}")]
     InsufficientValidity { have: U256, need: U256 },
@@ -394,6 +398,13 @@ pub enum BatchError {
     ReceiptTimeout,
     #[error("abi decode: {0}")]
     AbiDecode(String),
+}
+
+/// PLUR → decimal BZZ, trailing zeros trimmed (`240000000000000000` → `24`).
+/// BZZ has 16 decimals, not 18.
+fn format_bzz(plur: &U256) -> String {
+    let s = alloy_primitives::utils::format_units(*plur, 16u8).expect("16 is a valid unit");
+    s.trim_end_matches('0').trim_end_matches('.').to_string()
 }
 
 /// Inputs for `create_batch`.
@@ -1067,6 +1078,20 @@ mod tests {
         // 24h = 86400s; blocks = 86400 / 5 = 17280; with last_price=1
         // amount = 17280 + 10 (buffer)
         assert_eq!(amount_for_duration(1, 86400), U256::from(17290u64));
+    }
+
+    #[test]
+    fn insufficient_balance_renders_bzz() {
+        let e = BatchError::InsufficientBalance {
+            have: U256::from(240000000000000000u64),
+            need: U256::from(2328204510305976320u64),
+        };
+        assert_eq!(
+            e.to_string(),
+            "insufficient BZZ balance: have 24 BZZ, need 232.820451030597632 BZZ"
+        );
+        assert_eq!(format_bzz(&U256::ZERO), "0");
+        assert_eq!(format_bzz(&U256::from(1u64)), "0.0000000000000001");
     }
 }
 
