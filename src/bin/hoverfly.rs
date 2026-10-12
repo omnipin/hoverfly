@@ -3157,7 +3157,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     plur,
                     std::time::Duration::from_secs(timeout),
                 )
-                .await?;
+                .await
+                // Display, not main's Debug: renders a balance shortfall in BZZ.
+                .map_err(|e| e.to_string())?;
                 println!("  tx 0x{}", hex::encode(tx));
             }
             ChequebookAction::Status {
@@ -3281,7 +3283,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     params.owner, params.depth, params.initial_balance_per_chunk, params.immutable
                 );
 
-                let info = create_batch(&signer, params).await?;
+                // Display, not main's Debug: renders a balance shortfall in BZZ.
+                let info = create_batch(&signer, params)
+                    .await
+                    .map_err(|e| e.to_string())?;
 
                 println!("batch created:");
                 println!("  batch_id:    0x{}", hex::encode(info.batch_id));
