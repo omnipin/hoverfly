@@ -259,3 +259,69 @@ jobs:
           }
           EOF
           npm publish --access public
+
+  publish-aur:
+    name: AUR (hoverfly, hoverfly-bin)
+    runs-on: ubuntu-latest
+    # Publish both AUR packages AFTER the binaries are attached to the release:
+    # `hoverfly-bin` downloads the release tarballs (and updpkgsums hashes them),
+    # so they must already be uploaded by the `build` job.
+    needs: build
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.release.tag_name }}
+
+      # Skip cleanly (don't fail the release) when the AUR SSH key secret isn't
+      # configured yet — e.g. before the one-time AUR account + initial package
+      # submission has been done. Once AUR_SSH_PRIVATE_KEY exists, this lights up.
+      - name: Check for AUR secret
+        id: gate
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          if [ -n "$AUR_SSH_PRIVATE_KEY" ]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::AUR_SSH_PRIVATE_KEY not set — skipping AUR publish."
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # Stamp the release version into both PKGBUILD templates. Checksums are
+      # left as SKIP in the templates; the deploy action's `updpkgsums` computes
+      # the real sha256 from the `source` URLs at publish time.
+      - name: Template PKGBUILDs
+        if: steps.gate.outputs.enabled == 'true'
+        run: |
+          ver="${{ github.event.release.tag_name }}"
+          pkgver="${ver#v}"
+          sed -i "s/@PKGVER@/${pkgver}/" packaging/aur/hoverfly-bin/PKGBUILD
+          sed -i "s/@PKGVER@/${pkgver}/" packaging/aur/hoverfly/PKGBUILD
+
+      - name: Publish hoverfly-bin to the AUR
+        if: steps.gate.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
+        with:
+          pkgname: hoverfly-bin
+          pkgbuild: packaging/aur/hoverfly-bin/PKGBUILD
+          updpkgsums: true
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.event.release.tag_name }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
+
+      - name: Publish hoverfly (source) to the AUR
+        if: steps.gate.outputs.enabled == 'true'
+        uses: KSXGitHub/github-actions-deploy-aur@v4.1.3
+        with:
+          pkgname: hoverfly
+          pkgbuild: packaging/aur/hoverfly/PKGBUILD
+          updpkgsums: true
+          commit_username: ${{ secrets.AUR_USERNAME }}
+          commit_email: ${{ secrets.AUR_EMAIL }}
+          ssh_private_key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+          commit_message: "Update to ${{ github.event.release.tag_name }}"
+          ssh_keyscan_types: rsa,ecdsa,ed25519
