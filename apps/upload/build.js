@@ -33,8 +33,9 @@ const entryPoints = {
 function copyStatic () {
   cpSync(resolve(here, 'public'), dist, { recursive: true })
   // Vendor the cold-start peer seed (browser-dialable /ws[s] peers harvested
-  // from mainnet; the repo's refresh-peers workflow keeps it fresh). Bundled as
-  // a fallback for when the CDN copy is unreachable — see config.PEERS_SEED_URL.
+  // from mainnet; the omnipin/hoverfly-peers repo keeps the fresh copy). This
+  // bundled one is a fallback for when the CDN copy is unreachable — see
+  // config.PEERS_SEED_URL.
   if (existsSync(peersSeed)) {
     copyFileSync(peersSeed, resolve(assets, 'peers.ws.json'))
   } else {

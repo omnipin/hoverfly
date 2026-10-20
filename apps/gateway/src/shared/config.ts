@@ -116,10 +116,9 @@ export const PREWARM_SESSIONS = 0
 export const DOH_URL: string | undefined = undefined
 /**
  * Cold-start peer seed, fetched fresh from the GitHub raw CDN at daemon warm
- * time. The `refresh-peers` workflow re-derives `peers.ws.json` from a live
- * mainnet harvest HOURLY and commits it to `main`; mainnet /ws[s] underlays go
- * stale within ~2-3h (AutoTLS SNI rotation, churn), so the committed file is the
- * freshest seed available. The locally-bundled copy (`peers.ws.json` in dist/,
+ * time. The `omnipin/hoverfly-peers` repo re-derives `peers.ws.json` from a
+ * live mainnet harvest HOURLY; mainnet /ws[s] underlays go stale within ~2-3h
+ * (AutoTLS SNI rotation, churn), so that copy is the freshest seed available. The locally-bundled copy (`peers.ws.json` in dist/,
  * a build-time symlink snapshot) is only as fresh as the last gateway DEPLOY —
  * which can be days old — so we prefer the CDN at runtime and fall back to the
  * local copy only when the CDN is unreachable (offline / GitHub down / rate
@@ -130,7 +129,7 @@ export const DOH_URL: string | undefined = undefined
  * to disable the CDN seed and use only the bundled copy.
  */
 export const PEERS_SEED_URL: string | undefined =
-  'https://raw.githubusercontent.com/omnipin/hoverfly/main/peers.ws.json'
+  'https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.ws.json'
 
 // ---- persistence ----
 export const IDB_NAME = 'hoverfly-gateway'
