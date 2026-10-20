@@ -275,7 +275,14 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   requests. Unix-socket IPC, `u32-LE length` + JSON wire protocol. File
   contents pass by absolute path (not inline). **Not a security boundary** —
   anyone with socket access can read/write the daemon's filesystem and sign
-  uploads with whatever key they send.
+  uploads with whatever key they send. The upload request carries an optional
+  `nonce` (hex, 32 bytes) alongside `key`: the upload overlay is
+  `keccak256(eth_addr || network_id || nonce)`, so passing the same nonce on
+  every upload keeps the overlay stable across uploads (the bee-citizenship
+  lever — see `signer::from_bytes_with_nonce`). Without it the daemon falls
+  back to a fresh random nonce per upload. `hoverfly upload --daemon` passes
+  the `--nonce-file` nonce over the socket, so daemon mode and in-process mode
+  produce the same overlay.
 - `src/inbound.rs` — `#[cfg(not(target_arch = "wasm32"))]` only. Optional
   daemon listener for serving retrieval requests from the local upload cache
   (default `/ip4/0.0.0.0/tcp/1634/ws`; needs `--advertise .../p2p/<id>` for

@@ -1899,12 +1899,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // When the terminal is not a TTY (`make_progress_bar` returns
                 // None) we ask for no progress stream to avoid useless frames.
                 let progress_cb = make_progress_bar();
+                // Carry the overlay nonce over the socket: the daemon signs
+                // the upload with it, so the overlay stays stable across
+                // uploads exactly like the in-process path below.
+                let nonce = load_or_create_nonce(&cli.nonce_file)?;
                 let req = hoverfly::daemon::Request::Upload(hoverfly::daemon::UploadRequest {
                     file: file.clone(),
                     batch: batch.clone(),
                     depth,
                     immutable,
                     key: key.clone(),
+                    nonce: Some(format!("0x{}", hex::encode(nonce))),
                     max_retries,
                     concurrency,
                     raw,
