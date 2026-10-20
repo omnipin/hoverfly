@@ -70,6 +70,15 @@ pub struct UploadRequest {
     #[serde(default)]
     pub immutable: bool,
     pub key: String,
+    /// Overlay nonce (hex, 32 bytes) for the upload signer. The overlay is
+    /// `keccak256(eth_addr || network_id || nonce)`, so a caller that keeps
+    /// the same nonce across uploads gets a stable overlay — what bee's
+    /// kademlia memory needs to route back to us later. `None` — including
+    /// from a client that predates this field — means a fresh random nonce
+    /// per upload, which is what an in-process upload without a nonce file
+    /// does too.
+    #[serde(default)]
+    pub nonce: Option<String>,
     pub max_retries: usize,
     pub concurrency: usize,
     pub raw: bool,
@@ -724,6 +733,25 @@ where
     result
 }
 
+/// Build the signer for an upload.
+///
+/// The overlay is `keccak256(eth_addr || network_id || nonce)`. With an
+/// explicit nonce it is stable across uploads — which is what bee's kademlia
+/// memory needs to route back to us later, and what the in-process upload
+/// path gets from `--nonce-file`. Without one, every upload gets a fresh
+/// random overlay.
+fn upload_signer(
+    key: &str,
+    nonce: Option<&str>,
+    network_id: u64,
+) -> Result<crate::SwarmSigner, ClientError> {
+    let signer = match nonce {
+        Some(nonce) => crate::SwarmSigner::from_hex_with_nonce(key, nonce, network_id),
+        None => crate::SwarmSigner::from_hex(key, network_id),
+    };
+    signer.map_err(|e| ClientError::Stamp(e.to_string()))
+}
+
 /// Core upload logic shared by streaming and (potential) non-streaming
 /// callers. Returns `(root_hex, input_bytes)`.
 async fn run_upload(
@@ -731,8 +759,10 @@ async fn run_upload(
     r: &UploadRequest,
     progress: Option<&crate::client::ProgressFn>,
 ) -> Result<(String, usize), ClientError> {
-    let signer = crate::SwarmSigner::from_hex(&r.key, state.signer_network_id)
-        .map_err(|e| ClientError::Stamp(e.to_string()))?;
+    // The upload signer. With an explicit nonce the overlay is stable across
+    // uploads (bee citizenship: peers that learned our overlay can route back
+    // to us); without one every upload gets a fresh random overlay.
+    let signer = upload_signer(&r.key, r.nonce.as_deref(), state.signer_network_id)?;
     let data = std::fs::read(&r.file).map_err(|e| ClientError::File(e.to_string()))?;
     let bytes = data.len();
 
@@ -1479,6 +1509,53 @@ where
     stream.write_all(&body).await?;
     stream.flush().await?;
     Ok(())
+}
+
+#[cfg(test)]
+mod upload_signer_tests {
+    use super::*;
+
+    const KEY: &str = "0x2cfe73bcd53cc2708a35f6f2238e2aeeb0448b65339f43d398e736102a211569";
+    const NONCE: &str = "0x1111111111111111111111111111111111111111111111111111111111111111";
+
+    /// The whole point of carrying a nonce over the socket: the overlay must
+    /// be the same on every upload, so peers that learned it can route back.
+    #[test]
+    fn keeps_the_overlay_stable_across_uploads_with_a_nonce() {
+        let a = upload_signer(KEY, Some(NONCE), 1).expect("signer");
+        let b = upload_signer(KEY, Some(NONCE), 1).expect("signer");
+        assert_eq!(a.overlay(), b.overlay());
+        assert_eq!(a.nonce(), &[0x11; 32]);
+    }
+
+    /// Without a nonce every upload is a fresh random overlay — the old
+    /// daemon behaviour, kept as the fallback for clients that predate the
+    /// field.
+    #[test]
+    fn randomises_the_overlay_without_a_nonce() {
+        let a = upload_signer(KEY, None, 1).expect("signer");
+        let b = upload_signer(KEY, None, 1).expect("signer");
+        assert_ne!(a.overlay(), b.overlay());
+    }
+
+    /// A different nonce must move the overlay, and a different key must too.
+    #[test]
+    fn the_overlay_follows_the_key_and_the_nonce() {
+        let other_nonce = "0x2222222222222222222222222222222222222222222222222222222222222222";
+        let a = upload_signer(KEY, Some(NONCE), 1).expect("signer");
+        let b = upload_signer(KEY, Some(other_nonce), 1).expect("signer");
+        assert_ne!(a.overlay(), b.overlay());
+        assert_eq!(
+            a.overlay(),
+            &crate::signer::derive_overlay(a.eth_address(), 1, &[0x11; 32])
+        );
+    }
+
+    #[test]
+    fn rejects_a_malformed_nonce() {
+        assert!(upload_signer(KEY, Some("0xnothex"), 1).is_err());
+        assert!(upload_signer(KEY, Some("0xdeadbeef"), 1).is_err());
+    }
 }
 
 #[cfg(test)]
