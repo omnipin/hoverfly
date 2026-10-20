@@ -106,10 +106,11 @@ jobs:
             printf "%s" "${BENCH_NONCE#0x}" | tr -d '[:space:]' > overlay-nonce
           fi
 
-      - name: Seed peers.json from committed seed
-        # peers.seed.json (committed, refreshed hourly by refresh-peers.yml)
-        # gives the daemon ~3k dial candidates so the session pool can fill
-        # without discovering them first.
+      - name: Seed peers.json from the peers repo
+        # The fresh peerlist (refreshed hourly in omnipin/hoverfly-peers) gives
+        # the daemon ~3k dial candidates so the session pool can fill without
+        # discovering them first. The copy committed in this repo is a frozen
+        # fallback.
         #
         # Note what this does NOT do: the daemon's "skip the pre-fill discover"
         # fast path needs >= WARM_PEERLIST_MIN_KNOWN_GOOD (8) peers whose last
@@ -119,7 +120,16 @@ jobs:
         # timestamps are typically 20-40 min old. The daemon therefore always
         # takes the "peerlist not warm enough" branch and runs a pre-fill
         # discover; see --discover-rounds below for why that is kept to 1.
-        run: cp peers.seed.json peers.json
+        run: |
+          set -euo pipefail
+          if curl -fsSL -o peers.json \
+            https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json \
+            && [ -s peers.json ]; then
+            echo "Using the fresh peerlist from omnipin/hoverfly-peers"
+          else
+            echo "WARNING: fresh peerlist fetch failed; using the committed copy"
+            cp peers.seed.json peers.json
+          fi
 
       - name: Start daemon
         env:
