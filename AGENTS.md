@@ -515,10 +515,14 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   at root are local upload-test leftovers.
 - **`peers.seed.json`** (committed, ~800 IPs) and **`peers.ws.json`**
   (committed, WS-dialable subset for the browser builds) are IP-diverse
-  cold-start seeds harvested from a long-running daemon. CI copies a seed to
-  `peers.json` before starting the daemon so a fresh runner doesn't discover
-  from scratch. Regenerate via `hoverfly save-peers --socket <sock>` against a
-  daemon that's been running a few hours.
+  cold-start seeds harvested from a long-running daemon. The committed copies
+  are a **frozen fallback**: the fresh ones live in the
+  [`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo,
+  where an hourly workflow re-derives them (that's where the churn belongs —
+  the peerlists are data, not code). CI copies a seed to `peers.json` before
+  starting the daemon so a fresh runner doesn't discover from scratch.
+  Regenerate via `hoverfly save-peers --socket <sock>` against a daemon that's
+  been running a few hours.
 - Hard constants worth knowing before tuning (names are stable, lines drift —
   grep before trusting a line number):
   - `transport.rs  MAX_PUSHES_PER_SESSION = 10_000` — defence-in-depth

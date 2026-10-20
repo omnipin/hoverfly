@@ -92,10 +92,12 @@ What the daemon does:
 
 - Ships a committed **`public/__gw__/peers.ws.json`** seed (ws peers harvested
   from mainnet) so the first fetch has something to dial immediately. It's a
-  symlink to the repo-root `peers.ws.json`, which the `refresh-peers` GitHub
-  workflow re-derives from `peers.seed.json` hourly (ws/wss underlays only —
-  these go stale within ~2-3h, so the seed is kept fresh well inside that
-  window); `build.js` materializes it into a real file in `dist/`.
+  symlink to the repo-root `peers.ws.json` — a frozen fallback; the fresh
+  copy is re-derived from `peers.seed.json` hourly in the
+  [`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo
+  (ws/wss underlays only — these go stale within ~2-3h, so the seed is kept
+  fresh well inside that window) and fetched from the CDN at runtime;
+  `build.js` materializes the bundled copy into a real file in `dist/`.
 - Always runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to
   refresh from the live bootnodes (the seed goes stale), persisting the result
   to IndexedDB.
@@ -104,7 +106,8 @@ The landing page shows a live **dialable peer count** and a **Discover** box.
 For best reliability, point discovery at a WebSocket-capable bee you control
 (`/ip4/…/tcp/…/tls/sni/…/ws/p2p/…` or `/dns4/host/tcp/443/wss/p2p/…`).
 
-> Regenerate the seed by hand (the cron workflow normally does this):
+> Regenerate the seed by hand (the cron in `omnipin/hoverfly-peers` normally
+> does this):
 > `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 --ws-only -o peers.ws.json`
 > from the repo root.
 

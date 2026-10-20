@@ -106,7 +106,7 @@ export const WORKER_JS = `${ASSET_PREFIX}worker.js`
 // ---- peer seed (cold-start) ----
 /**
  * Cold-start peer seed: browser-dialable (/ws[s]) peers harvested from mainnet.
- * Fetched fresh from the GitHub raw CDN (the repo's `refresh-peers` workflow
+ * Fetched fresh from the GitHub raw CDN (the `omnipin/hoverfly-peers` repo
  * re-derives it hourly) so discovery starts warm instead of cold-dialing the
  * bootnode. mainnet /ws underlays go stale within ~2-3h (AutoTLS SNI rotation),
  * so the hourly CDN copy beats the build-time bundled copy. The bundled copy
@@ -114,7 +114,7 @@ export const WORKER_JS = `${ASSET_PREFIX}worker.js`
  * CDN is unreachable. Set to undefined to use only the bundled copy.
  */
 export const PEERS_SEED_URL: string | undefined =
-  'https://raw.githubusercontent.com/omnipin/hoverfly/main/peers.ws.json'
+  'https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.ws.json'
 /** Bundled fallback seed, relative to the app assets. */
 export const PEERS_SEED_BUNDLED = `${ASSET_PREFIX}peers.ws.json`
 

@@ -168,7 +168,18 @@ jobs:
           mkdir -p "$stage"
 
           cp "target/${{ matrix.target }}/release/hoverfly" "$stage/"
-          cp peers.seed.json README.md LICENSE "$stage/"
+          # Fresh peerlist from the peers repo: the copy in this repo is a
+          # frozen fallback (the peerlists are refreshed hourly in
+          # omnipin/hoverfly-peers, not committed here).
+          if curl -fsSL -o "$stage/peers.seed.json" \
+            https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json \
+            && [ -s "$stage/peers.seed.json" ]; then
+            echo "Using the fresh peerlist from omnipin/hoverfly-peers"
+          else
+            echo "WARNING: fresh peerlist fetch failed; using the bundled copy"
+            cp peers.seed.json "$stage/peers.seed.json"
+          fi
+          cp README.md LICENSE "$stage/"
 
           tar -czf "${name}.tar.gz" -C stage "${name}"
           shasum -a 256 "${name}.tar.gz" > "${name}.tar.gz.sha256"

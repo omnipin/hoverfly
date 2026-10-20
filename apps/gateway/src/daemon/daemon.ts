@@ -205,7 +205,7 @@ function countDialable (peersJson: string): number {
 }
 
 /** Load the cold-start peer seed, preferring the always-fresh GitHub CDN copy
- *  (refreshed hourly by the `refresh-peers` workflow) over the bundled copy
+ *  (refreshed hourly by the `omnipin/hoverfly-peers` repo) over the bundled copy
  *  (only as fresh as the last gateway deploy — see PEERS_SEED_URL). The CDN
  *  fetch is bounded by a short timeout and falls back to the bundled copy on any
  *  failure (offline / GitHub down / rate limited / slow), so this is never worse
@@ -337,7 +337,7 @@ async function warm (): Promise<void> {
       // First run: load the browser seed — peers harvested from mainnet that
       // expose a browser-dialable /ws (AutoTLS / libp2p.direct) underlay. Gives
       // the first fetch something to dial before discovery. Prefer the GitHub
-      // CDN copy (refreshed hourly by the `refresh-peers` workflow) over the
+      // CDN copy (refreshed hourly by the `omnipin/hoverfly-peers` repo) over the
       // bundled copy (only as fresh as the last deploy) — see PEERS_SEED_URL.
       const seed = await loadSeed()
       if (seed != null) {
