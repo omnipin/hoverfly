@@ -109,7 +109,16 @@ jobs:
           USE_SEED: ${{ inputs.use_seed_peers }}
         run: |
           if [ "$USE_SEED" = "true" ]; then
-            cp peers.seed.json peers.json
+            # Fresh peerlist from the peers repo; the committed copy is a
+            # frozen fallback.
+            if curl -fsSL -o peers.json \
+              https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json \
+              && [ -s peers.json ]; then
+              echo "Using the fresh peerlist from omnipin/hoverfly-peers"
+            else
+              echo "WARNING: fresh peerlist fetch failed; using the committed copy"
+              cp peers.seed.json peers.json
+            fi
           else
             START_T=$(date +%s)
             ./target/release/hoverfly discover --rounds 3 -v 2>&1 | tail -20
@@ -159,7 +168,7 @@ jobs:
           echo "- buffer multiplier: ${{ inputs.buffer_multiplier }}" >> "$GITHUB_STEP_SUMMARY"
           echo "- nonce mode: ${{ inputs.use_random_nonce == true && 'random (A/B baseline)' || 'vanity (BENCH_NONCE)' }}" >> "$GITHUB_STEP_SUMMARY"
           if [ "${{ inputs.use_seed_peers }}" = "true" ]; then
-            echo "- peers source: committed peers.seed.json" >> "$GITHUB_STEP_SUMMARY"
+            echo "- peers source: omnipin/hoverfly-peers peers.seed.json" >> "$GITHUB_STEP_SUMMARY"
           else
             echo "- peers source: cold discover (${DISCOVER_SECS:-?}s, $DISCOVER_PEERS peers)" >> "$GITHUB_STEP_SUMMARY"
           fi

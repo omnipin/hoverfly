@@ -106,10 +106,14 @@ Startup cost depends on how warm the peerlist is. On a cold or stale `peers.json
 hoverfly daemon --socket /tmp/hoverfly.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
 ```
 
-The repo ships a curated `peers.seed.json`; the daemon loads it via `--peerlist` (default: `peers.json`) for fast cold-start without running `discover` first.
+Fetch a curated `peers.seed.json` from the
+[`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo (it's
+refreshed hourly); the daemon loads it via `--peerlist` (default: `peers.json`)
+for fast cold-start without running `discover` first. The release tarball
+bundles a snapshot of the same file as a fallback.
 
 ```bash
-cp peers.seed.json peers.json
+curl -fsSL -o peers.json https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json
 ```
 
 ### 6. Upload
