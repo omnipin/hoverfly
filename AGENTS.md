@@ -71,7 +71,7 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
 - Native: `cargo build` / `cargo build --release`. Release is ~2-5× faster on
   crypto paths but only ~10-15% end-to-end (network dominates).
 - Edition **2024**; crate version tracked in `Cargo.toml` (`0.x`, currently
-  `0.2.0`).
+  `0.2.1`).
 - Default features are `cli`, `bridge`, `pusher`. `--no-default-features
   --features cli` drops both the bridge and the relay server (native-only
   code is compiled out entirely).
