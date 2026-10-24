@@ -32,7 +32,12 @@
 //! from the root span and a fixed branching factor, assuming every reference is
 //! a data chunk. That's wrong for erasure-coded content (the extra parity refs
 //! are not data, and the effective branching per node varies with the parity
-//! count). So we can't reuse it; we port bee's joiner here instead.
+//! count), and it also assumes a *canonical* tree — child extents are derived
+//! from the parent's span and never checked against the child's own span, so a
+//! hand-published non-canonical tree panics it (`assemble_range` slices a short
+//! leaf at the assumed length). So we port bee's span-driven joiner here
+//! instead, and use it for **both** shapes: plain roots go through it with zero
+//! parity.
 //!
 //! Key facts, verified against `~/Coding/forks/bee/pkg`:
 //! - **Span byte:** the redundancy level is encoded in the *most significant
@@ -56,7 +61,10 @@ pub mod joiner;
 pub mod replicas;
 
 pub use encoder::{EncodeError, SplitOutput, split_with_redundancy};
-pub use joiner::{ErasureError, fetch_erasure_bytes, fetch_erasure_bytes_progress};
+pub use joiner::{
+    ErasureError, JoinLimits, MAX_JOIN_BYTES, MAX_JOIN_DEPTH, fetch_erasure_bytes,
+    fetch_erasure_bytes_limited, fetch_erasure_bytes_progress,
+};
 pub use replicas::dispersed_replicas;
 
 use nectar_primitives::bmt::{DEFAULT_BODY_SIZE, HASH_SIZE, Hasher, SPAN_SIZE};
