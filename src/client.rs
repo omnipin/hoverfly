@@ -3875,6 +3875,14 @@ struct SessionEntry {
     /// only flag it dead once it crosses [`DEAD_STRIKES`]; a single
     /// transient peer hiccup shouldn't shrink the live pool.
     failure_strikes: std::sync::atomic::AtomicU32,
+    /// Consecutive pushsync *timeouts* observed on this entry, reset by
+    /// any push that gets an answer back (receipt, overdraft, protocol
+    /// error). A timeout is the only failure that is deliberately NOT
+    /// treated as a dead connection (see [`is_connection_dead`]), so
+    /// without this counter a session that stops answering — wedged
+    /// driver, dead substream, peer-side stall — is never replaced. See
+    /// [`PUSH_TIMEOUT_STRIKES`].
+    push_timeout_strikes: std::sync::atomic::AtomicU32,
     /// Unix-seconds timestamp before which this entry is considered
     /// "dead" and skipped by the dispatcher. Default `0` = always-live.
     skip_until_unix: std::sync::atomic::AtomicU64,
@@ -3995,6 +4003,22 @@ impl SessionEntry {
         } else {
             false
         }
+    }
+
+    /// Record one pushsync timeout. Returns the number of *consecutive*
+    /// timeouts seen on this entry (see [`PUSH_TIMEOUT_STRIKES`]).
+    fn note_push_timeout(&self) -> u32 {
+        self.push_timeout_strikes
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1
+    }
+
+    /// Reset the consecutive-timeout counter — the peer answered
+    /// (even if the answer was an overdraft or an error), so it is not
+    /// wedged.
+    fn clear_push_timeouts(&self) {
+        self.push_timeout_strikes
+            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Monotonically bump the recorded storage radius if `value`
@@ -4161,6 +4185,30 @@ const DEAD_SKIP_SECS: u64 = 15;
 /// the live pool; a peer that errors three pushes in a row is
 /// genuinely broken for the moment.
 const DEAD_STRIKES: u32 = 3;
+
+/// Consecutive pushsync timeouts on a single pool entry before we treat
+/// the session as *wedged* and replace the underlying connection, even
+/// though it never reported a dead connection.
+///
+/// [`is_connection_dead`] deliberately excludes `Timeout` (one slow op
+/// must not retire a session with useful pushes still in flight), so a
+/// session whose driver/substream has silently wedged — pushes go out
+/// and nothing ever answers — stays usable-looking forever. That is
+/// fatal in aggregate: every chunk dispatched to it pays the full
+/// `--timeout` while holding an inflight slot, `inflight_cap()` also
+/// tightens to 2 for a slow-EWMA peer, and once *every* entry is in
+/// that state the dispatcher finds no candidates at all. Each chunk then
+/// burns its `MAX_CHUNK_RETRIES` budget on capacity waits and the
+/// upload aborts minutes later reporting "all sessions filtered", having
+/// pushed nothing (observed live on an ENS release run: 8 sessions,
+/// `eligible=0`, abort after 4 m 35 s).
+///
+/// 3 is chosen to match [`DEAD_STRIKES`]: with a 10 s `--timeout` an
+/// entry has to waste ~30 s of push attempts before we pay one dial for
+/// a replacement, so a transient cluster-wide slow patch doesn't churn
+/// the whole pool, while a genuinely wedged session is evicted inside
+/// one retry budget.
+const PUSH_TIMEOUT_STRIKES: u32 = 3;
 
 /// Maximum concurrent pushes per pool entry. Capped at 4: with our
 /// CHUNK_PEER_PARALLELISM=3 fan-out and buffer=128 chunks in flight,
@@ -4964,8 +5012,54 @@ async fn push_chunks_with_pool_inner(
             // no eligible peer, the post-loop NoPeers error fires and
             // the chunk re-dispatches the normal way.
             if attempt_no == 0 {
-                for _ in 0..30 {
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                // Capacity wait. Everything in the pool is unusable *right
+                // now*: parked as dead (dial failures), at its per-peer
+                // in-flight cap, or behind a dial cooldown.
+                //
+                // Of those three, the in-flight cap is the one that resolves
+                // on push-completion timescales, and a slot can be held for
+                // up to the full `--timeout` (10 s by default) by a slow or
+                // wedged push. Waiting only 3 s (the old 30 × 100 ms) meant
+                // that whenever pushes were slower than ~3 s *every* chunk
+                // found zero candidates, spent one of its
+                // `MAX_CHUNK_RETRIES` on the wait, and the whole upload
+                // aborted ~4.5 min later with "all sessions filtered" —
+                // exactly what an ENS release run did (pool=8, eligible=0,
+                // zero chunks pushed). So wait at least one push timeout for
+                // a slot before spending a retry.
+                //
+                // Polling rather than notification: the slot holder is an
+                // arbitrary in-flight dispatch future, and a lost wakeup
+                // would strand this chunk for the rest of the upload. The
+                // backoff starts at 50 ms (a healthy pool hands the slot over
+                // almost immediately) and grows to 1 s so a 128-chunk burst
+                // doesn't spin on `build_order` (one sort per poll).
+                let slot_wait = transport.config().timeout.max(Duration::from_secs(3));
+                // Default-visible breadcrumb: this state used to be silent at
+                // WARN level, which made the abort above undiagnosable from a
+                // CI log. Throttled — a starved burst fires this for every
+                // buffered chunk at once.
+                static STARVED_DISPATCHES: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let n = STARVED_DISPATCHES
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
+                if n <= 3 || n % 128 == 0 {
+                    warn!(target: "hoverfly::upload",
+                        "chunk {} has no usable session: pool={} (at inflight cap={}, dead={}, in dial cooldown={}) — waiting up to {}s for a slot ({} such waits)",
+                        hex::encode(chunk.addr),
+                        pool.len(),
+                        filter_cap,
+                        filter_dead,
+                        filter_dead_session_cooldown,
+                        slot_wait.as_secs(),
+                        n);
+                }
+                let wait_start = web_time::Instant::now();
+                let mut poll_backoff = Duration::from_millis(50);
+                while wait_start.elapsed() < slot_wait {
+                    tokio::time::sleep(poll_backoff).await;
+                    poll_backoff = (poll_backoff * 2).min(Duration::from_secs(1));
                     order = build_order(
                         &mut filter_dead,
                         &mut filter_cap,
@@ -5437,6 +5531,12 @@ async fn push_chunks_with_pool_inner(
     let mut first_err: Option<ClientError> = None;
     let mut more_chunks = true;
     let mut last_pushed_seen = 0usize;
+    // Whether the current stall has already been reported at WARN. The
+    // heartbeat below is the only upload-path signal that survives the
+    // default WARN log level, and a stalled upload is exactly what a CI
+    // log needs to show (a run was once diagnosed only from its final
+    // `NoPeers(pool=8 eligible=0)` line, minutes after the fact).
+    let mut stall_announced = false;
     let mut heartbeat = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
     loop {
         // Done: all chunks dispatched, every dispatch resolved. Don't
@@ -5676,7 +5776,20 @@ async fn push_chunks_with_pool_inner(
                          eligible={} dead={} cap={} dead_cd={})",
                         now, total, inflight.len(), entries.len(),
                         eligible, dead, cap_full, dead_cd);
+                    // First stall after (any) progress is a WARN so it is
+                    // visible without `-v`; repeats stay at INFO so a long
+                    // stall doesn't flood the log.
+                    if !stall_announced {
+                        stall_announced = true;
+                        warn!(target: "hoverfly::upload",
+                            "upload stalled at {}/{} chunks after 5s without progress — \
+                             inflight={} pool={} eligible={} (dead={} at-inflight-cap={} dial-cooldown={}); \
+                             every chunk is waiting for a push slot",
+                            now, total, inflight.len(), entries.len(),
+                            eligible, dead, cap_full, dead_cd);
+                    }
                 } else {
+                    stall_announced = false;
                     info!(target: "hoverfly::upload",
                         "pushed {}/{} chunks (inflight={})",
                         now, total, inflight.len());
@@ -5845,13 +5958,44 @@ async fn try_push_with_rotation(
     let session = entry.snapshot();
     let net = transport.config().network_id;
     let t_start = web_time::Instant::now();
-    let result = match session
+    let first = session
         .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
-        .await
-    {
-        Ok(out) => Ok(out),
-        Err(e) if !is_connection_dead(&e) => Err(e),
+        .await;
+    // Does this failure warrant replacing the connection? Two triggers:
+    // the long-standing `is_connection_dead` (ConnectionClosed /
+    // StreamControl / framing), and — new — [`PUSH_TIMEOUT_STRIKES`]
+    // consecutive timeouts, i.e. the peer accepted the substream and
+    // then never answered at all. Without the second trigger a wedged
+    // session is never retired (see the const's doc comment), which is
+    // how a whole upload starves with a pool full of "healthy" sessions.
+    let replace = match &first {
+        Ok(_) => {
+            entry.clear_push_timeouts();
+            false
+        }
+        Err(e) if is_connection_dead(e) => true,
+        Err(TransportError::Timeout) => {
+            let strikes = entry.note_push_timeout();
+            if strikes >= PUSH_TIMEOUT_STRIKES {
+                warn!(target: "hoverfly::upload",
+                    "{} went unanswered for {} consecutive push timeouts ({} each) — replacing the session",
+                    entry.overlay_hex, strikes, transport.config().timeout.as_secs_f32());
+                true
+            } else {
+                false
+            }
+        }
         Err(_) => {
+            // The peer answered (overdraft, price error, protocol
+            // rejection): slow or unhappy, not wedged.
+            entry.clear_push_timeouts();
+            false
+        }
+    };
+    let result = if !replace {
+        first
+    } else {
+        {
             let fresh = match entry.take_pending() {
                 Some(s) => {
                     debug!(target: "hoverfly::upload",
@@ -5892,6 +6036,10 @@ async fn try_push_with_rotation(
                 },
             };
             entry.replace(fresh.clone());
+            // Fresh connection, fresh timeout budget — otherwise the
+            // counter stays at the threshold and the very next timeout
+            // re-dials again.
+            entry.clear_push_timeouts();
             fresh
                 .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
                 .await
@@ -6354,6 +6502,7 @@ async fn open_session_pool_into(
                     pending: std::sync::Mutex::new(None),
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
                     failure_strikes: std::sync::atomic::AtomicU32::new(0),
+                    push_timeout_strikes: std::sync::atomic::AtomicU32::new(0),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                     storage_radius: std::sync::atomic::AtomicU8::new(0),
                     push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
