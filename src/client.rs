@@ -100,6 +100,24 @@ pub enum ClientError {
     /// unrecoverable right now" from "wrong join path".
     #[error("erasure: {0}")]
     Erasure(#[from] crate::erasure::ErasureError),
+    /// The upload pushed nothing at all for [`UPLOAD_NO_PROGRESS_SECS`].
+    ///
+    /// Distinct from [`Self::NoPeers`], which describes one dispatch
+    /// finding no usable session. This is the upload-level verdict: the
+    /// pool exists, pushes are being dispatched, and *none* of them has
+    /// completed in minutes, so the retry budget is just burning wall
+    /// clock. Reported with the pool shape at the moment of the abort so
+    /// the reason is visible without replaying the run with `-v`.
+    #[error(
+        "upload stalled: no chunk completed in {secs}s ({pushed}/{total} pushed; pool={pool}, eligible={eligible}) — pushes are being dispatched but none is landing"
+    )]
+    UploadStalled {
+        pushed: usize,
+        total: usize,
+        secs: u64,
+        pool: usize,
+        eligible: usize,
+    },
 }
 
 impl From<nectar_primitives::error::PrimitivesError> for ClientError {
@@ -3875,14 +3893,11 @@ struct SessionEntry {
     /// only flag it dead once it crosses [`DEAD_STRIKES`]; a single
     /// transient peer hiccup shouldn't shrink the live pool.
     failure_strikes: std::sync::atomic::AtomicU32,
-    /// Consecutive pushsync *timeouts* observed on this entry, reset by
-    /// any push that gets an answer back (receipt, overdraft, protocol
-    /// error). A timeout is the only failure that is deliberately NOT
-    /// treated as a dead connection (see [`is_connection_dead`]), so
-    /// without this counter a session that stops answering — wedged
-    /// driver, dead substream, peer-side stall — is never replaced. See
-    /// [`PUSH_TIMEOUT_STRIKES`].
-    push_timeout_strikes: std::sync::atomic::AtomicU32,
+    /// Wedge detection for the current session (and the connections that
+    /// replaced it). Kept in its own struct so the concurrency semantics
+    /// can be unit-tested without a live session — see
+    /// [`WedgeState::timeout`].
+    wedge: WedgeState,
     /// Unix-seconds timestamp before which this entry is considered
     /// "dead" and skipped by the dispatcher. Default `0` = always-live.
     skip_until_unix: std::sync::atomic::AtomicU64,
@@ -3943,10 +3958,13 @@ impl SessionEntry {
 
     /// Replace the stored session with `new`. The previous session's
     /// `cmd_tx` is dropped, which signals its driver to shut down once
-    /// any in-flight pushes finish.
+    /// any in-flight pushes finish. The generation bump both invalidates
+    /// late timeouts from the old connection and marks the new one as a
+    /// fresh (empty) answer streak.
     fn replace(&self, new: PeerSession) {
         let mut guard = self.session.lock().expect("session mutex poisoned");
         *guard = new;
+        self.wedge.bump_generation();
     }
 
     /// Take a pre-warmed session if one is ready. Returns `None` if no
@@ -4003,22 +4021,6 @@ impl SessionEntry {
         } else {
             false
         }
-    }
-
-    /// Record one pushsync timeout. Returns the number of *consecutive*
-    /// timeouts seen on this entry (see [`PUSH_TIMEOUT_STRIKES`]).
-    fn note_push_timeout(&self) -> u32 {
-        self.push_timeout_strikes
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
-            + 1
-    }
-
-    /// Reset the consecutive-timeout counter — the peer answered
-    /// (even if the answer was an overdraft or an error), so it is not
-    /// wedged.
-    fn clear_push_timeouts(&self) {
-        self.push_timeout_strikes
-            .store(0, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Monotonically bump the recorded storage radius if `value`
@@ -4186,29 +4188,316 @@ const DEAD_SKIP_SECS: u64 = 15;
 /// genuinely broken for the moment.
 const DEAD_STRIKES: u32 = 3;
 
-/// Consecutive pushsync timeouts on a single pool entry before we treat
-/// the session as *wedged* and replace the underlying connection, even
-/// though it never reported a dead connection.
+/// What [`WedgeState::timeout`] wants the caller to do about a pushsync
+/// timeout.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WedgeVerdict {
+    /// Not wedged (or not our window to act on): keep using the session.
+    Keep,
+    /// The peer has answered nothing for a whole window: replace the
+    /// connection.
+    Rotate,
+    /// Rotations didn't help, so the peer itself is the problem: park the
+    /// entry and let the pool top-up find a different one.
+    Park,
+}
+
+/// Per-entry "has this peer stopped answering at all?" detector.
+///
+/// Split out from [`SessionEntry`] (which needs a live [`PeerSession`])
+/// so the concurrency semantics — which are the whole point — can be
+/// unit-tested deterministically: [`Self::timeout`] takes `now` from the
+/// caller instead of reading a clock.
+///
+/// Three pieces of state, each corresponding to a way the naive "N
+/// consecutive timeouts" counter failed:
+///
+/// * `generation` — bumped by [`Self::bump_generation`] whenever the
+///   connection is replaced. A push captures the generation it was
+///   dispatched under, so a timeout that arrives *after* the rotation it
+///   helped trigger cannot count against (or re-rotate) the successor.
+/// * `no_answer_since` — the wall-clock start of the current silence.
+///   Time, not count: an entry runs up to `inflight_cap()` pushes
+///   concurrently, so three timeouts from one wedged connection land
+///   together after a single `--timeout`, which a count threshold would
+///   mistake for three sequential ones.
+/// * `rotations` — how many fresh connections this entry has consumed
+///   without a single answer, so a *peer* that is broken (not just one
+///   connection) gets parked instead of redialed forever.
+#[derive(Debug, Default)]
+struct WedgeState {
+    generation: std::sync::atomic::AtomicU64,
+    no_answer_since: std::sync::atomic::AtomicU64,
+    rotations: std::sync::atomic::AtomicU32,
+}
+
+impl WedgeState {
+    /// Session generation, captured before a push so its timeout can be
+    /// attributed to the connection it was dispatched on.
+    fn generation(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The connection was replaced. Invalidates late timeouts from the
+    /// old one and starts the new one with an empty answer streak (a
+    /// stale window would otherwise make the very first timeout on the
+    /// fresh connection look like a completed wedge).
+    fn bump_generation(&self) {
+        self.no_answer_since
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The peer answered something — receipt, overdraft, protocol error —
+    /// so it is responsive and any streak is over. Resets the escalation
+    /// budget too: a session that was replaced *and then answers* proves
+    /// the rotation worked, and a peer that answers now but wedges again
+    /// an hour later deserves a fresh budget.
+    fn answered(&self) {
+        self.no_answer_since
+            .store(0, std::sync::atomic::Ordering::Release);
+        self.rotations
+            .store(0, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Record one pushsync timeout and decide what the caller should do.
+    ///
+    /// `generation` is what the push captured before dispatch; a timeout
+    /// from an already-replaced connection is ignored. `window_secs` is
+    /// how long the peer may stay silent before it counts as wedged
+    /// (see [`PUSH_UNANSWERED_TIMEOUTS`]).
+    ///
+    /// Exactly one caller wins a window: the winner is whoever's
+    /// `compare_exchange` clears `no_answer_since`, so a burst of
+    /// simultaneous timeouts yields one rotation, not one each.
+    fn timeout(&self, generation: u64, now: u64, window_secs: u64) -> WedgeVerdict {
+        if self.generation() != generation {
+            // Late timeout from a connection we already replaced: it says
+            // nothing about the session we are using now.
+            return WedgeVerdict::Keep;
+        }
+        // Open the window on the first timeout of the streak. `now.max(1)`
+        // keeps `0` free as the "no streak" sentinel.
+        let _ = self.no_answer_since.compare_exchange(
+            0,
+            now.max(1),
+            std::sync::atomic::Ordering::AcqRel,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let since = self
+            .no_answer_since
+            .load(std::sync::atomic::Ordering::Acquire);
+        if since == 0 || now.saturating_sub(since) < window_secs {
+            return WedgeVerdict::Keep;
+        }
+        // Claim the window; losers just keep using their session.
+        if self
+            .no_answer_since
+            .compare_exchange(
+                since,
+                0,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Relaxed,
+            )
+            .is_err()
+        {
+            return WedgeVerdict::Keep;
+        }
+        if self.rotations.load(std::sync::atomic::Ordering::Acquire) >= PUSH_ROTATIONS_BEFORE_PARK {
+            // We have already paid for fresh connections and the peer
+            // still answers nothing: this is the peer, not a connection.
+            self.rotations
+                .store(0, std::sync::atomic::Ordering::Release);
+            WedgeVerdict::Park
+        } else {
+            self.rotations
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+            WedgeVerdict::Rotate
+        }
+    }
+}
+
+#[cfg(test)]
+mod wedge_tests {
+    use super::{PUSH_ROTATIONS_BEFORE_PARK, WedgeState, WedgeVerdict};
+
+    const WINDOW: u64 = 20;
+
+    /// Drive one full silent window on the current generation and return
+    /// the verdict of the timeout that closes it.
+    fn silent_window(w: &WedgeState, start: u64) -> WedgeVerdict {
+        let g = w.generation();
+        assert_eq!(w.timeout(g, start, WINDOW), WedgeVerdict::Keep);
+        w.timeout(g, start + WINDOW, WINDOW)
+    }
+
+    #[test]
+    fn concurrent_timeouts_inside_one_push_timeout_do_not_rotate() {
+        // inflight_cap() pushes dispatched together all time out at once:
+        // that is one `--timeout` of silence, not a wedge.
+        let w = WedgeState::default();
+        for _ in 0..8 {
+            assert_eq!(w.timeout(0, 1_000, WINDOW), WedgeVerdict::Keep);
+        }
+        assert_eq!(w.timeout(0, 1_000 + WINDOW - 1, WINDOW), WedgeVerdict::Keep);
+        assert_eq!(w.timeout(0, 1_000 + WINDOW, WINDOW), WedgeVerdict::Rotate);
+    }
+
+    #[test]
+    fn any_answer_closes_the_window() {
+        let w = WedgeState::default();
+        assert_eq!(w.timeout(0, 1_000, WINDOW), WedgeVerdict::Keep);
+        w.answered();
+        // The window restarts from the next timeout, not the first one.
+        assert_eq!(w.timeout(0, 1_000 + WINDOW, WINDOW), WedgeVerdict::Keep);
+        assert_eq!(
+            w.timeout(0, 1_000 + 2 * WINDOW - 1, WINDOW),
+            WedgeVerdict::Keep
+        );
+        assert_eq!(
+            w.timeout(0, 1_000 + 2 * WINDOW, WINDOW),
+            WedgeVerdict::Rotate
+        );
+    }
+
+    #[test]
+    fn simultaneous_window_closers_rotate_exactly_once() {
+        let w = std::sync::Arc::new(WedgeState::default());
+        assert_eq!(w.timeout(0, 1_000, WINDOW), WedgeVerdict::Keep);
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(16));
+        let handles: Vec<_> = (0..16)
+            .map(|_| {
+                let w = w.clone();
+                let barrier = barrier.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    w.timeout(0, 1_000 + WINDOW, WINDOW)
+                })
+            })
+            .collect();
+        let rotations = handles
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .filter(|v| *v == WedgeVerdict::Rotate)
+            .count();
+        assert_eq!(rotations, 1);
+    }
+
+    #[test]
+    fn late_timeouts_from_a_replaced_session_are_ignored() {
+        let w = WedgeState::default();
+        assert_eq!(silent_window(&w, 1_000), WedgeVerdict::Rotate);
+        w.bump_generation();
+        // Pushes still running on generation 0 time out after the
+        // rotation: they must neither rotate nor open a window on gen 1.
+        for t in [1_000 + WINDOW, 1_000 + 3 * WINDOW, 1_000 + 10 * WINDOW] {
+            assert_eq!(w.timeout(0, t, WINDOW), WedgeVerdict::Keep);
+        }
+        // Gen 1's first timeout opens a fresh window.
+        assert_eq!(w.timeout(1, 5_000, WINDOW), WedgeVerdict::Keep);
+        assert_eq!(w.timeout(1, 5_000 + WINDOW - 1, WINDOW), WedgeVerdict::Keep);
+    }
+
+    #[test]
+    fn replacement_clears_a_dead_connection_window() {
+        // A dead-connection rotation bumps the generation without going
+        // through `timeout`; a half-open window must not carry over.
+        let w = WedgeState::default();
+        assert_eq!(w.timeout(0, 1_000, WINDOW), WedgeVerdict::Keep);
+        w.bump_generation();
+        assert_eq!(w.timeout(1, 1_000 + WINDOW, WINDOW), WedgeVerdict::Keep);
+    }
+
+    #[test]
+    fn a_peer_that_wedges_every_connection_is_parked() {
+        let w = WedgeState::default();
+        let mut t = 1_000;
+        for _ in 0..PUSH_ROTATIONS_BEFORE_PARK {
+            assert_eq!(silent_window(&w, t), WedgeVerdict::Rotate);
+            w.bump_generation();
+            t += 2 * WINDOW;
+        }
+        assert_eq!(silent_window(&w, t), WedgeVerdict::Park);
+        // Parking resets the budget, so a revived entry gets its
+        // rotations back rather than being parked on the first window.
+        t += 2 * WINDOW;
+        assert_eq!(silent_window(&w, t), WedgeVerdict::Rotate);
+    }
+
+    #[test]
+    fn an_answer_after_rotation_restores_the_budget() {
+        let w = WedgeState::default();
+        let mut t = 1_000;
+        for _ in 0..PUSH_ROTATIONS_BEFORE_PARK {
+            assert_eq!(silent_window(&w, t), WedgeVerdict::Rotate);
+            w.bump_generation();
+            t += 2 * WINDOW;
+        }
+        // The fresh connection answered: the rotation worked.
+        w.answered();
+        assert_eq!(silent_window(&w, t), WedgeVerdict::Rotate);
+    }
+}
+
+/// How long a pool entry may go without answering *anything* before its
+/// session is treated as wedged, expressed as a multiple of `--timeout`
+/// (floor [`PUSH_UNANSWERED_MIN_SECS`]).
 ///
 /// [`is_connection_dead`] deliberately excludes `Timeout` (one slow op
 /// must not retire a session with useful pushes still in flight), so a
-/// session whose driver/substream has silently wedged — pushes go out
-/// and nothing ever answers — stays usable-looking forever. That is
-/// fatal in aggregate: every chunk dispatched to it pays the full
-/// `--timeout` while holding an inflight slot, `inflight_cap()` also
-/// tightens to 2 for a slow-EWMA peer, and once *every* entry is in
-/// that state the dispatcher finds no candidates at all. Each chunk then
-/// burns its `MAX_CHUNK_RETRIES` budget on capacity waits and the
-/// upload aborts minutes later reporting "all sessions filtered", having
-/// pushed nothing (observed live on an ENS release run: 8 sessions,
-/// `eligible=0`, abort after 4 m 35 s).
+/// session whose driver/substream has silently wedged — pushes go out and
+/// nothing ever answers — stays usable-looking forever. That is fatal in
+/// aggregate: every chunk dispatched to it pays the full `--timeout` while
+/// holding an inflight slot, `inflight_cap()` also tightens to 2 for a
+/// slow-EWMA peer, and once *every* entry is in that state the dispatcher
+/// finds no candidates at all. Each chunk then burns its
+/// `MAX_CHUNK_RETRIES` budget on capacity waits and the upload aborts
+/// minutes later reporting "all sessions filtered", having pushed nothing
+/// (observed live on an ENS release run: 8 sessions, `eligible=0`, abort
+/// after 4 m 35 s).
 ///
-/// 3 is chosen to match [`DEAD_STRIKES`]: with a 10 s `--timeout` an
-/// entry has to waste ~30 s of push attempts before we pay one dial for
-/// a replacement, so a transient cluster-wide slow patch doesn't churn
-/// the whole pool, while a genuinely wedged session is evicted inside
-/// one retry budget.
-const PUSH_TIMEOUT_STRIKES: u32 = 3;
+/// Why a *duration* and not a strike count: an entry can have
+/// `inflight_cap()` (4, or 8 for fast peers) pushes in flight, so three
+/// concurrent timeouts all land after one `--timeout` — a count-based
+/// threshold would declare a wedge after ~10 s and churn the whole pool on
+/// a brief cluster-wide slowdown. Two push timeouts of total silence
+/// (≈20 s at the 10 s default) is long enough that a peer which is merely
+/// slow still gets to answer and clear the window.
+const PUSH_UNANSWERED_TIMEOUTS: u32 = 2;
+
+/// Floor for [`PUSH_UNANSWERED_TIMEOUTS`], so a small `--timeout` (fast
+/// CI/local links) doesn't rotate sessions on a single hiccup.
+const PUSH_UNANSWERED_MIN_SECS: u64 = 10;
+
+/// Fresh connections to the *same* peer we are willing to pay for one
+/// entry before concluding the peer, not the connection, is the problem.
+///
+/// The replacement targets the same overlay by definition, so a peer that
+/// has gone away-but-dialable (stale peerlist entry, peer that cannot
+/// forward, peer rate-limiting us at the pushsync layer) reproduces the
+/// wedge on every redial. Without this escalation the entry would rotate
+/// forever, one dial per window. Parking it instead lets
+/// `SessionPool::top_up` fill the slot with a *different* peer and the
+/// dead-skip window gives the peerlist a chance to be re-harvested.
+/// Reset by any answer, so a peer that merely had one bad connection is
+/// unaffected.
+const PUSH_ROTATIONS_BEFORE_PARK: u32 = 2;
+
+/// Abort a push that has completed **zero** chunks for this long.
+///
+/// The per-chunk `MAX_CHUNK_RETRIES` budget bounds *attempts*, not wall
+/// clock: with a healthy pool a chunk exhausts it in seconds, but when
+/// every dispatch is waiting out a slow or wedged push the same budget
+/// stretches to minutes (60 × (wait + 500 ms)) and the user/CI is left
+/// watching nothing happen. This is the upload-level backstop: no
+/// completed chunk for this long means the run cannot succeed, and a
+/// clear [`ClientError::UploadStalled`] is more useful than an eventual
+/// `NoPeers` that blames whichever filter happened to be non-zero last.
+///
+/// 120 s is ~6 push timeouts (default 10 s) and many wedge windows, so a
+/// genuinely slow-but-working pool (a few chunks a minute) is unaffected.
+const UPLOAD_NO_PROGRESS_SECS: u64 = 120;
 
 /// Maximum concurrent pushes per pool entry. Capped at 4: with our
 /// CHUNK_PEER_PARALLELISM=3 fan-out and buffer=128 chunks in flight,
@@ -5537,6 +5826,12 @@ async fn push_chunks_with_pool_inner(
     // log needs to show (a run was once diagnosed only from its final
     // `NoPeers(pool=8 eligible=0)` line, minutes after the fact).
     let mut stall_announced = false;
+    // When the last chunk completed. `MAX_CHUNK_RETRIES` bounds attempts
+    // per chunk, not wall clock: with a wedged pool the same budget
+    // stretches to minutes, so this is the upload-level backstop that
+    // turns "nothing has landed in two minutes" into a clear error
+    // instead of a slow death by retry exhaustion.
+    let mut no_progress_since = web_time::Instant::now();
     let mut heartbeat = Box::pin(tokio::time::sleep(Duration::from_secs(5)));
     loop {
         // Done: all chunks dispatched, every dispatch resolved. Don't
@@ -5788,8 +6083,26 @@ async fn push_chunks_with_pool_inner(
                             now, total, inflight.len(), entries.len(),
                             eligible, dead, cap_full, dead_cd);
                     }
+                    // Upload-level backstop: pushes are being dispatched
+                    // and none of them has completed in `UPLOAD_NO_PROGRESS_SECS`,
+                    // so the retry budget is only buying wall clock.
+                    let stalled_for = no_progress_since.elapsed();
+                    if stalled_for >= Duration::from_secs(UPLOAD_NO_PROGRESS_SECS) {
+                        let e = ClientError::UploadStalled {
+                            pushed: now,
+                            total,
+                            secs: stalled_for.as_secs(),
+                            pool: entries.len(),
+                            eligible,
+                        };
+                        warn!(target: "hoverfly::upload",
+                            "{e} — giving up instead of burning the rest of the per-chunk retry budget");
+                        first_err = Some(e);
+                        break;
+                    }
                 } else {
                     stall_announced = false;
+                    no_progress_since = web_time::Instant::now();
                     info!(target: "hoverfly::upload",
                         "pushed {}/{} chunks (inflight={})",
                         now, total, inflight.len());
@@ -5955,47 +6268,60 @@ async fn try_push_with_rotation(
     price: u64,
     transport: &Transport,
 ) -> Result<PushOutcome, TransportError> {
+    let generation = entry.wedge.generation();
     let session = entry.snapshot();
     let net = transport.config().network_id;
     let t_start = web_time::Instant::now();
     let first = session
         .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
         .await;
-    // Does this failure warrant replacing the connection? Two triggers:
-    // the long-standing `is_connection_dead` (ConnectionClosed /
-    // StreamControl / framing), and — new — [`PUSH_TIMEOUT_STRIKES`]
-    // consecutive timeouts, i.e. the peer accepted the substream and
-    // then never answered at all. Without the second trigger a wedged
-    // session is never retired (see the const's doc comment), which is
-    // how a whole upload starves with a pool full of "healthy" sessions.
-    let replace = match &first {
+    // Classify the outcome. `is_connection_dead` (ConnectionClosed /
+    // StreamControl / framing) has always been a replacement trigger; the
+    // new one is a *wedged* session that keeps timing out without ever
+    // answering (see [`PUSH_UNANSWERED_TIMEOUTS`]), which nothing used to
+    // act on — that is how a whole upload starves with a pool full of
+    // "healthy" sessions.
+    let verdict = match &first {
         Ok(_) => {
-            entry.clear_push_timeouts();
-            false
+            entry.wedge.answered();
+            WedgeVerdict::Keep
         }
-        Err(e) if is_connection_dead(e) => true,
+        Err(e) if is_connection_dead(e) => WedgeVerdict::Rotate,
         Err(TransportError::Timeout) => {
-            let strikes = entry.note_push_timeout();
-            if strikes >= PUSH_TIMEOUT_STRIKES {
-                warn!(target: "hoverfly::upload",
-                    "{} went unanswered for {} consecutive push timeouts ({} each) — replacing the session",
-                    entry.overlay_hex, strikes, transport.config().timeout.as_secs_f32());
-                true
-            } else {
-                false
-            }
+            let window_secs = (transport.config().timeout * PUSH_UNANSWERED_TIMEOUTS)
+                .as_secs()
+                .max(PUSH_UNANSWERED_MIN_SECS);
+            entry
+                .wedge
+                .timeout(generation, crate::peers::now_unix(), window_secs)
         }
         Err(_) => {
             // The peer answered (overdraft, price error, protocol
             // rejection): slow or unhappy, not wedged.
-            entry.clear_push_timeouts();
-            false
+            entry.wedge.answered();
+            WedgeVerdict::Keep
         }
     };
-    let result = if !replace {
-        first
-    } else {
-        {
+    let result = match verdict {
+        WedgeVerdict::Keep => first,
+        WedgeVerdict::Park => {
+            warn!(target: "hoverfly::upload",
+                "{} has taken {} fresh connections and still answers no push — parking it for {}s and letting the pool top-up pick a different peer",
+                entry.overlay_hex, PUSH_ROTATIONS_BEFORE_PARK, DEAD_SKIP_SECS);
+            entry.mark_dead(DEAD_SKIP_SECS);
+            first
+        }
+        // Another push on this entry already replaced the connection
+        // after we were dispatched (typical when several in-flight pushes
+        // all see the same dead connection): don't dial a second
+        // replacement on top of it, just retry on the one it installed.
+        WedgeVerdict::Rotate if entry.wedge.generation() != generation => {
+            entry
+                .snapshot()
+                .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
+                .await
+        }
+        WedgeVerdict::Rotate => {
             let fresh = match entry.take_pending() {
                 Some(s) => {
                     debug!(target: "hoverfly::upload",
@@ -6035,11 +6361,10 @@ async fn try_push_with_rotation(
                     }
                 },
             };
+            // The generation bump inside `replace` invalidates timeouts
+            // from the old connection and clears the wedge window, so the
+            // new session starts with a clean streak.
             entry.replace(fresh.clone());
-            // Fresh connection, fresh timeout budget — otherwise the
-            // counter stays at the threshold and the very next timeout
-            // re-dials again.
-            entry.clear_push_timeouts();
             fresh
                 .pushsync_chunk_priced(&chunk.addr, &chunk.wire, &chunk.stamp, price)
                 .await
@@ -6502,7 +6827,7 @@ async fn open_session_pool_into(
                     pending: std::sync::Mutex::new(None),
                     prewarm_inflight: std::sync::atomic::AtomicBool::new(false),
                     failure_strikes: std::sync::atomic::AtomicU32::new(0),
-                    push_timeout_strikes: std::sync::atomic::AtomicU32::new(0),
+                    wedge: WedgeState::default(),
                     skip_until_unix: std::sync::atomic::AtomicU64::new(0),
                     storage_radius: std::sync::atomic::AtomicU8::new(0),
                     push_latency_ewma_us: std::sync::atomic::AtomicU64::new(0),
