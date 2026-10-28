@@ -403,12 +403,20 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   port of klauspost's default matrix + GF(2^8) encode/reconstruct
   (golden-vector tested); `mod.rs` has the bee span/level decode, per-level
   erasure tables, and `ReferenceCount`/`ChunkAddresses` helpers.
-  - **Download** — `joiner.rs` is a bee-compatible tree-walking joiner that
-    fetches each intermediate node's data children and RS-reconstructs any that
-    time out from the node's parity siblings. `client::join_target` detects a
-    level-encoded root span and routes to it, else falls back to nectar's plain
-    `GenericJoiner`. All download entry points (CLI/daemon/wasm) funnel through
-    it.
+  - **Download** — `joiner.rs` is a bee-compatible, **span-driven** tree-walking
+    joiner: every child's extent comes from the child's own span, and each
+    intermediate node's children must cover that node's span *exactly*. It
+    fetches each node's data children and RS-reconstructs any that time out
+    from the node's parity siblings. `client::join_target` runs **both** shapes
+    through it — level-encoded and plain (zero parity) — so the download path
+    no longer depends on nectar's size-driven `GenericJoiner`, which assumes a
+    canonical tree and panics in `assemble_range` on a short leaf (a
+    hand-published chunk set can be non-canonical even though every chunk is
+    individually valid). The walk is bounded: `MAX_JOIN_BYTES` (8 GiB) caps the
+    attacker-chosen root span before anything is allocated (a level-encoded
+    span carries 56 bits, i.e. ~72 PB), and `MAX_JOIN_DEPTH` (64) bounds the
+    recursion. `tests/joiner_hardening.rs` holds the regressions. All download
+    entry points (CLI/daemon/wasm) funnel through it.
   - **Upload** — `encoder.rs` is a port of bee's `hashtrie` writer +
     `redundancy.Params`: it emits the parity chunks and the level-encoded
     intermediate nodes, so a hoverfly upload is byte-identical to a bee gateway

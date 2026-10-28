@@ -2,8 +2,9 @@
 //!
 //! Layered on top of `Transport` (libp2p WS) and nectar primitives. The
 //! retrieval path implements [`nectar_primitives::store::ChunkGet`] over
-//! peerlist-routed requests so that nectar's Joiner can drive multi-chunk
-//! reassembly without knowing about libp2p.
+//! peerlist-routed requests, and reassembly is driven by hoverfly's own
+//! span-driven joiner (`crate::erasure`) rather than nectar's size-driven one,
+//! so a non-canonical tree is rejected instead of trusted.
 
 use core::time::Duration;
 use libp2p::Multiaddr;
@@ -19,7 +20,7 @@ type HoverflyStamper =
     BatchStamper<Box<dyn StampIssuer + Send>, alloy_signer_local::PrivateKeySigner>;
 use nectar_primitives::bmt::DEFAULT_BODY_SIZE;
 use nectar_primitives::chunk::{AnyChunk, ChunkAddress, ContentChunk, SingleOwnerChunk};
-use nectar_primitives::file::{GenericJoiner, split};
+use nectar_primitives::file::split;
 use nectar_primitives::store::{ChunkGet, ChunkStoreError};
 use std::collections::HashMap;
 use thiserror::Error;
@@ -1431,26 +1432,26 @@ pub async fn fetch_bytes_progress(
     join_target(&store, root, concurrency, progress).await
 }
 
-/// Join a BMT reference into its full byte content, transparently handling
-/// **erasure-coded** objects.
+/// Join a BMT reference into its full byte content.
 ///
-/// Since ~bee v2.8.1, gateway uploads are Reed–Solomon erasure coded by default
-/// (see [`crate::erasure`]). Such an object's root chunk encodes a redundancy
-/// level in the top byte of its span, and its intermediate nodes carry parity
-/// references that nectar's plain joiner would mis-traverse as data. So we
-/// first fetch the root chunk (served from the store's cache on the subsequent
-/// join, no extra round-trip) and inspect its span:
+/// One **span-driven** walk handles both object shapes:
 ///
-/// - **level-encoded** → drive the erasure-aware joiner
-///   ([`crate::erasure::fetch_erasure_bytes`]), which fetches each node's data
-///   children and, for any that time out (the exact failure mode of a fresh
-///   upload on a light client — bee#5541), reconstructs them from the node's RS
-///   parity siblings;
-/// - **plain** → drive nectar's `GenericJoiner` as before.
+/// - **erasure-coded** (root span carries a redundancy level — every bee
+///   gateway upload since ~v2.8.1): the walk fetches each node's data children
+///   and, for any that time out (the exact failure mode of a fresh upload on a
+///   light client — bee#5541), reconstructs them from the node's RS parity
+///   siblings;
+/// - **plain** (no level byte): the same walk with zero parity, following each
+///   child's own span.
 ///
-/// The erasure joiner is byte-exact with bee's encoder, so a fully-retrievable
-/// object round-trips identically down either path; the difference only shows
-/// when some data chunks are unretrievable.
+/// The plain case used to run through nectar's `GenericJoiner`, which derives
+/// each child's extent from the *parent's* span and never checks the child
+/// against it. That assumes a canonical tree, which a hand-published chunk set
+/// need not be: a leaf shorter than the size its parent implies makes the
+/// reassembly slice out of bounds, and the process panics rather than
+/// reporting a bad object. Walking by spans and requiring children to cover
+/// their parent exactly (see `erasure::fetch_erasure_bytes_limited`) rejects
+/// such trees instead, so both shapes now share one validated path.
 async fn join_target<'a>(
     store: &NetworkedStore<'a>,
     root: ChunkAddress,
@@ -1458,7 +1459,7 @@ async fn join_target<'a>(
     progress: Option<&ProgressFn>,
 ) -> Result<Vec<u8>, ClientError> {
     // Peek at the root span. `get` populates the store's in-memory cache, so
-    // whichever joiner runs next re-reads the root for free.
+    // the join re-reads the root for free.
     //
     // If the root can't be retrieved at all, fall back to its dispersed
     // replicas before giving up (bee `pkg/replicas`, applied — as bee does —
@@ -1476,72 +1477,32 @@ async fn join_target<'a>(
         store.seed_wire(root, wire);
     }
 
-    if let Ok(root_chunk) = ChunkGet::get(store, &root).await {
-        // `AnyChunk::span()` returns the raw little-endian span as a u64 with
-        // the redundancy-level byte intact.
-        let raw_span = root_chunk.span().to_le_bytes();
-        if crate::erasure::joiner::root_is_erasure_coded(&raw_span) {
-            info!(
-                target: "hoverfly::fetch",
-                "root {} is erasure-coded; using RS-aware joiner",
-                root_chunk.address(),
-            );
-            // Same in-flight budget the plain joiner gets: the erasure path
-            // used to race every sibling of a node at once (up to 128), which
-            // overshoots the session pool's substream capacity and converts
-            // throughput into `stream control` failures and retries.
-            return Ok(crate::erasure::fetch_erasure_bytes_progress(
-                store,
-                root,
-                progress,
-                joiner_concurrency(concurrency),
-            )
-            .await?);
-        }
-    }
+    let root_chunk = ChunkGet::get(store, &root).await?;
 
-    // Plain (non-redundant) object: drive nectar's BMT joiner with a HIGHER
-    // chunks-in-flight count than the per-chunk peer-race width. These are
-    // different knobs: `concurrency` (the store's) is how many peers we race for
-    // ONE chunk — useful while cold for discovery, wasteful once warm (the extra
-    // attempts just consume substream slots). The joiner's concurrency is how
-    // many DISTINCT chunks pull at once, which is the real throughput lever.
-    // Decoupling them (and giving the joiner the larger value via
-    // `joiner_concurrency`) pumps many chunks through the few warm forwarders
-    // instead of redundantly racing each chunk against the whole pool.
-    let joiner =
-        GenericJoiner::<_, nectar_primitives::file::mode::PlainMode, DEFAULT_BODY_SIZE>::new(
-            store, root,
-        )
-        .await?
-        .with_concurrency(joiner_concurrency(concurrency));
+    // `AnyChunk::span()` returns the raw little-endian span as a u64 with the
+    // redundancy-level byte intact.
+    let raw_span = root_chunk.span().to_le_bytes();
+    let (level, span) = crate::erasure::decode_span(&raw_span);
+    info!(
+        target: "hoverfly::fetch",
+        "joining {} ({} bytes, level {level})",
+        root_chunk.address(),
+        span,
+    );
 
-    // Without a progress sink, `read_all()` is the simplest path. With one,
-    // stream leaves by offset and reassemble, reporting bytes as they land so
-    // the CLI can drive a byte-based bar (nectar's joiner has no progress
-    // callback of its own).
-    let Some(cb) = progress else {
-        return Ok(joiner.read_all().await?);
-    };
-
-    use futures::StreamExt as _;
-    let total = joiner.size() as usize;
-    let mut out = vec![0u8; total];
-    let mut done = 0usize;
-    cb(0, total);
-    let mut stream = std::pin::pin!(joiner.into_offset_stream());
-    while let Some(item) = stream.next().await {
-        let (offset, bytes) = item?;
-        let start = offset as usize;
-        let end = (start + bytes.len()).min(total);
-        if start < total {
-            out[start..end].copy_from_slice(&bytes[..end - start]);
-        }
-        done += bytes.len();
-        cb(done.min(total), total);
-    }
-    cb(total, total);
-    Ok(out)
+    // `joiner_concurrency` gives the walk a HIGHER chunks-in-flight count than
+    // the per-chunk peer-race width. These are different knobs: `concurrency`
+    // (the store's) is how many peers we race for ONE chunk — useful while cold
+    // for discovery, wasteful once warm (the extra attempts just consume
+    // substream slots). The joiner's concurrency is how many DISTINCT chunks
+    // pull at once, which is the real throughput lever.
+    Ok(crate::erasure::fetch_erasure_bytes_progress(
+        store,
+        root,
+        progress,
+        joiner_concurrency(concurrency),
+    )
+    .await?)
 }
 
 /// Resolve `path` through the mantaray manifest at `root_hex` and fetch the
