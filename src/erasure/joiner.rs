@@ -44,6 +44,53 @@ pub enum ErasureError {
     Rs(#[from] RsError),
     #[error("erasure: could not recover an intermediate node ({have}/{need} shards available)")]
     Unrecoverable { have: usize, need: usize },
+    /// The root chunk declares more bytes than the caller is willing to
+    /// materialise. Rejected before any buffer of that size is built.
+    #[error("erasure: declared size {span} exceeds the {max}-byte join limit")]
+    TooLarge { span: u64, max: u64 },
+    /// The tree nests deeper than the join limit. A chain of single-reference
+    /// intermediate nodes can be arbitrarily long, and the walk is recursive.
+    #[error("erasure: tree nests deeper than {max} levels")]
+    TooDeep { max: usize },
+}
+
+/// Largest object a single join will materialise, in bytes.
+///
+/// This is a **hard limit on attacker-controlled input**: the root chunk's span
+/// is whatever the publisher put there, and both the output buffer and the
+/// traversal budget are sized from it. Without a cap, one small root chunk can
+/// ask for an allocation up to the 56 bits a level-encoded span can carry
+/// (~72 PB), which aborts the process on allocation failure. 8 GiB is far above
+/// any content a light client is expected to stream into memory, and callers
+/// that need more can pass their own [`JoinLimits`].
+pub const MAX_JOIN_BYTES: u64 = 8 << 30;
+
+/// Deepest tree the walk will descend.
+///
+/// A canonical BMT is at most 9 levels deep (`nectar_primitives::file`
+/// `LEVEL_LIMIT`), so this leaves ample room for mixed-level erasure trees
+/// while still bounding the recursion: a non-canonical tree can chain
+/// single-reference intermediate nodes indefinitely, and each level costs a
+/// stack frame in [`read_node`].
+pub const MAX_JOIN_DEPTH: usize = 64;
+
+/// Bounds applied to one join. Defaults are [`MAX_JOIN_BYTES`] /
+/// [`MAX_JOIN_DEPTH`]; use [`fetch_erasure_bytes_limited`] to override.
+#[derive(Debug, Clone, Copy)]
+pub struct JoinLimits {
+    /// Maximum object size, in bytes, that may be materialised.
+    pub max_bytes: u64,
+    /// Maximum tree depth that may be descended.
+    pub max_depth: usize,
+}
+
+impl Default for JoinLimits {
+    fn default() -> Self {
+        Self {
+            max_bytes: MAX_JOIN_BYTES,
+            max_depth: MAX_JOIN_DEPTH,
+        }
+    }
 }
 
 /// A chunk's full wire form split into its decoded parts.
@@ -114,6 +161,28 @@ pub async fn fetch_erasure_bytes_progress<G>(
 where
     G: WireGet,
 {
+    fetch_erasure_bytes_limited(store, root, progress, in_flight, &JoinLimits::default()).await
+}
+
+/// Like [`fetch_erasure_bytes_progress`], with explicit [`JoinLimits`].
+///
+/// The walk is **span-driven**: every child's extent is read from the child's
+/// own span (as bee does), and each intermediate node's children must cover
+/// exactly that node's span. A tree that doesn't — which a hand-published
+/// chunk set can produce, since each chunk is separately valid — is rejected
+/// instead of being silently truncated or having chunks land at the wrong
+/// offsets. The root's declared span is also what sizes the output, so it is
+/// checked against `limits.max_bytes` before anything is allocated.
+pub async fn fetch_erasure_bytes_limited<G>(
+    store: &G,
+    root: ChunkAddress,
+    progress: Option<&crate::client::ProgressFn>,
+    in_flight: usize,
+    limits: &JoinLimits,
+) -> Result<Vec<u8>, ErasureError>
+where
+    G: WireGet,
+{
     let root_wire = store
         .get_wire(&root)
         .await
@@ -121,7 +190,21 @@ where
     let root_dc = DecodedChunk::from_wire(&root_wire)?;
     let (level, span) = root_dc.level_and_len();
 
-    let mut out = Vec::with_capacity(span as usize);
+    // Refuse an absurd declared size before allocating anything for it. On a
+    // 32-bit target `usize::try_from` also rejects a span that would otherwise
+    // truncate; it must never silently become a smaller buffer.
+    if span > limits.max_bytes {
+        return Err(ErasureError::TooLarge {
+            span,
+            max: limits.max_bytes,
+        });
+    }
+    let total = usize::try_from(span).map_err(|_| ErasureError::TooLarge {
+        span,
+        max: limits.max_bytes,
+    })?;
+
+    let mut out = Vec::with_capacity(total.min(PREALLOC_CAP));
     let root_parity = if level == Level::None {
         0
     } else {
@@ -129,13 +212,12 @@ where
     };
     info!(
         target: "hoverfly::erasure",
-        "joining erasure-coded object: {span} bytes, level {level:?}, root node has {root_parity} parities, \
+        "joining object: {span} bytes, level {level:?}, root node has {root_parity} parities, \
          {in_flight} sibling fetches in flight"
     );
 
     // Wrap the caller's ProgressFn into a reporter closure that tracks total
     // bytes appended and reports (done, span). `None` → a no-op reporter.
-    let total = span as usize;
     let reporter: Box<dyn Fn(usize) + Send + Sync> = match progress {
         Some(cb) => {
             let cb = cb.clone();
@@ -153,13 +235,26 @@ where
         &mut out,
         &*reporter,
         in_flight.max(1),
+        limits,
+        0,
     )
     .await?;
-    // The recursion copies exactly `span` bytes of leaf data in order.
-    out.truncate(span as usize);
+
+    // The traversal must produce exactly the bytes the root declared: a short
+    // (or long) result means the tree's spans don't agree with the root, and
+    // handing it back would silently corrupt the caller's view of the object.
+    if out.len() != total {
+        return Err(ErasureError::Malformed(
+            "assembled length does not match the root chunk's span",
+        ));
+    }
     reporter(out.len());
     Ok(out)
 }
+
+/// Cap on the up-front buffer reservation, so a large-but-permitted declared
+/// span doesn't commit memory before the tree has been validated against it.
+const PREALLOC_CAP: usize = 64 << 20;
 
 /// Boxed recursion future. `Send` on native so a fetch can run inside a
 /// multi-thread `tokio::spawn` (the daemon does this); `!Send` on wasm where the
@@ -188,14 +283,28 @@ fn read_node<'a, G>(
     out: &'a mut Vec<u8>,
     progress: EcProgress<'a>,
     in_flight: usize,
+    limits: &'a JoinLimits,
+    depth: usize,
 ) -> ReadNodeFut<'a>
 where
     G: WireGet,
 {
     Box::pin(async move {
+        // A non-canonical tree can chain single-reference intermediates for as
+        // long as the publisher likes; each level is a stack frame here.
+        if depth > limits.max_depth {
+            return Err(ErasureError::TooDeep {
+                max: limits.max_depth,
+            });
+        }
+
         // Leaf data chunk: its payload IS the file bytes for this range.
+        //
+        // Only `subtrie_size` of it. A leaf whose payload is longer than its own
+        // span is not a leaf we should trust, but taking the declared prefix
+        // keeps `out`'s length tied to the spans rather than to body sizes.
         if subtrie_size <= data.len() as u64 {
-            out.extend_from_slice(data);
+            out.extend_from_slice(&data[..subtrie_size as usize]);
             progress(out.len());
             return Ok(());
         }
@@ -219,8 +328,26 @@ where
         // cover an equal, maximal span; the last covers the remainder. We read
         // that directly off the child chunk's decoded span, which is
         // authoritative and matches bee (`chunkToSpan(ch.Data())`).
+        //
+        // Following each child's own span (rather than assuming a uniform one
+        // from the parent) is what makes the walk immune to a tree whose shape
+        // doesn't match its declared spans — but only if the spans are then
+        // checked to cover the parent exactly. Otherwise a short tree yields a
+        // short file and a long one has bytes placed at the wrong offsets, both
+        // without an error.
+        let mut covered = 0u64;
         for child in children.iter().take(shard_cnt) {
             let (child_level, child_span) = child.level_and_len();
+            covered = covered
+                .checked_add(child_span)
+                .ok_or(ErasureError::Malformed(
+                    "child spans overflow the parent span",
+                ))?;
+            if covered > subtrie_size {
+                return Err(ErasureError::Malformed(
+                    "child spans exceed the parent node's span",
+                ));
+            }
             let child_parity = if child_level == Level::None {
                 0
             } else {
@@ -234,8 +361,15 @@ where
                 out,
                 progress,
                 in_flight,
+                limits,
+                depth + 1,
             )
             .await?;
+        }
+        if covered != subtrie_size {
+            return Err(ErasureError::Malformed(
+                "child spans do not cover the parent node's span",
+            ));
         }
 
         Ok(())
@@ -466,9 +600,10 @@ fn decode_wire(wire: &[u8]) -> Result<DecodedChunk, ErasureError> {
     })
 }
 
-/// Whether a fetched root chunk's span carries an erasure-coding level, meaning
-/// the object must be joined with [`fetch_erasure_bytes`] rather than the plain
-/// nectar joiner. `root_span` is the raw 8-byte little-endian span.
+/// Whether a fetched root chunk's span carries an erasure-coding level.
+///
+/// Informational only: the join handles both shapes, so callers no longer need
+/// to pick a joiner from this.
 pub fn root_is_erasure_coded(root_span: &[u8]) -> bool {
     is_level_encoded(root_span)
 }
