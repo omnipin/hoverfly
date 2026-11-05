@@ -430,10 +430,16 @@ pub async fn run(
             // Fire the lazy `ensure_pool` immediately. After it
             // returns, the warm pool is open and subsequent uploads
             // skip the fill.
+            // A failed fill must not end this task: the maintenance loop
+            // below is the only thing that rebuilds the pool (uploads only
+            // read it), so returning here left the daemon without one until
+            // restart.
+            const FILL_RETRY: std::time::Duration = std::time::Duration::from_secs(30);
+            let mut next_fill = web_time::Instant::now();
             if let Err(e) = ensure_pool(&state).await {
                 warn!(target: "hoverfly::daemon",
-                    "eager pool fill failed: {e} (will retry lazily on first request)");
-                return;
+                    "eager pool fill failed: {e} (retrying every {}s)", FILL_RETRY.as_secs());
+                next_fill += FILL_RETRY;
             }
             // Maintenance tick. Bee RSTs most random-overlay
             // connections within seconds (see PERFORMANCE.md "Session-
@@ -479,6 +485,15 @@ pub async fn run(
                     idle_secs
                 };
                 tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+                if state.pool.read().await.is_none() {
+                    if web_time::Instant::now() >= next_fill
+                        && let Err(e) = ensure_pool(&state).await
+                    {
+                        debug!(target: "hoverfly::daemon", "pool fill retry failed: {e}");
+                        next_fill = web_time::Instant::now() + FILL_RETRY;
+                    }
+                    continue;
+                }
                 if let Err(e) = maintain_pool(&state).await {
                     debug!(target: "hoverfly::daemon",
                         "pool maintenance tick failed: {e}");
