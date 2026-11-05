@@ -659,8 +659,8 @@ enum Commands {
         /// Multiple bootnodes are useful because bee performs
         /// kademlia bin-saturation gating at the handshake substream:
         /// our overlay can be silently rejected by one peer (the
-        /// `/swarm/handshake/14.0.0/handshake` substream returns
-        /// `UnsupportedProtocol` even though identify completed),
+        /// handshake substream is refused even though identify
+        /// completed),
         /// while a peer in a different bin accepts us. Listing a
         /// handful of stable peers across different ASes / regions
         /// makes cold-start robust against this random rejection.

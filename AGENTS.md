@@ -296,14 +296,13 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   amplifier); fail-closed eviction. Cannot reuse `ratelimit.rs` for this
   reason.
 - `src/protocols/` — bee wire protocols. Current on-wire ids:
-  `handshake` `15.0.0` (+ `14.0.0` fallback), `hive` `2.0.0` (+ `1.1.0`),
-  `pricing` `1.0.0`, `pseudosettle` `1.0.0`, `pushsync` `1.3.1`,
-  `retrieval` `1.4.0`, `swap` `1.0.0`, `status` `1.1.3`; plus `framing`
-  and the vendored `stream_pool`. `handshake` and `hive` support two
-  versions concurrently (bee 2.8.0 raised handshake `14→15` and hive
-  `1.1→2.0` as a network-wide upgrade, May 2026): outbound tries v15/v2
-  first and falls back on `UnsupportedProtocol`; inbound accepts both ids in
-  parallel. The `Version` enum on each module disambiguates downstream. The
+  `handshake` `15.0.0`, `hive` `2.0.0`, `pricing` `1.0.0`,
+  `pseudosettle` `1.0.0`, `pushsync` `1.3.1`, `retrieval` `1.4.0`,
+  `swap` `1.0.0`, `status` `1.1.3`; plus `framing` and the vendored
+  `stream_pool`. Bee 2.8.0 raised handshake `14→15` and hive `1.1→2.0` as a
+  network-wide upgrade (May 2026); the old versions were dropped in
+  November 2026 once no pre-2.8 nodes remained (bee only accepts a protocol
+  id with the same major version, so 2.8.x refuses `14.0.0` outright). The
   `status` responder is inbound-only; bee's `pkg/salud` probes us to decide
   whether to mark us Healthy in its kademlia metrics collector.
 - `src/bridge.rs` — `#[cfg(all(not(target_arch = "wasm32"), feature =
@@ -481,7 +480,7 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   `CompletionPolicy::Group` is the seam for erasure-coded upload — a codeword
   completes at `need` acks, the same rule `erasure::joiner` uses on read.
 - `src/signer.rs` — `SwarmSigner`: overlay derivation, handshake signing
-  (v14 + cached v15), eth-address recovery. See "Bee 2.8.0 protocol support".
+  (cached v15), eth-address recovery. See "Bee 2.8.0 protocol support".
 - `src/wasm.rs` — `wasm-bindgen` façade (`HoverflyClient`): `start`/`stop`,
   peer load/merge/export, `prewarmSessions`, `enableChunkStore`,
   `discover`/`fetch`/`fetchManifestPath`/`listManifest`,
