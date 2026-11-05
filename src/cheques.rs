@@ -152,6 +152,13 @@ impl ChequeStore {
         Ok(next)
     }
 
+    /// Undo a [`Self::bump_and_get`] whose result never reached disk (and so
+    /// was never sent). The only sanctioned way to lower a cumulative.
+    pub fn revert_unsaved_bump(&mut self, peer_overlay_hex: &str, previous: u128) {
+        self.payouts
+            .insert(peer_overlay_hex.to_lowercase(), previous);
+    }
+
     /// Atomically persist via write-rename. Cheap; the file is tiny
     /// (~50 bytes per peer we've ever paid). Called from the same
     /// `apply_log`-style flush path peers.json uses.
