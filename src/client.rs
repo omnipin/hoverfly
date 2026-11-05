@@ -914,7 +914,9 @@ impl<'a> NetworkedStore<'a> {
                     // long-term reachability score) and do NOT log a warn (it
                     // produces a firehose of noise at ~37/sec under
                     // multi-chunk concurrency).
-                    Err(TransportError::DialTooSoon { .. }) => {
+                    // Overdraft = our credit with this peer is used up until
+                    // the next pseudosettle; same treatment.
+                    Err(TransportError::DialTooSoon { .. } | TransportError::Overdraft) => {
                         (peer, overlay, AttemptOutcome::Deferred)
                     }
                     // Connection closed mid-fetch (e.g. bee closed our session
