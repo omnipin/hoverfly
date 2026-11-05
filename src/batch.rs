@@ -1113,6 +1113,39 @@ sol! {
     // any (incentives §11.2).
     function liquidBalanceFor(address beneficiary) external view returns (uint256);
     function deployedContracts(address who) external view returns (bool);
+    // PriceOracle.getPrice() returns (price, chequeValueDeduction).
+    function getPrice() external view returns (uint256, uint256);
+}
+
+/// SWAP `PriceOracle` per chain (`bee/pkg/config/chain.go`
+/// `SwapPriceOracleAddress`). Bee refuses to issue a cheque at any other
+/// exchange rate (`swapprotocol.go` `ErrNegotiateRate`).
+pub fn swap_price_oracle_for_chain(chain_id: u64) -> Option<Address> {
+    let s = match chain_id {
+        100 => "0xA57A50a831B31c904A770edBCb706E03afCdbd94",
+        11155111 => "0x1814e9b3951Df0CB8e12b2bB99c5594514588936",
+        _ => return None,
+    };
+    s.parse().ok()
+}
+
+/// Read the SWAP exchange rate (BZZ base units per accounting unit) and
+/// cheque-value deduction from the price oracle.
+pub async fn read_swap_rates(rpc_url: &str, oracle: Address) -> Result<(U256, U256), BatchError> {
+    let r = EthRpc::new(rpc_url.to_string())
+        .call_view(oracle, getPriceCall {})
+        .await?;
+    Ok((r._0, r._1))
+}
+
+/// Read a chequebook's `issuer()`: the only key whose cheques it honours.
+pub async fn read_chequebook_issuer(
+    rpc_url: &str,
+    chequebook: Address,
+) -> Result<Address, BatchError> {
+    EthRpc::new(rpc_url.to_string())
+        .call_view(chequebook, issuerCall {})
+        .await
 }
 
 /// Canonical `SimpleSwapFactory` per chain (`bee/pkg/config/chain.go:66,89`).
