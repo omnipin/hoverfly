@@ -2,18 +2,22 @@
 
 # hoverfly
 
-Experimental [Swarm][swarm] light client. Upload and download files to decentralized storage natively and in a browser.
+Experimental [Swarm][swarm] light client. Upload and download files to
+decentralized storage natively and in a browser.
 
 [swarm]: https://www.ethswarm.org/
 
 ## Features
 
 - **Light node functionality.** End-to-end content upload and download.
-- **Browser-friendly.** upload files from your browser using the [demo](https://hoverfly.bzz.link) and integrate into your web app with [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) .
-- **Collection support.** Upload, download and list content-addressable tarballs.
-- **Erasure coding.** Reed–Solomon redundancy on both upload and download.
+- **Browser-friendly.** upload files from your browser using the
+  [demo](https://hoverfly.bzz.link) and integrate into your web app with
+  [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) .
+- **Collection support.** Upload, download and list content-addressable
+  tarballs.
 - **Onchain postage batch creation.** Buy storage straight from the CLI.
-- **Multiple modes** Static commands for simplicity, daemon mode for warm connection pool, pusher nodes for splitting content signing and upload.
+- **Multiple modes** Static commands for simplicity, daemon mode for warm
+  connection pool, pusher nodes for splitting content signing and upload.
 - **Cross-platform.** Compiles to WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
 - **Small size.** 5MB gzipped, 14MB unpacked x86 Linux binary.
 - **CI-friendly.** ~400-500KB/s uploads in GitHub Actions.
@@ -40,42 +44,45 @@ cargo install --git https://github.com/omnipin/hoverfly
 
 ### 1. Generate a key
 
-Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is
-your long-lived signer. Bee uses the derived Ethereum address to
-recognize you across reconnects, route cheques, and verify your
-postage stamps.
+Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is your
+long-lived signer. Bee uses the derived Ethereum address to recognize you across
+reconnects, route cheques, and verify your postage stamps.
 
 ```bash
 cast wallet new
 ```
 
-Save the printed `Private key` and `Address` — both are useful (the
-key for `--key`/`--identity`, the address for funding xDAI + BZZ).
+Save the printed `Private key` and `Address` — both are useful (the key for
+`--key`/`--identity`, the address for funding xDAI + BZZ).
 
 ### 2. Generate a vanity overlay nonce
 
-Your Swarm overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A
-random nonce works, but most random overlays land in bee's already-full
-low kademlia bins and get dropped right after the handshake. `hoverfly
-vanity-overlay` searches for a nonce that puts you in deeper,
-undersaturated bins instead. Anchoring against a few stable peers
-(`--target-overlay`) roughly **doubles** upload throughput.
+Your Swarm overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A random nonce
+works, but most random overlays land in bee's already-full low kademlia bins and
+get dropped right after the handshake. `hoverfly
+vanity-overlay` searches for a
+nonce that puts you in deeper, undersaturated bins instead. Anchoring against a
+few stable peers (`--target-overlay`) roughly **doubles** upload throughput.
 
 ```bash
 hoverfly vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
 ```
 
-One-time, CPU-bound (seconds to minutes). The resulting `overlay-nonce` is your Swarm identity together with `--key` — keep it.
+One-time, CPU-bound (seconds to minutes). The resulting `overlay-nonce` is your
+Swarm identity together with `--key` — keep it.
 
 ### 3. Obtain xDAI + BZZ on Gnosis
 
-The address from step 1 needs a little xDAI (for gas) and some BZZ (to fund the batch). The optional `bridge` command obtains both via [Relay](https://docs.relay.link) — for example, from USDC on Base:
+The address from step 1 needs a little xDAI (for gas) and some BZZ (to fund the
+batch). The optional `bridge` command obtains both via
+[Relay](https://docs.relay.link) — for example, from USDC on Base:
 
 ```bash
 hoverfly bridge --from-chain base --from-token USDC --amount 3 --to both --rpc-url https://mainnet.base.org --key 0xYOUR_KEY
 ```
 
-`--from-token` takes a symbol (resolved to the canonical address automatically) or a raw `0x` address.
+`--from-token` takes a symbol (resolved to the canonical address automatically)
+or a raw `0x` address.
 
 ### 4. Create a postage batch
 
@@ -85,10 +92,13 @@ Once the address holds xDAI + BZZ:
 hoverfly batch create --rpc-url https://rpc.gnosischain.com --key 0xYOUR_KEY --size 2GB --duration 30d
 ```
 
-`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via the same formulas as the [official postage stamp
-calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators).
+`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via the same
+formulas as the
+[official postage stamp calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators).
 
-The on-chain `BatchCreated` event takes 1-3 minutes to propagate to the bee nodes that'll accept your stamps. Poll [Swarmscan](https://swarmscan.io/) until it 200s:
+The on-chain `BatchCreated` event takes 1-3 minutes to propagate to the bee
+nodes that'll accept your stamps. Poll [Swarmscan](https://swarmscan.io/) until
+it 200s:
 
 ```bash
 curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
@@ -98,9 +108,17 @@ curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
 
 ### 5. Run the daemon
 
-A long-lived daemon holds a warm session pool across uploads, so it pays the pool-fill cost once at startup instead of on every upload — a big win for repeated or one-shot-heavy workloads. For a single upload you can skip this step and pass `--peerlist` directly to `hoverfly upload`.
+A long-lived daemon holds a warm session pool across uploads, so it pays the
+pool-fill cost once at startup instead of on every upload — a big win for
+repeated or one-shot-heavy workloads. For a single upload you can skip this step
+and pass `--peerlist` directly to `hoverfly upload`.
 
-Startup cost depends on how warm the peerlist is. On a cold or stale `peers.json` the daemon runs a bootnode discover round before filling the pool; on a warm one (enough recently-reachable peers) it skips discover automatically and fills straight from the peerlist, opening the pool in well under a second. The daemon persists reachability observations on shutdown, so a node that has run before restarts warm.
+Startup cost depends on how warm the peerlist is. On a cold or stale
+`peers.json` the daemon runs a bootnode discover round before filling the pool;
+on a warm one (enough recently-reachable peers) it skips discover automatically
+and fills straight from the peerlist, opening the pool in well under a second.
+The daemon persists reachability observations on shutdown, so a node that has
+run before restarts warm.
 
 ```bash
 hoverfly daemon --socket /tmp/hoverfly.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
