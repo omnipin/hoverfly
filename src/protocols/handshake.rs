@@ -1,20 +1,14 @@
-//! Bee handshake protocol.
+//! Bee handshake protocol, `/swarm/handshake/15.0.0/handshake`
+//! (bee 2.8.0+).
 //!
-//! Two on-wire versions are supported:
+//! `BzzAddress` carries `nonce`, `timestamp` and `chequebook_address`,
+//! all of which are part of the signed payload. `Ack.nonce` is unused
+//! (the nonce inside the embedded BzzAddress is canonical).
 //!
-//!   * v14 — `/swarm/handshake/14.0.0/handshake`, used by bee ≤ 2.7.x.
-//!     `BzzAddress = { underlay, signature, overlay }`; signature is
-//!     over `"bee-handshake-" || underlay || overlay || network_id_BE_8`.
-//!     `Ack.nonce` carries the overlay nonce out-of-band.
+//! The pre-2.8.0 `14.0.0` handshake is not supported: bee 2.8.x refuses
+//! it, so no peer that speaks only v14 can reach the rest of mainnet.
 //!
-//!   * v15 — `/swarm/handshake/15.0.0/handshake`, introduced in bee 2.8.0
-//!     (network-wide upgrade; old nodes no longer interoperate with new
-//!     ones). `BzzAddress` gains `nonce`, `timestamp`, and
-//!     `chequebook_address` fields, all of which are now part of the
-//!     signed payload. `Ack.nonce` becomes unused (the nonce inside the
-//!     embedded BzzAddress is canonical).
-//!
-//! Wire flow (client -> server) is identical between versions:
+//! Wire flow (client -> server):
 //!   1. Send `Syn { observed_underlay }`.
 //!   2. Receive `SynAck { syn, ack }`.
 //!   3. Send `Ack { address: BzzAddress, network_id, full_node, ... }`.
@@ -23,7 +17,7 @@
 //! advertises is chosen by the caller (`transport.rs` passes
 //! `full_node = true` — a deliberate throughput/accounting tactic, see
 //! that call site's comment). We run no on-chain chequebook, so we
-//! always send the zero `chequebook_address` in v15 to signal "no
+//! always send the zero `chequebook_address` to signal "no
 //! chequebook"; that's safe under either `full_node` value because bee's
 //! chequebook-verification gate only fires when the *peer* runs
 //! `--chequebook-verification` AND we advertise `full_node = true` — and
@@ -35,19 +29,7 @@ use crate::signer::SwarmSigner;
 use libp2p::{Multiaddr, PeerId};
 use thiserror::Error;
 
-/// Protocol identifier for the bee 2.8.0+ handshake. The micro-client
-/// upgrades to this when both sides agree at the libp2p multistream
-/// level; otherwise it falls back to v14.
-pub const PROTOCOL_V15: &str = "/swarm/handshake/15.0.0/handshake";
-
-/// Protocol identifier for the bee 2.7.x and older handshake.
-/// Kept for legacy peers that haven't upgraded yet.
-pub const PROTOCOL_V14: &str = "/swarm/handshake/14.0.0/handshake";
-
-/// Default-current protocol. Existing callers that don't yet thread the
-/// version through use this; once they do, prefer the explicit
-/// [`PROTOCOL_V14`] or [`PROTOCOL_V15`] consts.
-pub const PROTOCOL: &str = PROTOCOL_V15;
+pub const PROTOCOL: &str = "/swarm/handshake/15.0.0/handshake";
 
 #[derive(Debug, Error)]
 pub enum HandshakeError {
@@ -61,26 +43,8 @@ pub enum HandshakeError {
     MissingAddress,
     #[error("network id mismatch: ours={ours}, theirs={theirs}")]
     NetworkIdMismatch { ours: u64, theirs: u64 },
-    #[error("v15 timestamp out of range or invalid: {0}")]
+    #[error("timestamp out of range or invalid: {0}")]
     TimestampInvalid(i64),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Version {
-    V14,
-    V15,
-}
-
-impl Version {
-    /// Map a negotiated multistream protocol id back to a version
-    /// enum. Returns `None` for unknown ids.
-    pub fn from_protocol(proto: &str) -> Option<Self> {
-        match proto {
-            PROTOCOL_V14 => Some(Self::V14),
-            PROTOCOL_V15 => Some(Self::V15),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -90,11 +54,10 @@ pub struct HandshakeResult {
     pub peer_eth_signature: Vec<u8>,
     pub peer_full_node: bool,
     pub peer_nonce: Vec<u8>,
-    /// Bee v15 timestamp from the peer's BzzAddress. Always 0 for v14
-    /// peers (the field doesn't exist in v14).
+    /// Timestamp from the peer's BzzAddress.
     pub peer_timestamp: i64,
-    /// Bee v15 chequebook address from the peer's BzzAddress. 20-byte
-    /// zero address means "no chequebook" or v14 peer.
+    /// Chequebook address from the peer's BzzAddress. 20-byte zero
+    /// address means "no chequebook".
     pub peer_chequebook: [u8; 20],
     /// Recovered 20-byte Ethereum address of the peer (their cheque
     /// beneficiary). `None` if recovery failed (malformed signature);
@@ -108,25 +71,16 @@ pub struct HandshakeResult {
     pub our_underlay: Vec<u8>,
     /// 65-byte EIP-191 signature over our handshake payload. Stored
     /// alongside `our_underlay` so the caller can rebuild the same
-    /// `BzzAddress { underlay, signature, overlay, [nonce, timestamp,
-    /// chequebook]}` we sent in the Ack, without recomputing.
+    /// `BzzAddress { underlay, signature, overlay, nonce, timestamp,
+    /// chequebook }` we sent in the Ack, without recomputing.
     pub our_signature: Vec<u8>,
-    /// v15 timestamp we put in our outgoing BzzAddress. 0 when we
-    /// negotiated v14. Stored so the caller can replay the exact same
-    /// signed record over hive without resigning.
+    /// Timestamp we put in our outgoing BzzAddress. Stored so the
+    /// caller can replay the exact same signed record over hive
+    /// without resigning.
     pub our_timestamp: i64,
-    /// Protocol version actually negotiated. Tells the caller whether
-    /// the v15-specific fields in this struct were sent on the wire.
-    pub version: Version,
 }
 
 /// Run the bee handshake on an open libp2p stream.
-///
-/// `version` is the negotiated multistream protocol version. Callers
-/// pick this based on the substream id their `open_stream` resolved
-/// to; if you only opened by id with no fallback path, just pass
-/// [`Version::V15`] and let v14 peers reject upstream at the
-/// multistream layer.
 ///
 /// `observed_underlay` is the multiaddr we observed for the remote peer
 /// (just the underlay portion, e.g. `/ip4/x.x.x.x/tcp/443/wss/p2p/<id>`).
@@ -144,7 +98,6 @@ pub async fn run<S>(
     advertised_underlay: Option<&Multiaddr>,
     our_peer_id: &PeerId,
     our_full_node: bool,
-    version: Version,
 ) -> Result<HandshakeResult, HandshakeError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
@@ -181,58 +134,33 @@ where
     // gate stays dormant and the zero chequebook is accepted.
     let our_chequebook = [0u8; 20];
 
-    let (our_signature, our_timestamp, our_addr) = match version {
-        Version::V14 => {
-            let sig = signer.sign_handshake(&our_underlay)?.to_vec();
-            (
-                sig.clone(),
-                0i64,
-                pb::BzzAddress {
-                    underlay: our_underlay.clone(),
-                    signature: sig,
-                    overlay: signer.overlay().to_vec(),
-                    nonce: Vec::new(),
-                    timestamp: 0,
-                    chequebook_address: Vec::new(),
-                },
-            )
-        }
-        Version::V15 => {
-            // Cached `(timestamp, signature)` per `(our_underlay,
-            // our_chequebook)`. First call signs fresh; subsequent calls
-            // replay the same record. See
-            // `SwarmSigner::sign_handshake_v15_cached` for why bee 2.8.0
-            // requires this — repeatedly bumping the timestamp on every
-            // reconnect ages our overlay out of other bees' addressbooks
-            // via the `MinimumUpdateInterval` gossip-reject path.
-            let (timestamp, sig_bytes) =
-                signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
-            if timestamp <= 0 {
-                return Err(HandshakeError::TimestampInvalid(timestamp));
-            }
-            let sig = sig_bytes.to_vec();
-            (
-                sig.clone(),
-                timestamp,
-                pb::BzzAddress {
-                    underlay: our_underlay.clone(),
-                    signature: sig,
-                    overlay: signer.overlay().to_vec(),
-                    nonce: signer.nonce().to_vec(),
-                    timestamp,
-                    chequebook_address: our_chequebook.to_vec(),
-                },
-            )
-        }
+    // Cached `(timestamp, signature)` per `(our_underlay,
+    // our_chequebook)`. First call signs fresh; subsequent calls replay
+    // the same record. See `SwarmSigner::sign_handshake_v15_cached` for
+    // why bee 2.8.0 requires this — repeatedly bumping the timestamp on
+    // every reconnect ages our overlay out of other bees' addressbooks
+    // via the `MinimumUpdateInterval` gossip-reject path.
+    let (our_timestamp, sig_bytes) =
+        signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
+    if our_timestamp <= 0 {
+        return Err(HandshakeError::TimestampInvalid(our_timestamp));
+    }
+    let our_signature = sig_bytes.to_vec();
+    let our_addr = pb::BzzAddress {
+        underlay: our_underlay.clone(),
+        signature: our_signature.clone(),
+        overlay: signer.overlay().to_vec(),
+        nonce: signer.nonce().to_vec(),
+        timestamp: our_timestamp,
+        chequebook_address: our_chequebook.to_vec(),
     };
 
     let ack = pb::Ack {
         address: Some(our_addr),
         network_id,
         full_node: our_full_node,
-        // v14 ack-level nonce. v15 ignores this field (the canonical
-        // nonce lives inside BzzAddress), but proto3 forces us to fill
-        // it. Sending the real nonce is harmless either way.
+        // Unused by bee (the canonical nonce lives inside BzzAddress),
+        // but sending the real nonce is harmless.
         nonce: signer.nonce().to_vec(),
         welcome_message: String::new(),
     };
@@ -244,50 +172,33 @@ where
     let mut peer_overlay = [0u8; 32];
     peer_overlay.copy_from_slice(&their_addr.overlay);
 
-    // Per-version peer-record interpretation.
-    // v14: nonce comes from Ack.nonce; timestamp + chequebook absent.
-    // v15: nonce/timestamp/chequebook all inside BzzAddress and
-    //      covered by the signature.
-    let (peer_nonce_vec, peer_timestamp, peer_chequebook) = match version {
-        Version::V14 => (their_ack.nonce.clone(), 0i64, [0u8; 20]),
-        Version::V15 => {
-            let mut cb = [0u8; 20];
-            if their_addr.chequebook_address.len() == 20 {
-                cb.copy_from_slice(&their_addr.chequebook_address);
-            }
-            (their_addr.nonce.clone(), their_addr.timestamp, cb)
-        }
-    };
+    // Nonce, timestamp and chequebook all live inside BzzAddress and
+    // are covered by the signature.
+    let peer_nonce_vec = their_addr.nonce.clone();
+    let peer_timestamp = their_addr.timestamp;
+    let mut peer_chequebook = [0u8; 20];
+    if their_addr.chequebook_address.len() == 20 {
+        peer_chequebook.copy_from_slice(&their_addr.chequebook_address);
+    }
 
     // Recover the peer's Ethereum address from the BzzAddress
     // signature so we can use it as the cheque beneficiary later.
     // Best-effort: a malformed signature shouldn't fail the handshake
     // (the peer is otherwise usable for pseudosettle-only).
-    let peer_eth_address = match version {
-        Version::V14 => crate::signer::recover_eth_address_from_handshake(
-            &their_addr.underlay,
-            &peer_overlay,
-            network_id,
-            &their_addr.signature,
-        )
-        .ok(),
-        Version::V15 => {
-            let mut nonce32 = [0u8; 32];
-            if peer_nonce_vec.len() == 32 {
-                nonce32.copy_from_slice(&peer_nonce_vec);
-            }
-            crate::signer::recover_eth_address_from_handshake_v15(
-                &their_addr.underlay,
-                &peer_overlay,
-                network_id,
-                &nonce32,
-                peer_timestamp,
-                &peer_chequebook,
-                &their_addr.signature,
-            )
-            .ok()
-        }
-    };
+    let mut nonce32 = [0u8; 32];
+    if peer_nonce_vec.len() == 32 {
+        nonce32.copy_from_slice(&peer_nonce_vec);
+    }
+    let peer_eth_address = crate::signer::recover_eth_address_from_handshake_v15(
+        &their_addr.underlay,
+        &peer_overlay,
+        network_id,
+        &nonce32,
+        peer_timestamp,
+        &peer_chequebook,
+        &their_addr.signature,
+    )
+    .ok();
 
     Ok(HandshakeResult {
         peer_overlay,
@@ -301,7 +212,6 @@ where
         our_underlay,
         our_signature,
         our_timestamp,
-        version,
     })
 }
 

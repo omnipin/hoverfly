@@ -958,7 +958,7 @@ async fn ensure_pool(state: &Arc<State>) -> Result<Arc<SessionPool>, ClientError
     if let Some(doh) = state.doh.as_ref().filter(|_| !skip_discover) {
         // Iterate every configured bootnode, accumulating their
         // hive responses. A peer that bin-saturates and rejects our
-        // /swarm/handshake/14.0.0/handshake substream contributes
+        // handshake substream contributes
         // zero peers; the next bootnode in the list typically
         // succeeds, so we still warm a candidate set.
         use std::collections::HashSet;

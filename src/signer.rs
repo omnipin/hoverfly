@@ -3,8 +3,9 @@
 //! Wraps an alloy-local secp256k1 key and exposes:
 //! - the 20-byte Ethereum address,
 //! - the 32-byte Swarm overlay (`keccak256(eth_addr || network_id_LE_8 || nonce_32)`),
-//! - a `sign_handshake` that signs `"bee-handshake-" || underlay || overlay || network_id_BE_8`
-//!   with an EIP-191 prefix and produces a 65-byte (r || s || v) signature where v ∈ {27, 28}.
+//! - a `sign_handshake_v15` that signs `"bee-handshake-" || underlay || overlay ||
+//!   network_id_BE_8 || nonce || timestamp_BE_8 || chequebook_address` with an EIP-191 prefix
+//!   and produces a 65-byte (r || s || v) signature where v ∈ {27, 28}.
 
 use alloy_signer::SignerSync;
 use alloy_signer_local::PrivateKeySigner;
@@ -191,14 +192,6 @@ impl SwarmSigner {
         &self.inner
     }
 
-    /// Sign bee handshake payload (v14 / pre-bee-2.8.0 format).
-    /// Payload: `b"bee-handshake-" || underlay || overlay || network_id_BE_8`.
-    /// Returns 65-byte (r || s || v) signature with v ∈ {27, 28}.
-    pub fn sign_handshake(&self, underlay: &[u8]) -> Result<[u8; 65], SignerError> {
-        let payload = generate_sign_data(underlay, &self.overlay, self.network_id);
-        self.sign_eip191(&payload)
-    }
-
     /// Sign bee handshake payload (v15 / bee 2.8.0+ format).
     /// Payload:
     ///   `b"bee-handshake-" || underlay || overlay || network_id_BE_8
@@ -366,17 +359,6 @@ pub fn derive_overlay(eth_address: &[u8; 20], network_id: u64, nonce: &[u8; 32])
     h.finalize().into()
 }
 
-/// v14 / pre-bee-2.8.0 handshake sign payload:
-/// `b"bee-handshake-" || underlay || overlay || network_id_BE_8`
-pub fn generate_sign_data(underlay: &[u8], overlay: &[u8; 32], network_id: u64) -> Vec<u8> {
-    let mut data = Vec::with_capacity(14 + underlay.len() + 32 + 8);
-    data.extend_from_slice(b"bee-handshake-");
-    data.extend_from_slice(underlay);
-    data.extend_from_slice(overlay);
-    data.extend_from_slice(&network_id.to_be_bytes());
-    data
-}
-
 /// v15 / bee-2.8.0+ handshake sign payload:
 /// `b"bee-handshake-" || underlay || overlay || network_id_BE_8
 ///   || nonce_32 || timestamp_BE_8 || chequebook_address_20`
@@ -405,34 +387,21 @@ pub fn generate_sign_data_v15(
     data
 }
 
-/// Recover the Ethereum address of the signer of a bee v14 BzzAddress.
+/// Recover the Ethereum address of the signer of a bee v15 BzzAddress
+/// (bee 2.8.0+).
 ///
 /// Bee's `bzz/address.go::ParseAddress` does exactly this: it recovers
-/// the secp256k1 public key from the EIP-191-prefixed `generate_sign_data`
-/// payload + signature and converts it to a 20-byte Ethereum address
-/// via `keccak256(pubkey)[12..]`. We need this for SWAP cheque issuance
-/// because the cheque's `Beneficiary` field is the peer's Ethereum
-/// address, and bee will only accept a cheque whose beneficiary matches
-/// what it derived from our own BzzAddress signature — symmetrically,
-/// we use *its* signature to derive the address we put in cheques we
-/// send to it.
+/// the secp256k1 public key from the EIP-191-prefixed
+/// [`generate_sign_data_v15`] payload + signature and converts it to a
+/// 20-byte Ethereum address via `keccak256(pubkey)[12..]`. We need this
+/// for SWAP cheque issuance because the cheque's `Beneficiary` field is
+/// the peer's Ethereum address, and bee will only accept a cheque whose
+/// beneficiary matches what it derived from our own BzzAddress
+/// signature — symmetrically, we use *its* signature to derive the
+/// address we put in cheques we send to it.
 ///
 /// `signature` is the 65-byte `r || s || v` from `BzzAddress.signature`,
 /// with `v` in Ethereum form (27 or 28).
-pub fn recover_eth_address_from_handshake(
-    underlay: &[u8],
-    overlay: &[u8; 32],
-    network_id: u64,
-    signature: &[u8],
-) -> Result<[u8; 20], SignerError> {
-    let payload = generate_sign_data(underlay, overlay, network_id);
-    recover_eth_from_eip191(&payload, signature)
-}
-
-/// Recover the Ethereum address of the signer of a bee v15 BzzAddress
-/// (bee 2.8.0+). Mirrors v14's [`recover_eth_address_from_handshake`]
-/// but uses the v15 sign payload that includes nonce, timestamp, and
-/// chequebook address.
 pub fn recover_eth_address_from_handshake_v15(
     underlay: &[u8],
     overlay: &[u8; 32],
