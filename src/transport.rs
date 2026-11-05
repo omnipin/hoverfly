@@ -241,6 +241,36 @@ pub fn classify_io_error(e: &std::io::Error) -> String {
     format!("other:{}", trimmed)
 }
 
+/// What a failed push or fetch did to bee's ledger for us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebitFate {
+    /// Bee wrote a valid receipt, so it applied the debit; the failure is
+    /// our own check on that receipt. Counts as balance.
+    Applied,
+    /// Bee never prepared a debit: the stream never opened, or bee
+    /// answered with an error receipt (`pushsync.go` writes those from
+    /// its deferred error path, before `PrepareDebit`).
+    NotPrepared,
+    /// We gave up or lost the stream mid-push. If bee had prepared a
+    /// debit, its receipt write failed and `debitAction.Cleanup` moved
+    /// the price into `ghostBalance`.
+    Unknown,
+}
+
+fn debit_fate(e: &TransportError) -> DebitFate {
+    use crate::protocols::pushsync::PushsyncError;
+    use crate::protocols::retrieval::RetrievalError;
+    match e {
+        // Bee wrote a delivery/receipt; our own check on it failed.
+        TransportError::Pushsync(PushsyncError::ReceiptMismatch(_))
+        | TransportError::Retrieval(RetrievalError::Empty) => DebitFate::Applied,
+        TransportError::Pushsync(PushsyncError::Peer(_))
+        | TransportError::Retrieval(RetrievalError::Peer(_))
+        | TransportError::StreamControl(_) => DebitFate::NotPrepared,
+        _ => DebitFate::Unknown,
+    }
+}
+
 pub fn is_connection_dead(e: &TransportError) -> bool {
     use crate::protocols::pushsync::PushsyncError;
     match e {
@@ -561,6 +591,11 @@ pub enum TransportError {
     /// a single peer's rate-limit window. See [`crate::ratelimit`].
     #[error("dial too soon (try again in {wait:?})")]
     DialTooSoon { wait: Duration },
+    /// The request would push our debt to this peer past the credit we
+    /// allow ourselves, even after settling. Transient: retry later or use
+    /// another peer.
+    #[error("peer credit exhausted (settling)")]
+    Overdraft,
 }
 
 #[derive(Clone, Debug)]
@@ -1035,6 +1070,23 @@ enum SessionCommand {
     },
 }
 
+impl SessionCommand {
+    /// Answer without doing the work: the session is retiring.
+    fn refuse(self) {
+        match self {
+            Self::PushSync { reply, .. } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+            Self::Fetch { reply, .. } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+            Self::StatusProbe { reply } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+        }
+    }
+}
+
 impl PeerSession {
     /// Dial `peer_addr`, complete identify + handshake + pricing, and spawn
     /// the swarm driver task. The returned handle stays usable until either
@@ -1257,6 +1309,7 @@ impl PeerSession {
         let state = std::sync::Arc::new(SessionState {
             control,
             peer_id,
+            peer_overlay: hs_result.peer_overlay,
             timeout,
             accounting: tokio::sync::Mutex::new(AccountingState {
                 reserve_plur: 0,
@@ -1278,8 +1331,8 @@ impl PeerSession {
             state,
             cmd_rx,
             _hs_in: hs_in,
-            _pr_in: pr_in,
-            _hive_in: hive_in,
+            pr_in,
+            hive_in,
             status_in,
             status_snapshot: transport.status_snapshot.clone(),
         });
@@ -1434,6 +1487,9 @@ impl AccountingState {
 struct SessionState {
     control: crate::protocols::stream_pool::Control,
     peer_id: PeerId,
+    /// The peer's overlay from the handshake; bee prices a chunk by its own
+    /// proximity to it.
+    peer_overlay: [u8; 32],
     timeout: Duration,
     accounting: tokio::sync::Mutex<AccountingState>,
     /// Serializes pseudosettle attempts on this peer — bee rejects
@@ -1512,56 +1568,75 @@ impl SessionState {
         stamp: &[u8],
         price: u64,
     ) -> Result<PushOutcome, TransportError> {
-        // 1. Try to reserve. If we'd exceed threshold, try an in-line
-        // settlement to recover credit, then re-check.
-        {
-            let mut acc = self.accounting.lock().await;
-            if !acc.try_reserve(price) {
-                drop(acc);
-                let _ = self.try_settle_once().await;
-                let mut acc = self.accounting.lock().await;
-                if !acc.try_reserve(price) {
-                    return Ok(PushOutcome::Overdraft);
-                }
-            }
+        if !self.reserve(price).await {
+            return Ok(PushOutcome::Overdraft);
         }
-
-        // 2. Do the actual push over a fresh substream.
         let result = self.do_pushsync(addr, wire, stamp).await;
+        self.commit(price, result.as_ref().err()).await;
+        result.map(PushOutcome::Receipt)
+    }
 
-        // 3. Account for the outcome.
+    /// One retrieval, with accounting. Bee debits every chunk it delivers
+    /// (`retrieval.go` handler: `PrepareDebit` before the write, `Apply`
+    /// after), so retrieval draws on the same per-peer credit as pushes. An
+    /// unsettled fetch session reached bee's disconnect limit (~21M PLUR,
+    /// ~100 chunks) and was blocklisted.
+    async fn fetch(
+        self: &std::sync::Arc<Self>,
+        addr: &[u8; 32],
+    ) -> Result<ChunkDelivery, TransportError> {
+        let price = peer_price(&self.peer_overlay, addr);
+        if !self.reserve(price).await {
+            return Err(TransportError::Overdraft);
+        }
+        let result = self.do_fetch(addr).await;
+        self.commit(price, result.as_ref().err()).await;
+        result
+    }
+
+    /// Reserve `price` against the peer's credit, settling in-line once if
+    /// the reservation would cross the threshold. `false` = still over.
+    async fn reserve(self: &std::sync::Arc<Self>, price: u64) -> bool {
+        if self.accounting.lock().await.try_reserve(price) {
+            return true;
+        }
+        // A settle already in flight is what we're waiting for; queueing a
+        // second one behind it only adds bee's one-second gap.
+        match self.settle_lock.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                let _ = self.try_settle_once().await;
+            }
+            Err(_) => drop(self.settle_lock.lock().await),
+        }
+        self.accounting.lock().await.try_reserve(price)
+    }
+
+    /// Release a reservation and record what bee did with it. Once the
+    /// balance reaches one refresh-rate, start a settle in the background
+    /// unless one is already running. Awaiting it here held the receipt back
+    /// behind bee's one-second gap, and every request that crossed the line
+    /// queued its own settle behind the last.
+    async fn commit(self: &std::sync::Arc<Self>, price: u64, err: Option<&TransportError>) {
         let should_settle = {
             let mut acc = self.accounting.lock().await;
-            match &result {
-                Ok(_) => {
-                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+            acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+            match err.map_or(DebitFate::Applied, debit_fate) {
+                DebitFate::Applied => {
                     acc.balance_plur = acc.balance_plur.saturating_add(price);
                     acc.balance_plur >= REFRESH_RATE_PLUR
                 }
-                Err(_) => {
-                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+                DebitFate::NotPrepared => false,
+                DebitFate::Unknown => {
                     self.ghost_balance_plur
                         .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
                     false
                 }
             }
         };
-
-        // Auto-settle when balance reaches one refresh-rate (weeb-3:
-        // `apply_credit` triggers the refresh channel at this level).
-        // Outside the accounting lock so concurrent pushes don't stall.
-        if should_settle {
-            let _ = self.try_settle_once().await;
+        if should_settle && self.settle_lock.try_lock().is_ok() {
+            spawn_settle(self.clone());
         }
-
-        result.map(PushOutcome::Receipt)
-    }
-
-    async fn fetch(
-        self: &std::sync::Arc<Self>,
-        addr: &[u8; 32],
-    ) -> Result<ChunkDelivery, TransportError> {
-        self.do_fetch(addr).await
     }
 
     async fn do_pushsync(
@@ -1741,6 +1816,14 @@ impl SessionState {
     /// means the next reserve attempt will report overdraft.
     async fn try_settle_once(&self) -> Result<(), TransportError> {
         let _guard = self.settle_lock.lock().await;
+        // Opening a stream on a closed connection makes the stream pool
+        // redial the peer outside the handshake (and the dial limiter).
+        if self
+            .connection_dead
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(TransportError::ConnectionClosed);
+        }
 
         // Bee rejects two pseudosettles within the same wall-second.
         let needs_wait = {
@@ -1954,16 +2037,23 @@ struct SessionDriver {
     // Held to keep the accept registrations alive for the lifetime
     // of the session.
     _hs_in: crate::protocols::stream_pool::IncomingStreams,
-    _pr_in: crate::protocols::stream_pool::IncomingStreams,
-    _hive_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound pricing streams. Bee opens one whenever it raises the
+    /// threshold it grants us (`notifyPaymentThresholdUpgrade`); answered
+    /// so the stream doesn't sit in the pool unread.
+    pr_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound hive streams. Bee opens one to every peer it admits
+    /// (`Kad.onConnected` → `Announce` → `BroadcastPeers`) and waits
+    /// `HeadersRWTimeout` (10 s) for our response headers. If that send
+    /// fails it disconnects us with "failed broadcasting to peer", so an
+    /// unanswered stream ends every session ~10 s after the handshake.
+    hive_in: crate::protocols::stream_pool::IncomingStreams,
     /// Inbound `/swarm/status/1.1.3/status` streams. Bee's `pkg/salud`
     /// opens this stream periodically (10s..5min backoff) over any
     /// connection it has to us — including the outbound connections
     /// our session pool maintains. NOT responding leaves us marked
     /// `Unhealthy` (the zero-value default), which makes us prime
-    /// candidates for kademlia bin-prune disconnection. So unlike the
-    /// other three `_*_in` slots, we actively poll this one and
-    /// respond. See `protocols::status` module docs.
+    /// candidates for kademlia bin-prune disconnection. See
+    /// `protocols::status` module docs.
     ///
     /// `None` when the daemon's status responder isn't configured;
     /// the stream pool still accepts the protocol so multistream-select
@@ -1998,6 +2088,7 @@ impl SessionDriver {
         type TaskFuture = std::pin::Pin<Box<dyn core::future::Future<Output = bool>>>;
         let mut tasks: FuturesUnordered<TaskFuture> = FuturesUnordered::new();
         let mut accept_new = true;
+        let mut cmd_rx_closed = false;
 
         loop {
             tokio::select! {
@@ -2111,9 +2202,43 @@ impl SessionDriver {
                             timeout,
                             crate::protocols::status::respond(&mut stream, &snapshot),
                         ).await;
-                        true
+                        // `false`: answering a probe says nothing about the
+                        // connection. `true` would retire the session.
+                        false
                     });
                     tasks.push(task);
+                }
+
+                Some((_pid, mut stream)) = self.hive_in.next() => {
+                    let timeout = self.state.timeout;
+                    let peer_id = self.state.peer_id;
+                    tasks.push(Box::pin(async move {
+                        match tokio::time::timeout(
+                            timeout,
+                            crate::protocols::hive::read_peers(&mut stream),
+                        ).await {
+                            Ok(Ok(peers)) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {}: {} peer(s)", peer_id, peers.len()),
+                            Ok(Err(e)) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {} failed: {}", peer_id, e),
+                            Err(_) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {} timed out", peer_id),
+                        }
+                        false
+                    }));
+                }
+
+                Some((_pid, mut stream)) = self.pr_in.next() => {
+                    let timeout = self.state.timeout;
+                    tasks.push(Box::pin(async move {
+                        let _ = tokio::time::timeout(timeout, async {
+                            read_then_write_empty_headers(&mut stream).await?;
+                            crate::protocols::pricing::read_announcement(&mut stream)
+                                .await
+                                .map_err(|e| TransportError::StreamControl(e.to_string()))
+                        }).await;
+                        false
+                    }));
                 }
 
                 ev = self.swarm.select_next_some() => {
@@ -2173,6 +2298,18 @@ impl SessionDriver {
 
             // Once we've stopped accepting new commands and drained all
             // in-flight tasks, the session is fully retired.
+            // Retiring: refuse new work now instead of leaving it queued
+            // until the in-flight tasks drain (up to `--timeout`). Closing
+            // the channel also flips `is_alive()`, so the dispatcher rotates
+            // away rather than queueing onto a session that won't read.
+            if !accept_new && !cmd_rx_closed {
+                self.cmd_rx.close();
+                while let Ok(cmd) = self.cmd_rx.try_recv() {
+                    cmd.refuse();
+                }
+                cmd_rx_closed = true;
+            }
+
             if !accept_new && tasks.is_empty() {
                 break;
             }
@@ -2188,6 +2325,20 @@ fn spawn_session_driver(driver: SessionDriver) {
 #[cfg(target_arch = "wasm32")]
 fn spawn_session_driver(driver: SessionDriver) {
     wasm_bindgen_futures::spawn_local(driver.run());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_settle(state: std::sync::Arc<SessionState>) {
+    tokio::spawn(async move {
+        let _ = state.try_settle_once().await;
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_settle(state: std::sync::Arc<SessionState>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = state.try_settle_once().await;
+    });
 }
 
 /// Poll the swarm in parallel with `fut` so that libp2p behaviours
