@@ -19,7 +19,11 @@ pub enum FrameError {
     TooLarge(usize),
 }
 
-const MAX_FRAME: usize = 16 * 1024 * 1024;
+/// Bee's `delimitedReaderMaxSize` (`pkg/p2p/protobuf`): no bee message is
+/// larger, so neither is any we need to read. The buffer is allocated
+/// before a byte arrives, so 16 MiB here let any peer cost us 16 MiB per
+/// stream for one varint.
+const MAX_FRAME: usize = 128 * 1024;
 
 pub async fn write_message<W: AsyncWrite + Unpin, M: Message>(
     w: &mut W,
@@ -89,4 +93,25 @@ pub fn try_take_message<M: Message + Default>(buf: &mut BytesMut) -> Result<Opti
         shift += 7;
     }
     Ok(None)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn oversized_length_prefix_is_refused_before_allocating() {
+        // Varint for MAX_FRAME + 1, and no body behind it.
+        let mut prefix = Vec::new();
+        let mut n = MAX_FRAME + 1;
+        while n >= 0x80 {
+            prefix.push((n as u8) | 0x80);
+            n >>= 7;
+        }
+        prefix.push(n as u8);
+        let mut r = futures::io::Cursor::new(prefix);
+        let res =
+            futures::executor::block_on(read_message::<_, crate::proto::headers::Headers>(&mut r));
+        assert!(matches!(res, Err(FrameError::TooLarge(_))), "{res:?}");
+    }
 }
