@@ -8,8 +8,8 @@
 
 use core::time::Duration;
 use libp2p::Multiaddr;
-use nectar_postage::{Batch, BatchId};
-use nectar_postage_issuer::{BatchStamper, MemoryIssuer, RingIssuer, StampIssuer};
+use nectar_postage::BatchId;
+use nectar_postage_issuer::{BatchStamper, CounterMode, CounterTable, StampIssuer};
 
 /// Boxed issuer so a single `BatchStamper` type covers both batch kinds:
 /// immutable batches use the fill-only `MemoryIssuer`, mutable batches use
@@ -1949,7 +1949,6 @@ pub fn prepare_upload_collection(
     }
 
     let batch_id = parse_batch_id(batch_id_hex)?;
-    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
 
     // Bee enforces `index < 2^(depth - bucketDepth)` per (batch, bucket).
     // Stamping the same chunk address twice burns two indices in the same
@@ -2007,6 +2006,13 @@ pub fn prepare_upload_collection(
         manifest_chunks.len(), manifest_root,
     );
 
+    let mut stamper = build_stamper(
+        signer,
+        batch_id,
+        depth,
+        immutable,
+        stamp_in.iter().map(|(a, _)| a),
+    )?;
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
     Ok((manifest_root, work))
 }
@@ -2167,11 +2173,17 @@ pub fn prepare_upload_file_with_manifest(
             .map_err(|e| ClientError::Manifest(e.to_string()))?;
     info!(target: "hoverfly::upload", "manifest: {} chunks (root {})", manifest_chunks.len(), manifest_root);
 
-    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
     stamp_in.reserve(manifest_chunks.len());
     for (addr, wire) in manifest_chunks {
         stamp_in.push((addr, wire.to_vec()));
     }
+    let mut stamper = build_stamper(
+        signer,
+        batch_id,
+        depth,
+        immutable,
+        stamp_in.iter().map(|(a, _)| a),
+    )?;
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
     Ok((manifest_root, work))
 }
@@ -2253,29 +2265,102 @@ pub struct StampedChunk {
     pub stamp: Vec<u8>,
 }
 
-fn build_stamper(
+fn build_stamper<'a>(
     signer: &SwarmSigner,
     batch_id: BatchId,
     depth: u8,
     immutable: bool,
+    addrs: impl IntoIterator<Item = &'a ChunkAddress>,
 ) -> Result<HoverflyStamper, ClientError> {
-    let batch = Batch::new(
-        batch_id,
-        0u128,
-        0u64,
-        alloy_primitives::Address::from(*signer.eth_address()),
-        depth,
-        BUCKET_DEPTH,
-        immutable,
-    );
-    // Immutable → fill-only `MemoryIssuer`; mutable → externally-tracked
-    // `RingIssuer`. Each errors on the wrong batch kind, so gate on `immutable`.
-    let issuer: Box<dyn StampIssuer + Send> = if immutable {
-        Box::new(MemoryIssuer::from_batch(&batch).map_err(|e| ClientError::Stamp(e.to_string()))?)
+    if depth < BUCKET_DEPTH || depth - BUCKET_DEPTH > 31 {
+        return Err(ClientError::Stamp(format!(
+            "invalid batch depth {depth}: must be between {BUCKET_DEPTH} and {}",
+            BUCKET_DEPTH + 31
+        )));
+    }
+    // Immutable batches fill each bucket once; mutable ones wrap and overwrite
+    // the oldest slot (nectar's `MemoryIssuer` / `RingIssuer::external`).
+    let mode = if immutable {
+        CounterMode::Fill
     } else {
-        Box::new(RingIssuer::external(&batch).map_err(|e| ClientError::Stamp(e.to_string()))?)
+        CounterMode::Ring
     };
+    // Start where earlier uploads to this batch left off. Restarting at index
+    // 0 makes bee's reserve replace the previous upload's chunks slot by slot
+    // (see `stamp_state`).
+    #[cfg(not(target_arch = "wasm32"))]
+    let counters = {
+        let start = crate::stamp_state::reserve(&batch_id, depth, BUCKET_DEPTH, !immutable, addrs)
+            .map_err(|e| ClientError::Stamp(e.to_string()))?;
+        CounterTable::from_counts(depth, BUCKET_DEPTH, mode, start)
+            .map_err(|e| ClientError::Stamp(e.to_string()))?
+    };
+    // The browser build has no slot store yet, so it still starts at 0.
+    #[cfg(target_arch = "wasm32")]
+    let counters = {
+        let _ = addrs;
+        CounterTable::new(depth, BUCKET_DEPTH, mode)
+    };
+    let issuer: Box<dyn StampIssuer + Send> = Box::new(SeededIssuer { batch_id, counters });
     Ok(BatchStamper::new(issuer, signer.alloy_signer().clone()))
+}
+
+/// Stamp issuer that starts from given per-bucket counters. Issues exactly as
+/// nectar's `MemoryIssuer` (fill) or `RingIssuer::external` (ring), which
+/// can't be seeded.
+struct SeededIssuer {
+    batch_id: BatchId,
+    counters: CounterTable,
+}
+
+impl StampIssuer for SeededIssuer {
+    fn prepare_stamp(
+        &mut self,
+        address: &SwarmAddress,
+        timestamp: u64,
+    ) -> Result<nectar_postage::StampDigest, nectar_postage::StampError> {
+        let bucket = nectar_postage::calculate_bucket(address, self.counters.bucket_depth());
+        let capacity = self.counters.bucket_capacity();
+        let position = self
+            .counters
+            .record(bucket, |_| false)
+            .map_err(|_| nectar_postage::StampError::BucketFull { bucket, capacity })?;
+        let index = nectar_postage::StampIndex::new(bucket, position);
+        Ok(nectar_postage::StampDigest::new(
+            *address,
+            self.batch_id,
+            index,
+            timestamp,
+        ))
+    }
+
+    fn batch_id(&self) -> BatchId {
+        self.batch_id
+    }
+
+    fn batch_depth(&self) -> u8 {
+        self.counters.depth()
+    }
+
+    fn bucket_depth(&self) -> u8 {
+        self.counters.bucket_depth()
+    }
+
+    fn max_bucket_utilization(&self) -> u32 {
+        self.counters.max_count()
+    }
+
+    fn bucket_utilization(&self, bucket: u32) -> u32 {
+        self.counters.count(bucket).unwrap_or(0)
+    }
+
+    fn bucket_has_capacity(&self, bucket: u32) -> bool {
+        self.counters.has_capacity(bucket).unwrap_or(false)
+    }
+
+    fn stamps_issued(&self) -> Option<u64> {
+        (!self.counters.is_ring()).then(|| self.counters.total_issued())
+    }
 }
 
 /// Current Unix time in **nanoseconds** for stamping, on wasm.
@@ -2427,7 +2512,13 @@ impl UploadStreamer {
     ) -> Result<Self, ClientError> {
         let batch_id = parse_batch_id(batch_id_hex)?;
         let (root, stamp_in) = split_chunks(data, redundancy)?;
-        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
+        let stamper = build_stamper(
+            signer,
+            batch_id,
+            depth,
+            immutable,
+            stamp_in.iter().map(|(a, _)| a),
+        )?;
         Ok(Self::from_parts(root, stamp_in, stamper))
     }
 
@@ -2448,11 +2539,17 @@ impl UploadStreamer {
         let (manifest_root, manifest_chunks) =
             crate::manifest::build_single_entry_manifest(path, file_root, content_type)
                 .map_err(|e| ClientError::Manifest(e.to_string()))?;
-        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
         stamp_in.reserve(manifest_chunks.len());
         for (addr, wire) in manifest_chunks {
             stamp_in.push((addr, wire.to_vec()));
         }
+        let stamper = build_stamper(
+            signer,
+            batch_id,
+            depth,
+            immutable,
+            stamp_in.iter().map(|(a, _)| a),
+        )?;
         Ok(Self::from_parts(manifest_root, stamp_in, stamper))
     }
 
@@ -2473,7 +2570,6 @@ impl UploadStreamer {
             return Err(ClientError::Manifest("collection is empty".into()));
         }
         let batch_id = parse_batch_id(batch_id_hex)?;
-        let stamper = build_stamper(signer, batch_id, depth, immutable)?;
         let mut seen: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
         let mut stamp_in: Vec<(ChunkAddress, Vec<u8>)> = Vec::new();
         let mut entries: Vec<CollectionEntry> = Vec::with_capacity(files.len());
@@ -2502,6 +2598,13 @@ impl UploadStreamer {
                 stamp_in.push((*addr, wire.to_vec()));
             }
         }
+        let stamper = build_stamper(
+            signer,
+            batch_id,
+            depth,
+            immutable,
+            stamp_in.iter().map(|(a, _)| a),
+        )?;
         Ok(Self::from_parts(manifest_root, stamp_in, stamper))
     }
 
@@ -3829,7 +3932,13 @@ pub fn prepare_upload_bytes(
     info!(target: "hoverfly::upload", "split {} bytes into {} chunks (root {}, redundancy {})",
         data.len(), stamp_in.len(), root, redundancy);
 
-    let mut stamper = build_stamper(signer, batch_id, depth, immutable)?;
+    let mut stamper = build_stamper(
+        signer,
+        batch_id,
+        depth,
+        immutable,
+        stamp_in.iter().map(|(a, _)| a),
+    )?;
     let work = stamp_chunks_parallel(&mut stamper, stamp_in)?;
     Ok((root, work))
 }
@@ -6930,6 +7039,37 @@ mod streamer_tests {
     /// address) as the one-shot prepare, every stamp must validate to the
     /// signer, and the root must match — across several window sizes, at both
     /// redundancy levels (erasure adds parity chunks to the same stream).
+    /// Two uploads to one batch must not share a `(bucket, index)` slot: bee's
+    /// reserve would replace the first upload's chunk with the second's.
+    #[test]
+    fn uploads_to_one_batch_get_disjoint_slots() {
+        let s = signer();
+        let batch = "0x5107000000000000000000000000000000000000000000000000000000000001";
+        let slots = |data: &[u8]| -> std::collections::HashSet<[u8; 8]> {
+            let (_, work) = prepare_upload_bytes(&s, batch, 20, true, data, Level::None).unwrap();
+            work.iter()
+                .map(|c| {
+                    let vs = crate::stamp::validate(&c.addr, &c.stamp).expect("stamp validates");
+                    <[u8; 8]>::try_from(vs.index).expect("8-byte index")
+                })
+                .collect()
+        };
+        let a: Vec<u8> = (0..300_000u32)
+            .map(|i| (i.wrapping_mul(2654435761) >> 7) as u8)
+            .collect();
+        // Same bytes bar the last: nearly every chunk (and so bucket) is
+        // shared, so slots restarting at 0 would collide in all of them.
+        let mut b = a.clone();
+        *b.last_mut().unwrap() ^= 1;
+        let (sa, sb) = (slots(&a), slots(&b));
+        assert!(!sa.is_empty() && !sb.is_empty());
+        assert!(
+            sa.is_disjoint(&sb),
+            "second upload reused {} slot(s)",
+            sa.intersection(&sb).count()
+        );
+    }
+
     #[test]
     fn streamer_raw_matches_oneshot() {
         let s = signer();

@@ -20,6 +20,8 @@ pub mod mime;
 pub mod peers;
 pub mod signer;
 pub mod stamp;
+#[cfg(not(target_arch = "wasm32"))]
+pub mod stamp_state;
 
 pub mod proto;
 
