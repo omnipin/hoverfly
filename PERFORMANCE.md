@@ -258,10 +258,21 @@ graceful failure handling.
   (~16.875M PLUR) with headroom for in-flight pushes. When our mirror crosses
   the limit, the session flips `accept_new = false` and retires gracefully;
   the replacement's `Connect()` resets bee's ghostBalance for us.
+  Bee only adds to ghostBalance when it prepared a debit and then failed to
+  write the receipt, i.e. we timed out or the stream broke. Error receipts
+  and failed stream opens cost nothing on bee's side (it writes those before
+  `PrepareDebit`), so they don't count. Until Nov 2026 every error counted,
+  and a session retired after ~50 failed pushes bee never charged for.
 - **Pseudosettle wall-second rule.** Bee rejects two pseudosettles within the
   same wall-second; sessions serialise settles via `settle_lock` and gate
   them on `last_settle.elapsed() >= ~1.1 s`. Auto-settle triggers at one
-  `REFRESH_RATE_PLUR` (4.5M PLUR) of accrued balance.
+  `REFRESH_RATE_PLUR` (4.5M PLUR) of accrued balance and runs in the
+  background, one at a time per session (it used to be awaited by the push
+  that crossed the line, holding its receipt behind the 1.1 s gate).
+- **Retrieval is accounted like pushsync.** Bee debits every delivered chunk
+  at the same price, so fetch sessions reserve, commit and pseudosettle
+  through the same path. Unsettled, a fetch session hit bee's disconnect
+  limit after ~100 chunks; sessions dying every ~10 s hid this.
 - **Narrow `SAFE_PEER_THRESHOLD_PLUR`** (`= REFRESH_RATE_PLUR × 2` = 9M
   PLUR). The peer's announced threshold is larger, but using it directly
   produced thundering-herd contention on the accounting mutex (one
@@ -315,6 +326,21 @@ graceful failure handling.
   `into_par_iter` runs inline. The wasm stamp path also uses
   `issuer.prepare_stamp` + `sign_message_sync` + `js_sys::Date` timestamps
   (never `SystemTime::now`, which panics on wasm).
+- **Slots are reserved across uploads.** Each upload reserves its bucket
+  slots in a per-batch state file before stamping (`stamp_state.rs`), so a
+  second upload to the same batch never reuses a slot. It used to restart
+  every bucket at index 0, and bee's reserve replaces the stored chunk when a
+  newer stamp arrives for the same slot.
+- **Erasure encoding** (`erasure/reedsolomon.rs`). Parity is computed with a
+  64 KiB GF(2^8) product table, rows in parallel on native, and codecs cached
+  per shape (the matrix used to be rebuilt and inverted per codeword).
+  `hoverfly bmt` on a 256 MiB file, Apple M-series, 8 cores:
+
+  | Level | Before | After |
+  |---|---:|---:|
+  | none | 1.2 s | 1.2 s |
+  | medium (default) | 13.4 s | 2.5 s |
+  | paranoid | 67.3 s | 6.4 s |
 
 ## Shared infrastructure
 
@@ -417,6 +443,22 @@ because bee RSTs non-citizen sessions continuously (below); the maintenance
 loop tops the pool back up each tick. For contrast, a bee node maintains ~131
 kademlia neighbours as a structural obligation of full participation — a
 different quantity from our upload fan-out working set.
+
+> **Correction (Nov 2026).** The ~10-15 s lifetime below was not bin-prune.
+> Bee opens a hive stream to every peer it admits (`Kad.onConnected` →
+> `Announce` → `BroadcastPeers`) and waits `HeadersRWTimeout` (10 s) for our
+> response headers; when that send fails it disconnects with "failed
+> broadcasting to peer". Sessions registered the hive protocol but never read
+> it. Separately, the status responder's task told the driver the connection
+> was dead, so each salud probe retired a healthy session. With both fixed, an
+> interleaved daemon A/B on mainnet (pool target 64, 4 min per arm, 2 arms
+> each, no uploads) held 64/64 sessions for the whole run on one dial wave,
+> against ~55 live and ~700 dials per 4 min on the old build. A 15-minute
+> soak, spanning three 5-minute prune ticks, also held 64/64 with no
+> replacement dials. One-shot 20 MiB uploads (three interleaved pairs,
+> `--concurrency 128`) went from 257-282 KiB/s to 782-1198 KiB/s, with
+> session retirements per upload down from 140-155 to 1-2. The paragraphs
+> below describe the old regime.
 
 The sustained live count is arithmetic — `live ≈ refill_rate × lifetime ×
 dial_success` with lifetime pinned at ~10-15 s by bee's bin-prune of
@@ -628,20 +670,55 @@ Interleaved A/B (May 2026 mainnet, VPS, 771-peer pool, c=64, 5 MiB, 4 trials):
 
 Distributions overlap completely (~3× trial variance). **Verdict: not
 confirmed at this workload.** Cheques are correct (`cheques_emitted` > 0,
-`cheques_failed` ≈ 0). Reading bee's accounting (`notifyPaymentThresholdUpgrade`),
-paying a peer only raises its threshold once cumulative settled debt crosses a
-**checkpoint**, and the first checkpoint is `refreshRate × linearCheckpointNumber
-= 4.5M × 1800 ≈ 8.1B PLUR` per peer (then linear `+refreshRate` per
-`refreshRate × 100` step, going exponential past the linear limit). Our per-peer
-cumulative reaches only a few million before the session dies (external causes)
-— roughly **three orders of magnitude short of even the first checkpoint**. The
-3× claim is consistent with **long-lived daemon sessions** accumulating 100s of
-MiB per peer over hours, not one-shot uploads. Code stays: it's correct, and the
-retrieval path debits us via the same accounting, so a long-running fetch worker
-would benefit identically.
-Re-measure in the daemon + public-reachability + multi-GB regime.
+`cheques_failed` ≈ 0).
+
+**Re-analysis against bee v2.8.3 (Nov 2026).** The original reasoning had the
+checkpoint arithmetic wrong, but the verdict stands, for different reasons:
+
+- *Threshold upgrades.* `thresholdGrowAt` starts at `thresholdGrowStep =
+  refreshRate × 100` = 450M PLUR, not `refreshRate × 1800` = 8.1B (that is
+  where linear growth turns exponential). Each 450M repaid raises the
+  threshold we get by one refresh-rate. Pseudosettle refreshments and cheques
+  both count (`NotifyRefreshmentReceived` and `NotifyPaymentReceived` both add
+  to `totalDebtRepay`), and `Connect` resets it on every reconnect. So cheques
+  buy no upgrade that pseudosettle doesn't.
+- *Ghost balance* is never reduced by any payment, only reset on reconnect.
+  Cheques can't delay ghost retirement.
+- *Bee never refuses a push for debt*; it disconnects past
+  `disconnectLimit` (16.875M) plus up to one second of refresh. Our own
+  9M cap is the only throttle.
+- *Pseudosettle capacity.* Bee accepts min(request, debt including in-flight,
+  elapsed wall-seconds × 4.5M). The elapsed clock persists across reconnects
+  for a stable overlay, so the first settle after any idle gap clears the
+  whole debt. Sustained, that is ~4.1M PLUR/s per peer at our 1.1 s cadence,
+  ~15-20 chunks/s per peer at typical prices (~220k-300k PLUR/chunk).
+
+The one thing a cheque adds is settling one peer faster than that. A one-shot
+or daemon upload spreads chunks over the pool by proximity, so per-peer demand
+is roughly total rate × race width / pool size: well under 1 chunk/s per peer
+at observed rates, and `IN_FLIGHT_CAP = 4` per peer caps a single peer near
+the pseudosettle rate anyway. Cheques would only bind with a tiny pool and
+RTTs under ~250 ms. At the oracle's rate (100000 BZZ base units per
+accounting unit) each paid push costs ~2.2e-6 BZZ, roughly 0.6 BZZ per GiB
+pushed once, for no throughput.
+
+With sessions now long-lived, the local 9M cap did start to bind a little:
+in three one-shot 20 MiB uploads it refused 0, 44 and 51 of ~6000-7200
+pushes, each rerouted to another peer. That is the only place a cheque could
+add credit, and it is under 1% of pushes. A paid A/B was not run: there is
+no funded chequebook. The SWAP path now also pins the exchange rate and deduction to the
+on-chain oracle (a peer used to set its own price through its stream headers),
+checks the chequebook issuer at startup, and skips cheques below bee's
+minimum payment.
 
 ## Session-death cause (RST analysis)
+
+> **Correction (Nov 2026).** The dominant bee-side `Disconnect` was
+> "failed broadcasting to peer": bee's hive broadcast to a newly admitted
+> peer timed out after 10 s because sessions never answered the stream. See
+> the correction under "Steady-state connection count". The prune-priority
+> analysis below still describes what bee does, but it was not what was
+> killing sessions.
 
 `CONN_CLOSED_IO_DETAIL` classifies every `SwarmEvent::ConnectionClosed` by
 `cause`. On mainnet at c=64-128: **~100% of session deaths are TCP
