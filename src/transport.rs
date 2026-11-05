@@ -241,6 +241,33 @@ pub fn classify_io_error(e: &std::io::Error) -> String {
     format!("other:{}", trimmed)
 }
 
+/// What a failed push did to bee's ledger for us.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DebitFate {
+    /// Bee wrote a valid receipt, so it applied the debit; the failure is
+    /// our own check on that receipt. Counts as balance.
+    Applied,
+    /// Bee never prepared a debit: the stream never opened, or bee
+    /// answered with an error receipt (`pushsync.go` writes those from
+    /// its deferred error path, before `PrepareDebit`).
+    NotPrepared,
+    /// We gave up or lost the stream mid-push. If bee had prepared a
+    /// debit, its receipt write failed and `debitAction.Cleanup` moved
+    /// the price into `ghostBalance`.
+    Unknown,
+}
+
+fn push_debit_fate(e: &TransportError) -> DebitFate {
+    use crate::protocols::pushsync::PushsyncError;
+    match e {
+        TransportError::Pushsync(PushsyncError::ReceiptMismatch(_)) => DebitFate::Applied,
+        TransportError::Pushsync(PushsyncError::Peer(_)) | TransportError::StreamControl(_) => {
+            DebitFate::NotPrepared
+        }
+        _ => DebitFate::Unknown,
+    }
+}
+
 pub fn is_connection_dead(e: &TransportError) -> bool {
     use crate::protocols::pushsync::PushsyncError;
     match e {
@@ -1278,8 +1305,8 @@ impl PeerSession {
             state,
             cmd_rx,
             _hs_in: hs_in,
-            _pr_in: pr_in,
-            _hive_in: hive_in,
+            pr_in,
+            hive_in,
             status_in,
             status_snapshot: transport.status_snapshot.clone(),
         });
@@ -1538,11 +1565,20 @@ impl SessionState {
                     acc.balance_plur = acc.balance_plur.saturating_add(price);
                     acc.balance_plur >= REFRESH_RATE_PLUR
                 }
-                Err(_) => {
+                Err(e) => {
                     acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
-                    self.ghost_balance_plur
-                        .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
-                    false
+                    match push_debit_fate(e) {
+                        DebitFate::Applied => {
+                            acc.balance_plur = acc.balance_plur.saturating_add(price);
+                            acc.balance_plur >= REFRESH_RATE_PLUR
+                        }
+                        DebitFate::NotPrepared => false,
+                        DebitFate::Unknown => {
+                            self.ghost_balance_plur
+                                .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
+                            false
+                        }
+                    }
                 }
             }
         };
@@ -1954,16 +1990,23 @@ struct SessionDriver {
     // Held to keep the accept registrations alive for the lifetime
     // of the session.
     _hs_in: crate::protocols::stream_pool::IncomingStreams,
-    _pr_in: crate::protocols::stream_pool::IncomingStreams,
-    _hive_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound pricing streams. Bee opens one whenever it raises the
+    /// threshold it grants us (`notifyPaymentThresholdUpgrade`); answered
+    /// so the stream doesn't sit in the pool unread.
+    pr_in: crate::protocols::stream_pool::IncomingStreams,
+    /// Inbound hive streams. Bee opens one to every peer it admits
+    /// (`Kad.onConnected` → `Announce` → `BroadcastPeers`) and waits
+    /// `HeadersRWTimeout` (10 s) for our response headers. If that send
+    /// fails it disconnects us with "failed broadcasting to peer", so an
+    /// unanswered stream ends every session ~10 s after the handshake.
+    hive_in: crate::protocols::stream_pool::IncomingStreams,
     /// Inbound `/swarm/status/1.1.3/status` streams. Bee's `pkg/salud`
     /// opens this stream periodically (10s..5min backoff) over any
     /// connection it has to us — including the outbound connections
     /// our session pool maintains. NOT responding leaves us marked
     /// `Unhealthy` (the zero-value default), which makes us prime
-    /// candidates for kademlia bin-prune disconnection. So unlike the
-    /// other three `_*_in` slots, we actively poll this one and
-    /// respond. See `protocols::status` module docs.
+    /// candidates for kademlia bin-prune disconnection. See
+    /// `protocols::status` module docs.
     ///
     /// `None` when the daemon's status responder isn't configured;
     /// the stream pool still accepts the protocol so multistream-select
@@ -2111,9 +2154,43 @@ impl SessionDriver {
                             timeout,
                             crate::protocols::status::respond(&mut stream, &snapshot),
                         ).await;
-                        true
+                        // `false`: answering a probe says nothing about the
+                        // connection. `true` would retire the session.
+                        false
                     });
                     tasks.push(task);
+                }
+
+                Some((_pid, mut stream)) = self.hive_in.next() => {
+                    let timeout = self.state.timeout;
+                    let peer_id = self.state.peer_id;
+                    tasks.push(Box::pin(async move {
+                        match tokio::time::timeout(
+                            timeout,
+                            crate::protocols::hive::read_peers(&mut stream),
+                        ).await {
+                            Ok(Ok(peers)) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {}: {} peer(s)", peer_id, peers.len()),
+                            Ok(Err(e)) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {} failed: {}", peer_id, e),
+                            Err(_) => debug!(target: "hoverfly::transport",
+                                "hive gossip from {} timed out", peer_id),
+                        }
+                        false
+                    }));
+                }
+
+                Some((_pid, mut stream)) = self.pr_in.next() => {
+                    let timeout = self.state.timeout;
+                    tasks.push(Box::pin(async move {
+                        let _ = tokio::time::timeout(timeout, async {
+                            read_then_write_empty_headers(&mut stream).await?;
+                            crate::protocols::pricing::read_announcement(&mut stream)
+                                .await
+                                .map_err(|e| TransportError::StreamControl(e.to_string()))
+                        }).await;
+                        false
+                    }));
                 }
 
                 ev = self.swarm.select_next_some() => {
