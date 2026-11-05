@@ -241,7 +241,7 @@ pub fn classify_io_error(e: &std::io::Error) -> String {
     format!("other:{}", trimmed)
 }
 
-/// What a failed push did to bee's ledger for us.
+/// What a failed push or fetch did to bee's ledger for us.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DebitFate {
     /// Bee wrote a valid receipt, so it applied the debit; the failure is
@@ -257,13 +257,16 @@ enum DebitFate {
     Unknown,
 }
 
-fn push_debit_fate(e: &TransportError) -> DebitFate {
+fn debit_fate(e: &TransportError) -> DebitFate {
     use crate::protocols::pushsync::PushsyncError;
+    use crate::protocols::retrieval::RetrievalError;
     match e {
-        TransportError::Pushsync(PushsyncError::ReceiptMismatch(_)) => DebitFate::Applied,
-        TransportError::Pushsync(PushsyncError::Peer(_)) | TransportError::StreamControl(_) => {
-            DebitFate::NotPrepared
-        }
+        // Bee wrote a delivery/receipt; our own check on it failed.
+        TransportError::Pushsync(PushsyncError::ReceiptMismatch(_))
+        | TransportError::Retrieval(RetrievalError::Empty) => DebitFate::Applied,
+        TransportError::Pushsync(PushsyncError::Peer(_))
+        | TransportError::Retrieval(RetrievalError::Peer(_))
+        | TransportError::StreamControl(_) => DebitFate::NotPrepared,
         _ => DebitFate::Unknown,
     }
 }
@@ -588,6 +591,11 @@ pub enum TransportError {
     /// a single peer's rate-limit window. See [`crate::ratelimit`].
     #[error("dial too soon (try again in {wait:?})")]
     DialTooSoon { wait: Duration },
+    /// The request would push our debt to this peer past the credit we
+    /// allow ourselves, even after settling. Transient: retry later or use
+    /// another peer.
+    #[error("peer credit exhausted (settling)")]
+    Overdraft,
 }
 
 #[derive(Clone, Debug)]
@@ -1284,6 +1292,7 @@ impl PeerSession {
         let state = std::sync::Arc::new(SessionState {
             control,
             peer_id,
+            peer_overlay: hs_result.peer_overlay,
             timeout,
             accounting: tokio::sync::Mutex::new(AccountingState {
                 reserve_plur: 0,
@@ -1461,6 +1470,9 @@ impl AccountingState {
 struct SessionState {
     control: crate::protocols::stream_pool::Control,
     peer_id: PeerId,
+    /// The peer's overlay from the handshake; bee prices a chunk by its own
+    /// proximity to it.
+    peer_overlay: [u8; 32],
     timeout: Duration,
     accounting: tokio::sync::Mutex<AccountingState>,
     /// Serializes pseudosettle attempts on this peer — bee rejects
@@ -1539,65 +1551,65 @@ impl SessionState {
         stamp: &[u8],
         price: u64,
     ) -> Result<PushOutcome, TransportError> {
-        // 1. Try to reserve. If we'd exceed threshold, try an in-line
-        // settlement to recover credit, then re-check.
-        {
-            let mut acc = self.accounting.lock().await;
-            if !acc.try_reserve(price) {
-                drop(acc);
-                let _ = self.try_settle_once().await;
-                let mut acc = self.accounting.lock().await;
-                if !acc.try_reserve(price) {
-                    return Ok(PushOutcome::Overdraft);
-                }
-            }
+        if !self.reserve(price).await {
+            return Ok(PushOutcome::Overdraft);
         }
-
-        // 2. Do the actual push over a fresh substream.
         let result = self.do_pushsync(addr, wire, stamp).await;
-
-        // 3. Account for the outcome.
-        let should_settle = {
-            let mut acc = self.accounting.lock().await;
-            match &result {
-                Ok(_) => {
-                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
-                    acc.balance_plur = acc.balance_plur.saturating_add(price);
-                    acc.balance_plur >= REFRESH_RATE_PLUR
-                }
-                Err(e) => {
-                    acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
-                    match push_debit_fate(e) {
-                        DebitFate::Applied => {
-                            acc.balance_plur = acc.balance_plur.saturating_add(price);
-                            acc.balance_plur >= REFRESH_RATE_PLUR
-                        }
-                        DebitFate::NotPrepared => false,
-                        DebitFate::Unknown => {
-                            self.ghost_balance_plur
-                                .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
-                            false
-                        }
-                    }
-                }
-            }
-        };
-
-        // Auto-settle when balance reaches one refresh-rate (weeb-3:
-        // `apply_credit` triggers the refresh channel at this level).
-        // Outside the accounting lock so concurrent pushes don't stall.
-        if should_settle {
-            let _ = self.try_settle_once().await;
-        }
-
+        self.commit(price, result.as_ref().err()).await;
         result.map(PushOutcome::Receipt)
     }
 
+    /// One retrieval, with accounting. Bee debits every chunk it delivers
+    /// (`retrieval.go` handler: `PrepareDebit` before the write, `Apply`
+    /// after), so retrieval draws on the same per-peer credit as pushes. An
+    /// unsettled fetch session reached bee's disconnect limit (~21M PLUR,
+    /// ~100 chunks) and was blocklisted.
     async fn fetch(
         self: &std::sync::Arc<Self>,
         addr: &[u8; 32],
     ) -> Result<ChunkDelivery, TransportError> {
-        self.do_fetch(addr).await
+        let price = peer_price(&self.peer_overlay, addr);
+        if !self.reserve(price).await {
+            return Err(TransportError::Overdraft);
+        }
+        let result = self.do_fetch(addr).await;
+        self.commit(price, result.as_ref().err()).await;
+        result
+    }
+
+    /// Reserve `price` against the peer's credit, settling in-line once if
+    /// the reservation would cross the threshold. `false` = still over.
+    async fn reserve(self: &std::sync::Arc<Self>, price: u64) -> bool {
+        if self.accounting.lock().await.try_reserve(price) {
+            return true;
+        }
+        let _ = self.try_settle_once().await;
+        self.accounting.lock().await.try_reserve(price)
+    }
+
+    /// Release a reservation and record what bee did with it, then settle
+    /// once the balance reaches one refresh-rate (outside the accounting
+    /// lock so concurrent requests don't stall).
+    async fn commit(self: &std::sync::Arc<Self>, price: u64, err: Option<&TransportError>) {
+        let should_settle = {
+            let mut acc = self.accounting.lock().await;
+            acc.reserve_plur = acc.reserve_plur.saturating_sub(price);
+            match err.map_or(DebitFate::Applied, debit_fate) {
+                DebitFate::Applied => {
+                    acc.balance_plur = acc.balance_plur.saturating_add(price);
+                    acc.balance_plur >= REFRESH_RATE_PLUR
+                }
+                DebitFate::NotPrepared => false,
+                DebitFate::Unknown => {
+                    self.ghost_balance_plur
+                        .fetch_add(price, std::sync::atomic::Ordering::Relaxed);
+                    false
+                }
+            }
+        };
+        if should_settle {
+            let _ = self.try_settle_once().await;
+        }
     }
 
     async fn do_pushsync(
