@@ -230,6 +230,16 @@ pub enum BridgeError {
     UnsupportedStep(String),
     #[error("refusing to sign quote transaction: {0}")]
     UnsafeQuote(String),
+    #[error(
+        "origin transaction(s) {hashes} broadcast for Relay request {request_id} but not \
+         confirmed ({reason}); check them and the request status before retrying, or you \
+         may deposit twice"
+    )]
+    Unconfirmed {
+        hashes: String,
+        request_id: String,
+        reason: String,
+    },
     #[error("origin transaction reverted (status=0)")]
     Reverted,
     #[error("receipt not found within timeout")]
@@ -447,8 +457,23 @@ async fn run_leg(
             let hash = origin_rpc
                 .send_eip1559(signer, params.origin_chain_id, tx)
                 .await?;
-            origin_rpc.wait_for_success(hash, params.timeout).await?;
             origin_tx_hashes.push(hash);
+            // Once anything is broadcast, a failure must still say what was
+            // sent: the deposit may land, and a blind retry deposits again.
+            if let Err(e) = origin_rpc.wait_for_success(hash, params.timeout).await {
+                if matches!(e, BridgeError::Reverted) {
+                    return Err(e);
+                }
+                return Err(BridgeError::Unconfirmed {
+                    hashes: origin_tx_hashes
+                        .iter()
+                        .map(|h| h.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    request_id: request_id.clone(),
+                    reason: e.to_string(),
+                });
+            }
         }
     }
 
