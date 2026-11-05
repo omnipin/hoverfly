@@ -877,7 +877,16 @@ impl<'a> NetworkedStore<'a> {
                 }
                 let rtt_ms = started.elapsed().as_millis().min(u32::MAX as u128) as u32;
                 match res {
-                    Ok(delivery) => {
+                    // Validate before crediting: a peer that answers with
+                    // bytes not matching the address would otherwise be
+                    // promoted to the front for every later chunk (and, via
+                    // the shared RetrievalCache, across daemon requests).
+                    //
+                    // The delivered bytes are either a content-addressed chunk
+                    // (CAC, address = BMT hash of data) or a single-owner chunk
+                    // (SOC, address = keccak256(id||owner)); feed updates are
+                    // SOCs, so both are accepted.
+                    Ok(delivery) if validate_delivery(&delivery.data, &address) => {
                         log.lock().unwrap().insert(
                             overlay.to_lowercase(),
                             crate::peers::DialResult::Success {
@@ -885,26 +894,16 @@ impl<'a> NetworkedStore<'a> {
                                 full_node: peer_full_node,
                             },
                         );
-                        // Proven reachable forwarder — promote for every later
-                        // chunk this fetch (see `peer_scores` field rationale).
                         self.note_response(&overlay);
-                        // The delivered bytes are either a content-addressed
-                        // chunk (CAC, address = BMT hash of data) or a single-
-                        // owner chunk (SOC, address = keccak256(id||owner)).
-                        // Feed updates are SOCs, whose address is NOT the BMT
-                        // hash — so validating every delivery as a CAC rejects
-                        // them ("address mismatch"). Try CAC first (the common
-                        // case), then fall back to SOC, accepting whichever
-                        // validates against the requested address.
-                        if validate_delivery(&delivery.data, &address) {
-                            (peer, overlay, AttemptOutcome::Got(delivery.data))
-                        } else {
-                            (
-                                peer,
-                                overlay,
-                                AttemptOutcome::Failed("address mismatch".to_string()),
-                            )
-                        }
+                        (peer, overlay, AttemptOutcome::Got(delivery.data))
+                    }
+                    Ok(_) => {
+                        self.note_timeout(&overlay);
+                        (
+                            peer,
+                            overlay,
+                            AttemptOutcome::Failed("address mismatch".to_string()),
+                        )
                     }
                     // DialTooSoon = another concurrent fetch claimed this peer's
                     // dial window. Transient deferral — re-queue the peer; do
@@ -1674,6 +1673,36 @@ struct ResolvedRoot {
     feed_resolved: bool,
 }
 
+/// Largest serialized manifest node we'll join. A node holds at most 256
+/// forks of ~100 bytes plus their metadata, so this is generous.
+const MAX_MANIFEST_NODE_BYTES: u64 = 1 << 20;
+
+/// A manifest node's serialized bytes. Bee saves and loads nodes through
+/// the splitter/joiner (`pkg/file/loadsave`), so a node with many forks or
+/// much metadata spans several chunks; reading only the first chunk's
+/// payload then fails to decode.
+async fn load_manifest_node(
+    store: &NetworkedStore<'_>,
+    addr: ChunkAddress,
+) -> Result<Vec<u8>, ClientError> {
+    let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
+        .await
+        .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
+    let (_, span) = crate::erasure::decode_span(&chunk.span().to_le_bytes());
+    if span <= chunk.data().len() as u64 {
+        return Ok(chunk.data().to_vec());
+    }
+    if span > MAX_MANIFEST_NODE_BYTES {
+        return Err(ClientError::Manifest(format!(
+            "manifest node {addr} spans {span} bytes (limit {MAX_MANIFEST_NODE_BYTES})"
+        )));
+    }
+    Ok(
+        crate::erasure::fetch_erasure_bytes_progress(store, addr, None, joiner_concurrency(1))
+            .await?,
+    )
+}
+
 async fn resolve_feed_root(
     store: &NetworkedStore<'_>,
     root: ChunkAddress,
@@ -1682,10 +1711,8 @@ async fn resolve_feed_root(
     use crate::feed::{Feed, resolve_latest};
     use crate::manifest::{decode_node, extract_feed_meta};
 
-    let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &root)
-        .await
-        .map_err(|e| ClientError::Manifest(format!("fetch root {root}: {e}")))?;
-    let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+    let node = decode_node(&load_manifest_node(store, root).await?)
+        .map_err(|e| ClientError::Manifest(e.to_string()))?;
 
     let Some((owner_hex, topic_hex, ty)) = extract_feed_meta(&node) else {
         // ordinary content manifest — immutable, content-addressed
@@ -1731,10 +1758,8 @@ async fn lookup_manifest_path(
     let mut index_redirected = false;
 
     loop {
-        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &current)
-            .await
-            .map_err(|e| ClientError::Manifest(format!("fetch node {current}: {e}")))?;
-        let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+        let node = decode_node(&load_manifest_node(store, current).await?)
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         if remaining.is_empty() {
             if let Some(addr) = node.entry {
@@ -1829,18 +1854,19 @@ fn walk_manifest<'a>(
             )));
         }
 
-        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
-            .await
-            .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
         // A single-owner chunk's address doesn't commit to its content, so a
         // SOC "node" can list itself as a fork and recurse forever. Bee loads
         // manifest nodes through the joiner, which never yields one.
+        let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
+            .await
+            .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
         if matches!(chunk, AnyChunk::SingleOwner(_)) {
             return Err(ClientError::Manifest(format!(
                 "manifest node {addr} is a single-owner chunk"
             )));
         }
-        let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
+        let node = decode_node(&load_manifest_node(store, addr).await?)
+            .map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         let mut out = Vec::new();
         if let Some(entry_addr) = node.entry {
@@ -6914,6 +6940,46 @@ mod streamer_tests {
     }
 
     const BATCH: &str = "0x2c18bcb885649cb468732c98d70d9cb0280aaffb30ffd0c882fccd8e22cd7408";
+
+    /// Bee stores manifest nodes through the splitter, so a wide node (a fork
+    /// per distinct next byte) is a multi-chunk object whose reference is an
+    /// intermediate chunk. Decoding only that chunk's payload used to fail.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[tokio::test]
+    async fn lists_a_manifest_whose_root_node_spans_chunks() {
+        use crate::manifest::encode_test_node;
+        let leaf = encode_test_node(Some([7u8; 32]), &[]);
+        let (leaf_addr, leaf_chunks) = split_chunks(&leaf, Level::None).unwrap();
+        let forks: Vec<(Vec<u8>, [u8; 32])> = (b'!'..=b'~')
+            .filter(|b| *b != b'/')
+            .map(|b| {
+                let mut r = [0u8; 32];
+                r.copy_from_slice(leaf_addr.as_bytes());
+                (vec![b], r)
+            })
+            .collect();
+        let root_bytes = encode_test_node(None, &forks);
+        assert!(
+            root_bytes.len() > 4096,
+            "fixture must need a multi-chunk node"
+        );
+        let (root, root_chunks) = split_chunks(&root_bytes, Level::None).unwrap();
+
+        let transport = Transport::new(
+            SwarmSigner::random(1),
+            crate::transport::TransportConfig::default(),
+        );
+        let peers = PeerStore::default();
+        let store = NetworkedStore::with_concurrency(&transport, &peers, 1, 1);
+        for (a, w) in leaf_chunks.into_iter().chain(root_chunks) {
+            store.seed_wire(a, w);
+        }
+        let budget = std::sync::atomic::AtomicUsize::new(MAX_MANIFEST_NODES);
+        let listed = walk_manifest(&store, root, Vec::new(), 0, &budget)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), forks.len());
+    }
 
     /// UploadStreamer windows must yield exactly the same chunk set (by
     /// address) as the one-shot prepare, every stamp must validate to the
