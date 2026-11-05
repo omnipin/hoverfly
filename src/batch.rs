@@ -390,14 +390,32 @@ pub enum BatchError {
     InsufficientBalance { have: U256, need: U256 },
     #[error("initial balance per chunk too low for 24h validity: have {have}, need >= {need}")]
     InsufficientValidity { have: U256, need: U256 },
-    #[error("invalid depth: must be > bucket depth ({BUCKET_DEPTH}), got {0}")]
+    #[error("invalid depth {0}: must be above the bucket depth ({BUCKET_DEPTH}) and at most 63")]
     InvalidDepth(u8),
     #[error("BatchCreated event not found in receipt logs")]
     NoBatchEvent,
     #[error("receipt not found within timeout")]
     ReceiptTimeout,
+    #[error(
+        "createBatch {tx} was broadcast but not confirmed ({reason}). If it mines, \
+         the batch id is {batch_id}: check it on-chain before retrying, or you \
+         will buy a second batch"
+    )]
+    UnconfirmedCreate {
+        tx: B256,
+        batch_id: B256,
+        reason: String,
+    },
     #[error("abi decode: {0}")]
     AbiDecode(String),
+}
+
+/// The id `PostageStamp.createBatch` assigns: `keccak256(abi.encode(msg.sender, nonce))`.
+fn batch_id_for(sender: Address, nonce: B256) -> B256 {
+    let mut enc = [0u8; 64];
+    enc[12..32].copy_from_slice(sender.as_slice());
+    enc[32..].copy_from_slice(nonce.as_slice());
+    keccak256(enc)
 }
 
 /// PLUR → decimal BZZ, trailing zeros trimmed (`240000000000000000` → `24`).
@@ -499,7 +517,12 @@ pub async fn create_batch(
         });
     }
 
-    // total = initial * 2^depth (overflow check via U256 mul).
+    // total = initial * 2^depth (overflow check via U256 mul). The shift
+    // itself overflows a u128 from depth 128 (a panic in debug builds, a
+    // wrong total in release), so bound the depth first.
+    if params.depth > 63 {
+        return Err(BatchError::InvalidDepth(params.depth));
+    }
     let total = params
         .initial_balance_per_chunk
         .checked_mul(U256::from(1u128 << params.depth))
@@ -560,9 +583,23 @@ pub async fn create_batch(
     let create_tx = rpc
         .send_signed(signer, params.chain_id, params.postage_stamp, &create_call)
         .await?;
-    let receipt = rpc
+    // From here the batch may exist whatever we observe. PostageStamp
+    // derives its id as keccak256(abi.encode(msg.sender, nonce)), so name
+    // both the tx and that id on any failure short of a revert.
+    let receipt = match rpc
         .wait_for_success(create_tx, params.receipt_timeout)
-        .await?;
+        .await
+    {
+        Ok(r) => r,
+        Err(BatchError::Reverted) => return Err(BatchError::Reverted),
+        Err(e) => {
+            return Err(BatchError::UnconfirmedCreate {
+                tx: create_tx,
+                batch_id: batch_id_for(signer.address(), nonce),
+                reason: e.to_string(),
+            });
+        }
+    };
 
     // Parse BatchCreated event from logs. The event signature topic
     // is keccak256("BatchCreated(bytes32,uint256,uint256,address,uint8,uint8,bool)").
@@ -859,12 +896,22 @@ impl EthRpc {
     ) -> Result<ReceiptResp, BatchError> {
         let start = std::time::Instant::now();
         loop {
-            let r: Option<ReceiptResp> = self
+            // A transient RPC error (rate limit, dropped connection) is not
+            // an answer about the transaction; keep polling until timeout.
+            let r: Option<ReceiptResp> = match self
                 .raw_opt(
                     "eth_getTransactionReceipt",
                     [format!("0x{}", hex::encode(tx_hash))],
                 )
-                .await?;
+                .await
+            {
+                Ok(r) => r,
+                Err(e) if start.elapsed() <= timeout => {
+                    tracing::debug!("receipt poll for 0x{}: {e}", hex::encode(tx_hash));
+                    None
+                }
+                Err(e) => return Err(e),
+            };
             if let Some(rcpt) = r {
                 let ok =
                     u64::from_str_radix(rcpt.status.trim_start_matches("0x"), 16).unwrap_or(0) == 1;
@@ -989,6 +1036,19 @@ fn encode_1559_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn batch_id_matches_contract_derivation() {
+        use alloy_sol_types::SolValue;
+        let sender: Address = "0x1234567890abcdef1234567890abcdef12345678"
+            .parse()
+            .unwrap();
+        let nonce = B256::repeat_byte(0x5a);
+        assert_eq!(
+            batch_id_for(sender, nonce),
+            keccak256((sender, nonce).abi_encode())
+        );
+    }
 
     /// Byte-for-byte cross-check of the hand-rolled type-2 envelope against
     /// an independent implementation.
