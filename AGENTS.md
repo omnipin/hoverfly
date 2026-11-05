@@ -248,10 +248,16 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   wasm), per-peer `PeerSession` with a single swarm-driver task + concurrent
   pushes via `Arc<SessionState>` + cloned stream-pool `Control`.
   Accounting (`reserve_plur`, `balance_plur`, pseudosettle) lives here,
-  guarded by `tokio::sync::Mutex`. Client-side ghost-balance mirror retires
-  the session at `GHOST_BALANCE_LIMIT_PLUR`; `MAX_PUSHES_PER_SESSION` is the
-  defence-in-depth ceiling. Hosts `TransportConfig`
-  (incl. `max_concurrent_substream_upgrades`).
+  guarded by `tokio::sync::Mutex`, and covers **both** pushes and fetches
+  (bee debits retrieval at the same price). Settles run in the background,
+  one at a time per session. Client-side ghost-balance mirror retires
+  the session at `GHOST_BALANCE_LIMIT_PLUR`; it only counts failures where
+  bee may have prepared a debit (`debit_fate`: timeouts and broken streams,
+  not error receipts or failed opens). `MAX_PUSHES_PER_SESSION` is the
+  defence-in-depth ceiling. The session driver must answer every inbound
+  stream bee opens on the connection: hive (bee disconnects a new peer whose
+  hive broadcast times out after 10 s), pricing and status. Hosts
+  `TransportConfig` (incl. `max_concurrent_substream_upgrades`).
 - `src/client.rs` — high-level `discover`/`fetch`/`upload`. `NetworkedStore`
   implements nectar's `ChunkGet`; cache is shared via `Clone`. Fetch resolves
   mantaray manifest paths and mutable **feeds** (`resolve_feed_root`,
@@ -315,8 +321,10 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   legacy type-0 — the L2 origins return 1559 fee fields. `--to both` uses
   the Beeport pattern: conditional xDAI gas top-up (only when the
   recipient is below threshold) followed by a BZZ swap, so it's one origin
-  swap in the common case and two when a top-up is needed. No API key
-  required (Relay is permissionless). `--from-token` accepts a bare symbol
+  swap in the common case and two when a top-up is needed. Relay requires
+  an API key (`--api-key`) on every `POST /quote/v2` since 2026-10-02.
+  Quote transactions pass `check_quote_txs` before signing (origin chain,
+  our address, spend bounded by `--amount`). `--from-token` accepts a bare symbol
   (e.g. `USDC`), resolved to the canonical address + decimals via Relay's
   `/chains` token list (`resolve_token`); a raw `0x` address is used
   verbatim with `--from-decimals`; omitted = native gas token. Verified
@@ -520,6 +528,13 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   it publishes who was paid what, and restoring a stale copy re-issues
   cheques the counterparty already banked). Stray `blob*.bin` / `hello.tar`
   at root are local upload-test leftovers.
+- **Postage slot state** lives outside the repo: `$HOVERFLY_STAMP_DIR`, else
+  `$XDG_STATE_HOME/hoverfly/stamps`, else `~/.local/state/hoverfly/stamps`,
+  one `<batch>.slots` file per batch (`src/stamp_state.rs`). Every native
+  upload reserves its bucket slots there before stamping; bee's reserve
+  replaces a stored chunk when a newer stamp claims its slot, so losing this
+  file means the next upload to that batch overwrites earlier ones. The wasm
+  build has no slot store yet.
 - **`peers.seed.json`** (~800 IPs) and **`peers.ws.json`** (WS-dialable
   subset for the browser builds) are IP-diverse cold-start seeds harvested
   from a long-running daemon. They are **not committed here**: they live in
@@ -600,12 +615,14 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   because bee 2.8's reacher uses `/ipfs/ping/1.0.0` to verify reachability;
   failed pings mark us private and the kademlia prune loop kicks us. See
   PERFORMANCE.md "Bee 2.8.0 protocol migration".
-- **SWAP / chequebook** has grown past issuance-only: peer sessions still
-  advertise the beneficiary in a one-shot `/swarm/swap/1.0.0/swap` handshake
-  and `try_settle_once` emits a cheque for the PLUR remainder after
-  pseudosettle (exchange-rate fallback is abort→pseudosettle-only — no
-  hardcoded rate; trust bee's per-stream `exchange`+`deduction` headers),
-  but the CLI now also manages the chequebook lifecycle itself
+- **SWAP / chequebook** has grown past issuance-only. There is no swap
+  handshake on the wire (bee 2.8.3 sets SWAP up locally from the handshake's
+  eth address); `try_settle_once` emits a cheque for a PLUR remainder after
+  pseudosettle of at least bee's minimum payment (refreshRate / 5). With
+  `--chequebook` the CLI reads the SWAP `PriceOracle` and the chequebook's
+  `issuer()` once at startup (`--chequebook-rpc-url`); cheques are only
+  signed at the oracle rate and deduction (`cheque_amount`), and only by a
+  session whose signer is the issuer. The CLI now also manages the chequebook lifecycle itself
   (`chequebook deploy`/`fund`/`status` on Gnosis via alloy) and banks
   metered-relay cheques (`cashout` reads the relay `ledger.json` — an
   off-box operation). What still doesn't exist: on-chain verification in the
@@ -632,6 +649,8 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   conflate them. Bee's internal `pushsync.defaultTTL` is 30 s; setting
   `--timeout` below ~10-15 s on slow links causes spurious timeouts that
   bee then logs as ghost-balance overdraw on our overlay.
+- `fetch --max-retries` defaults to 32 (bee's `maxOriginErrors`); `0` walks
+  every peer in the peerlist, which makes a missing chunk take hours to fail.
 - CLI `--max-retries` per chunk: see `client.rs`
   `cap = max_retries.max(1).min(order.len())`. `0` is silently promoted to
   `1`; the value is also capped by the live pool size, so on a small/attrited
@@ -656,4 +675,5 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   handshake / v2 hive wire format, feed derivation, kademlia
   saturation/prune behavior — read Bee directly; the upstream docs lag the
   code. Check out the tag running on mainnet
-  (`git -C ~/Coding/forks/bee checkout v2.8.1`) when you need exact code.
+  (v2.8.3 as of Nov 2026: `git -C ~/Coding/forks/bee checkout v2.8.3`)
+  when you need exact code.
