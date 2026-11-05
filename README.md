@@ -161,15 +161,15 @@ that reference offline.
 
 Tracks the upstream [bee][bee] mainnet protocols:
 
-| Protocol     | Versions accepted                         | Notes                            |
-| ------------ | ----------------------------------------- | -------------------------------- |
-| handshake    | `15.0.0` (preferred), `14.0.0` (fallback) |                                  |
-| hive         | `2.0.0` (preferred), `1.1.0` (fallback)   |                                  |
-| retrieval    | `1.4.0`                                   |                                  |
-| pushsync     | `1.3.1`                                   |                                  |
-| pricing      | `1.0.0`                                   |                                  |
-| pseudosettle | `1.0.0`                                   |                                  |
-| status       | `1.1.3`                                   | inbound-only                     |
-| swap         | `1.0.0`                                   | cheque issuance only, no cashout |
+| Protocol     | Version  | Notes                            |
+| ------------ | -------- | -------------------------------- |
+| handshake    | `15.0.0` |                                  |
+| hive         | `2.0.0`  |                                  |
+| retrieval    | `1.4.0`  |                                  |
+| pushsync     | `1.3.1`  |                                  |
+| pricing      | `1.0.0`  |                                  |
+| pseudosettle | `1.0.0`  |                                  |
+| status       | `1.1.3`  | inbound-only                     |
+| swap         | `1.0.0`  | cheque issuance only, no cashout |
 
 [bee]: https://github.com/ethersphere/bee

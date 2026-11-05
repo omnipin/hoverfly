@@ -19,7 +19,11 @@ fn main() {
     let underlay: libp2p::Multiaddr = underlay_str.parse().unwrap();
     let underlay_bytes = underlay.to_vec();
 
-    let sig = signer.sign_handshake(&underlay_bytes).unwrap();
+    let timestamp = 1_700_000_000i64;
+    let chequebook = [0u8; 20];
+    let sig = signer
+        .sign_handshake_v15(&underlay_bytes, signer.nonce(), timestamp, &chequebook)
+        .unwrap();
     println!("signature (alloy): {}", hex::encode(sig));
 
     // Manually reproduce the digest (EIP-191 prefix + keccak).
@@ -28,6 +32,9 @@ fn main() {
     payload.extend_from_slice(&underlay_bytes);
     payload.extend_from_slice(signer.overlay());
     payload.extend_from_slice(&network_id.to_be_bytes());
+    payload.extend_from_slice(signer.nonce());
+    payload.extend_from_slice(&(timestamp as u64).to_be_bytes());
+    payload.extend_from_slice(&chequebook);
 
     let prefix = format!("\x19Ethereum Signed Message:\n{}", payload.len());
     let mut prefixed = prefix.into_bytes();

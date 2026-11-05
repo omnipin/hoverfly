@@ -1,16 +1,9 @@
-//! Bee hive (peer-gossip) protocol.
+//! Bee hive (peer-gossip) protocol, `/swarm/hive/2.0.0/peers`
+//! (bee 2.8.0+).
 //!
-//! Two on-wire versions are supported:
-//!
-//!   * v1.1.0 — `/swarm/hive/1.1.0/peers`, used by bee ≤ 2.7.x.
-//!     `BzzAddress = { underlay, signature, overlay, nonce }`.
-//!
-//!   * v2.0.0 — `/swarm/hive/2.0.0/peers`, introduced in bee 2.8.0.
-//!     `BzzAddress` gains `timestamp` and `chequebook_address` fields,
-//!     both of which are covered by the signature on the handshake
-//!     path. Bee 2.8.0 rejects gossip records whose `timestamp == 0`,
-//!     so we cannot forward v1.1.0 records over a v2.0.0 substream
-//!     without resigning, and vice versa.
+//! `BzzAddress` carries `timestamp` and `chequebook_address`, both
+//! covered by the handshake signature. Bee rejects gossip records whose
+//! `timestamp == 0`. The pre-2.8.0 `1.1.0` version is not supported.
 //!
 //! Server-push only: after the substream is open the peer announces
 //! its known peers via repeated `Peers` messages until EOF.
@@ -25,30 +18,9 @@ use crate::protocols::framing::{FrameError, read_message, write_message};
 use libp2p::Multiaddr;
 use thiserror::Error;
 
-pub const PROTOCOL_V2: &str = "/swarm/hive/2.0.0/peers";
-pub const PROTOCOL_V1: &str = "/swarm/hive/1.1.0/peers";
-
-/// Default-current protocol for callers that don't yet thread version
-/// through. Prefer the explicit consts and [`Version`] enum.
-pub const PROTOCOL: &str = PROTOCOL_V2;
+pub const PROTOCOL: &str = "/swarm/hive/2.0.0/peers";
 
 const UNDERLAY_LIST_PREFIX: u8 = 0x99;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Version {
-    V1,
-    V2,
-}
-
-impl Version {
-    pub fn from_protocol(proto: &str) -> Option<Self> {
-        match proto {
-            PROTOCOL_V1 => Some(Self::V1),
-            PROTOCOL_V2 => Some(Self::V2),
-            _ => None,
-        }
-    }
-}
 
 #[derive(Debug, Error)]
 pub enum HiveError {
@@ -57,9 +29,8 @@ pub enum HiveError {
 }
 
 /// Drain Peers envelopes from the hive stream until EOF, returning all
-/// announced peers. Works for both v1 and v2; we just ignore the
-/// v2-only timestamp/chequebook fields (no field they refer to in our
-/// `Peer` type yet).
+/// announced peers. The timestamp/chequebook fields are ignored (no
+/// field they refer to in our `Peer` type yet).
 pub async fn read_peers<S>(stream: &mut S) -> Result<Vec<Peer>, HiveError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
@@ -110,23 +81,20 @@ where
 /// `HandshakeResult` of our outbound bee handshake (where signature
 /// and nonce are produced) plus our advertised underlay.
 ///
-/// For v2 announcements, the caller must also provide `timestamp`
-/// and `chequebook_address`. Both must match the values they signed
-/// in the handshake — bee verifies the signature over the v2 sign
-/// payload, which includes both.
+/// `timestamp` and `chequebook_address` must match the values signed
+/// in the handshake — bee verifies the signature over a payload that
+/// includes both.
 #[derive(Clone, Debug)]
 pub struct OwnBzzAddress {
     pub overlay: Vec<u8>,
     pub underlay: Vec<u8>,
     pub signature: Vec<u8>,
     pub nonce: Vec<u8>,
-    /// v2-only. Set to the same `timestamp` field we passed to the
-    /// v15 handshake; bee 2.8.0+ rejects gossip records whose
-    /// timestamp is zero or older than what it already has on file.
-    /// Ignored on v1 announcements.
+    /// Same `timestamp` we signed in the handshake; bee rejects gossip
+    /// records whose timestamp is zero or older than what it already
+    /// has on file.
     pub timestamp: i64,
-    /// v2-only. 20-byte zero address when we don't run a chequebook.
-    /// Ignored on v1 announcements.
+    /// 20-byte zero address when we don't run a chequebook.
     pub chequebook_address: [u8; 20],
 }
 
@@ -148,11 +116,7 @@ pub struct OwnBzzAddress {
 /// dialer side: we write empty request headers, read empty response
 /// headers, then write the actual `Peers` message. Mirrors what
 /// `pkg/p2p/libp2p/headers.go::sendHeaders` does internally.
-pub async fn announce_self<S>(
-    stream: &mut S,
-    me: &OwnBzzAddress,
-    version: Version,
-) -> Result<(), HiveError>
+pub async fn announce_self<S>(stream: &mut S, me: &OwnBzzAddress) -> Result<(), HiveError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
 {
@@ -160,23 +124,13 @@ where
     write_message(stream, &hdr::Headers { headers: vec![] }).await?;
     let _: hdr::Headers = read_message(stream).await?;
 
-    let bzz_addr = match version {
-        Version::V1 => pb::BzzAddress {
-            overlay: me.overlay.clone(),
-            underlay: me.underlay.clone(),
-            signature: me.signature.clone(),
-            nonce: me.nonce.clone(),
-            timestamp: 0,
-            chequebook_address: Vec::new(),
-        },
-        Version::V2 => pb::BzzAddress {
-            overlay: me.overlay.clone(),
-            underlay: me.underlay.clone(),
-            signature: me.signature.clone(),
-            nonce: me.nonce.clone(),
-            timestamp: me.timestamp,
-            chequebook_address: me.chequebook_address.to_vec(),
-        },
+    let bzz_addr = pb::BzzAddress {
+        overlay: me.overlay.clone(),
+        underlay: me.underlay.clone(),
+        signature: me.signature.clone(),
+        nonce: me.nonce.clone(),
+        timestamp: me.timestamp,
+        chequebook_address: me.chequebook_address.to_vec(),
     };
 
     let envelope = pb::Peers {
