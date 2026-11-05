@@ -3,7 +3,7 @@
 // pkg/ (built via `cargo build --target wasm32-... && wasm-bindgen`).
 
 import * as esbuild from 'esbuild'
-import { copyFileSync, cpSync, existsSync, mkdirSync, readFileSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { createHash } from 'node:crypto'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -12,6 +12,7 @@ const here = dirname(fileURLToPath(import.meta.url))
 const dist = resolve(here, 'dist')
 const assets = resolve(dist, '__gw__')
 const pkg = resolve(here, '../../pkg')
+const peersSeedUrl = 'https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.ws.json'
 const watch = process.argv.includes('--watch')
 
 const entryPoints = {
@@ -24,15 +25,6 @@ const entryPoints = {
 
 function copyStatic () {
   cpSync(resolve(here, 'public'), dist, { recursive: true })
-  // public/__gw__/peers.ws.json is a symlink to the repo-root peers.ws.json
-  // (a frozen fallback — the fresh copy is regenerated hourly in the
-  // omnipin/hoverfly-peers repo). cpSync's `dereference`
-  // option is ignored for entries nested inside a recursive copy, so
-  // materialize it by hand — dist/ must contain a real file, not a symlink,
-  // for the deployed artifact to be self-contained.
-  const peersWs = resolve(dist, '__gw__/peers.ws.json')
-  rmSync(peersWs, { force: true })
-  copyFileSync(resolve(here, 'public/__gw__/peers.ws.json'), peersWs)
   if (existsSync(pkg)) {
     cpSync(pkg, resolve(assets, 'hoverfly'), { recursive: true })
   } else {
@@ -44,6 +36,20 @@ function copyStatic () {
       // the repo's .cargo/config.toml (applied automatically).
       '     RUSTUP_TOOLCHAIN=nightly cargo build --release --locked --target wasm32-unknown-unknown --no-default-features --features wasm-threads --lib\n' +
       '     wasm-bindgen --target web --out-dir pkg target/wasm32-unknown-unknown/release/hoverfly.wasm\n')
+  }
+}
+
+/** Vendor a snapshot of the cold-start peer seed (browser-dialable /ws[s]
+ *  peers, refreshed hourly in the omnipin/hoverfly-peers repo). The daemon
+ *  prefers the live CDN copy (config.PEERS_SEED_URL); this one is the fallback
+ *  for when that's unreachable. Best effort: without either, it discovers cold. */
+async function vendorPeerSeed () {
+  try {
+    const resp = await fetch(peersSeedUrl, { signal: AbortSignal.timeout(10_000) })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    writeFileSync(resolve(assets, 'peers.ws.json'), await resp.text())
+  } catch (e) {
+    console.warn(`\n  ⚠  couldn't fetch ${peersSeedUrl} (${e.message}) — no bundled peer seed.\n`)
   }
 }
 
@@ -85,6 +91,7 @@ function daemonVersion () {
 rmSync(dist, { recursive: true, force: true })
 mkdirSync(assets, { recursive: true })
 copyStatic()
+await vendorPeerSeed()
 
 if (watch) {
   const ctx = await esbuild.context(options)

@@ -9,7 +9,7 @@
 // hashing pool); serve.js sets the COOP/COEP headers.
 
 import * as esbuild from 'esbuild'
-import { copyFileSync, cpSync, existsSync, mkdirSync, rmSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -21,7 +21,7 @@ const assets = resolve(dist, '__up__')
 // the gateway's threaded/shared-memory build). This is what lets the dApp run
 // on the eth.limo ENS gateway, which can't set COOP/COEP.
 const pkg = resolve(here, 'pkg')
-const peersSeed = resolve(here, '../../peers.ws.json')
+const peersSeedUrl = 'https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.ws.json'
 const watch = process.argv.includes('--watch')
 
 const entryPoints = {
@@ -32,20 +32,25 @@ const entryPoints = {
 
 function copyStatic () {
   cpSync(resolve(here, 'public'), dist, { recursive: true })
-  // Vendor the cold-start peer seed (browser-dialable /ws[s] peers harvested
-  // from mainnet; the omnipin/hoverfly-peers repo keeps the fresh copy). This
-  // bundled one is a fallback for when the CDN copy is unreachable — see
-  // config.PEERS_SEED_URL.
-  if (existsSync(peersSeed)) {
-    copyFileSync(peersSeed, resolve(assets, 'peers.ws.json'))
-  } else {
-    console.warn(`\n  ⚠  ${peersSeed} not found — upload will discover peers cold.\n`)
-  }
   if (existsSync(pkg)) {
     cpSync(pkg, resolve(assets, 'hoverfly'), { recursive: true })
   } else {
     console.warn(`\n  ⚠  ${pkg} not found — build the no-shared-memory wasm first:\n` +
       '     ./build-wasm.sh   (from apps/upload/)\n')
+  }
+}
+
+// Vendor a snapshot of the cold-start peer seed (browser-dialable /ws[s] peers,
+// refreshed hourly in the omnipin/hoverfly-peers repo). It's the fallback for
+// when the CDN copy is unreachable — see config.PEERS_SEED_URL. Best effort:
+// without either, upload discovers peers cold.
+async function vendorPeerSeed () {
+  try {
+    const resp = await fetch(peersSeedUrl, { signal: AbortSignal.timeout(10_000) })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    writeFileSync(resolve(assets, 'peers.ws.json'), await resp.text())
+  } catch (e) {
+    console.warn(`\n  ⚠  couldn't fetch ${peersSeedUrl} (${e.message}) — upload will discover peers cold.\n`)
   }
 }
 
@@ -68,6 +73,7 @@ const options = {
 rmSync(dist, { recursive: true, force: true })
 mkdirSync(assets, { recursive: true })
 copyStatic()
+await vendorPeerSeed()
 
 if (watch) {
   const ctx = await esbuild.context(options)

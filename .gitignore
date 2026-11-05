@@ -17,13 +17,9 @@ cheques.json
 # `git add -A` mid-session can publish a key that was passed on a command
 # line. Ignore the whole directory.
 .claude/
-# `peers.seed.json` is checked in: an IP-diverse cold-start seed
-# harvested from a long-running daemon (~800 peers across ~800 unique
-# /32 IPs as of the last refresh; regenerate via
-# `hoverfly save-peers --socket <sock>` against a daemon that's been
-# running long enough to accumulate kademlia memberships). Used by CI
-# (which has no persistent peerlist) and by fresh local installs.
-# Lives alongside the gitignored `peers.json` that gets written at
-# daemon shutdown / SavePeers. CI copies the seed into place before
-# starting the daemon.
+# Cold-start seeds are published by the omnipin/hoverfly-peers repo
+# (refreshed hourly), not committed here. Local copies (e.g. the
+# `pusher --peerlist` default) are runtime state like `peers.json`.
+peers.seed.json
+peers.ws.json
 .DS_Store

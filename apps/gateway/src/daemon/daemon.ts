@@ -230,7 +230,7 @@ async function loadSeed (): Promise<string | undefined> {
       console.warn('[daemon] seed: CDN fetch failed, falling back to bundled copy:', errMsg(e))
     }
   }
-  // Fallback: the copy bundled into dist/ at build time (symlink snapshot).
+  // Fallback: the snapshot build.js vendors into dist/ at build time.
   try {
     const resp = await fetch(new URL('peers.ws.json', self.location.href).href)
     if (resp.ok) {
