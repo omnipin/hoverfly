@@ -266,13 +266,14 @@ enum Commands {
         #[arg(long, default_value = "peers.json", value_name = "FILE")]
         peerlist: PathBuf,
 
-        /// Cap on peers tried per chunk before giving up. `0` means no
-        /// cap — march through every peer in the peerlist (proximity-
-        /// ordered) until one yields the chunk. Useful when the chunk
-        /// neighborhood isn't densely represented in your peerlist:
-        /// non-neighbor Bee nodes will forward the request through their
-        /// own kademlia table.
-        #[arg(long, default_value_t = 0)]
+        /// Cap on peers tried per chunk before giving up, closest first.
+        /// The default matches bee's `maxOriginErrors`. `0` means no cap —
+        /// march through every peer in the peerlist (thousands) — so a
+        /// missing chunk takes hours to fail, and erasure-coded content
+        /// can't fall back to parity until it does. Non-neighbor bee nodes
+        /// forward the request through their own kademlia table, so the
+        /// closest few dozen usually suffice.
+        #[arg(long, default_value_t = 32)]
         max_retries: usize,
 
         /// Number of peers to race in parallel per chunk request.
