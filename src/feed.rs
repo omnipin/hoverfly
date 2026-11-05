@@ -343,6 +343,7 @@ where
             break;
         }
         let mut any_present = false;
+        let mut absent = Vec::new();
         while let Some((idx, res)) = futs.next().await {
             match res? {
                 Some(c) => {
@@ -352,13 +353,13 @@ where
                         last_chunk = c;
                     }
                 }
-                None => {
-                    if idx < hi {
-                        hi = idx;
-                    }
-                }
+                None => absent.push(idx),
             }
         }
+        // Only an absence above the highest present index bounds the head. A
+        // miss below it was transient (a later update exists), and taking it
+        // as `hi` left `hi < lo`.
+        hi = lowest_above(&absent, lo).unwrap_or(hi);
         if hi != u64::MAX {
             break 'outer; // bracketed
         }
@@ -374,7 +375,7 @@ where
     if hi != u64::MAX {
         let mut low = lo;
         let mut high = hi;
-        while high - low > 1 {
+        while high > low.saturating_add(1) {
             let candidates = bracket_candidates(low, high, PROBE_BAND);
             let mut futs = FuturesUnordered::new();
             for idx in candidates {
@@ -384,8 +385,8 @@ where
                 break;
             }
             let mut round_low = low;
-            let mut round_high = high;
             let mut round_chunk: Option<AnyChunk<DEFAULT_BODY_SIZE>> = None;
+            let mut absent = Vec::new();
             while let Some((idx, res)) = futs.next().await {
                 match res? {
                     Some(c) => {
@@ -394,13 +395,10 @@ where
                             round_chunk = Some(c);
                         }
                     }
-                    None => {
-                        if idx < round_high {
-                            round_high = idx;
-                        }
-                    }
+                    None => absent.push(idx),
                 }
             }
+            let round_high = lowest_above(&absent, round_low).map_or(high, |h| h.min(high));
             if round_low == low && round_high == high {
                 break; // no progress guard
             }
@@ -424,6 +422,11 @@ where
         hex::encode(reference)
     );
     Ok((ChunkAddress::new(reference), lo))
+}
+
+/// Smallest index in `absent` strictly above `lo`.
+fn lowest_above(absent: &[u64], lo: u64) -> Option<u64> {
+    absent.iter().copied().filter(|&i| i > lo).min()
 }
 
 /// Outcome of a single bounded probe, distinguishing *why* a chunk was absent.
@@ -784,6 +787,33 @@ mod tests {
             .expect("must resolve through transient anchor misses, not error NoUpdate");
         assert_eq!(index, 0);
         assert_eq!(*addr.as_ref(), reference);
+    }
+
+    /// A miss *below* a present index is transient (a later update exists). It
+    /// used to become the upper bound, leaving `hi < lo`: `high - low`
+    /// underflowed (a panic in debug builds) and the head came out stale.
+    #[tokio::test]
+    async fn transient_miss_below_a_present_index_is_ignored() {
+        let feed = test_feed();
+        let head_ref = [0x42u8; 32];
+        let mut present = HashMap::new();
+        for i in 0..=10u64 {
+            let r = if i == 10 { head_ref } else { [i as u8; 32] };
+            present.insert(feed.update_address(i), head_chunk(r));
+        }
+        // Index 2 misses once; 4 and 8 (probed in the same band) are present.
+        let mut scripts: HashMap<_, std::collections::VecDeque<Outcome>> = HashMap::new();
+        scripts.insert(
+            feed.update_address(2),
+            [Outcome::NotFound].into_iter().collect(),
+        );
+        let store = MockStore {
+            scripts: Mutex::new(scripts),
+            present: Mutex::new(present),
+        };
+        let (addr, index) = resolve_latest(&store, &feed, 0).await.expect("resolves");
+        assert_eq!(index, 10);
+        assert_eq!(*addr.as_ref(), head_ref);
     }
 
     /// A definitive not-found at index 0 (no transient noise) still concludes the
