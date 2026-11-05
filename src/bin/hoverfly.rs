@@ -239,7 +239,7 @@ enum Commands {
         /// `/ws` or `/wss` (WebSocket) underlay, and strip each peer's
         /// non-ws underlays. Browser builds can't open raw TCP, so this
         /// produces a peers.json the in-browser gateway daemon can use
-        /// directly (e.g. `apps/gateway/public/__gw__/peers.ws.json`).
+        /// directly (e.g. the `peers.ws.json` the browser apps seed from).
         #[arg(long)]
         ws_only: bool,
     },

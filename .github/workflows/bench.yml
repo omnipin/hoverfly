@@ -109,27 +109,19 @@ jobs:
       - name: Seed peers.json from the peers repo
         # The fresh peerlist (refreshed hourly in omnipin/hoverfly-peers) gives
         # the daemon ~3k dial candidates so the session pool can fill without
-        # discovering them first. The copy committed in this repo is a frozen
-        # fallback.
+        # discovering them first.
         #
         # Note what this does NOT do: the daemon's "skip the pre-fill discover"
         # fast path needs >= WARM_PEERLIST_MIN_KNOWN_GOOD (8) peers whose last
         # successful dial is within KNOWN_GOOD_FRESHNESS_SECS (15 min). A seed
-        # that was committed to git can essentially never satisfy that — the
-        # refresh cron runs hourly, so by the time a bench starts the newest
-        # timestamps are typically 20-40 min old. The daemon therefore always
-        # takes the "peerlist not warm enough" branch and runs a pre-fill
-        # discover; see --discover-rounds below for why that is kept to 1.
+        # snapshot can essentially never satisfy that — the refresh cron runs
+        # hourly, so by the time a bench starts the newest timestamps are
+        # typically 20-40 min old. The daemon therefore always takes the
+        # "peerlist not warm enough" branch and runs a pre-fill discover; see
+        # --discover-rounds below for why that is kept to 1.
         run: |
-          set -euo pipefail
-          if curl -fsSL -o peers.json \
-            https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json \
-            && [ -s peers.json ]; then
-            echo "Using the fresh peerlist from omnipin/hoverfly-peers"
-          else
-            echo "WARNING: fresh peerlist fetch failed; using the committed copy"
-            cp peers.seed.json peers.json
-          fi
+          curl -fsSL --retry 3 -o peers.json \
+            https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json
 
       - name: Start daemon
         env:

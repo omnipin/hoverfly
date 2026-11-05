@@ -90,14 +90,14 @@ can serve arbitrary chunks.
 
 What the daemon does:
 
-- Ships a committed **`public/__gw__/peers.ws.json`** seed (ws peers harvested
-  from mainnet) so the first fetch has something to dial immediately. It's a
-  symlink to the repo-root `peers.ws.json` — a frozen fallback; the fresh
-  copy is re-derived from `peers.seed.json` hourly in the
+- Seeds from **`peers.ws.json`** (ws peers harvested from mainnet) so the
+  first fetch has something to dial immediately. It's re-derived from
+  `peers.seed.json` hourly in the
   [`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo
   (ws/wss underlays only — these go stale within ~2-3h, so the seed is kept
   fresh well inside that window) and fetched from the CDN at runtime;
-  `build.js` materializes the bundled copy into a real file in `dist/`.
+  `build.js` also vendors a snapshot into `dist/__gw__/` as the fallback for
+  when the CDN is unreachable.
 - Always runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to
   refresh from the live bootnodes (the seed goes stale), persisting the result
   to IndexedDB.
@@ -108,8 +108,7 @@ For best reliability, point discovery at a WebSocket-capable bee you control
 
 > Regenerate the seed by hand (the cron in `omnipin/hoverfly-peers` normally
 > does this):
-> `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 --ws-only -o peers.ws.json`
-> from the repo root.
+> `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 --ws-only -o peers.ws.json`.
 
 > The wasm `/ws` dial path itself still needs verification in a real browser —
 > the peer availability and multiaddr shape are confirmed here, but the

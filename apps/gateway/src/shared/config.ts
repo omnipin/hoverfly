@@ -119,7 +119,7 @@ export const DOH_URL: string | undefined = undefined
  * time. The `omnipin/hoverfly-peers` repo re-derives `peers.ws.json` from a
  * live mainnet harvest HOURLY; mainnet /ws[s] underlays go stale within ~2-3h
  * (AutoTLS SNI rotation, churn), so that copy is the freshest seed available. The locally-bundled copy (`peers.ws.json` in dist/,
- * a build-time symlink snapshot) is only as fresh as the last gateway DEPLOY —
+ * a snapshot build.js fetches at build time) is only as fresh as the last gateway DEPLOY —
  * which can be days old — so we prefer the CDN at runtime and fall back to the
  * local copy only when the CDN is unreachable (offline / GitHub down / rate
  * limited). raw.githubusercontent.com serves it with `access-control-allow-
