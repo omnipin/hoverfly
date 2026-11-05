@@ -103,6 +103,12 @@ pub fn decode_node(payload: &[u8]) -> Result<Node, ManifestError> {
 
     let mut offset = NODE_HEADER_SIZE;
 
+    if data.len() < offset + ref_size as usize + INDEX_SIZE {
+        return Err(ManifestError::TooShort {
+            expected: offset + ref_size as usize + INDEX_SIZE,
+            actual: data.len(),
+        });
+    }
     let entry = if ref_size > 0 {
         let entry_bytes = &data[offset..offset + ref_size as usize];
         offset += ref_size as usize;
@@ -365,6 +371,38 @@ pub fn build_collection_manifest(
     Ok((root, chunks))
 }
 
+/// Serialize an unobfuscated v0.2 node in the layout [`decode_node`] reads.
+/// Test-only: unlike nectar's encoder it doesn't refuse nodes over 4 KiB,
+/// which bee produces for wide directories.
+#[cfg(test)]
+pub(crate) fn encode_test_node(entry: Option<[u8; 32]>, forks: &[(Vec<u8>, [u8; 32])]) -> Vec<u8> {
+    let mut out = vec![0u8; OBFUSCATION_KEY_SIZE];
+    out.extend_from_slice(&VERSION_HASH_V02);
+    match entry {
+        Some(e) => {
+            out.push(32);
+            out.extend_from_slice(&e);
+        }
+        None => out.push(0),
+    }
+    let mut bitfield = [0u8; INDEX_SIZE];
+    for (prefix, _) in forks {
+        bitfield[prefix[0] as usize / 8] |= 1 << (prefix[0] % 8);
+    }
+    out.extend_from_slice(&bitfield);
+    let mut sorted: Vec<_> = forks.iter().collect();
+    sorted.sort_by_key(|(p, _)| p[0]);
+    for (prefix, reference) in sorted {
+        out.push(2); // value
+        out.push(prefix.len() as u8);
+        let mut padded = [0u8; 30];
+        padded[..prefix.len()].copy_from_slice(prefix);
+        out.extend_from_slice(&padded);
+        out.extend_from_slice(reference);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +417,22 @@ mod tests {
         let node = decode_node(&data).unwrap();
         assert!(node.entry.is_none());
         assert!(node.forks.is_empty());
+    }
+
+    /// A node claiming a 32-byte entry but too short to hold it (and the fork
+    /// index) must be rejected; slicing the entry used to panic. Anyone can
+    /// upload such a chunk and hand out its reference.
+    #[test]
+    fn truncated_node_is_rejected_not_panicked_on() {
+        for len in 64..(64 + 32 + 32) {
+            let mut data = vec![0u8; len];
+            data[32..63].copy_from_slice(&VERSION_HASH_V02);
+            data[63] = 32; // ref_size
+            assert!(
+                matches!(decode_node(&data), Err(ManifestError::TooShort { .. })),
+                "len {len}"
+            );
+        }
     }
 
     /// Real `swarm.eth` feed-manifest root chunk (ref
