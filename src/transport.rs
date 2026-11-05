@@ -27,14 +27,11 @@ use crate::protocols::retrieval::{self, ChunkDelivery};
 use crate::protocols::status as status_proto;
 use crate::signer::{SignerError, SwarmSigner};
 
-pub(crate) const HANDSHAKE_PROTO_V15: StreamProtocol =
+pub(crate) const HANDSHAKE_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/handshake/15.0.0/handshake");
-pub(crate) const HANDSHAKE_PROTO_V14: StreamProtocol =
-    StreamProtocol::new("/swarm/handshake/14.0.0/handshake");
 pub(crate) const PRICING_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/pricing/1.0.0/pricing");
-pub(crate) const HIVE_PROTO_V2: StreamProtocol = StreamProtocol::new("/swarm/hive/2.0.0/peers");
-pub(crate) const HIVE_PROTO_V1: StreamProtocol = StreamProtocol::new("/swarm/hive/1.1.0/peers");
+pub(crate) const HIVE_PROTO: StreamProtocol = StreamProtocol::new("/swarm/hive/2.0.0/peers");
 pub(crate) const RETRIEVAL_PROTO: StreamProtocol =
     StreamProtocol::new("/swarm/retrieval/1.4.0/retrieval");
 pub(crate) const PUSHSYNC_PROTO: StreamProtocol =
@@ -875,14 +872,9 @@ impl Transport {
         let peer_id = ensure_ws(peer_addr)?;
         let mut swarm = build_swarm(self).await?;
         let mut control = swarm.behaviour().stream.new_control();
-        // Accept both handshake & hive versions. Bee's inbound
-        // dial-back mirrors our outbound choice; we don't yet know
-        // which version we'll negotiate.
-        let mut hs_in_v15 = accept(&mut control, HANDSHAKE_PROTO_V15)?;
-        let mut hs_in_v14 = accept(&mut control, HANDSHAKE_PROTO_V14)?;
+        let mut hs_in = accept(&mut control, HANDSHAKE_PROTO)?;
         let mut pr_in = accept(&mut control, PRICING_PROTO)?;
-        let mut hive_in_v2 = accept(&mut control, HIVE_PROTO_V2)?;
-        let mut hive_in_v1 = accept(&mut control, HIVE_PROTO_V1)?;
+        let mut hive_in = accept(&mut control, HIVE_PROTO)?;
         dial(&mut swarm, peer_id, peer_addr)?;
 
         let underlay = prep_connection(&mut swarm, peer_id, self.config.timeout).await?;
@@ -890,8 +882,7 @@ impl Transport {
             &mut swarm,
             peer_id,
             &mut control,
-            &mut hs_in_v15,
-            &mut hs_in_v14,
+            &mut hs_in,
             &underlay,
             &self.signer,
             self.config.advertise.as_ref(),
@@ -963,33 +954,11 @@ impl Transport {
             let remaining = hard_remaining.min(soft_remaining);
             tokio::select! {
                 _ = tokio::time::sleep(remaining) => continue,
-                ev = hive_in_v2.next() => {
+                ev = hive_in.next() => {
                     match ev {
                         Some((pid, mut stream)) if pid == peer_id => {
                             debug!(target: "hoverfly::hive",
-                                "inbound hive v2 stream opened (batch {})", batches_read + 1);
-                            match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
-                                Ok(mut batch) => {
-                                    let n = batch.len();
-                                    peers.append(&mut batch);
-                                    batches_read += 1;
-                                    last_batch_at = Some(web_time::Instant::now());
-                                    info!(target: "hoverfly::hive",
-                                        "read {} peers (batch {}, total {})",
-                                        n, batches_read, peers.len());
-                                }
-                                Err(e) => debug!(target: "hoverfly::hive", "read_peers err: {}", e),
-                            }
-                        }
-                        Some(_) => {}
-                        None => break,
-                    }
-                }
-                ev = hive_in_v1.next() => {
-                    match ev {
-                        Some((pid, mut stream)) if pid == peer_id => {
-                            debug!(target: "hoverfly::hive",
-                                "inbound hive v1 stream opened (batch {})", batches_read + 1);
+                                "inbound hive stream opened (batch {})", batches_read + 1);
                             match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
                                 Ok(mut batch) => {
                                     let n = batch.len();
@@ -1118,17 +1087,9 @@ impl PeerSession {
         let peer_id = ensure_ws(peer_addr)?;
         let mut swarm = build_swarm(transport).await?;
         let mut control = swarm.behaviour().stream.new_control();
-        // Accept handshake & hive on both protocol versions. The
-        // outbound `do_handshake` picks v15 first and falls back to
-        // v14, so a peer's inbound dial-back will normally land on
-        // whichever version we just used. The unused v14 acceptor
-        // sits idle when talking to a v15 peer (and vice versa)
-        // costing nothing but an `IncomingStreams` future.
-        let mut hs_in_v15 = accept(&mut control, HANDSHAKE_PROTO_V15)?;
-        let mut hs_in_v14 = accept(&mut control, HANDSHAKE_PROTO_V14)?;
+        let mut hs_in = accept(&mut control, HANDSHAKE_PROTO)?;
         let mut pr_in = accept(&mut control, PRICING_PROTO)?;
-        let hive_in_v2 = accept(&mut control, HIVE_PROTO_V2)?;
-        let hive_in_v1 = accept(&mut control, HIVE_PROTO_V1)?;
+        let hive_in = accept(&mut control, HIVE_PROTO)?;
         // Accept STATUS even if no snapshot is configured — bee opens
         // this stream from its `pkg/salud` worker on every connection,
         // and a multistream-select NACK on this protocol gets logged
@@ -1171,8 +1132,7 @@ impl PeerSession {
             &mut swarm,
             peer_id,
             &mut control,
-            &mut hs_in_v15,
-            &mut hs_in_v14,
+            &mut hs_in,
             &underlay,
             &transport.signer,
             transport.config.advertise.as_ref(),
@@ -1198,7 +1158,7 @@ impl PeerSession {
 
         // Hive self-announcement (best-effort). Tell bee about
         // ourselves by sending a `Peers` envelope containing our own
-        // BzzAddress over a fresh `/swarm/hive/1.1.0/peers` substream.
+        // BzzAddress over a fresh `/swarm/hive/2.0.0/peers` substream.
         // Bee's `peersHandler` reads the envelope, dial-probes each
         // announced address to verify reachability (works because we
         // run `--listen --advertise`), and adds successfully verified
@@ -1222,15 +1182,9 @@ impl PeerSession {
         if !hs_result.our_underlay.is_empty() {
             let our_overlay = transport.signer.overlay().to_vec();
             let our_nonce = transport.signer.nonce().to_vec();
-            // Hive announce uses the same version family as the
-            // handshake we just completed: v14 handshake ⇒ v1 hive,
-            // v15 ⇒ v2. Bee gossiped records must include a non-zero
-            // timestamp on v2; we replay the timestamp we signed in
-            // the handshake (`hs_result.our_timestamp`).
-            let hive_version = match hs_result.version {
-                handshake::Version::V14 => crate::protocols::hive::Version::V1,
-                handshake::Version::V15 => crate::protocols::hive::Version::V2,
-            };
+            // Bee rejects gossiped records with a zero timestamp, so we
+            // replay the timestamp we signed in the handshake
+            // (`hs_result.our_timestamp`).
             let me = crate::protocols::hive::OwnBzzAddress {
                 overlay: our_overlay,
                 underlay: hs_result.our_underlay.clone(),
@@ -1246,7 +1200,6 @@ impl PeerSession {
                 &mut control,
                 transport.config.dial_timeout,
                 &me,
-                hive_version,
             )
             .await
             {
@@ -1324,11 +1277,9 @@ impl PeerSession {
             swarm,
             state,
             cmd_rx,
-            _hs_in_v15: hs_in_v15,
-            _hs_in_v14: hs_in_v14,
+            _hs_in: hs_in,
             _pr_in: pr_in,
-            _hive_in_v2: hive_in_v2,
-            _hive_in_v1: hive_in_v1,
+            _hive_in: hive_in,
             status_in,
             status_snapshot: transport.status_snapshot.clone(),
         });
@@ -2001,14 +1952,10 @@ struct SessionDriver {
     state: std::sync::Arc<SessionState>,
     cmd_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
     // Held to keep the accept registrations alive for the lifetime
-    // of the session. Two of each because we accept handshake/hive on
-    // both protocol versions (v14 + v15 / v1 + v2) during the bee
-    // 2.8.0 network-wide upgrade.
-    _hs_in_v15: crate::protocols::stream_pool::IncomingStreams,
-    _hs_in_v14: crate::protocols::stream_pool::IncomingStreams,
+    // of the session.
+    _hs_in: crate::protocols::stream_pool::IncomingStreams,
     _pr_in: crate::protocols::stream_pool::IncomingStreams,
-    _hive_in_v2: crate::protocols::stream_pool::IncomingStreams,
-    _hive_in_v1: crate::protocols::stream_pool::IncomingStreams,
+    _hive_in: crate::protocols::stream_pool::IncomingStreams,
     /// Inbound `/swarm/status/1.1.3/status` streams. Bee's `pkg/salud`
     /// opens this stream periodically (10s..5min backoff) over any
     /// connection it has to us — including the outbound connections
@@ -2381,8 +2328,7 @@ async fn do_handshake(
     swarm: &mut Swarm<Behaviour>,
     peer_id: PeerId,
     control: &mut crate::protocols::stream_pool::Control,
-    hs_in_v15: &mut crate::protocols::stream_pool::IncomingStreams,
-    hs_in_v14: &mut crate::protocols::stream_pool::IncomingStreams,
+    hs_in: &mut crate::protocols::stream_pool::IncomingStreams,
     underlay: &Multiaddr,
     signer: &SwarmSigner,
     advertised: Option<&Multiaddr>,
@@ -2390,24 +2336,9 @@ async fn do_handshake(
     let local_peer_id = *swarm.local_peer_id();
     debug!(target: "hoverfly::transport", "opening outbound handshake");
 
-    // Try v15 first (bee 2.8.0+). Bee ≤ 2.7.x's libp2p multistream
-    // negotiation will reject the v15 protocol id with
-    // `UnsupportedProtocol`; on that specific failure we fall back to
-    // v14. Any other open_stream error (connection closed, dial
-    // cooldown, etc.) bubbles up — those aren't version-related.
-    let (mut stream, version) =
-        match poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO_V15)).await {
-            Ok(s) => (s, handshake::Version::V15),
-            Err(e) if is_unsupported_protocol(&e) => {
-                debug!(target: "hoverfly::transport",
-                    "peer rejected handshake/15.0.0, falling back to 14.0.0");
-                let s = poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO_V14))
-                    .await
-                    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-                (s, handshake::Version::V14)
-            }
-            Err(e) => return Err(TransportError::StreamControl(format!("{e:?}"))),
-        };
+    let mut stream = poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO))
+        .await
+        .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
 
     let hs_result = {
         let hs_run = handshake::run(
@@ -2449,30 +2380,18 @@ async fn do_handshake(
             // in the inbound-handshake handler at handshake.go:355), but
             // light_node is still net-worse for throughput.
             true,
-            version,
         );
         // Run handshake while still draining inbound handshake/swarm
-        // events. Inbound dial-back can land on EITHER substream id
-        // (the peer chooses; usually matches the outbound version we
-        // just used) so we poll both inbound channels.
+        // events, so a peer's inbound dial-back doesn't stall.
         tokio::pin!(hs_run);
         loop {
             tokio::select! {
                 r = &mut hs_run => { break r?; }
-                ev = hs_in_v15.next() => {
+                ev = hs_in.next() => {
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
                             let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, true, handshake::Version::V15)
-                            ).await;
-                        }
-                    }
-                }
-                ev = hs_in_v14.next() => {
-                    if let Some((pid, mut s)) = ev {
-                        if pid == peer_id {
-                            let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, true, handshake::Version::V14)
+                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, true)
                             ).await;
                         }
                     }
@@ -2483,18 +2402,8 @@ async fn do_handshake(
     };
     close_stream_polled(swarm, &mut stream).await;
     debug!(target: "hoverfly::transport",
-        "outbound handshake complete (version={:?} peer_full_node={})",
-        hs_result.version, hs_result.peer_full_node);
+        "outbound handshake complete (peer_full_node={})", hs_result.peer_full_node);
     Ok(hs_result)
-}
-
-/// Heuristic: detect the "remote rejected our protocol id" error so
-/// the version negotiator can fall back without misclassifying other
-/// errors as version-mismatch. libp2p's multistream surface stringifies
-/// `UnsupportedProtocol` consistently inside the error chain.
-fn is_unsupported_protocol(err: &impl std::fmt::Debug) -> bool {
-    let s = format!("{err:?}");
-    s.contains("UnsupportedProtocol")
 }
 
 async fn do_pricing(
@@ -2577,7 +2486,7 @@ async fn do_swap_handshake(
     Ok(())
 }
 
-/// Open a fresh `/swarm/hive/1.1.0/peers` substream to `peer_id` and
+/// Open a fresh `/swarm/hive/2.0.0/peers` substream to `peer_id` and
 /// announce ourselves via a `Peers` envelope. Best-effort — bee's
 /// `peersHandler` reads the envelope, then bee verifies the
 /// advertised address asynchronously via its reacher's dial-probe.
@@ -2592,20 +2501,10 @@ async fn do_hive_announce(
     control: &mut crate::protocols::stream_pool::Control,
     timeout: Duration,
     me: &crate::protocols::hive::OwnBzzAddress,
-    version: crate::protocols::hive::Version,
 ) -> Result<(), TransportError> {
-    // `version` must match the handshake we performed — bee derives
-    // each peer's signed BzzAddress format from the negotiated
-    // handshake version, and our v2 sign payload includes timestamp
-    // + chequebook fields that don't exist in v1. Mixing versions
-    // would produce a signature bee rejects as invalid.
-    let proto = match version {
-        crate::protocols::hive::Version::V1 => HIVE_PROTO_V1,
-        crate::protocols::hive::Version::V2 => HIVE_PROTO_V2,
-    };
     let mut stream = tokio::time::timeout(
         timeout,
-        poll_until(swarm, control.open_stream(peer_id, proto)),
+        poll_until(swarm, control.open_stream(peer_id, HIVE_PROTO)),
     )
     .await
     .map_err(|_| TransportError::Timeout)?
@@ -2614,7 +2513,7 @@ async fn do_hive_announce(
         timeout,
         poll_until(
             swarm,
-            crate::protocols::hive::announce_self(&mut stream, me, version),
+            crate::protocols::hive::announce_self(&mut stream, me),
         ),
     )
     .await
@@ -2632,7 +2531,6 @@ pub(crate) async fn respond_to_handshake<S>(
     our_peer_id: &PeerId,
     remote_peer_id: PeerId,
     full_node: bool,
-    version: handshake::Version,
 ) -> Result<(), TransportError>
 where
     S: futures::AsyncRead + futures::AsyncWrite + Unpin,
@@ -2667,35 +2565,20 @@ where
     // mainnet peer enables by default — so the zero chequebook is fine.
     let our_chequebook = [0u8; 20];
 
-    let our_addr = match version {
-        handshake::Version::V14 => {
-            let signature = signer.sign_handshake(&our_underlay)?;
-            pb::BzzAddress {
-                underlay: our_underlay,
-                signature: signature.to_vec(),
-                overlay: signer.overlay().to_vec(),
-                nonce: Vec::new(),
-                timestamp: 0,
-                chequebook_address: Vec::new(),
-            }
-        }
-        handshake::Version::V15 => {
-            // Use the cached `(timestamp, signature)` pair so inbound
-            // and outbound handshakes for the same `(underlay,
-            // chequebook)` present byte-identical records to bee. See
-            // `SwarmSigner::sign_handshake_v15_cached` for the
-            // gossip-update-interval rationale.
-            let (timestamp, signature) =
-                signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
-            pb::BzzAddress {
-                underlay: our_underlay,
-                signature: signature.to_vec(),
-                overlay: signer.overlay().to_vec(),
-                nonce: signer.nonce().to_vec(),
-                timestamp,
-                chequebook_address: our_chequebook.to_vec(),
-            }
-        }
+    // Use the cached `(timestamp, signature)` pair so inbound and
+    // outbound handshakes for the same `(underlay, chequebook)` present
+    // byte-identical records to bee. See
+    // `SwarmSigner::sign_handshake_v15_cached` for the
+    // gossip-update-interval rationale.
+    let (timestamp, signature) =
+        signer.sign_handshake_v15_cached(&our_underlay, &our_chequebook)?;
+    let our_addr = pb::BzzAddress {
+        underlay: our_underlay,
+        signature: signature.to_vec(),
+        overlay: signer.overlay().to_vec(),
+        nonce: signer.nonce().to_vec(),
+        timestamp,
+        chequebook_address: our_chequebook.to_vec(),
     };
     let synack = pb::SynAck {
         syn: Some(pb::Syn {

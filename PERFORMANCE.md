@@ -778,6 +778,8 @@ wire compat); `signer::generate_sign_data_v15` (byte-for-byte bee payload),
 `sign_handshake_v15`, and `sign_handshake_v15_cached`; `Version` enums on
 handshake/hive with outbound v15/v2-first-then-fallback and inbound both-in-
 parallel; `libp2p::ping::Behaviour`; a fresh IP-diverse `peers.seed.json`.
+The v14/v1 fallback was removed in November 2026, once Swarmscan showed no
+pre-2.8 nodes left on mainnet (bee 2.8.x refuses major-14 handshakes anyway).
 
 **The cached-signature detail matters.** `sign_handshake_v15_cached` returns
 the same `(timestamp, signature)` per `(underlay, chequebook)` so reconnects
