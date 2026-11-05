@@ -1583,13 +1583,23 @@ impl SessionState {
         if self.accounting.lock().await.try_reserve(price) {
             return true;
         }
-        let _ = self.try_settle_once().await;
+        // A settle already in flight is what we're waiting for; queueing a
+        // second one behind it only adds bee's one-second gap.
+        match self.settle_lock.try_lock() {
+            Ok(guard) => {
+                drop(guard);
+                let _ = self.try_settle_once().await;
+            }
+            Err(_) => drop(self.settle_lock.lock().await),
+        }
         self.accounting.lock().await.try_reserve(price)
     }
 
-    /// Release a reservation and record what bee did with it, then settle
-    /// once the balance reaches one refresh-rate (outside the accounting
-    /// lock so concurrent requests don't stall).
+    /// Release a reservation and record what bee did with it. Once the
+    /// balance reaches one refresh-rate, start a settle in the background
+    /// unless one is already running. Awaiting it here held the receipt back
+    /// behind bee's one-second gap, and every request that crossed the line
+    /// queued its own settle behind the last.
     async fn commit(self: &std::sync::Arc<Self>, price: u64, err: Option<&TransportError>) {
         let should_settle = {
             let mut acc = self.accounting.lock().await;
@@ -1607,8 +1617,8 @@ impl SessionState {
                 }
             }
         };
-        if should_settle {
-            let _ = self.try_settle_once().await;
+        if should_settle && self.settle_lock.try_lock().is_ok() {
+            spawn_settle(self.clone());
         }
     }
 
@@ -1789,6 +1799,14 @@ impl SessionState {
     /// means the next reserve attempt will report overdraft.
     async fn try_settle_once(&self) -> Result<(), TransportError> {
         let _guard = self.settle_lock.lock().await;
+        // Opening a stream on a closed connection makes the stream pool
+        // redial the peer outside the handshake (and the dial limiter).
+        if self
+            .connection_dead
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(TransportError::ConnectionClosed);
+        }
 
         // Bee rejects two pseudosettles within the same wall-second.
         let needs_wait = {
@@ -2277,6 +2295,20 @@ fn spawn_session_driver(driver: SessionDriver) {
 #[cfg(target_arch = "wasm32")]
 fn spawn_session_driver(driver: SessionDriver) {
     wasm_bindgen_futures::spawn_local(driver.run());
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn spawn_settle(state: std::sync::Arc<SessionState>) {
+    tokio::spawn(async move {
+        let _ = state.try_settle_once().await;
+    });
+}
+
+#[cfg(target_arch = "wasm32")]
+fn spawn_settle(state: std::sync::Arc<SessionState>) {
+    wasm_bindgen_futures::spawn_local(async move {
+        let _ = state.try_settle_once().await;
+    });
 }
 
 /// Poll the swarm in parallel with `fut` so that libp2p behaviours
