@@ -969,8 +969,8 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         recipient: Option<String>,
 
-        /// Optional Relay API key. Not required (Relay is permissionless);
-        /// only raises the rate limit.
+        /// Relay API key, sent as `x-api-key`. Relay requires one on every
+        /// `POST /quote/v2` since 2026-10-02; without it quotes are refused.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 

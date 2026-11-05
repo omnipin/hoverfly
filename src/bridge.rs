@@ -228,6 +228,8 @@ pub enum BridgeError {
          (signature/permit-based gasless flows aren't). Use a native-gas origin."
     )]
     UnsupportedStep(String),
+    #[error("refusing to sign quote transaction: {0}")]
+    UnsafeQuote(String),
     #[error("origin transaction reverted (status=0)")]
     Reverted,
     #[error("receipt not found within timeout")]
@@ -420,6 +422,20 @@ async fn run_leg(
         .find_map(|s| s.request_id.clone())
         .ok_or_else(|| BridgeError::Relay("quote returned no requestId".into()))?;
 
+    // Everything below gets signed with the user's key, so check it first.
+    let txs: Vec<&TxData> = quote
+        .steps
+        .iter()
+        .flat_map(|s| s.items.iter().map(|i| &i.data))
+        .collect();
+    check_quote_txs(
+        &txs,
+        params.origin_chain_id,
+        signer.address(),
+        params.origin_currency,
+        params.amount,
+    )?;
+
     // Execute each transaction step on the origin chain, in order.
     let mut origin_tx_hashes = Vec::new();
     for step in &quote.steps {
@@ -592,6 +608,10 @@ struct QuoteStepItem {
 /// fields for the chains we support.
 #[derive(Debug, Deserialize)]
 struct TxData {
+    #[serde(default)]
+    from: Option<String>,
+    #[serde(rename = "chainId", default)]
+    chain_id: Option<u64>,
     to: String,
     data: String,
     #[serde(default)]
@@ -1010,6 +1030,69 @@ fn fmt_addr(a: Address) -> String {
 }
 
 /// Parse an optional decimal-or-hex string into U256. `None`/empty → zero.
+/// Bound what a Relay quote can make us sign. The quote is fetched over
+/// HTTPS but otherwise trusted wholesale: its transactions carry arbitrary
+/// `to`/`data`/`value` and are signed with the user's key. Whatever the API
+/// returns, a leg may only act on the origin chain from our own address,
+/// and never move or approve more than `budget`, the amount the user asked
+/// to spend.
+fn check_quote_txs(
+    txs: &[&TxData],
+    origin_chain_id: u64,
+    from: Address,
+    origin_currency: Address,
+    budget: U256,
+) -> Result<(), BridgeError> {
+    const APPROVE: [u8; 4] = [0x09, 0x5e, 0xa7, 0xb3];
+    const TRANSFER: [u8; 4] = [0xa9, 0x05, 0x9c, 0xbb];
+    let unsafe_quote = |m: String| Err(BridgeError::UnsafeQuote(m));
+    let native = origin_currency == NATIVE_TOKEN.parse::<Address>().expect("hardcoded valid");
+    let mut native_out = U256::ZERO;
+    let mut token_out = U256::ZERO;
+    for tx in txs {
+        if let Some(c) = tx.chain_id
+            && c != origin_chain_id
+        {
+            return unsafe_quote(format!(
+                "transaction for chain {c}, expected {origin_chain_id}"
+            ));
+        }
+        if let Some(f) = tx.from.as_deref()
+            && f.parse::<Address>().ok() != Some(from)
+        {
+            return unsafe_quote(format!("transaction from {f}, expected {from}"));
+        }
+        let value = parse_u256_opt(tx.value.as_deref())?;
+        if !native && !value.is_zero() {
+            return unsafe_quote(format!("sends {value} native wei on a token bridge"));
+        }
+        native_out = native_out.saturating_add(value);
+        // ERC-20 calls on the origin token: approvals and transfers spend it.
+        let to = tx.to.parse::<Address>().ok();
+        let data = hex::decode(tx.data.trim_start_matches("0x"))?;
+        if !native && to == Some(origin_currency) && data.len() >= 4 + 64 {
+            let selector: [u8; 4] = data[..4].try_into().expect("len checked");
+            if selector == APPROVE || selector == TRANSFER {
+                token_out = token_out.saturating_add(U256::from_be_slice(&data[36..68]));
+            } else {
+                return unsafe_quote(format!(
+                    "unexpected call 0x{} on the origin token",
+                    hex::encode(selector)
+                ));
+            }
+        }
+    }
+    if native_out > budget {
+        return unsafe_quote(format!("sends {native_out} native wei, budget {budget}"));
+    }
+    if token_out > budget {
+        return unsafe_quote(format!(
+            "approves/transfers {token_out} tokens, budget {budget}"
+        ));
+    }
+    Ok(())
+}
+
 fn parse_u256_opt(s: Option<&str>) -> Result<U256, BridgeError> {
     match s {
         None => Ok(U256::ZERO),
@@ -1023,6 +1106,85 @@ fn parse_u256_opt(s: Option<&str>) -> Result<U256, BridgeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod quote_guard {
+        use super::*;
+
+        const ME: &str = "0x1111111111111111111111111111111111111111";
+        const USDC: &str = "0x833589fcd6edb6e08f4c7c32d4f71b54bda02913";
+        const ROUTER: &str = "0xf70da97812cb96acdf810712aa562db8dfa3dbef";
+
+        fn tx(chain: u64, to: &str, data: &str, value: &str) -> TxData {
+            TxData {
+                from: Some(ME.into()),
+                chain_id: Some(chain),
+                to: to.into(),
+                data: data.into(),
+                value: Some(value.into()),
+                gas: None,
+                max_fee_per_gas: None,
+                max_priority_fee_per_gas: None,
+            }
+        }
+
+        fn approve(spender: &str, amount: u64) -> String {
+            format!(
+                "0x095ea7b3{:0>64}{:064x}",
+                spender.trim_start_matches("0x"),
+                amount
+            )
+        }
+
+        fn check(txs: &[TxData], currency: &str, budget: u64) -> Result<(), BridgeError> {
+            let refs: Vec<&TxData> = txs.iter().collect();
+            check_quote_txs(
+                &refs,
+                8453,
+                ME.parse().unwrap(),
+                currency.parse().unwrap(),
+                U256::from(budget),
+            )
+        }
+
+        #[test]
+        fn honest_native_and_token_quotes_pass() {
+            assert!(
+                check(
+                    &[tx(8453, ROUTER, "0x00fad611", "1000")],
+                    NATIVE_TOKEN,
+                    1000
+                )
+                .is_ok()
+            );
+            assert!(
+                check(
+                    &[
+                        tx(8453, USDC, &approve(ROUTER, 500), "0"),
+                        tx(8453, ROUTER, "0xdeadbeef", "0")
+                    ],
+                    USDC,
+                    500
+                )
+                .is_ok()
+            );
+        }
+
+        #[test]
+        fn quotes_that_overspend_or_misdirect_are_refused() {
+            // More native value than asked for.
+            assert!(check(&[tx(8453, ROUTER, "0x", "1001")], NATIVE_TOKEN, 1000).is_err());
+            // Unlimited approval.
+            let max = format!("0x095ea7b3{:0>64}{}", "ab".repeat(20), "f".repeat(64));
+            assert!(check(&[tx(8453, USDC, &max, "0")], USDC, 500).is_err());
+            // Another chain, or another sender.
+            assert!(check(&[tx(1, ROUTER, "0x", "1")], NATIVE_TOKEN, 1000).is_err());
+            let mut other = tx(8453, ROUTER, "0x", "1");
+            other.from = Some(ROUTER.into());
+            assert!(check(&[other], NATIVE_TOKEN, 1000).is_err());
+            // Native value riding on a token bridge.
+            assert!(check(&[tx(8453, ROUTER, "0x", "5")], USDC, 500).is_err());
+        }
+    }
 
     #[test]
     fn chain_names() {
