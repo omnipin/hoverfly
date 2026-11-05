@@ -28,8 +28,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates
     && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=build /src/target/release/hoverfly /usr/local/bin/hoverfly
-# CI-refreshed peer cache the warm pool fills from.
-COPY peers.seed.json /app/peers.seed.json
+# Peer cache the warm pool fills from, refreshed hourly in omnipin/hoverfly-peers.
+ADD https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json /app/peers.seed.json
 ENV PORT=8550
 # Bind 0.0.0.0:$PORT so the platform's router can reach it.
 CMD ["sh", "-c", "exec hoverfly pusher --listen 0.0.0.0:${PORT} --peerlist /app/peers.seed.json -v"]
