@@ -67,11 +67,27 @@ impl Default for Doh {
     }
 }
 
+/// A resolver that never answers must not hang discovery (and, in the
+/// daemon, everything waiting on the pool fill behind it).
+#[cfg(not(target_arch = "wasm32"))]
+fn doh_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(5))
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn doh_client() -> reqwest::Client {
+    reqwest::Client::new()
+}
+
 impl Doh {
     pub fn with_url(url: impl Into<String>) -> Self {
         Self {
             url: url.into(),
-            client: reqwest::Client::new(),
+            client: doh_client(),
         }
     }
 
