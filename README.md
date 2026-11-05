@@ -19,7 +19,7 @@ decentralized storage natively and in a browser.
 - **Multiple modes** Static commands for simplicity, daemon mode for warm
   connection pool, pusher nodes for splitting content signing and upload.
 - **Cross-platform.** Compiles to WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
-- **Small size.** 5MB gzipped, 14MB unpacked x86 Linux binary.
+- **Small size.** 7MB gzipped, 17MB unpacked x86 Linux binary.
 - **CI-friendly.** ~1-1.6 MiB/s uploads in GitHub Actions.
 
 ## Install
