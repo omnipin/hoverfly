@@ -31,7 +31,7 @@ curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | 
 ### Specific version
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | HOVERFLY_VERSION=v0.2.2 sh
+curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | HOVERFLY_VERSION=v0.3.0 sh
 ```
 
 ### Build from source
