@@ -2085,10 +2085,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                     // upload whose lanes are all open/soft and
                                     // would serve unpaid. Per-lane relay checks
                                     // still enforce funding at accept time.
+                                    // Unbounded would put the whole chequebook
+                                    // behind whatever a lane claims; zero signs
+                                    // nothing and leaves soft lanes serving.
                                     eprintln!(
-                                        "metered: chequebook state unreadable ({e}); continuing with no global balance pre-check"
+                                        "metered: chequebook state unreadable ({e}); no cheques will be signed this run"
                                     );
-                                    (u128::MAX, false)
+                                    (0, false)
                                 }
                             };
                         let _ = issuer_ok;

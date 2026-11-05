@@ -546,6 +546,19 @@ impl LaneAccount {
 /// stamps chunks (§6) — so a metered upload needs no extra credential and,
 /// in a browser, no wallet prompt.
 #[cfg(not(target_arch = "wasm32"))]
+/// The debt to re-present at after a relay refused a cheque as an
+/// overpayment. That path repairs *our* over-count, so it may only lower
+/// the debt; a higher figure must go through `reconcile`, which bounds it.
+/// Adopted here, it was signed for unchecked, up to the whole chequebook.
+fn corrected_debt(ours: u128, relay: u128) -> Result<u128, String> {
+    if relay >= ours {
+        return Err(format!(
+            "relay reports {relay} owed, not below our {ours}; refusing to raise it on a refused cheque"
+        ));
+    }
+    Ok(relay)
+}
+
 pub struct PaymentConfig {
     pub signer: crate::signer::SwarmSigner,
     pub batch: [u8; 32],
@@ -990,6 +1003,8 @@ impl LanePayer {
             // the same reason, and the lane never settles again.
             if correct_once && text.contains("is owed") {
                 let relay = self.relay_owed(http, cfg).await?;
+                let relay = corrected_debt(self.account.owed(), relay)
+                    .map_err(|e| format!("pay {code}: {e}"))?;
                 self.account.sync_relay_debt(relay);
                 let Some(corrected) = self.account.next_cumulative() else {
                     return Ok(None);
@@ -1516,6 +1531,16 @@ mod tests {
             Some(carried),
             "now a cheque clears the refusal"
         );
+    }
+
+    /// A refused cheque may lower the debt to the relay's figure, never
+    /// raise it: a relay answering "is owed" with an inflated /v1/account
+    /// used to get a cheque for whatever it named.
+    #[test]
+    fn refused_cheque_correction_only_lowers_debt() {
+        assert_eq!(corrected_debt(500, 300), Ok(300));
+        assert!(corrected_debt(500, 500).is_err());
+        assert!(corrected_debt(500, u128::MAX).is_err());
     }
 
     /// §7.3's ack-tail leaves the two sides disagreeing in the *other*
