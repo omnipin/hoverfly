@@ -405,16 +405,41 @@ impl PeerStore {
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn load_or_create<P: AsRef<Path>>(path: P) -> Self {
-        match std::fs::read_to_string(&path) {
-            Ok(s) => serde_json::from_str(&s).unwrap_or_default(),
-            Err(_) => Self::default(),
+        let path = path.as_ref();
+        let Ok(s) = std::fs::read_to_string(path) else {
+            return Self::default();
+        };
+        match serde_json::from_str(&s) {
+            Ok(store) => store,
+            Err(e) => {
+                // Starting empty is fine; overwriting the only copy on the
+                // next save is not. Move it aside.
+                let aside = path.with_extension(format!("corrupt-{}", now_unix()));
+                tracing::warn!(
+                    "{}: unparseable ({e}); starting empty, moved to {}",
+                    path.display(),
+                    aside.display()
+                );
+                let _ = std::fs::rename(path, &aside);
+                Self::default()
+            }
         }
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     pub fn save<P: AsRef<Path>>(&self, path: P) -> Result<(), PeerStoreError> {
+        use std::io::Write;
+        // Write-then-rename: an in-place rewrite that is interrupted, or read
+        // concurrently by another process, leaves a truncated file.
+        let path = path.as_ref();
         let s = serde_json::to_string_pretty(self)?;
-        std::fs::write(&path, s).map_err(|e| PeerStoreError::Io(e.to_string()))
+        let tmp = path.with_extension(format!("tmp.{}", std::process::id()));
+        let io = |e: std::io::Error| PeerStoreError::Io(e.to_string());
+        let mut f = std::fs::File::create(&tmp).map_err(io)?;
+        f.write_all(s.as_bytes()).map_err(io)?;
+        f.sync_all().map_err(io)?;
+        drop(f);
+        std::fs::rename(&tmp, path).map_err(io)
     }
 }
 
@@ -487,6 +512,32 @@ fn is_dialable_str(ma: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An unparseable peers.json used to load as empty and be overwritten
+    /// with `{"peers":{}}` on the next save, losing the only copy.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn corrupt_peerlist_is_moved_aside_not_overwritten() {
+        let dir = std::env::temp_dir().join(format!("hoverfly-peers-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("peers.json");
+        std::fs::write(&path, b"{\"peers\": {truncated").unwrap();
+
+        let store = PeerStore::load_or_create(&path);
+        assert!(store.peers.is_empty());
+        store.save(&path).unwrap();
+        let kept = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains("corrupt"))
+            .count();
+        assert_eq!(kept, 1, "original moved aside");
+        assert!(
+            serde_json::from_str::<PeerStore>(&std::fs::read_to_string(&path).unwrap()).is_ok()
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     const NOW: u64 = 1_000_000;
 

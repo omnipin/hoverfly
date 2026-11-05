@@ -394,7 +394,10 @@ pub async fn run(
             advertise: lc.advertise.clone(),
             signer: lc.identity,
             op_timeout,
-            idle_timeout: op_timeout,
+            // Not `op_timeout`: libp2p closes a connection with no open
+            // streams after this, and a bee that dialed us in should stay
+            // connected (same reasoning as the outbound 600 s).
+            idle_timeout: std::time::Duration::from_secs(600),
             cache: cache.clone(),
             status_snapshot: lc.status_snapshot,
         };
@@ -803,10 +806,13 @@ async fn run_upload(
             .as_deref()
             .map(|s| if s.is_empty() { None } else { Some(s) })
             .unwrap_or(Some("index.html"));
-        let peers = state.peers.read().await;
+        // Snapshot, don't hold the read guard: tokio's RwLock is
+        // write-preferring, so a SavePeers/ReloadPeers queued behind a
+        // minutes-long upload would block every later reader.
+        let peers = state.peers.read().await.clone();
         upload_collection(
             &state.transport,
-            &*peers,
+            &peers,
             &signer,
             &r.batch,
             r.depth,
@@ -825,12 +831,12 @@ async fn run_upload(
         // persistent pool. First request lazily fills it; subsequent
         // ones reuse it with zero dial-fill cost.
         let pool = ensure_pool(state).await?;
-        let peers = state.peers.read().await;
+        let peers = state.peers.read().await.clone();
         if r.raw {
             upload_bytes_with_pool(
                 &state.transport,
                 &*pool,
-                &*peers,
+                &peers,
                 &signer,
                 &r.batch,
                 r.depth,
@@ -854,7 +860,7 @@ async fn run_upload(
             upload_file_with_manifest_with_pool(
                 &state.transport,
                 &*pool,
-                &*peers,
+                &peers,
                 &signer,
                 &r.batch,
                 r.depth,
@@ -1337,10 +1343,10 @@ async fn maintain_pool(state: &Arc<State>) -> Result<(), ClientError> {
 async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
     // List mode: enumerate manifest entries, write nothing, reply Listed.
     if r.list {
-        let peers = state.peers.read().await;
+        let peers = state.peers.read().await.clone();
         return match crate::client::list_manifest_ex(
             &state.transport,
-            &*peers,
+            &peers,
             &r.hash,
             r.max_retries,
             r.concurrency,
@@ -1357,11 +1363,11 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
         let output = r.output.as_ref().ok_or_else(|| {
             ClientError::File("internal: fetch without --list requires an output path".into())
         })?;
-        let peers = state.peers.read().await;
+        let peers = state.peers.read().await.clone();
         let (bytes, ct) = if let Some(p) = r.path.as_deref() {
             let (b, c) = fetch_manifest_path_cached_ex(
                 &state.transport,
-                &*peers,
+                &peers,
                 &r.hash,
                 p,
                 r.max_retries,
@@ -1373,7 +1379,7 @@ async fn handle_fetch(state: &Arc<State>, r: FetchRequest) -> Response {
         } else {
             let b = fetch_bytes_cached_ex(
                 &state.transport,
-                &*peers,
+                &peers,
                 &r.hash,
                 r.max_retries,
                 r.concurrency,
@@ -1411,7 +1417,10 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         if path.is_empty() || path == "." {
             continue;
         }
-        let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
+        // The header's size is attacker-chosen; a huge one made this
+        // allocation abort the process before a byte was read.
+        let mut data =
+            Vec::with_capacity(header.size().unwrap_or(0).min(bytes.len() as u64) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
         let content_type = crate::mime::guess_from_path(&path);
         out.push(UploadFile {

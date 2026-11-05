@@ -45,6 +45,8 @@ pub enum HandshakeError {
     NetworkIdMismatch { ours: u64, theirs: u64 },
     #[error("timestamp out of range or invalid: {0}")]
     TimestampInvalid(i64),
+    #[error("peer's overlay is not derived from its signing key")]
+    OverlayMismatch,
 }
 
 #[derive(Debug, Clone)]
@@ -199,6 +201,14 @@ where
         &their_addr.signature,
     )
     .ok();
+    // Bee checks overlay = keccak(eth || network_id || nonce)
+    // (`bzz.ParseAddress`). Without it a peer can claim any overlay: win
+    // proximity routing for chunks it picks, skew `peer_price`, and plant
+    // that overlay in peers.json.
+    match peer_eth_address {
+        Some(eth) if crate::signer::derive_overlay(&eth, network_id, &nonce32) == peer_overlay => {}
+        _ => return Err(HandshakeError::OverlayMismatch),
+    }
 
     Ok(HandshakeResult {
         peer_overlay,

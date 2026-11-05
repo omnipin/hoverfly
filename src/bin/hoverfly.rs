@@ -1170,7 +1170,10 @@ fn read_tar_files(bytes: &[u8]) -> Result<Vec<UploadFile>, Box<dyn std::error::E
         if path.is_empty() || path == "." {
             continue;
         }
-        let mut data = Vec::with_capacity(header.size().unwrap_or(0) as usize);
+        // The header's size is attacker-chosen; a huge one made this
+        // allocation abort the process before a byte was read.
+        let mut data =
+            Vec::with_capacity(header.size().unwrap_or(0).min(bytes.len() as u64) as usize);
         std::io::Read::read_to_end(&mut entry, &mut data)?;
         let content_type = guess_content_type(&path);
         out.push(UploadFile {
@@ -1698,6 +1701,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if !list && output.is_none() {
                     return Err("--output is required when using --daemon (unless --list)".into());
                 }
+                // The daemon resolves paths against its own working
+                // directory, not ours.
+                let output = output.map(std::path::absolute).transpose()?;
                 let req = hoverfly::daemon::Request::Fetch(hoverfly::daemon::FetchRequest {
                     hash,
                     path,
@@ -1904,7 +1910,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 // uploads exactly like the in-process path below.
                 let nonce = load_or_create_nonce(&cli.nonce_file)?;
                 let req = hoverfly::daemon::Request::Upload(hoverfly::daemon::UploadRequest {
-                    file: file.clone(),
+                    // The daemon resolves paths against its own working
+                    // directory, not ours.
+                    file: std::path::absolute(&file)?,
                     batch: batch.clone(),
                     depth,
                     immutable,

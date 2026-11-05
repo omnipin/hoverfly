@@ -878,16 +878,22 @@ impl Transport {
         dial(&mut swarm, peer_id, peer_addr)?;
 
         let underlay = prep_connection(&mut swarm, peer_id, self.config.timeout).await?;
-        let hs = do_handshake(
-            &mut swarm,
-            peer_id,
-            &mut control,
-            &mut hs_in,
-            &underlay,
-            &self.signer,
-            self.config.advertise.as_ref(),
+        // Discovery dials gossip-learned peers; one that stalls the handshake
+        // must not stall the whole round.
+        let hs = tokio::time::timeout(
+            self.config.timeout,
+            do_handshake(
+                &mut swarm,
+                peer_id,
+                &mut control,
+                &mut hs_in,
+                &underlay,
+                &self.signer,
+                self.config.advertise.as_ref(),
+            ),
         )
-        .await?;
+        .await
+        .map_err(|_| TransportError::Timeout)??;
         let _peer_threshold = do_pricing(
             &mut swarm,
             peer_id,
@@ -959,7 +965,15 @@ impl Transport {
                         Some((pid, mut stream)) if pid == peer_id => {
                             debug!(target: "hoverfly::hive",
                                 "inbound hive stream opened (batch {})", batches_read + 1);
-                            match poll_until(&mut swarm, hive::read_peers(&mut stream)).await {
+                            // `read_peers` reads to EOF; bound it by the round's
+                            // deadline so a peer that never closes can't hold it.
+                            let read = tokio::time::timeout(
+                                hard_remaining,
+                                poll_until(&mut swarm, hive::read_peers(&mut stream)),
+                            )
+                            .await;
+                            let Ok(read) = read else { break };
+                            match read {
                                 Ok(mut batch) => {
                                     let n = batch.len();
                                     peers.append(&mut batch);
