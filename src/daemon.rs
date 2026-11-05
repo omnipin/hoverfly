@@ -208,8 +208,10 @@ struct State {
     /// Shared chunk cache populated by every upload (and optionally
     /// every fetch), served by the inbound retrieval responder so
     /// freshly uploaded roots are retrievable through bzz.limo / any
-    /// bee peer that routes a retrieval request back to us.
-    cache: ChunkCache,
+    /// bee peer that routes a retrieval request back to us. `None`
+    /// without `--listen`: nothing reads it then, and it is unbounded, so
+    /// a long-running daemon grew by every byte it ever uploaded.
+    cache: Option<ChunkCache>,
     /// Optional DoH resolver + bootnodes for live peer discovery
     /// before pool fill. Multiple bootnodes are tried in order during
     /// each discover round, accumulating their peer lists, so a peer
@@ -368,6 +370,7 @@ pub async fn run(
     // BEFORE we move `listen` into the inbound spawn. Auto-iteration
     // needs the eth address to compute candidate vanity overlays.
     let identity_eth_address = listen.as_ref().map(|lc| *lc.identity.eth_address());
+    let served_cache = listen.as_ref().map(|_| cache.clone());
     let state = Arc::new(State {
         transport,
         signer_network_id: network_id,
@@ -377,7 +380,7 @@ pub async fn run(
         fill_lock: tokio::sync::Mutex::new(()),
         active_ops: std::sync::atomic::AtomicUsize::new(0),
         pool_target,
-        cache: cache.clone(),
+        cache: served_cache,
         doh,
         bootnodes,
         discover_rounds: discover_rounds.max(1),
@@ -844,7 +847,7 @@ async fn run_upload(
                 &data,
                 redundancy,
                 r.max_retries,
-                Some(&state.cache),
+                state.cache.as_ref(),
                 progress,
             )
             .await?
@@ -870,7 +873,7 @@ async fn run_upload(
                 ct.as_deref(),
                 redundancy,
                 r.max_retries,
-                Some(&state.cache),
+                state.cache.as_ref(),
                 progress,
             )
             .await?
