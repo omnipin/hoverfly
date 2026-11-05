@@ -28,6 +28,9 @@
 struct GfTables {
     exp: [u8; 255 * 2],
     log: [u8; 256],
+    /// Full product table, `mul[a][b] = a·b`. 64 KiB, so the shard loops do one
+    /// lookup per byte instead of two log lookups, an add and a zero branch.
+    mul: Vec<[u8; 256]>,
 }
 
 fn build_tables() -> GfTables {
@@ -51,7 +54,13 @@ fn build_tables() -> GfTables {
     for i in 255..(255 * 2) {
         exp[i] = exp[i - 255];
     }
-    GfTables { exp, log }
+    let mut mul = vec![[0u8; 256]; 256];
+    for a in 1..256usize {
+        for b in 1..256usize {
+            mul[a][b] = exp[log[a] as usize + log[b] as usize];
+        }
+    }
+    GfTables { exp, log, mul }
 }
 
 // `OnceLock` works on both native and wasm (wasm std has it); the tables are
@@ -70,6 +79,25 @@ fn gal_mul(a: u8, b: u8) -> u8 {
     let t = tables();
     let log_sum = t.log[a as usize] as usize + t.log[b as usize] as usize;
     t.exp[log_sum]
+}
+
+/// `out ^= coeff · input`, byte-wise over GF(2^8).
+#[inline]
+fn mul_add_slice(coeff: u8, input: &[u8], out: &mut [u8]) {
+    match coeff {
+        0 => {}
+        1 => {
+            for (o, &b) in out.iter_mut().zip(input) {
+                *o ^= b;
+            }
+        }
+        _ => {
+            let row = &tables().mul[coeff as usize];
+            for (o, &b) in out.iter_mut().zip(input) {
+                *o ^= row[b as usize];
+            }
+        }
+    }
 }
 
 #[inline]
@@ -291,6 +319,36 @@ impl ReedSolomon {
         })
     }
 
+    /// Like [`Self::new`], but memoised per `(data_shards, parity_shards)`.
+    ///
+    /// Building the matrix inverts a `data_shards`-square Vandermonde block,
+    /// which cost as much as the parity arithmetic itself when it ran once per
+    /// codeword. An upload only ever sees a handful of shapes (one full
+    /// codeword shape per level plus the trailing partial ones), so they all
+    /// hit. The cache is capped because the download path takes shard counts
+    /// from untrusted chunk spans; past the cap we just build uncached.
+    pub fn cached(
+        data_shards: usize,
+        parity_shards: usize,
+    ) -> Result<std::sync::Arc<Self>, RsError> {
+        use std::collections::HashMap;
+        use std::sync::{Arc, Mutex, OnceLock};
+        type Codecs = Mutex<HashMap<(usize, usize), Arc<ReedSolomon>>>;
+        const MAX_CACHED_CODECS: usize = 64;
+        static CODECS: OnceLock<Codecs> = OnceLock::new();
+        let key = (data_shards, parity_shards);
+        let cache = CODECS.get_or_init(|| Mutex::new(HashMap::new()));
+        if let Some(rs) = cache.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+            return Ok(rs.clone());
+        }
+        let rs = Arc::new(Self::new(data_shards, parity_shards)?);
+        let mut map = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() < MAX_CACHED_CODECS {
+            map.insert(key, rs.clone());
+        }
+        Ok(rs)
+    }
+
     /// Reconstruct any missing **data** shards in place.
     ///
     /// `shards` has length `total_shards`. A present shard is `Some(bytes)`
@@ -377,13 +435,7 @@ impl ReedSolomon {
             let row = &decode_matrix.data[i_shard];
             let mut out = vec![0u8; shard_size];
             for (c, in_shard) in sub_shards.iter().enumerate() {
-                let coeff = row[c];
-                if coeff == 0 {
-                    continue;
-                }
-                for (o, &b) in out.iter_mut().zip(in_shard.iter()) {
-                    *o ^= gal_mul(coeff, b);
-                }
+                mul_add_slice(row[c], in_shard, &mut out);
             }
             shards[i_shard] = Some(out);
         }
@@ -407,20 +459,25 @@ impl ReedSolomon {
                 return Err(RsError::ShardSizeMismatch);
             }
         }
-        for p in 0..self.parity_shards {
-            let row = &self.matrix.data[self.data_shards + p];
-            let mut out = vec![0u8; shard_size];
-            for c in 0..self.data_shards {
-                let coeff = row[c];
-                if coeff == 0 {
-                    continue;
-                }
-                for (o, &b) in out.iter_mut().zip(shards[c].iter()) {
-                    *o ^= gal_mul(coeff, b);
-                }
+        let (data, parity) = shards.split_at_mut(self.data_shards);
+        let data: &[Vec<u8>] = data;
+        let rows = &self.matrix.data[self.data_shards..self.data_shards + self.parity_shards];
+        let fill = |(row, out): (&Vec<u8>, &mut Vec<u8>)| {
+            out.fill(0);
+            for (&coeff, input) in row.iter().zip(data.iter()) {
+                mul_add_slice(coeff, input, out);
             }
-            shards[self.data_shards + p].copy_from_slice(&out);
+        };
+        // Parity rows are independent, so native builds spread them over the
+        // rayon pool. Wasm keeps the serial loop (no pool on the threadless
+        // build, and rayon isn't a wasm dependency).
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            use rayon::prelude::*;
+            rows.par_iter().zip(parity.par_iter_mut()).for_each(fill);
         }
+        #[cfg(target_arch = "wasm32")]
+        rows.iter().zip(parity.iter_mut()).for_each(fill);
         Ok(())
     }
 }
@@ -540,6 +597,55 @@ mod tests {
             rs.reconstruct_data(&mut shards),
             Err(RsError::TooFewShards { .. })
         ));
+    }
+
+    /// The table-driven, row-parallel `encode` must stay byte-identical to the
+    /// textbook `Σ coeff·data` over `gal_mul`, at the shard shapes bee uses
+    /// (full 4104-byte shards, every redundancy level's codeword sizes).
+    #[test]
+    fn encode_matches_scalar_reference_at_bee_shapes() {
+        let shard_size = 4104;
+        for &(d, p) in &[
+            (128usize, 9usize),
+            (119, 9),
+            (107, 21),
+            (97, 31),
+            (37, 90),
+            (1, 2),
+            (3, 1),
+        ] {
+            let rs = ReedSolomon::cached(d, p).unwrap();
+            let mut shards: Vec<Vec<u8>> = (0..d)
+                .map(|i| {
+                    (0..shard_size)
+                        .map(|j| ((i * 131 + j * 17 + (i ^ j)) & 0xff) as u8)
+                        .collect()
+                })
+                .collect();
+            shards.extend((0..p).map(|_| vec![0xAAu8; shard_size]));
+            let mut expected = shards.clone();
+            for k in 0..p {
+                let row = &rs.matrix.data[d + k];
+                let mut out = vec![0u8; shard_size];
+                for c in 0..d {
+                    for (o, &b) in out.iter_mut().zip(expected[c].iter()) {
+                        *o ^= gal_mul(row[c], b);
+                    }
+                }
+                expected[d + k] = out;
+            }
+            rs.encode(&mut shards).unwrap();
+            assert_eq!(shards, expected, "parity mismatch at ({d}, {p})");
+        }
+    }
+
+    #[test]
+    fn mul_table_matches_log_exp() {
+        for a in 0..=255u8 {
+            for b in 0..=255u8 {
+                assert_eq!(tables().mul[a as usize][b as usize], gal_mul(a, b));
+            }
+        }
     }
 
     #[test]
