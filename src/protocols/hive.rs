@@ -22,6 +22,10 @@ pub const PROTOCOL: &str = "/swarm/hive/2.0.0/peers";
 
 const UNDERLAY_LIST_PREFIX: u8 = 0x99;
 
+/// bee `pkg/bzz/underlay.go` `maxUnderlaysPerPeer` / `maxUnderlayBytes`.
+const MAX_UNDERLAYS_PER_PEER: usize = 20;
+const MAX_UNDERLAY_BYTES: usize = 2048;
+
 #[derive(Debug, Error)]
 pub enum HiveError {
     #[error("frame: {0}")]
@@ -158,7 +162,7 @@ where
 }
 
 fn deserialize_underlays(data: &[u8]) -> Result<Vec<Multiaddr>, ()> {
-    if data.is_empty() {
+    if data.is_empty() || data.len() > MAX_UNDERLAY_BYTES {
         return Err(());
     }
     if data[0] == UNDERLAY_LIST_PREFIX {
@@ -173,9 +177,14 @@ fn deserialize_list(data: &[u8]) -> Result<Vec<Multiaddr>, ()> {
     let mut addrs = Vec::new();
     let mut pos = 0;
     while pos < data.len() {
+        if addrs.len() >= MAX_UNDERLAYS_PER_PEER {
+            return Err(());
+        }
         let (len, n) = read_varint(&data[pos..])?;
         pos += n;
-        if pos + len > data.len() {
+        // `len` is peer-controlled and can be near `usize::MAX`; compare
+        // against what's left instead of computing `pos + len`.
+        if len > data.len() - pos {
             return Err(());
         }
         if let Ok(ma) = Multiaddr::try_from(data[pos..pos + len].to_vec()) {
@@ -200,4 +209,72 @@ fn read_varint(data: &[u8]) -> Result<(usize, usize), ()> {
         }
     }
     Err(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn list(entries: &[&[u8]]) -> Vec<u8> {
+        let mut out = vec![UNDERLAY_LIST_PREFIX];
+        for e in entries {
+            let mut len = e.len();
+            loop {
+                let b = (len & 0x7f) as u8;
+                len >>= 7;
+                if len == 0 {
+                    out.push(b);
+                    break;
+                }
+                out.push(b | 0x80);
+            }
+            out.extend_from_slice(e);
+        }
+        out
+    }
+
+    fn tcp_addr() -> Vec<u8> {
+        "/ip4/1.2.3.4/tcp/1634"
+            .parse::<Multiaddr>()
+            .unwrap()
+            .to_vec()
+    }
+
+    /// A length varint near `usize::MAX` used to wrap `pos + len` and pass
+    /// the bounds check, then panic on the slice.
+    #[test]
+    fn huge_length_varint_is_rejected_not_panicked_on() {
+        let data = [
+            UNDERLAY_LIST_PREFIX,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0xff,
+            0x01,
+        ];
+        assert!(deserialize_underlays(&data).is_err());
+    }
+
+    #[test]
+    fn list_round_trips() {
+        let a = tcp_addr();
+        let got = deserialize_underlays(&list(&[&a, &a])).unwrap();
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn bee_limits_are_enforced() {
+        let a = tcp_addr();
+        let twenty: Vec<&[u8]> = (0..MAX_UNDERLAYS_PER_PEER).map(|_| a.as_slice()).collect();
+        assert!(deserialize_underlays(&list(&twenty)).is_ok());
+        let twenty_one: Vec<&[u8]> = (0..=MAX_UNDERLAYS_PER_PEER).map(|_| a.as_slice()).collect();
+        assert!(deserialize_underlays(&list(&twenty_one)).is_err());
+        let oversized = vec![0u8; MAX_UNDERLAY_BYTES + 1];
+        assert!(deserialize_underlays(&oversized).is_err());
+    }
 }

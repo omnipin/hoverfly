@@ -14,8 +14,12 @@ pub const PROTOCOL: &str = "/swarm/pushsync/1.3.1/pushsync";
 pub enum PushsyncError {
     #[error("frame: {0}")]
     Frame(#[from] FrameError),
+    /// Bee answered with an error receipt.
     #[error("peer error: {0}")]
     Peer(String),
+    /// Bee answered with a receipt, but not one for the chunk we pushed.
+    #[error("receipt address mismatch: {0}")]
+    ReceiptMismatch(String),
 }
 
 #[derive(Debug, Clone)]
@@ -140,8 +144,8 @@ where
     // Checking it here means every `PushsyncReceipt` in the codebase
     // carries exactly the 32-byte address that was pushed.
     if receipt.address != address[..] {
-        return Err(PushsyncError::Peer(format!(
-            "receipt address mismatch: pushed {}, receipt {}",
+        return Err(PushsyncError::ReceiptMismatch(format!(
+            "pushed {}, receipt {}",
             hex::encode(address),
             hex::encode(&receipt.address),
         )));
@@ -240,7 +244,7 @@ mod tests {
     fn receipt_for_a_different_address_is_rejected() {
         let err = push_against(receipt_for(vec![2u8; 32])).expect_err("should reject");
         assert!(
-            matches!(&err, PushsyncError::Peer(m) if m.contains("address mismatch")),
+            matches!(&err, PushsyncError::ReceiptMismatch(_)),
             "unexpected error: {err}"
         );
     }
@@ -255,7 +259,7 @@ mod tests {
             let err =
                 push_against(receipt_for(bad)).expect_err("missized address must be rejected");
             assert!(
-                matches!(&err, PushsyncError::Peer(m) if m.contains("address mismatch")),
+                matches!(&err, PushsyncError::ReceiptMismatch(_)),
                 "unexpected error for {n}-byte address: {err}"
             );
         }
