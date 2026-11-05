@@ -1070,6 +1070,23 @@ enum SessionCommand {
     },
 }
 
+impl SessionCommand {
+    /// Answer without doing the work: the session is retiring.
+    fn refuse(self) {
+        match self {
+            Self::PushSync { reply, .. } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+            Self::Fetch { reply, .. } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+            Self::StatusProbe { reply } => {
+                let _ = reply.send(Err(TransportError::ConnectionClosed));
+            }
+        }
+    }
+}
+
 impl PeerSession {
     /// Dial `peer_addr`, complete identify + handshake + pricing, and spawn
     /// the swarm driver task. The returned handle stays usable until either
@@ -2071,6 +2088,7 @@ impl SessionDriver {
         type TaskFuture = std::pin::Pin<Box<dyn core::future::Future<Output = bool>>>;
         let mut tasks: FuturesUnordered<TaskFuture> = FuturesUnordered::new();
         let mut accept_new = true;
+        let mut cmd_rx_closed = false;
 
         loop {
             tokio::select! {
@@ -2280,6 +2298,18 @@ impl SessionDriver {
 
             // Once we've stopped accepting new commands and drained all
             // in-flight tasks, the session is fully retired.
+            // Retiring: refuse new work now instead of leaving it queued
+            // until the in-flight tasks drain (up to `--timeout`). Closing
+            // the channel also flips `is_alive()`, so the dispatcher rotates
+            // away rather than queueing onto a session that won't read.
+            if !accept_new && !cmd_rx_closed {
+                self.cmd_rx.close();
+                while let Ok(cmd) = self.cmd_rx.try_recv() {
+                    cmd.refuse();
+                }
+                cmd_rx_closed = true;
+            }
+
             if !accept_new && tasks.is_empty() {
                 break;
             }
