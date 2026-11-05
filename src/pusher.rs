@@ -205,6 +205,11 @@ struct State {
     /// Stage 1 metered mode. `None` in `open` mode, which is every
     /// production lane today.
     metered: Option<crate::metered::Metered>,
+    /// One permit per `/v1/push` in progress, held by the detached push
+    /// task itself. The connection permit is released when the client
+    /// hangs up, but the push it started keeps running; without this a
+    /// client could POST, reset, and repeat to stack up unbounded pushes.
+    push_slots: Arc<tokio::sync::Semaphore>,
 }
 
 /// Outcome of resolving a batch id on-chain.
@@ -400,6 +405,12 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         peers_known,
         opts.peerlist.display(),
     );
+    // Bound concurrent connections, and as many pushes (see `push_slots`).
+    let max_conns = std::env::var("HOVERFLY_PUSH_MAX_CONNS")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .map(|n| n.clamp(8, 4096))
+        .unwrap_or(PUSH_MAX_CONNS_DEFAULT);
     let state = Arc::new(State {
         opts,
         started: Instant::now(),
@@ -411,6 +422,7 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
         owner_cache: std::sync::Mutex::new(OwnerCache::new(OWNER_CACHE_CAP)),
         meter: std::sync::Mutex::new(crate::meter::Meter::default()),
         metered,
+        push_slots: Arc::new(tokio::sync::Semaphore::new(max_conns)),
     });
 
     // Background warm-pool maintenance: fill on startup and keep the pool
@@ -426,11 +438,6 @@ pub async fn run(opts: PusherOpts) -> Result<(), Box<dyn std::error::Error>> {
     // the OS backlog supplies the backpressure. Without this the accept loop
     // spawned per connection with no cap at all, and (see the timer below)
     // held those connections open forever.
-    let max_conns = std::env::var("HOVERFLY_PUSH_MAX_CONNS")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .map(|n| n.clamp(8, 4096))
-        .unwrap_or(PUSH_MAX_CONNS_DEFAULT);
     info!("pusher connection cap = {max_conns} (HOVERFLY_PUSH_MAX_CONNS to override)");
     let conns = Arc::new(tokio::sync::Semaphore::new(max_conns));
     let mut accept_backoff_ms = 0u64;
@@ -1527,6 +1534,9 @@ async fn push_response(
             "push disabled (no node identity resolvable)",
         );
     }
+    let Ok(slot) = state.push_slots.clone().try_acquire_owned() else {
+        return json_line_response(StatusCode::SERVICE_UNAVAILABLE, "too many pushes in flight");
+    };
     // Metered admission, entirely before the body is read (§7.2). Nothing
     // here touches the chain: the challenge already carries the credit line,
     // which is the point of issuing it.
@@ -1534,13 +1544,32 @@ async fn push_response(
         Ok(a) => a,
         Err(resp) => return *resp,
     };
+    // The reservation was sized from Content-Length, so never read past it.
+    // hyper keeps a Content-Length header that precedes
+    // `Transfer-Encoding: chunked` but decodes the body as chunked, so a
+    // declared 1 byte could otherwise carry PUSH_MAX_BODY unreserved.
+    let body_limit = match &admitted {
+        Some(_) if req.headers().contains_key(hyper::header::TRANSFER_ENCODING) => {
+            return json_line_response(
+                StatusCode::BAD_REQUEST,
+                "metered mode requires a plain Content-Length body",
+            );
+        }
+        Some(_) => req
+            .headers()
+            .get(hyper::header::CONTENT_LENGTH)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse::<usize>().ok())
+            .map_or(PUSH_MAX_BODY, |n| n.min(PUSH_MAX_BODY)),
+        None => PUSH_MAX_BODY,
+    };
     // Bounded body read — a whole batch, not a stream. Bounded in *time* as
     // well as size: the size limit alone let a client dribble a body forever
     // and hold the connection (and, under metering, its admission
     // reservation) for free.
     let read = tokio::time::timeout(
         std::time::Duration::from_secs(PUSH_BODY_READ_TIMEOUT_SECS),
-        Limited::new(req.into_body(), PUSH_MAX_BODY).collect(),
+        Limited::new(req.into_body(), body_limit).collect(),
     )
     .await;
     let bytes = match read {
@@ -1572,6 +1601,7 @@ async fn push_response(
     // sessions from it (maintain=false), so no per-push dial burst.
     let (tx, rx) = futures::channel::mpsc::unbounded::<Result<Frame<Bytes>, Infallible>>();
     tokio::spawn(async move {
+        let _slot = slot;
         run_push(state, chunks, tx, admitted).await;
     });
 
@@ -1637,6 +1667,17 @@ async fn run_push(
     let mut rpc_budget = PUSH_MAX_BATCH_LOOKUPS;
 
     for chunk in chunks {
+        // Bee answers a chunk whose data doesn't hash to its address with
+        // an error receipt; pushing it anyway costs a delivery per pool
+        // peer tried and buys nothing (design §6: recompute addr from wire).
+        if !crate::client::chunk_matches_address(&chunk.wire, &chunk.addr) {
+            ack(
+                &chunk.addr,
+                "err",
+                Some("chunk data does not match its address"),
+            );
+            continue;
+        }
         let vs = match crate::stamp::validate(&chunk.addr, &chunk.stamp) {
             Ok(v) => v,
             Err(e) => {
