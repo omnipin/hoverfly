@@ -1679,6 +1679,12 @@ fn validate_delivery(data: &[u8], address: &ChunkAddress) -> bool {
     false
 }
 
+/// Does `wire` (span + payload) authentically belong at `addr`, as a
+/// content-addressed or single-owner chunk?
+pub(crate) fn chunk_matches_address(wire: &[u8], addr: &[u8; 32]) -> bool {
+    validate_delivery(wire, &ChunkAddress::new(*addr))
+}
+
 /// Parse already-validated wire bytes into a nectar chunk.
 ///
 /// `None` for a bee erasure parity chunk — nectar's `ContentChunk` rejects its
@@ -6928,6 +6934,19 @@ mod streamer_tests {
     /// address) as the one-shot prepare, every stamp must validate to the
     /// signer, and the root must match — across several window sizes, at both
     /// redundancy levels (erasure adds parity chunks to the same stream).
+    #[test]
+    fn chunk_matches_address_rejects_tampered_data() {
+        let chunk = AnyChunk::from(
+            ContentChunk::<DEFAULT_BODY_SIZE>::new(b"relay frame".to_vec()).unwrap(),
+        );
+        let mut addr = [0u8; 32];
+        addr.copy_from_slice(chunk.address().as_bytes());
+        let mut wire = wire_form(&chunk);
+        assert!(chunk_matches_address(&wire, &addr));
+        *wire.last_mut().unwrap() ^= 1;
+        assert!(!chunk_matches_address(&wire, &addr));
+    }
+
     #[test]
     fn streamer_raw_matches_oneshot() {
         let s = signer();
