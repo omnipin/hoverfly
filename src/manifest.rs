@@ -103,6 +103,12 @@ pub fn decode_node(payload: &[u8]) -> Result<Node, ManifestError> {
 
     let mut offset = NODE_HEADER_SIZE;
 
+    if data.len() < offset + ref_size as usize + INDEX_SIZE {
+        return Err(ManifestError::TooShort {
+            expected: offset + ref_size as usize + INDEX_SIZE,
+            actual: data.len(),
+        });
+    }
     let entry = if ref_size > 0 {
         let entry_bytes = &data[offset..offset + ref_size as usize];
         offset += ref_size as usize;
@@ -379,6 +385,22 @@ mod tests {
         let node = decode_node(&data).unwrap();
         assert!(node.entry.is_none());
         assert!(node.forks.is_empty());
+    }
+
+    /// A node claiming a 32-byte entry but too short to hold it (and the fork
+    /// index) must be rejected; slicing the entry used to panic. Anyone can
+    /// upload such a chunk and hand out its reference.
+    #[test]
+    fn truncated_node_is_rejected_not_panicked_on() {
+        for len in 64..(64 + 32 + 32) {
+            let mut data = vec![0u8; len];
+            data[32..63].copy_from_slice(&VERSION_HASH_V02);
+            data[63] = 32; // ref_size
+            assert!(
+                matches!(decode_node(&data), Err(ManifestError::TooShort { .. })),
+                "len {len}"
+            );
+        }
     }
 
     /// Real `swarm.eth` feed-manifest root chunk (ref
