@@ -805,21 +805,19 @@ impl<'a> NetworkedStore<'a> {
         // loop port (mirroring Bee's `pkg/retrieval` semantics): the keystone
         // fix for the cooldown-as-failure thrash hoverfly hits against post-2.8
         // mainnet (~37 `dial too soon` rejections/sec, 0 chunks retrieved).
-        use std::collections::{HashMap, HashSet, VecDeque};
-        let all_candidates: Vec<&Peer> = candidates.into_iter().take(attempt_cap).collect();
-        let mut deque: VecDeque<&Peer> = all_candidates.iter().copied().collect();
+        use std::collections::{HashMap, VecDeque};
+        let mut deque: VecDeque<&Peer> = candidates.into_iter().take(attempt_cap).collect();
         let initial_deque_len = deque.len();
 
-        // Per-chunk skiplist of recently-failed peers — Tier 2 of the
-        // retrieval-loop port. Mirrors Bee's `errSkip` from
-        // `pkg/retrieval/retrieval.go:80,277-280` with the same 60-second
-        // expiry. A peer that returned `storage: not found` (or any non-Deferred
-        // failure) for *this chunk* is parked here for `skiplist_dur`; after
-        // that the deque is refilled with re-eligible candidates so they get a
-        // second chance (the peer's local state may have changed in the
-        // meantime — fresh pushsync, neighborhood replay, etc.).
-        let skiplist_dur = Duration::from_secs(60);
-        let mut skiplist: HashMap<String, web_time::Instant> = HashMap::new();
+        // A peer that failed this chunk is not asked again within this
+        // request, as in bee's `pkg/retrieval` (`skip.Forever` per request;
+        // its 60 s `errSkip` spans requests). Re-admitting failed peers after
+        // a cooldown meant an unretrievable chunk retried forever, so a fetch
+        // of missing content never returned and the erasure joiner never got
+        // the failure it reconstructs from. Deferrals (dial cooldown, closed
+        // connection) requeue the peer, but only a bounded number of times.
+        const MAX_DEFERRALS_PER_PEER: u32 = 8;
+        let mut deferrals: HashMap<String, u32> = HashMap::new();
 
         // Build a future that performs a single peer fetch and returns a
         // structured result. Captures peer metadata for logging and feeds
@@ -971,53 +969,9 @@ impl<'a> NetworkedStore<'a> {
             .saturating_add(1);
         let mut consecutive_deferrals: usize = 0;
 
-        loop {
-            // No work left in flight. Try to refill the deque with skiplisted
-            // peers whose 60-second cooldown has elapsed (Tier 2). If the
-            // skiplist is empty we've truly exhausted the pool with no live
-            // entries to wait on; return the last error.
-            if inflight.is_empty() && deque.is_empty() {
-                let now = web_time::Instant::now();
-                skiplist.retain(|_, expiry| *expiry > now);
-                if skiplist.is_empty() {
-                    break;
-                }
-                // Sleep to the earliest live skiplist expiry, then refill from
-                // all_candidates whose entries have aged out. This is the
-                // partner mechanism to Tier 1's cycle-sleep: instead of giving
-                // up after one pass through the pool, we wait for failed peers
-                // to become eligible again (their local state — pushsync,
-                // neighborhood replay, network recovery — may have changed).
-                let earliest = skiplist.values().min().copied().unwrap_or(now);
-                if earliest > now {
-                    tokio::time::sleep(earliest.saturating_duration_since(now)).await;
-                }
-                let now = web_time::Instant::now();
-                skiplist.retain(|_, expiry| *expiry > now);
-                let still_skipped: HashSet<String> = skiplist.keys().cloned().collect();
-                for peer in all_candidates.iter() {
-                    if !still_skipped.contains(&peer.overlay.to_lowercase()) {
-                        deque.push_back(*peer);
-                    }
-                }
-                // Re-seed inflight from the refilled deque.
-                for _ in 0..concurrency {
-                    if let Some(p) = deque.pop_front() {
-                        inflight.push(try_peer(p));
-                    } else {
-                        break;
-                    }
-                }
-                if inflight.is_empty() {
-                    // Couldn't refill (skiplist entries kept all candidates out).
-                    break;
-                }
-            }
-            let Some((peer, overlay, outcome)) = inflight.next().await else {
-                // inflight became empty between checks — re-enter the refill
-                // branch on the next iteration.
-                continue;
-            };
+        // Every completion queues the next peer, so `inflight` only drains
+        // once the deque is empty too.
+        while let Some((peer, overlay, outcome)) = inflight.next().await {
             match outcome {
                 AttemptOutcome::Got(wire) => {
                     let wire = std::sync::Arc::new(wire);
@@ -1041,12 +995,21 @@ impl<'a> NetworkedStore<'a> {
                     return Ok(wire);
                 }
                 AttemptOutcome::Deferred => {
-                    // Transient: do not log, do not record failure, requeue.
-                    deque.push_back(peer);
-                    consecutive_deferrals = consecutive_deferrals.saturating_add(1);
-                    if consecutive_deferrals >= cycle_threshold {
-                        tokio::time::sleep(Duration::from_millis(200)).await;
-                        consecutive_deferrals = 0;
+                    let n = deferrals.entry(overlay.to_lowercase()).or_insert(0);
+                    *n += 1;
+                    if *n > MAX_DEFERRALS_PER_PEER {
+                        // A peer that keeps deferring (e.g. accepts and then
+                        // drops every connection) counts as failed.
+                        failed_attempts = failed_attempts.saturating_add(1);
+                        last_err = format!("peer {overlay} deferred {n} times");
+                    } else {
+                        // Transient: do not log, do not record failure, requeue.
+                        deque.push_back(peer);
+                        consecutive_deferrals = consecutive_deferrals.saturating_add(1);
+                        if consecutive_deferrals >= cycle_threshold {
+                            tokio::time::sleep(Duration::from_millis(200)).await;
+                            consecutive_deferrals = 0;
+                        }
                     }
                 }
                 AttemptOutcome::Failed(e) => {
@@ -1063,11 +1026,6 @@ impl<'a> NetworkedStore<'a> {
                     debug!(target: "hoverfly::fetch", "peer {} failed: {}", overlay, e);
                     last_err = e;
                     consecutive_deferrals = 0;
-                    // Tier 2: park failed peer in per-chunk skiplist.
-                    skiplist.insert(
-                        overlay.to_lowercase(),
-                        web_time::Instant::now() + skiplist_dur,
-                    );
                 }
             }
             if let Some(next) = deque.pop_front() {
@@ -1639,7 +1597,8 @@ pub async fn list_manifest_ex(
     let store =
         NetworkedStore::with_concurrency(transport, peers, max_retries_per_chunk, concurrency);
     let root = resolve_feed_root(&store, root, None).await?.root;
-    walk_manifest(&store, root, Vec::new()).await
+    let budget = std::sync::atomic::AtomicUsize::new(MAX_MANIFEST_NODES);
+    walk_manifest(&store, root, Vec::new(), 0, &budget).await
 }
 
 /// Validate delivered bytes against the address that was requested, trying both
@@ -1838,17 +1797,49 @@ type MaybeSendWalk<'a> = std::pin::Pin<
     Box<dyn std::future::Future<Output = Result<Vec<ManifestEntry>, ClientError>> + 'a>,
 >;
 
+/// Bounds on a manifest listing. Every fork consumes at least one path byte,
+/// so depth is bounded by path length; bee paths are far shorter than this.
+const MAX_MANIFEST_DEPTH: usize = 256;
+/// Nodes one listing may visit. A manifest is a DAG: forks may share a child,
+/// so five chunks with ~62 forks each already describe ~10^9 paths.
+const MAX_MANIFEST_NODES: usize = 1_000_000;
+
 fn walk_manifest<'a>(
     store: &'a NetworkedStore<'a>,
     addr: ChunkAddress,
     path_so_far: Vec<u8>,
+    depth: usize,
+    budget: &'a std::sync::atomic::AtomicUsize,
 ) -> MaybeSendWalk<'a> {
     Box::pin(async move {
         use crate::manifest::decode_node;
+        use std::sync::atomic::Ordering;
+
+        if depth > MAX_MANIFEST_DEPTH {
+            return Err(ClientError::Manifest(format!(
+                "manifest deeper than {MAX_MANIFEST_DEPTH} levels"
+            )));
+        }
+        if budget
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_sub(1))
+            .is_err()
+        {
+            return Err(ClientError::Manifest(format!(
+                "manifest has more than {MAX_MANIFEST_NODES} nodes"
+            )));
+        }
 
         let chunk = ChunkGet::<DEFAULT_BODY_SIZE>::get(store, &addr)
             .await
             .map_err(|e| ClientError::Manifest(format!("fetch node {addr}: {e}")))?;
+        // A single-owner chunk's address doesn't commit to its content, so a
+        // SOC "node" can list itself as a fork and recurse forever. Bee loads
+        // manifest nodes through the joiner, which never yields one.
+        if matches!(chunk, AnyChunk::SingleOwner(_)) {
+            return Err(ClientError::Manifest(format!(
+                "manifest node {addr} is a single-owner chunk"
+            )));
+        }
         let node = decode_node(chunk.data()).map_err(|e| ClientError::Manifest(e.to_string()))?;
 
         let mut out = Vec::new();
@@ -1865,7 +1856,7 @@ fn walk_manifest<'a>(
             let mut next_path = path_so_far.clone();
             next_path.extend_from_slice(&fork.prefix);
             let r = fork.reference;
-            out.extend(walk_manifest(store, r, next_path).await?);
+            out.extend(walk_manifest(store, r, next_path, depth + 1, budget).await?);
         }
         Ok(out)
     })
