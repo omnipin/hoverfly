@@ -145,6 +145,17 @@ struct Cli {
     #[arg(long, global = true, default_value_t = 100, value_name = "ID")]
     chequebook_chain_id: u64,
 
+    /// JSON-RPC endpoint for `--chequebook-chain-id`. With `--chequebook`,
+    /// read once at startup for the SWAP price oracle's exchange rate and
+    /// the chequebook's issuer; cheques are only signed at that rate.
+    #[arg(
+        long,
+        global = true,
+        default_value = "https://rpc.gnosischain.com",
+        value_name = "URL"
+    )]
+    chequebook_rpc_url: String,
+
     /// Pin a metered lane's identity: `URL,NODE,BENEFICIARY` (0x-hex).
     /// Repeatable. Without a pin the first-seen quote is trusted for the
     /// run (TOFU) with a warning — any host answering the URL could mint
@@ -1573,10 +1584,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|e| format!("--chequebook-per-peer-cap-bzz: {e}"))?;
         let store = hoverfly::cheques::ChequeStore::load_or_create(&cli.cheques_file, cb)
             .map_err(|e| format!("loading {}: {e}", cli.cheques_file.display()))?;
+        let oracle = hoverfly::batch::swap_price_oracle_for_chain(cli.chequebook_chain_id)
+            .ok_or_else(|| {
+                format!(
+                    "--chequebook: no SWAP price oracle known for chain {}",
+                    cli.chequebook_chain_id
+                )
+            })?;
+        let (exchange_rate, deduction) =
+            hoverfly::batch::read_swap_rates(&cli.chequebook_rpc_url, oracle)
+                .await
+                .map_err(|e| format!("--chequebook: reading SWAP price oracle: {e}"))?;
+        let issuer = hoverfly::batch::read_chequebook_issuer(
+            &cli.chequebook_rpc_url,
+            alloy_primitives::Address::from(cb),
+        )
+        .await
+        .map_err(|e| format!("--chequebook: reading issuer(): {e}"))?;
         eprintln!(
-            "swap: chequebook=0x{} chain_id={} per_peer_cap_bzz={} cheques_file={}",
+            "swap: chequebook=0x{} issuer={} chain_id={} rate={} deduction={} per_peer_cap_bzz={} cheques_file={}",
             hex::encode(cb),
+            issuer,
             cli.chequebook_chain_id,
+            exchange_rate,
+            deduction,
             per_peer_cap,
             cli.cheques_file.display(),
         );
@@ -1584,6 +1615,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chequebook: cb,
             chain_id: cli.chequebook_chain_id,
             max_cumulative_per_peer_bzz: per_peer_cap,
+            exchange_rate,
+            deduction,
+            issuer: issuer.into_array(),
             store: std::sync::Arc::new(tokio::sync::Mutex::new(store)),
         })
     } else {

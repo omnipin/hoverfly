@@ -271,6 +271,84 @@ fn debit_fate(e: &TransportError) -> DebitFate {
     }
 }
 
+/// BZZ value of a cheque settling `plur` accounting units, from the
+/// peer's `exchange`/`deduction` headers. Those headers set the price, so
+/// only the oracle's rate is accepted and the deduction must be zero or
+/// the oracle's (bee's issuing side: `ErrNegotiateRate` /
+/// `ErrNegotiateDeduction`). Amount = `plur * rate + deduction`
+/// (`swapprotocol.go` `sentAmount`).
+#[cfg(not(target_arch = "wasm32"))]
+fn cheque_amount(
+    plur: u64,
+    rates: &crate::protocols::swap::SettlementRates,
+    oracle_rate: alloy_primitives::U256,
+    oracle_deduction: alloy_primitives::U256,
+) -> Result<alloy_primitives::U256, TransportError> {
+    use alloy_primitives::U256;
+    if rates.exchange_rate != oracle_rate {
+        return Err(TransportError::Swap(format!(
+            "peer exchange rate {} != oracle {}",
+            rates.exchange_rate, oracle_rate
+        )));
+    }
+    if !rates.deduction.is_zero() && rates.deduction != oracle_deduction {
+        return Err(TransportError::Swap(format!(
+            "peer deduction {} != oracle {}",
+            rates.deduction, oracle_deduction
+        )));
+    }
+    let amount = U256::from(plur)
+        .checked_mul(rates.exchange_rate)
+        .and_then(|p| p.checked_add(rates.deduction))
+        .ok_or_else(|| TransportError::Swap("BZZ amount overflows u256".into()))?;
+    // Bee's chequestore requires `amount - deduction >= rate`.
+    if amount < rates.exchange_rate.saturating_add(rates.deduction) {
+        return Err(TransportError::Swap("amount below minimum payable".into()));
+    }
+    Ok(amount)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod cheque_amount_tests {
+    use super::*;
+    use crate::protocols::swap::SettlementRates;
+    use alloy_primitives::U256;
+
+    const RATE: u64 = 100_000;
+    const DEDUCTION: u64 = 100;
+
+    fn rates(rate: u64, deduction: u64) -> SettlementRates {
+        SettlementRates {
+            exchange_rate: U256::from(rate),
+            deduction: U256::from(deduction),
+        }
+    }
+
+    fn amount(r: SettlementRates) -> Result<U256, TransportError> {
+        cheque_amount(1_000_000, &r, U256::from(RATE), U256::from(DEDUCTION))
+    }
+
+    #[test]
+    fn oracle_rate_with_or_without_deduction_is_paid() {
+        assert_eq!(
+            amount(rates(RATE, 0)).unwrap(),
+            U256::from(1_000_000u64 * RATE)
+        );
+        assert_eq!(
+            amount(rates(RATE, DEDUCTION)).unwrap(),
+            U256::from(1_000_000u64 * RATE + DEDUCTION)
+        );
+    }
+
+    /// A peer naming its own price used to be paid at it, up to the
+    /// per-peer cap.
+    #[test]
+    fn peer_chosen_rate_or_deduction_is_refused() {
+        assert!(amount(rates(RATE * 1000, 0)).is_err());
+        assert!(amount(rates(RATE, 10u64.pow(18))).is_err());
+    }
+}
+
 pub fn is_connection_dead(e: &TransportError) -> bool {
     use crate::protocols::pushsync::PushsyncError;
     match e {
@@ -717,6 +795,15 @@ pub struct SwapConfig {
     /// balance, so the user should set this <= chequebook deposited
     /// balance to avoid bouncing cheques.
     pub max_cumulative_per_peer_bzz: alloy_primitives::U256,
+    /// Exchange rate and cheque-value deduction read from the on-chain
+    /// price oracle at startup. A peer's `exchange`/`deduction` headers set
+    /// the cheque's value, so they are only trusted when they match these
+    /// (as bee's issuing side does, `swapprotocol.go` `EmitCheque`).
+    pub exchange_rate: alloy_primitives::U256,
+    pub deduction: alloy_primitives::U256,
+    /// The chequebook's on-chain `issuer()`. Sessions whose signer differs
+    /// never emit cheques: bee would reject every one.
+    pub issuer: [u8; 20],
     /// Persistent per-peer cumulative-payout state. Shared across all
     /// sessions; must be loaded from disk before first session and
     /// flushed on shutdown.
@@ -1273,33 +1360,28 @@ impl PeerSession {
         // emission. We don't want a swap-stream hiccup to abort a
         // session that's otherwise perfectly capable of pushing.
         #[cfg(not(target_arch = "wasm32"))]
+        // Bee sets up SWAP locally from the handshake's eth address
+        // (`swapprotocol.go` `init`); there is no swap handshake message on
+        // the wire, and its stream handler only parses cheques.
         let swap = match (&transport.swap, hs_result.peer_eth_address) {
-            (Some(cfg), Some(peer_eth)) => {
-                let our_beneficiary = *transport.signer.eth_address();
-                match do_swap_handshake(
-                    &mut swarm,
-                    peer_id,
-                    &mut control,
-                    transport.config.dial_timeout,
-                    &our_beneficiary,
-                )
-                .await
-                {
-                    Ok(()) => Some(SessionSwap {
-                        peer_beneficiary: peer_eth,
-                        peer_overlay_hex: hex::encode(hs_result.peer_overlay),
-                        signer: transport.signer.clone(),
-                        config: cfg.clone(),
-                    }),
-                    Err(e) => {
-                        tracing::debug!(
-                            target: "hoverfly::transport",
-                            "swap handshake failed with {}: {} — falling back to pseudosettle-only",
-                            peer_id, e
-                        );
-                        None
-                    }
-                }
+            (Some(cfg), Some(peer_eth)) if *transport.signer.eth_address() == cfg.issuer => {
+                Some(SessionSwap {
+                    peer_beneficiary: peer_eth,
+                    peer_overlay_hex: hex::encode(hs_result.peer_overlay),
+                    signer: transport.signer.clone(),
+                    config: cfg.clone(),
+                })
+            }
+            (Some(_), Some(_)) => {
+                static WARNED: std::sync::Once = std::sync::Once::new();
+                WARNED.call_once(|| {
+                    tracing::warn!(
+                        target: "hoverfly::transport",
+                        "--chequebook issuer is not this node's signing key; cheques disabled \
+                         (daemon: pass --identity with the issuer key)"
+                    )
+                });
+                None
             }
             _ => None,
         };
@@ -1892,7 +1974,10 @@ impl SessionState {
         let Some(swap_state) = self.swap.as_ref() else {
             return Ok(());
         };
-        if plur_to_settle == 0 {
+        // Bee's own minimum (`accounting.go`: refreshRate / 5). Anything
+        // smaller is cleared by the next pseudosettle within a second, so
+        // paying BZZ for it buys nothing.
+        if plur_to_settle < REFRESH_RATE_PLUR / 5 {
             return Ok(());
         }
 
@@ -1908,23 +1993,12 @@ impl SessionState {
             .await
             .map_err(|_| TransportError::Timeout)?
             .map_err(|e| TransportError::Swap(e.to_string()))?;
-
-        // Compute BZZ-wei amount: bee's chequestore.go:139-143 enforces
-        // `amount - deduction >= exchange`, i.e. amount >= exchange +
-        // deduction. We compute amount = plur * exchange + deduction
-        // (mirrors swapprotocol.go:224-225, where sentAmount =
-        // paymentAmount*exchangeRate + deduction).
-        let plur_u256 = U256::from(plur_to_settle);
-        let amount_bzz = plur_u256
-            .checked_mul(rates.exchange_rate)
-            .and_then(|p| p.checked_add(rates.deduction))
-            .ok_or_else(|| TransportError::Swap("BZZ amount overflows u256".into()))?;
-        if amount_bzz < rates.exchange_rate.saturating_add(rates.deduction) {
-            // Pathological: deduction == 0 and amount < exchange would
-            // bounce as ErrChequeValueTooLow. Defensive guard for the
-            // arithmetic above.
-            return Err(TransportError::Swap("amount below minimum payable".into()));
-        }
+        let amount_bzz = cheque_amount(
+            plur_to_settle,
+            &rates,
+            swap_state.config.exchange_rate,
+            swap_state.config.deduction,
+        )?;
 
         // Bump per-peer cumulative under the store lock, then sign.
         // The store mutation has to happen *before* we sign because
@@ -1944,11 +2018,14 @@ impl SessionState {
                 let next = store
                     .bump_and_get(&swap_state.peer_overlay_hex, delta)
                     .map_err(|e| TransportError::Swap(e.to_string()))?;
+                // A cumulative that isn't on disk goes backwards after a
+                // restart, and bee refuses every later cheque to this peer
+                // (ErrChequeNotIncreasing). Don't send what we can't record.
                 if let Err(e) = store.save() {
-                    tracing::warn!(
-                        target: "hoverfly::transport",
-                        "cheques.json save failed: {} — continuing in-memory only", e
-                    );
+                    store.revert_unsaved_bump(&swap_state.peer_overlay_hex, cur);
+                    return Err(TransportError::Swap(format!(
+                        "cheques.json save failed: {e}"
+                    )));
                 }
                 (U256::from(next), false)
             }
@@ -2601,40 +2678,6 @@ async fn do_pricing(
     debug!(target: "hoverfly::transport",
         "outbound pricing complete (peer threshold {} PLUR)", peer_threshold);
     Ok(peer_threshold)
-}
-
-/// One-shot outbound SWAP handshake. Open `/swarm/swap/1.0.0/swap`,
-/// exchange empty headers, send `Handshake { Beneficiary }`, close.
-/// Bee's `swapprotocol.go::init` is called on every new connection
-/// regardless of who dialed; bee's own outbound handshake to us is
-/// served by the inbound stream-pool listener for `SWAP_PROTO` (which
-/// we accept and discard, since this client is send-only — see
-/// PERFORMANCE.md SWAP scope).
-#[cfg(not(target_arch = "wasm32"))]
-async fn do_swap_handshake(
-    swarm: &mut Swarm<Behaviour>,
-    peer_id: PeerId,
-    control: &mut crate::protocols::stream_pool::Control,
-    timeout: Duration,
-    beneficiary: &[u8; 20],
-) -> Result<(), TransportError> {
-    use crate::protocols::swap;
-    let mut stream = tokio::time::timeout(
-        timeout,
-        poll_until(swarm, control.open_stream(peer_id, SWAP_PROTO)),
-    )
-    .await
-    .map_err(|_| TransportError::Timeout)?
-    .map_err(|e| TransportError::StreamControl(format!("{e:?}")))?;
-    tokio::time::timeout(
-        timeout,
-        poll_until(swarm, swap::send_handshake(&mut stream, beneficiary)),
-    )
-    .await
-    .map_err(|_| TransportError::Timeout)?
-    .map_err(|e| TransportError::Swap(e.to_string()))?;
-    close_stream_polled(swarm, &mut stream).await;
-    Ok(())
 }
 
 /// Open a fresh `/swarm/hive/2.0.0/peers` substream to `peer_id` and
