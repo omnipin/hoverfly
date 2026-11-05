@@ -118,11 +118,13 @@ jobs:
           command: printf "%s" "${BENCH_NONCE#0x}" | tr -d '[:space:]' > overlay-nonce
 
       - run:
-          name: Seed peers.json from committed seed
-          # Skip cold discover: peers.seed.json (committed, harvested
-          # from a long-running v15 daemon) gives the daemon a usable
-          # candidate set to dial immediately.
-          command: cp peers.seed.json peers.json
+          name: Seed peers.json from the peers repo
+          # Skip cold discover: peers.seed.json (refreshed hourly in
+          # omnipin/hoverfly-peers) gives the daemon a usable candidate
+          # set to dial immediately.
+          command: |
+            curl -fsSL --retry 3 -o peers.json \
+              https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json
 
       - run:
           name: Start daemon

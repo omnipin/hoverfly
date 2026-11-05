@@ -51,7 +51,7 @@ on:
         default: false
         type: boolean
       use_seed_peers:
-        description: "Seed peers.json from peers.seed.json instead of running fresh discover (faster cold start; less representative of a true cold path)"
+        description: "Seed peers.json from the omnipin/hoverfly-peers seed instead of running fresh discover (faster cold start; less representative of a true cold path)"
         required: false
         default: false
         type: boolean
@@ -103,22 +103,15 @@ jobs:
           fi
 
       - name: Populate peers.json
-        # `use_seed_peers=true` mirrors bench.yml's fast path (committed
-        # seed). `false` measures the real cold path via `hoverfly discover`.
+        # `use_seed_peers=true` mirrors bench.yml's fast path (the
+        # hoverfly-peers seed). `false` measures the real cold path via
+        # `hoverfly discover`.
         env:
           USE_SEED: ${{ inputs.use_seed_peers }}
         run: |
           if [ "$USE_SEED" = "true" ]; then
-            # Fresh peerlist from the peers repo; the committed copy is a
-            # frozen fallback.
-            if curl -fsSL -o peers.json \
-              https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json \
-              && [ -s peers.json ]; then
-              echo "Using the fresh peerlist from omnipin/hoverfly-peers"
-            else
-              echo "WARNING: fresh peerlist fetch failed; using the committed copy"
-              cp peers.seed.json peers.json
-            fi
+            curl -fsSL --retry 3 -o peers.json \
+              https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json
           else
             START_T=$(date +%s)
             ./target/release/hoverfly discover --rounds 3 -v 2>&1 | tail -20
