@@ -315,7 +315,7 @@ impl Encoder {
 
         let mut buf = std::mem::take(&mut self.rs_buf[rs_level]);
         buf.resize(shards + parities, vec![0u8; CHUNK_WITH_SPAN]);
-        ReedSolomon::new(shards, parities)?.encode(&mut buf)?;
+        ReedSolomon::cached(shards, parities)?.encode(&mut buf)?;
 
         for parity in buf.into_iter().skip(shards) {
             // A parity chunk is a plain content chunk over the full padded
