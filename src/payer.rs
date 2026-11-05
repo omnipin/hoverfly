@@ -262,6 +262,29 @@ impl OfferedChallenge {
         })
     }
 
+    /// Is this the challenge we asked this relay for? Signing binds
+    /// `origin`, so a relay handing us *another* relay's challenge (fetched
+    /// there for our public account and batch) would get a header it can
+    /// replay at that relay, which then bills us (incentives §11.1). The
+    /// origin must be the one this lane's signed quote states.
+    pub fn check_for(
+        &self,
+        quote_origin: &str,
+        account: [u8; 20],
+        batch: [u8; 32],
+    ) -> Result<(), String> {
+        if quote_origin.is_empty() || self.origin != quote_origin {
+            return Err(format!(
+                "challenge origin {:?} is not this lane's quoted origin {quote_origin:?}",
+                self.origin
+            ));
+        }
+        if self.account != account || self.batch != batch {
+            return Err("challenge names a different account or batch than requested".into());
+        }
+        Ok(())
+    }
+
     /// Sign it and produce the header value.
     ///
     /// Signing binds `origin`, which is what makes this header useless at
@@ -695,6 +718,7 @@ impl LanePayer {
                 .await
                 .map_err(|e| format!("challenge json: {e}"))?;
             let offered = OfferedChallenge::parse(&v)?;
+            offered.check_for(&self.quote.origin, account, cfg.batch)?;
             self.cap_plur = offered.cap_plur;
             // §10.1's thresholds scale with the line, so the account needs
             // it too — see `Params::effective`.
@@ -1530,6 +1554,42 @@ mod tests {
             a.next_cumulative(),
             Some(carried),
             "now a cheque clears the refusal"
+        );
+    }
+
+    /// A challenge must name the origin from this lane's quote and the
+    /// account and batch we asked for, or one relay can have us sign a
+    /// header that bills us at another.
+    #[test]
+    fn foreign_challenges_are_not_signed() {
+        let offered = OfferedChallenge {
+            nonce: [1; 32],
+            account: [2; 20],
+            batch: [3; 32],
+            origin: "relay-a.example".into(),
+            expiry_unix: 0,
+            cap_plur: 0,
+        };
+        assert!(
+            offered
+                .check_for("relay-a.example", [2; 20], [3; 32])
+                .is_ok()
+        );
+        assert!(
+            offered
+                .check_for("relay-b.example", [2; 20], [3; 32])
+                .is_err()
+        );
+        assert!(offered.check_for("", [2; 20], [3; 32]).is_err());
+        assert!(
+            offered
+                .check_for("relay-a.example", [9; 20], [3; 32])
+                .is_err()
+        );
+        assert!(
+            offered
+                .check_for("relay-a.example", [2; 20], [9; 32])
+                .is_err()
         );
     }
 
