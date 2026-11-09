@@ -117,8 +117,8 @@ graceful failure handling.
   `DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64` (`--substream-upgrade-cap`).
   This alone moved a 222-peer residential run from ~75 → ~133 KiB/s.
 - **Session pool** (`client.rs::SessionPool`). `--concurrency`
-  (`DEFAULT_UPLOAD_CONCURRENCY = 8` one-shot; daemon `--pool-size` default 256,
-  the throughput operating point) controls target pool size. The per-chunk dispatcher picks
+  (`DEFAULT_UPLOAD_CONCURRENCY = 256` one-shot, same as the daemon's
+  `--pool-size` default, the throughput operating point) controls target pool size. The per-chunk dispatcher picks
   the closest-by-proximity session for routing.
 - **Address-space spread** (`client.rs::spread_across_address_space`). Pool
   candidates are bucketed by leading overlay byte (256 bins) and

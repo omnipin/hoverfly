@@ -384,8 +384,9 @@ enum Commands {
         content_type: Option<String>,
 
         /// Number of peer sessions to keep open in parallel during upload.
-        /// Each session reuses a single libp2p connection for many chunks,
-        /// so a small pool (4-16) is usually plenty.
+        /// Each chunk is routed through the closest session, so a wider pool
+        /// means shorter forwarding paths. Small uploads open fewer sessions
+        /// than this (about four per chunk, at least 16).
         #[arg(long, default_value_t = DEFAULT_UPLOAD_CONCURRENCY)]
         concurrency: usize,
 
