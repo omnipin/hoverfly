@@ -70,6 +70,11 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
 
 - Native: `cargo build` / `cargo build --release`. Release is ~2-5× faster on
   crypto paths but only ~10-15% end-to-end (network dominates).
+- `[profile.release]` is tuned for binary size: fat LTO, `codegen-units = 1`.
+  A release build is a full slow rebuild; iterate on `cargo build`. Don't
+  switch it to `panic = "abort"` for the extra ~2 MiB: unwinding is what
+  confines a panic to the one tokio task (peer session, daemon request,
+  relay connection) it happened in.
 - Edition **2024**; crate version tracked in `Cargo.toml` (`0.x`, currently
   `0.3.0`).
 - Default features are `cli`, `bridge`, `pusher`. `--no-default-features

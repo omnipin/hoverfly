@@ -131,14 +131,17 @@ jobs:
 
       - name: Build release binary
         env:
-          # Smaller, more portable binaries. LTO is on by default in
-          # the `release` profile; this just makes binaries strip-friendly.
+          # LTO and codegen units come from `[profile.release]` in
+          # Cargo.toml. Symbols are left in here and removed by the
+          # target's own `strip` in the next step.
           CARGO_PROFILE_RELEASE_STRIP: none
+        # `--bin hoverfly`: sigcheck isn't shipped, so don't pay for a
+        # second fat-LTO link.
         run: |
           if [ "${{ matrix.use-cross }}" = "true" ]; then
-            cross build --release --locked --target ${{ matrix.target }}
+            cross build --release --locked --target ${{ matrix.target }} --bin hoverfly
           else
-            cargo build --release --locked --target ${{ matrix.target }}
+            cargo build --release --locked --target ${{ matrix.target }} --bin hoverfly
           fi
 
       - name: Strip binary
