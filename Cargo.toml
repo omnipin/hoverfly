@@ -189,3 +189,14 @@ tokio-test = "0.4"
 # from `proto/*.proto`. Not pulled into normal `cargo build` — invoke
 # explicitly via `scripts/regen-protos.sh`.
 prost-build = "0.13"
+
+# Binary size over build time. Without LTO each of the default 16 codegen
+# units carries its own copy of every async body and closure it touches;
+# fat LTO with a single unit merges them. cargo can't LTO the cdylib+rlib lib
+# target, so the wasm build only gets the single unit. Panics stay `unwind`
+# despite the unwind tables: each peer session drives its swarm in its own
+# task, and a panic there (say, a dependency choking on a peer's bytes) must
+# drop that session, not the whole upload, daemon or relay.
+[profile.release]
+lto = "fat"
+codegen-units = 1
