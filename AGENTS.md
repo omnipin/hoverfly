@@ -76,7 +76,7 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
   confines a panic to the one tokio task (peer session, daemon request,
   relay connection) it happened in.
 - Edition **2024**; crate version tracked in `Cargo.toml` (`0.x`, currently
-  `0.3.0`).
+  `0.3.1`).
 - Default features are `cli`, `bridge`, `pusher`. `--no-default-features
   --features cli` drops both the bridge and the relay server (native-only
   code is compiled out entirely).
