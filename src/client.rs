@@ -1903,8 +1903,12 @@ pub struct ManifestEntry {
     pub content_type: Option<String>,
 }
 
-/// Default number of peer sessions opened in parallel for upload.
-pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 8;
+/// Default number of peer sessions opened in parallel for upload. Matches the
+/// daemon's `--pool-size`: per-chunk routing picks the closest session, so a
+/// small pool sends most chunks through far-away peers (more hops, more
+/// shallow receipts). Small uploads still open far fewer — see
+/// `push_chunks_concurrent`.
+pub const DEFAULT_UPLOAD_CONCURRENCY: usize = 256;
 
 /// Upload a file's content plus a single-entry mantaray manifest pointing
 /// `path` at the file root, with optional `Content-Type` metadata. Returns

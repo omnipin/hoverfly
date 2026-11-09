@@ -563,7 +563,7 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   - `stream_pool/handler.rs  DEFAULT_MAX_CONCURRENT_OUTBOUND_UPGRADES = 64`
     — per-connection concurrent substream-upgrade cap (`--substream-upgrade-cap`).
   - `client.rs  DEFAULT_FETCH_CONCURRENCY = 5`,
-    `DEFAULT_DISCOVER_CONCURRENCY = 16`, `DEFAULT_UPLOAD_CONCURRENCY = 8`
+    `DEFAULT_DISCOVER_CONCURRENCY = 16`, `DEFAULT_UPLOAD_CONCURRENCY = 256`
     (the only `pub` tuning consts — the rest below are private).
   - `client.rs  CHUNK_PEER_PARALLELISM = 3` — each chunk races up to 3
     proximity-ordered peers (≈2-3× throughput for ≈3× bandwidth).

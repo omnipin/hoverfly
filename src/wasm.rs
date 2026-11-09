@@ -55,8 +55,8 @@ const DEFAULT_WARM_POOL: usize = 0;
 
 /// Upload session-pool target for the browser pusher.
 ///
-/// The native CLI defaults to 8 (`DEFAULT_UPLOAD_CONCURRENCY`) and the VPS
-/// daemon runs 256+, but the browser is different in BOTH directions:
+/// The native CLI and daemon default to 256 (`DEFAULT_UPLOAD_CONCURRENCY`,
+/// `--pool-size`), but the browser is different in BOTH directions:
 ///
 /// - `push_chunks_with_pool` now tops the pool up mid-upload (`maintain=true`
 ///   on the one-shot path): every `HOVERFLY_PUSH_TOPUP_SECS` (default 2 s — the
