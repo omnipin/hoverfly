@@ -620,6 +620,7 @@ impl HoverflyClient {
         root_hex: String,
         max_retries: usize,
     ) -> Result<String, JsError> {
+        let _guard = FetchGuard::new(&self.inflight_fetches);
         let peers = self.peers.borrow().clone();
         let entries = list_manifest_ex(
             &self.transport,
