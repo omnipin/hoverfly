@@ -13,11 +13,10 @@
     "selftest": "node --experimental-strip-types scripts/selftest.ts"
   },
   "dependencies": {
-    "@ensdomains/content-hash": "^3.0.0",
-    "viem": "^2.21.0"
+    "viem": "^2.58.4"
   },
   "devDependencies": {
-    "esbuild": "^0.24.2",
+    "esbuild": "^0.28.2",
     "typescript": "^5.7.2"
   }
 }
