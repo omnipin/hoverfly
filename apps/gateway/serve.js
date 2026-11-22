@@ -6,9 +6,8 @@
 // shared memory, so the page MUST be cross-origin isolated:
 //
 //   Cross-Origin-Opener-Policy: same-origin
-//   Cross-Origin-Embedder-Policy: credentialless   (lets the cross-origin
-//     daemon iframe + CDN-free same-origin wasm load without explicit CORP)
-//   Cross-Origin-Resource-Policy: cross-origin      (so the broker iframe is
+//   Cross-Origin-Embedder-Policy: require-corp     (see isolationHeaders)
+//   Cross-Origin-Resource-Policy: cross-origin     (so the broker iframe is
 //     embeddable from content subdomains)
 //
 // *.localhost resolves to 127.0.0.1 in Chrome automatically, so no /etc/hosts

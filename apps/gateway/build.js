@@ -66,19 +66,17 @@ const options = {
   logLevel: 'info',
   define: {
     'process.env.NODE_ENV': '"production"',
-    // Build version stamped into the daemon SharedWorker URL + name so a new
-    // deploy spawns a FRESH worker instead of rejoining the stale instance a
-    // browser keeps alive across reloads (SharedWorker is keyed by origin +
-    // script URL + name and persists until every client closes). Derived from
-    // the vendored wasm's content hash, since the daemon going stale only
-    // matters when the wasm changes; falls back to the build timestamp.
+    // Build version, used by the boot shell to reload at most once per deploy
+    // when a new service worker takes over. Derived from the vendored wasm's
+    // content hash; falls back to the build timestamp. (The daemon
+    // SharedWorker's URL + name are deliberately NOT versioned — see
+    // DAEMON_WORKER_SCRIPT in src/shared/config.ts.)
     __GW_VERSION__: JSON.stringify(daemonVersion())
   }
 }
 
-/** Short content hash of the vendored wasm (the thing whose change makes a
- *  running daemon stale). Falls back to the build time if pkg/ isn't present
- *  yet (the wasm is vendored just below in copyStatic). */
+/** Short content hash of the vendored wasm. Falls back to the build time if
+ *  pkg/ isn't present. */
 function daemonVersion () {
   try {
     const wasm = readFileSync(resolve(pkg, 'hoverfly_bg.wasm'))
@@ -96,8 +94,7 @@ await vendorPeerSeed()
 if (watch) {
   const ctx = await esbuild.context(options)
   await ctx.watch()
-  // re-copy static on a simple interval is overkill; copy once and rely on
-  // editing public/ rarely. Re-run `npm run build` for static changes.
+  // Static files are copied once; re-run `pnpm build` after editing public/.
   console.log('esbuild watching for changes…')
 } else {
   await esbuild.build(options)
