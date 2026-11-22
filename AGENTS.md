@@ -22,7 +22,7 @@ There is no `package.json` / `index.ts` / `bun.lock` / `node_modules` at the
 root anymore (those old `bun init` leftovers are gone; a root `tsconfig.json`
 with bun types is still lying around — harmless, each app carries its own
 tsconfig). Other top-level entries: `install.sh`, `Cargo.toml` /
-`Cargo.lock`, `proto/` (+ `build.rs`), `vendor/futures-bounded`, `scripts/`,
+`Cargo.lock`, `proto/` (+ `build.rs`), `scripts/`,
 `examples/` (`regen-protos.rs`, `upload.yml`), `tests/`
 (`attack_vectors.rs`, `joiner_hardening.rs`), `docs/` (`pusher-design.md`,
 `pusher-incentives.md`, `pusher-incentives-slides.md`, `review-2026-11.md`,
@@ -126,11 +126,8 @@ are in flight at once. Public API (`Behaviour`, `Control`, `IncomingStreams`,
   name-dropping nectar 0.1.0 / alloy-primitives 1.5.x are likewise stale;
   the tree is on nectar 0.4.0 / alloy-primitives 1.6.)
 
-  There **is** one active `[patch.crates-io]`: `futures-bounded` →
-  `vendor/futures-bounded`, whose `Delay::tokio` falls back to
-  `futures-timer` on wasm32 (real tokio's timer panics in the browser). This
-  fixes libp2p-identify's (and any other) `futures_bounded::Delay::tokio`
-  usage on wasm.
+  The `wasm-bindgen` CLI pinned in `.github/workflows/release.yml` (and your
+  local one) must match the `wasm-bindgen` version in `Cargo.lock`.
 
   First-time setup:
   ```
