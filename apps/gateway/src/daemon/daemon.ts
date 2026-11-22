@@ -16,7 +16,7 @@
 
 import {
   DAEMON_REFRESH_SECS, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, DOH_URL,
-  FETCH_DEADLINE_MS, FETCH_RETRIES, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
+  FETCH_DEADLINE_MS, FETCH_RETRIES, HOVERFLY_JS, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
   IDB_NONCE_KEY, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID, PEERS_SEED_URL,
   PREWARM_SESSIONS, STATUS_POLL_SECS
 } from '../shared/config.ts'
@@ -31,19 +31,16 @@ interface ManifestFetch {
   readonly contentType: string | undefined
   /** True iff the reference resolved through a feed manifest — i.e. the content
    *  is mutable (feed head moves forward), so the gateway must not cache it as
-   *  immutable. Older wasm builds don't expose this getter; treated as false. */
-  readonly feedResolved?: boolean
+   *  immutable. */
+  readonly feedResolved: boolean
 }
 interface HoverflyClient {
   /** Launch the daemon: eager initial discovery + warm-pool fill, plus a
    *  background maintenance loop that re-discovers every `intervalSecs` AND
    *  tops the warm retrieval-session pool back up to `warmPool` while
    *  connections are quiet. Resolves with the peer count after the initial
-   *  round. Idempotent. `warmPool` is optional (older wasm builds ignore it and
-   *  fall back to lazy session opening). */
-  start: (bootstrap: string, intervalSecs: number, waitSecs: number, warmPool?: number) => Promise<number>
-  /** Stop the background maintenance loop. */
-  stop: () => void
+   *  round. Idempotent. */
+  start: (bootstrap: string, intervalSecs: number, waitSecs: number, warmPool: number) => Promise<number>
   /** Enable the persistent IndexedDB chunk cache (L2). Retrieved chunks are
    *  written back and reused across fetches/sessions. */
   enableChunkStore: (dbName: string) => Promise<void>
@@ -54,20 +51,13 @@ interface HoverflyClient {
   fetchManifestPath: (rootHex: string, path: string, maxRetries: number) => Promise<ManifestFetch>
   /** List every entry in the manifest as JSON: [{path, reference, contentType}]. */
   listManifest: (rootHex: string, maxRetries: number) => Promise<string>
-  fetch: (rootHex: string, maxRetries: number) => Promise<Uint8Array>
   loadPeers: (json: string) => void
   exportPeers: () => string
   peerCount: () => number
   /** Number of peers with a live retrieval session (open connection) — the
    *  warm forwarder set. Async: the count is read behind the wasm node's
-   *  session lock. Older wasm builds without this binding are handled by a
-   *  feature check at the call site. */
-  connectedPeerCount?: () => Promise<number>
-  /** Proactively open retrieval sessions to up to `target` dialable peers so
-   *  the warm forwarder set (and the "connected peers" count) is non-zero
-   *  before the first fetch. Returns the total session count now cached. Older
-   *  wasm builds without this binding are handled by a feature check. */
-  prewarmSessions?: (target: number) => Promise<number>
+   *  session lock. */
+  connectedPeerCount: () => Promise<number>
   /** Export resolved feed head-index hints as JSON ({ "<owner||topic>": idx }). */
   exportFeedHints: () => string
   /** Merge persisted feed hints back in (monotonic). */
@@ -75,13 +65,13 @@ interface HoverflyClient {
 }
 interface HoverflyModule {
   default: (input?: any) => Promise<unknown>
-  initThreadPool?: (n: number) => Promise<unknown>
+  initThreadPool: (n: number) => Promise<unknown>
   HoverflyClient: new (key?: string | null, networkId?: bigint | null, doh?: string | null, timeout?: number | null, nonceHex?: string | null) => HoverflyClient
 }
-// Resolved at runtime (relative to this worker script) so esbuild leaves the
-// dynamic import alone — the wasm-bindgen module must load itself + its wasm
-// via import.meta.url, so it must NOT be bundled.
-const HOVERFLY_URL = new URL('hoverfly/hoverfly.js', self.location.href).href
+// Resolved at runtime so esbuild leaves the dynamic import alone — the
+// wasm-bindgen module must load itself + its wasm via import.meta.url, so it
+// must NOT be bundled.
+const HOVERFLY_URL = new URL(HOVERFLY_JS, self.location.href).href
 
 const status: DaemonStatus = {
   ready: false,
@@ -276,11 +266,10 @@ function refreshCounts (): void {
 /** Refresh the live "connected peers" count (number of warm retrieval
  *  sessions). Async because the count is read behind the wasm node's session
  *  lock. Returns true iff the value changed (so callers can decide whether to
- *  broadcast). Tolerates older wasm builds without the binding by leaving the
- *  count at 0. */
+ *  broadcast). */
 async function refreshConnected (): Promise<boolean> {
   const c = client
-  if (c?.connectedPeerCount == null) return false
+  if (c == null) return false
   try {
     const n = await c.connectedPeerCount()
     if (n !== status.connected) { status.connected = n; return true }
@@ -302,12 +291,10 @@ async function warm (): Promise<void> {
     setPhase('instantiating wasm')
     await mod.default() // instantiate wasm (shared memory; needs crossOriginIsolated)
     setPhase('wasm ready')
-    if (typeof mod.initThreadPool === 'function') {
-      setPhase('init thread pool')
-      try { await mod.initThreadPool(self.navigator.hardwareConcurrency || 4) } catch (e) {
-        // single-threaded fetch is fine; hashing parallelism is for uploads
-        console.warn('[daemon] initThreadPool unavailable, continuing single-threaded:', e)
-      }
+    setPhase('init thread pool')
+    try { await mod.initThreadPool(self.navigator.hardwareConcurrency || 4) } catch (e) {
+      // single-threaded fetch is fine; hashing parallelism is for uploads
+      console.warn('[daemon] initThreadPool unavailable, continuing single-threaded:', e)
     }
     // Reuse a persisted node identity (key + overlay nonce) so this browser
     // daemon keeps one stable Swarm overlay across reloads — see config.ts.
@@ -556,8 +543,8 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       // A feed-resolved fetch may have advanced a feed's cached head index;
       // persist hints so the next session resolves it fast (best effort, off
       // the hot path).
-      if (r.feedResolved === true) persistFeedHints()
-      return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer, mutable: r.feedResolved === true }
+      if (r.feedResolved) persistFeedHints()
+      return { httpStatus: 200, contentType: r.contentType ?? guessType(candidate), body: bytes.buffer, mutable: r.feedResolved }
     } catch (e) {
       setPhase('fetch ' + candidate + ' failed: ' + errMsg(e), refHex)
       lastErr = errMsg(e)
@@ -582,7 +569,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
         const r = await bounded(() => c.fetchManifestPath(refHex, only.path, FETCH_RETRIES), only.path)
         const bytes = r.bytes.slice()
         setPhase('got ' + only.path + ' (' + bytes.length + ' bytes, single-file)', refHex)
-        return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer, mutable: r.feedResolved === true }
+        return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer, mutable: r.feedResolved }
       }
     } catch (e) {
       lastErr = errMsg(e)

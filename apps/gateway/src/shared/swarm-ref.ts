@@ -36,12 +36,3 @@ export function normalizeRef (input: string): SwarmRef {
 
   throw new Error('Enter a 64-char hex Swarm reference or a swarm CID (starts with "b").')
 }
-
-export function isValidRef (input: string): boolean {
-  try {
-    normalizeRef(input)
-    return true
-  } catch {
-    return false
-  }
-}

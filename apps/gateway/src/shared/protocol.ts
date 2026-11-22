@@ -37,12 +37,10 @@ export interface DaemonStatus {
 
 interface WithId { id: number }
 
-export type DaemonRequestBody =
+type DaemonRequestBody =
   | { kind: 'status' }
   | { kind: 'discover', bootstrap?: string, waitSecs?: number }
   | { kind: 'fetchPath', refHex: string, path: string }
-
-export type DaemonRequest = DaemonRequestBody & WithId
 
 export interface StatusResponse extends WithId { kind: 'status', status: DaemonStatus }
 export interface DiscoverResponse extends WithId { kind: 'discover', ok: boolean, status: DaemonStatus, error?: string }
@@ -57,9 +55,6 @@ export interface FetchPathResponse extends WithId {
    *  The SW must not cache such responses as immutable — see sw.ts. */
   mutable?: boolean
 }
-
-export type DaemonResponse = StatusResponse | DiscoverResponse | FetchPathResponse
-export type DaemonEvent = { kind: 'event', event: 'status', status: DaemonStatus }
 
 export const ATTACH = 'attach'
 

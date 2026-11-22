@@ -142,16 +142,9 @@ self.addEventListener('fetch', (event: FetchEvent) => {
   if (req.mode === 'navigate' && req.destination === 'document') {
     const isContent = url.searchParams.has(CONTENT_MARKER) ||
       req.headers.get('sec-fetch-dest') === 'iframe'
-    if (!isContent) {
-      console.log('[sw] passthrough top-level document nav', url.pathname)
-      return // boot shell
-    }
-    console.log('[sw] serve content iframe document', url.pathname)
-    event.respondWith(serveContent(req))
-    return
+    if (!isContent) return // boot shell
   }
 
-  console.log('[sw] serve content:', url.pathname, 'dest=', req.destination, 'mode=', req.mode)
   event.respondWith(serveContent(req))
 })
 
@@ -204,7 +197,6 @@ async function serveContent (req: Request): Promise<Response> {
     return errorPage(504, 'Daemon bridge not connected', 'The gateway shell did not provide a daemon channel in time.')
   }
 
-  console.log('[sw] fetchPath', refHex.slice(0, 12) + '…', 'path=', path || '(root)')
   let res
   try {
     // Bound the RPC so a lost/dropped daemon message can't hang the document
@@ -225,7 +217,6 @@ async function serveContent (req: Request): Promise<Response> {
     return errorPage(504, 'Swarm fetch timed out', (e as Error).message)
   }
 
-  console.log('[sw] fetchPath result ' + JSON.stringify({ path, ok: res.ok, httpStatus: res.httpStatus, bytes: res.body?.byteLength, contentType: res.contentType, error: res.error }))
   if (!res.ok || res.body == null) {
     return errorPage(res.httpStatus >= 400 ? res.httpStatus : 502, 'Could not retrieve from Swarm', res.error ?? 'unknown error')
   }

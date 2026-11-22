@@ -23,29 +23,3 @@ export function bytesToHex (bytes: Uint8Array): string {
   }
   return out
 }
-
-export function isZero (bytes: Uint8Array): boolean {
-  for (let i = 0; i < bytes.length; i++) {
-    if (bytes[i] !== 0) return false
-  }
-  return true
-}
-
-export function startsWith (haystack: Uint8Array, needle: Uint8Array): boolean {
-  if (needle.length > haystack.length) return false
-  for (let i = 0; i < needle.length; i++) {
-    if (haystack[i] !== needle[i]) return false
-  }
-  return true
-}
-
-const textEncoder = new TextEncoder()
-const textDecoder = new TextDecoder()
-
-export function utf8 (s: string): Uint8Array {
-  return textEncoder.encode(s)
-}
-
-export function fromUtf8 (b: Uint8Array): string {
-  return textDecoder.decode(b)
-}
