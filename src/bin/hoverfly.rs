@@ -900,7 +900,7 @@ enum Commands {
     /// address to already hold a little xDAI (gas) and some BZZ on Gnosis.
     /// This command funds it from a token you hold on Ethereum, Base,
     /// Optimism, or Arbitrum, using the permissionless Relay API
-    /// (<https://docs.relay.link>) — no API key required.
+    /// (<https://docs.relay.link>); see `--api-key`.
     ///
     /// `--to both` (default) checks the recipient's xDAI balance on Gnosis
     /// and only tops up gas if it's below the threshold, then swaps the
@@ -970,8 +970,9 @@ enum Commands {
         #[arg(long, value_name = "ADDR")]
         recipient: Option<String>,
 
-        /// Relay API key, sent as `x-api-key`. Relay requires one on every
-        /// `POST /quote/v2` since 2026-10-02; without it quotes are refused.
+        /// Relay API key, sent as `x-api-key`. Optional for now: Relay's
+        /// docs require one on `POST /quote/v2` from 2026-10-02, but keyless
+        /// quotes are still served. Pass one if quotes come back 401.
         #[arg(long, value_name = "KEY")]
         api_key: Option<String>,
 

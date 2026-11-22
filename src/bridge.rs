@@ -571,7 +571,7 @@ impl RelayClient {
             .post(format!("{RELAY_API_BASE}/quote/v2"))
             .json(&body);
         if let Some(key) = &self.api_key {
-            rb = rb.header("Authorization", key);
+            rb = rb.header("x-api-key", key);
         }
         let resp = rb.send().await?;
         let status = resp.status();
