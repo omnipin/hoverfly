@@ -141,6 +141,13 @@ export const DOH_URL: string | undefined = undefined
  */
 export const PEERS_SEED_URL: string | undefined =
   'https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.ws.json'
+/**
+ * How often (seconds) a running daemon re-pulls PEERS_SEED_URL and replaces its
+ * peer store. Well inside the ~2-3h AutoTLS underlay rotation, so a daemon that
+ * stays alive for hours (a SharedWorker lives as long as any gateway tab) keeps
+ * dialable peers.
+ */
+export const SEED_REFRESH_SECS = 1800
 
 // ---- persistence ----
 export const IDB_NAME = 'hoverfly-gateway'

@@ -17,7 +17,7 @@
 import {
   DAEMON_REFRESH_SECS, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, DOH_URL,
   FETCH_DEADLINE_MS, FETCH_RETRIES, HOVERFLY_JS, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
-  IDB_NONCE_KEY, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID, PEERS_SEED_URL,
+  IDB_NONCE_KEY, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID, PEERS_SEED_URL, SEED_REFRESH_SECS,
   PREWARM_SESSIONS, STATUS_POLL_SECS
 } from '../shared/config.ts'
 import { ATTACH, type DaemonStatus } from '../shared/protocol.ts'
@@ -88,6 +88,7 @@ let client: HoverflyClient | null = null
 let warmPromise: Promise<void> | null = null
 let statusTimer: ReturnType<typeof setInterval> | null = null
 let countTimer: ReturnType<typeof setInterval> | null = null
+let seedTimer: ReturnType<typeof setInterval> | null = null
 
 // ---------------- IndexedDB (peer-store persistence) ----------------
 // One connection for the worker's lifetime, reopened only if it fails or the
@@ -201,33 +202,27 @@ function countDialable (peersJson: string): number {
   } catch { return 0 }
 }
 
-/** Load the cold-start peer seed, preferring the always-fresh GitHub CDN copy
- *  (refreshed hourly by the `omnipin/hoverfly-peers` repo) over the bundled copy
- *  (only as fresh as the last gateway deploy — see PEERS_SEED_URL). The CDN
- *  fetch is bounded by a short timeout and falls back to the bundled copy on any
- *  failure (offline / GitHub down / rate limited / slow), so this is never worse
- *  than the old bundled-only behaviour. Returns the peers.json text, or
- *  undefined if both sources fail. */
-async function loadSeed (): Promise<string | undefined> {
-  // CDN first. Bound it so a slow/blocked CDN can't delay warm — the bundled
-  // copy is a fine fallback and discovery refreshes the set shortly anyway.
-  if (PEERS_SEED_URL != null) {
-    try {
-      const ctrl = new AbortController()
-      const t = setTimeout(() => ctrl.abort(), 5_000)
-      const resp = await fetch(PEERS_SEED_URL, { signal: ctrl.signal, cache: 'no-store' })
-      clearTimeout(t)
-      if (resp.ok) {
-        const text = await resp.text()
-        console.log('[daemon] seed: loaded fresh from CDN', PEERS_SEED_URL)
-        return text
-      }
-      console.warn('[daemon] seed: CDN returned', resp.status, '— falling back to bundled copy')
-    } catch (e) {
-      console.warn('[daemon] seed: CDN fetch failed, falling back to bundled copy:', errMsg(e))
-    }
+/** Fetch the hourly-refreshed peer seed from the GitHub CDN (see
+ *  PEERS_SEED_URL). Bounded by a short timeout so a slow/blocked CDN can't
+ *  delay warm-up. Returns the peers.json text, or undefined on any failure. */
+async function fetchCdnSeed (): Promise<string | undefined> {
+  if (PEERS_SEED_URL == null) return undefined
+  try {
+    const ctrl = new AbortController()
+    const t = setTimeout(() => ctrl.abort(), 5_000)
+    const resp = await fetch(PEERS_SEED_URL, { signal: ctrl.signal, cache: 'no-store' })
+    clearTimeout(t)
+    if (resp.ok) return await resp.text()
+    console.warn('[daemon] seed: CDN returned', resp.status)
+  } catch (e) {
+    console.warn('[daemon] seed: CDN fetch failed:', errMsg(e))
   }
-  // Fallback: the snapshot build.js vendors into dist/ at build time.
+  return undefined
+}
+
+/** The seed snapshot build.js vendors into dist/ at build time (only as fresh
+ *  as the last deploy). Returns the peers.json text, or undefined. */
+async function fetchBundledSeed (): Promise<string | undefined> {
   try {
     const resp = await fetch(new URL('peers.ws.json', self.location.href).href)
     if (resp.ok) {
@@ -309,22 +304,22 @@ async function warm (): Promise<void> {
       console.warn('[daemon] chunk store unavailable:', e)
     }
 
+    // Peers: the fresh CDN seed wins over the persisted store. Browser-dialable
+    // peers are AutoTLS /ws[s] underlays that rotate every ~2-3h, discovery
+    // yields almost no new ones, and the wasm fetch path never marks dead
+    // peers down — so a saved store from an earlier visit is mostly dead
+    // underlays (merging the seed into it would still dial those first).
+    // The saved store is only the fallback when the CDN is unreachable, and
+    // the bundled snapshot the last resort.
     setPhase('loading peers')
-    const saved = await idbGet(IDB_PEERS_KEY)
-    if (saved != null) {
-      try { c.loadPeers(saved); refreshCounts() } catch (e) { console.warn('[daemon] loadPeers (idb) failed:', e) }
-    } else {
-      // First run: load the browser seed — peers harvested from mainnet that
-      // expose a browser-dialable /ws (AutoTLS / libp2p.direct) underlay. Gives
-      // the first fetch something to dial before discovery. Prefer the GitHub
-      // CDN copy (refreshed hourly by the `omnipin/hoverfly-peers` repo) over the
-      // bundled copy (only as fresh as the last deploy) — see PEERS_SEED_URL.
-      const seed = await loadSeed()
-      if (seed != null) {
-        try { c.loadPeers(seed); refreshCounts() } catch (e) { console.warn('[daemon] loadPeers (seed) failed:', e) }
-      }
+    const cdn = await fetchCdnSeed()
+    const saved = cdn == null ? await idbGet(IDB_PEERS_KEY) : undefined
+    const peers = cdn ?? saved ?? await fetchBundledSeed()
+    if (peers != null) {
+      try { c.loadPeers(peers); refreshCounts() } catch (e) { console.warn('[daemon] loadPeers failed:', e) }
     }
-    console.log('[daemon] warm: peers loaded, count=', status.peerCount, 'dialable=', status.dialable)
+    console.log('[daemon] warm: peers from', cdn != null ? 'CDN seed' : saved != null ? 'saved store' : 'bundled seed',
+      'count=', status.peerCount, 'dialable=', status.dialable)
 
     // Restore persisted feed head-index hints so a returning visitor resolves a
     // feed (e.g. swarm.eth) in ~1 fast round from the cached head instead of a
@@ -415,6 +410,23 @@ function startStatusPoll (): void {
     })
     try { void idbSet(IDB_PEERS_KEY, client.exportPeers()) } catch { /* best effort */ }
   }, DAEMON_REFRESH_SECS * 1000)
+
+  // A SharedWorker can outlive the seed's underlays (they rotate every ~2-3h),
+  // so re-pull it periodically and replace the store. Warm sessions are held
+  // separately and survive the swap.
+  if (seedTimer != null) return
+  seedTimer = setInterval(() => {
+    void fetchCdnSeed().then((seed) => {
+      const c = client
+      if (seed == null || c == null) return
+      try {
+        c.loadPeers(seed)
+        refreshCounts()
+        broadcastStatus()
+        void idbSet(IDB_PEERS_KEY, c.exportPeers())
+      } catch (e) { console.warn('[daemon] seed refresh failed:', e) }
+    })
+  }, SEED_REFRESH_SECS * 1000)
 }
 
 async function discover (bootstrap = DEFAULT_BOOTSTRAP, waitSecs = DISCOVER_WAIT_SECS): Promise<{ ok: boolean, error?: string }> {

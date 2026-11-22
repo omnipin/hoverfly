@@ -100,12 +100,14 @@ What the daemon does:
   `peers.seed.json` hourly in the
   [`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo
   (ws/wss underlays only — these go stale within ~2-3h, so the seed is kept
-  fresh well inside that window) and fetched from the CDN at runtime;
-  `build.js` also vendors a snapshot into `dist/__gw__/` as the fallback for
-  when the CDN is unreachable.
-- Always runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to
-  refresh from the live bootnodes (the seed goes stale), persisting the result
-  to IndexedDB.
+  fresh well inside that window) and fetched from the CDN on every daemon
+  start and every 30 minutes after. The fresh seed replaces the peer store
+  rather than merging into it: a store saved on an earlier visit is mostly
+  rotated-away underlays. The store persisted in IndexedDB is only used when
+  the CDN is unreachable, and the snapshot `build.js` vendors into
+  `dist/__gw__/` is the last resort.
+- Runs `discover(/dnsaddr/mainnet.ethswarm.org)` in the background to pick up
+  any extra ws peers from the live bootnodes.
 
 The landing page shows the live **connected peer** count (open retrieval
 sessions) and a **Discover** box. For best reliability, point discovery at a
