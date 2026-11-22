@@ -32,23 +32,11 @@ const OWN_REF: string | null = (() => {
 async function main (): Promise<void> {
   if (window.top !== window) return // only the top shell bootstraps
 
-  // Catch-all: log EVERY postMessage the shell receives, to debug the bridge.
+  // Surface errors the broker frame reports (its own console is hard to reach).
+  const daemonFrameOrigin = daemonOrigin(location)
   window.addEventListener('message', (e) => {
-    if (e.data?.type === 'frame-error') {
-      // frame.ts reuses this message type for a benign 'loaded' heartbeat as
-      // well as real 'error'/'rejection' reports — only the latter are errors.
-      if (e.data?.tag === 'error' || e.data?.tag === 'rejection') {
-        console.error('[boot] FRAME ERROR', e.data?.tag, '·', e.data?.detail)
-      } else {
-        console.log('[boot] frame', e.data?.tag, '·', e.data?.detail)
-      }
-      return
-    }
-    // Only log messages that carry a recognizable type. The content site (and
-    // its libraries) post plenty of internal, typeless self-messages; logging
-    // every one floods the console (esp. since syncHead polls on an interval).
-    if (e.data?.type != null) {
-      console.log('[boot] MSG from', e.origin, 'type=', e.data.type, 'src?', e.source === window ? 'self' : 'other')
+    if (e.origin === daemonFrameOrigin && e.data?.type === 'frame-error') {
+      console.error('[boot] daemon frame', e.data?.tag, '·', e.data?.detail)
     }
   })
   console.log('[boot] shell start', location.href)
@@ -217,9 +205,6 @@ function connectDaemon (): Promise<MessagePort> {
   iframe.style.display = 'none'
   iframe.setAttribute('allow', 'cross-origin-isolated')
 
-  iframe.addEventListener('load', () => console.log('[boot] daemon iframe load event fired'))
-  iframe.addEventListener('error', (e) => console.log('[boot] daemon iframe error event', e))
-  console.log('[boot] embedding daemon frame', iframe.src)
   return new Promise<MessagePort>((resolve, reject) => {
     const timeout = setTimeout(() => reject(new Error('daemon frame did not load (no frame-ready from ' + origin + ')')), 30_000)
     const done = (): void => { window.removeEventListener('message', onMessage); clearTimeout(timeout) }

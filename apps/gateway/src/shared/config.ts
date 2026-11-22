@@ -28,8 +28,6 @@ export const ASSET_PREFIX = '/__gw__/'
 export const CONTENT_MARKER = '__gw_content'
 
 export const SW_SCRIPT = `${ASSET_PREFIX}sw.js`
-export const BOOT_SCRIPT = `${ASSET_PREFIX}boot.js`
-export const LANDING_SCRIPT = `${ASSET_PREFIX}landing.js`
 
 /**
  * Build version, stamped by build.js (`define`) from the vendored wasm's
@@ -171,7 +169,6 @@ export const IDB_FEED_HINTS_KEY = 'feed-hints-json'
  * file-level Cache API.
  */
 export const IDB_CHUNKS_DB = 'hoverfly-gw-chunks'
-export const LS_USER_PEERS = 'hoverfly-gw:user-wss-peers'
 
 // ---- caching ----
 export const CONTENT_CACHE = 'swarm-content-v2'

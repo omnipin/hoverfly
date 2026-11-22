@@ -16,8 +16,6 @@ const report = (tag: string, detail: unknown): void => {
 }
 window.addEventListener('error', (e) => report('error', e.message))
 window.addEventListener('unhandledrejection', (e) => report('rejection', (e as PromiseRejectionEvent).reason))
-console.log('[frame] loaded at', location.href, 'parent?', window.parent !== window)
-report('loaded', location.href)
 
 let worker: SharedWorker
 try {
@@ -47,7 +45,6 @@ window.addEventListener('message', (e: MessageEvent) => {
     console.log('[frame] got connect from', e.origin, '— attaching port to daemon')
     // Hand the embedder's port to the daemon; it becomes a direct RPC channel.
     worker.port.postMessage({ type: ATTACH }, [e.ports[0]])
-    try { (e.source as Window | null)?.postMessage({ type: 'connected' }, e.origin) } catch { /* ignore */ }
   }
 })
 

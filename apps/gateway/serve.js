@@ -77,15 +77,11 @@ const server = createServer(async (req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
     const hostKind = classifyHost(req.headers.host)
 
-    // gateway unregister escape hatch
-    if (url.searchParams.has('gw-unregister')) {
-      res.writeHead(200, { 'content-type': 'text/html; charset=utf-8', ...isolationHeaders() })
-      res.end(UNREGISTER_HTML)
-      return
-    }
-
-    // 1) static asset?
-    let file = await tryFile(url.pathname)
+    // 1) static asset? (?gw-unregister is the escape hatch that removes the
+    //    service worker, the same page the Caddy deploy serves.)
+    let file = url.searchParams.has('gw-unregister')
+      ? join(dist, '__gw__', 'unregister.html')
+      : await tryFile(url.pathname)
 
     // 2) SPA fallback for navigations
     if (file == null) {
@@ -115,18 +111,6 @@ const server = createServer(async (req, res) => {
     res.end('server error: ' + (err?.message ?? err))
   }
 })
-
-const UNREGISTER_HTML = `<!doctype html><meta charset=utf8><title>Unregistering…</title>
-<body style="font:15px system-ui;background:#0e1116;color:#e6edf3;display:grid;place-items:center;height:100vh;margin:0">
-<div>Unregistering service worker &amp; clearing caches…</div>
-<script type="module">
-  if ('serviceWorker' in navigator) {
-    const regs = await navigator.serviceWorker.getRegistrations()
-    await Promise.all(regs.map(r => r.unregister()))
-  }
-  if (globalThis.caches) { for (const k of await caches.keys()) await caches.delete(k) }
-  location.href = '/'
-</script></body>`
 
 server.listen(PORT, () => {
   console.log(`\n  hoverfly Swarm gateway`)
