@@ -24,7 +24,8 @@ with bun types is still lying around — harmless, each app carries its own
 tsconfig). Other top-level entries: `install.sh`, `Cargo.toml` /
 `Cargo.lock`, `proto/` (+ `build.rs`), `vendor/futures-bounded`, `scripts/`,
 `examples/` (`regen-protos.rs`, `upload.yml`), `tests/`
-(`attack_vectors.rs`), `docs/` (`pusher-design.md`, `pusher-incentives.md`,
+(`attack_vectors.rs`, `joiner_hardening.rs`), `docs/` (`pusher-design.md`,
+`pusher-incentives.md`, `pusher-incentives-slides.md`, `review-2026-11.md`,
 `deck/`), `PERFORMANCE.md`, `apps/`, `.cargo/config.toml`, `Dockerfile`.
 
 ## Transport
@@ -200,12 +201,14 @@ comment atop those modules in `src/lib.rs`).
 
 ## Tests / verification
 
-~260 unit tests live next to the code (`#[test]` almost everywhere;
-`#[tokio::test]` only in `src/daemon.rs` and `src/feed.rs`), plus
-`tests/attack_vectors.rs` (adversarial pure-logic tests for the
-`docs/pusher-incentives.md` threat model — challenge MACs, ledger
-monotonicity, cheque decoding, quote/credit/scheduler accounting; run with
-`cargo test --test attack_vectors`). Heaviest suites: `src/payer.rs`,
+~280 unit tests live next to the code (`#[test]` almost everywhere;
+`#[tokio::test]` only in `src/client.rs`, `src/daemon.rs` and
+`src/feed.rs`), plus two integration suites: `tests/attack_vectors.rs`
+(adversarial pure-logic tests for the `docs/pusher-incentives.md` threat
+model — challenge MACs, ledger monotonicity, cheque decoding,
+quote/credit/scheduler accounting; run with `cargo test --test
+attack_vectors`) and `tests/joiner_hardening.rs` (malformed-tree joiner
+regressions). Heaviest suites: `src/payer.rs`,
 `src/pushsched/tests.rs` (deterministic mock-lane + virtual-clock simulation,
 no network/clock/threads), `src/meter.rs`, `src/metered.rs`, `src/ledger.rs`,
 `src/erasure/encoder.rs`. `dev-dependencies = tokio-test` still exists but is
@@ -326,8 +329,10 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   legacy type-0 — the L2 origins return 1559 fee fields. `--to both` uses
   the Beeport pattern: conditional xDAI gas top-up (only when the
   recipient is below threshold) followed by a BZZ swap, so it's one origin
-  swap in the common case and two when a top-up is needed. Relay requires
-  an API key (`--api-key`) on every `POST /quote/v2` since 2026-10-02.
+  swap in the common case and two when a top-up is needed.
+  `--api-key` is optional: Relay's docs say every `POST /quote/v2` needs
+  a key from 2026-10-02, but as of 2026-11-22 keyless quotes still return
+  200. The key goes in the `x-api-key` header.
   Quote transactions pass `check_quote_txs` before signing (origin chain,
   our address, spend bounded by `--amount`). `--from-token` accepts a bare symbol
   (e.g. `USDC`), resolved to the canonical address + decimals via Relay's

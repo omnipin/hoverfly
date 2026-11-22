@@ -2,158 +2,126 @@
 
 # hoverfly
 
-Experimental [Swarm][swarm] light client. Upload and download files to
-decentralized storage natively and in a browser.
+Extremely fast, minimal and portable [Swarm][swarm] light client. Upload and
+download files to decentralized storage natively and in a browser.
 
 [swarm]: https://www.ethswarm.org/
 
 ## Features
 
-- **Light node functionality.** End-to-end content upload and download.
-- **Browser-friendly.** upload files from your browser using the
-  [demo](https://hoverfly.bzz.link) and integrate into your web app with
-  [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly) .
-- **Collection support.** Upload, download and list content-addressable
-  tarballs.
-- **Onchain postage batch creation.** Buy storage straight from the CLI.
-- **Multiple modes** Static commands for simplicity, daemon mode for warm
-  connection pool, pusher nodes for splitting content signing and upload.
-- **Cross-platform.** Compiles to WebAssembly, Linux x86/ARM, MacOS and FreeBSD.
-- **Small size.** 7MB gzipped, 17MB unpacked x86 Linux binary.
+- **Runs in the browser.** Try the [demo](https://hoverfly.bzz.link) or embed
+  it with [`@omnipin/hoverfly`](https://www.npmjs.com/package/@omnipin/hoverfly).
+- **Collections.** Upload, download and list tarballs as Swarm manifests.
+- **Onchain postage batches.** Buy storage straight from the CLI.
+- **Three modes.** One-shot commands, a daemon with a warm connection pool, and
+  pusher relays that split signing from uploading.
+- **Cross-platform.** WebAssembly, Linux x86/ARM, macOS and FreeBSD.
+- **Small.** 7MB gzipped, 17MB unpacked (x86 Linux).
 - **CI-friendly.** ~1-1.6 MiB/s uploads in GitHub Actions.
 
 ## Install
 
-```bash
+```sh
 curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | sh
 ```
 
-### Specific version
+This installs to `~/.local/bin`. Pin a version with `HOVERFLY_VERSION=v0.3.1`
+before `sh`, or build from source:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | HOVERFLY_VERSION=v0.3.1 sh
-```
-
-### Build from source
-
-```bash
 cargo install --git https://github.com/omnipin/hoverfly
 ```
 
 ## Setup
 
-### 1. Generate a key
+Run every step from the same directory: hoverfly reads `peers.json` and
+`overlay-nonce` from the current directory by default.
 
-Your secp256k1 private key (`--key` / `--identity`, 32 bytes hex) is your
-long-lived signer. Bee uses the derived Ethereum address to recognize you across
-reconnects, route cheques, and verify your postage stamps.
+### 1. Create a key
 
-```bash
+```sh
 cast wallet new
+export KEY=0x...   # the printed private key
 ```
 
-Save the printed `Private key` and `Address` — both are useful (the key for
-`--key`/`--identity`, the address for funding xDAI + BZZ).
+The key signs your postage stamps and identifies you to the network. Fund the
+printed address in step 4.
 
-### 2. Generate a vanity overlay nonce
+### 2. Fetch a peerlist
 
-Your Swarm overlay is `keccak256(eth_addr ‖ network_id ‖ nonce)`. A random nonce
-works, but most random overlays land in bee's already-full low kademlia bins and
-get dropped right after the handshake. `hoverfly
-vanity-overlay` searches for a
-nonce that puts you in deeper, undersaturated bins instead. Anchoring against a
-few stable peers (`--target-overlay`) roughly **doubles** upload throughput.
-
-```bash
-hoverfly vanity-overlay --key 0xYOUR_KEY --output overlay-nonce
-```
-
-One-time, CPU-bound (seconds to minutes). The resulting `overlay-nonce` is your
-Swarm identity together with `--key` — keep it.
-
-### 3. Obtain xDAI + BZZ on Gnosis
-
-The address from step 1 needs a little xDAI (for gas) and some BZZ (to fund the
-batch). The optional `bridge` command obtains both via
-[Relay](https://docs.relay.link) — for example, from USDC on Base:
-
-```bash
-hoverfly bridge --from-chain base --from-token USDC --amount 3 --to both --rpc-url https://mainnet.base.org --key 0xYOUR_KEY
-```
-
-`--from-token` takes a symbol (resolved to the canonical address automatically)
-or a raw `0x` address.
-
-### 4. Create a postage batch
-
-Once the address holds xDAI + BZZ:
-
-```bash
-hoverfly batch create --rpc-url https://rpc.gnosischain.com --key 0xYOUR_KEY --size 2GB --duration 30d
-```
-
-`--size` and `--duration` map to `--depth` and `--amount-per-chunk` via the same
-formulas as the
-[official postage stamp calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators).
-
-The on-chain `BatchCreated` event takes 1-3 minutes to propagate to the bee
-nodes that'll accept your stamps. Poll [Swarmscan](https://swarmscan.io/) until
-it 200s:
-
-```bash
-curl -s "https://api.swarmscan.io/v1/postage/batches/<BATCH_ID>"
-# 404 = network hasn't indexed it yet
-# 200 with a JSON body = ready to use
-```
-
-### 5. Run the daemon
-
-A long-lived daemon holds a warm session pool across uploads, so it pays the
-pool-fill cost once at startup instead of on every upload — a big win for
-repeated or one-shot-heavy workloads. For a single upload you can skip this step
-and pass `--peerlist` directly to `hoverfly upload`.
-
-Startup cost depends on how warm the peerlist is. On a cold or stale
-`peers.json` the daemon runs a bootnode discover round before filling the pool;
-on a warm one (enough recently-reachable peers) it skips discover automatically
-and fills straight from the peerlist, opening the pool in well under a second.
-The daemon persists reachability observations on shutdown, so a node that has
-run before restarts warm.
-
-```bash
-hoverfly daemon --socket /tmp/hoverfly.sock --pool-size 256 --listen /ip4/0.0.0.0/tcp/1635 --identity 0xYOUR_KEY --advertise /ip4/YOUR_PUBLIC_IP/tcp/1635 --discover-rounds 3
-```
-
-Fetch a curated `peers.seed.json` from the
-[`omnipin/hoverfly-peers`](https://github.com/omnipin/hoverfly-peers) repo (it's
-refreshed hourly); the daemon loads it via `--peerlist` (default: `peers.json`)
-for fast cold-start without running `discover` first. The release tarball
-bundles a snapshot of the same file as a fallback.
-
-```bash
+```sh
 curl -fsSL -o peers.json https://raw.githubusercontent.com/omnipin/hoverfly-peers/main/peers.seed.json
 ```
 
+The list is refreshed hourly. hoverfly records which peers it reached in this
+file, so later runs start faster.
+
+### 3. Pick an overlay nonce
+
+```sh
+hoverfly vanity-overlay --key $KEY
+```
+
+This takes a few seconds to minutes and writes `overlay-nonce`. Generating it
+up front keeps uploads fast. Keep the file with your key: together they make up
+your identity.
+
+### 4. Get xDAI and BZZ on Gnosis
+
+Your address needs a little xDAI for gas and some BZZ to pay for storage. If
+you already have them, skip ahead. Otherwise `bridge` swaps them in through
+[Relay](https://docs.relay.link), for example from 3 USDC on Base:
+
+```sh
+hoverfly bridge --from-chain base --from-token USDC --amount 3 \
+  --rpc-url https://mainnet.base.org --key $KEY
+```
+
+You need a little ETH on the origin chain for gas.
+
+### 5. Buy a postage batch
+
+```sh
+hoverfly batch create --rpc-url https://rpc.gnosischain.com --key $KEY --size 2GB --duration 30d
+export BATCH=0x...   # the printed batch_id
+```
+
+`--size` and `--duration` follow the
+[official stamp calculator](https://docs.ethswarm.org/docs/develop/tools-and-features/buy-a-stamp-batch/#calculators).
+Bee nodes only accept stamps from the new batch 1-3 minutes after it lands
+on-chain, so wait a few minutes before the first upload.
+
 ### 6. Upload
 
-```bash
-hoverfly upload --daemon /tmp/hoverfly.sock --batch YOUR_BATCH_ID_HEX --key 0xYOUR_KEY path/to/file.bin
+```sh
+hoverfly upload --batch $BATCH --key $KEY path/to/file
 ```
 
-Uploads are Reed–Solomon erasure coded at level `medium` by default, exactly as
-a bee gateway codes `POST /bzz`. The extra parity chunks are what keep a freshly
-uploaded object readable while its data chunks are still confined to their
-storage neighbourhood ([bee#5541]) — at a cost of roughly +8% chunks (and hence
-postage) on large files, more on small ones. Pass `--redundancy` to change it:
+It prints the root reference and a `bzz.limo` link to the file.
 
-```bash
-hoverfly upload --redundancy none   ... # no parity, cheapest, pre-erasure behaviour
-hoverfly upload --redundancy strong ... # ~5% expected chunk retrieval error rate
+For repeated uploads, start a daemon in another terminal. It keeps a pool of
+peer connections open, so each upload skips connecting to the network first:
+
+```sh
+hoverfly daemon --socket /tmp/hoverfly.sock
+hoverfly upload --daemon /tmp/hoverfly.sock --batch $BATCH --key $KEY path/to/file
 ```
 
-Note that the level is encoded in the root chunk's span, so the same file has a
-different reference at each level. `hoverfly bmt --redundancy <level>` computes
-that reference offline.
+### Redundancy
+
+Uploads use Reed–Solomon erasure coding at level `medium` by default, the same
+as a bee gateway. The parity chunks keep a fresh upload readable while its data
+chunks are still reaching their neighbourhood ([bee#5541]). They add about 8%
+more chunks (and postage) on large files, and more on small ones.
+
+```sh
+hoverfly upload --redundancy none   ...   # no parity, cheapest
+hoverfly upload --redundancy strong ...   # more parity
+```
+
+The level is part of the reference, so the same file gets a different
+reference at each level. `hoverfly bmt --redundancy <level> <file>` computes it
+offline.
 
 [bee#5541]: https://github.com/ethersphere/bee/issues/5541
 
