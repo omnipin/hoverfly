@@ -14,7 +14,7 @@
 //   - iframe navigation + subresources on this origin -> served as Swarm
 //     content via the daemon bridge.
 
-import { ASSET_PREFIX, CONTENT_CACHE, CONTENT_MARKER } from '../shared/config.ts'
+import { ASSET_PREFIX, CONTENT_CACHE, CONTENT_MARKER, EVENT_BUDGET_MS } from '../shared/config.ts'
 import { DaemonRpc } from '../shared/protocol.ts'
 import { parseHost } from '../shared/parse-request.ts'
 import { cidToReference } from '../shared/swarm-cid.ts'
@@ -36,7 +36,16 @@ let daemonWaiters: Array<(d: DaemonRpc) => void> = []
 let askTimer: ReturnType<typeof setInterval> | null = null
 
 self.addEventListener('install', () => { console.log('[sw] install'); void self.skipWaiting() })
-self.addEventListener('activate', (event) => { console.log('[sw] activate + claim'); event.waitUntil(self.clients.claim()) })
+self.addEventListener('activate', (event) => {
+  console.log('[sw] activate + claim')
+  event.waitUntil((async () => {
+    // Drop content caches left by earlier CONTENT_CACHE versions.
+    for (const key of await caches.keys()) {
+      if (key !== CONTENT_CACHE) await caches.delete(key)
+    }
+    await self.clients.claim()
+  })())
+})
 
 self.addEventListener('message', (event: ExtendableMessageEvent) => {
   const msg = event.data
@@ -109,6 +118,14 @@ self.addEventListener('fetch', (event: FetchEvent) => {
   if (url.origin !== self.location.origin) return // not ours
   if (url.pathname.startsWith(ASSET_PREFIX)) return // gateway's own assets
 
+  // Swarm content is read-only: there is nothing to POST/PUT to.
+  if (req.method !== 'GET' && req.method !== 'HEAD') {
+    const headers = new Headers({ allow: 'GET, HEAD', server: 'hoverfly-gateway' })
+    isolation(headers)
+    event.respondWith(new Response(null, { status: 405, headers }))
+    return
+  }
+
   // A document navigation is EITHER the top boot shell (passthrough → network
   // returns boot.html) OR a document inside the content iframe the shell hosts.
   // Both have mode 'navigate' + destination 'document', so we need another
@@ -137,12 +154,6 @@ self.addEventListener('fetch', (event: FetchEvent) => {
   console.log('[sw] serve content:', url.pathname, 'dest=', req.destination, 'mode=', req.mode)
   event.respondWith(serveContent(req))
 })
-
-// Total budget for one fetch event. Chrome hard-kills a service worker whose
-// event hasn't settled within ~5 minutes — if we blow past that, the request
-// dies as a bare network error (no error page at all). Stay under the cap so
-// the worst case is still OUR 504 page, not a dead worker.
-const EVENT_BUDGET_MS = 290_000
 
 async function serveContent (req: Request): Promise<Response> {
   const started = Date.now()
@@ -198,9 +209,10 @@ async function serveContent (req: Request): Promise<Response> {
   try {
     // Bound the RPC so a lost/dropped daemon message can't hang the document
     // request forever (which would leave the boot overlay stuck with no error).
-    // The daemon bounds each candidate at 90s and tries up to 3 (≈270s worst
-    // case), so give it the rest of the event budget — but no more, or Chrome
-    // kills the whole worker before we can return an error page.
+    // The daemon caps its whole fetchPath at FETCH_DEADLINE_MS, a little under
+    // this budget, so normally its own error arrives first. Give it the rest
+    // of the event budget but no more, or Chrome kills the whole worker before
+    // we can return an error page.
     const remaining = Math.max(5_000, EVENT_BUDGET_MS - (Date.now() - started))
     res = await withTimeout(rpc.fetchPath(refHex, path), remaining)
   } catch (e) {

@@ -113,8 +113,37 @@ export function cidToReference (cid: string): { refHex: string, codec: number } 
   if (cid.length === 0 || cid[0] !== 'b') {
     throw new Error('only multibase "b" (base32 lower) CIDs are supported')
   }
-  const bytes = base32LowerDecode(cid.slice(1))
-  let r = readVarint(bytes, 0)
+  return decodeCidBytes(base32LowerDecode(cid.slice(1)), 0)
+}
+
+/** Multicodec namespace codes (EIP-1577 contenthash prefixes) we can name. */
+const SWARM_NS_CODEC = 0xe4
+const CONTENTHASH_PROTOCOLS: Record<number, string> = {
+  0xe3: 'ipfs',
+  0xe5: 'ipns',
+  0xb29910: 'arweave',
+  0x01bc: 'onion',
+  0x01bd: 'onion3',
+  0xb19910: 'skynet'
+}
+
+/**
+ * Decode an ENS contenthash (EIP-1577) that points at Swarm into the 32-byte
+ * reference hex. The value is `varint(0xe4 swarm-ns) || CIDv1 bytes`; any
+ * other namespace throws, naming the protocol when it's a known one.
+ */
+export function decodeSwarmContenthash (hex: string): { refHex: string, codec: number } {
+  const bytes = hexToBytes(hex)
+  const ns = readVarint(bytes, 0)
+  if (ns.value !== SWARM_NS_CODEC) {
+    const known = CONTENTHASH_PROTOCOLS[ns.value]
+    throw new Error('points at ' + (known ?? 'codec 0x' + ns.value.toString(16)) + ', not Swarm')
+  }
+  return decodeCidBytes(bytes, ns.next)
+}
+
+function decodeCidBytes (bytes: Uint8Array, offset: number): { refHex: string, codec: number } {
+  let r = readVarint(bytes, offset)
   if (r.value !== CID_V1) throw new Error(`unexpected CID version ${r.value}`)
   r = readVarint(bytes, r.next)
   const codec = r.value

@@ -16,7 +16,7 @@
 
 import {
   DAEMON_REFRESH_SECS, DEFAULT_BOOTSTRAP, DISCOVER_WAIT_SECS, DOH_URL,
-  FETCH_RETRIES, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
+  FETCH_DEADLINE_MS, FETCH_RETRIES, IDB_CHUNKS_DB, IDB_FEED_HINTS_KEY, IDB_NAME, IDB_NODEKEY_KEY,
   IDB_NONCE_KEY, IDB_PEERS_KEY, IDB_STORE, NETWORK_ID, PEERS_SEED_URL,
   PREWARM_SESSIONS, STATUS_POLL_SECS
 } from '../shared/config.ts'
@@ -106,13 +106,26 @@ let countTimer: ReturnType<typeof setInterval> | null = null
 // daemon's background maintenance — no JS-side serialization required.
 
 // ---------------- IndexedDB (peer-store persistence) ----------------
+// One connection for the worker's lifetime, reopened only if it fails or the
+// browser closes it.
+let dbPromise: Promise<IDBDatabase> | null = null
 function idb (): Promise<IDBDatabase> {
-  return new Promise((resolve, reject) => {
+  if (dbPromise != null) return dbPromise
+  const p = new Promise<IDBDatabase>((resolve, reject) => {
     const req = indexedDB.open(IDB_NAME, 1)
     req.onupgradeneeded = () => req.result.createObjectStore(IDB_STORE)
-    req.onsuccess = () => resolve(req.result)
+    req.onsuccess = () => {
+      const db = req.result
+      const drop = (): void => { if (dbPromise === p) dbPromise = null }
+      db.onclose = drop
+      db.onversionchange = () => { db.close(); drop() }
+      resolve(db)
+    }
     req.onerror = () => reject(req.error)
   })
+  p.catch(() => { if (dbPromise === p) dbPromise = null })
+  dbPromise = p
+  return p
 }
 async function idbGet (key: string): Promise<string | undefined> {
   try {
@@ -275,20 +288,6 @@ async function refreshConnected (): Promise<boolean> {
   return false
 }
 
-/** Proactively open retrieval sessions to dialable ws peers so the warm
- *  forwarder set (and the "connected peers" count) is non-zero before any
- *  fetch — and so the first site load reuses already-open sessions. Best
- *  effort; tolerates older wasm builds without the binding. Refreshes the
- *  connected count and broadcasts if it moved. */
-async function prewarm (): Promise<void> {
-  const c = client
-  if (c?.prewarmSessions == null) return
-  try {
-    await c.prewarmSessions(PREWARM_SESSIONS)
-  } catch (e) { console.warn('[daemon] prewarm failed:', errMsg(e)) }
-  if (await refreshConnected()) broadcastStatus()
-}
-
 function ensureWarm (): Promise<void> {
   if (warmPromise == null) warmPromise = warm()
   return warmPromise
@@ -386,13 +385,6 @@ async function warm (): Promise<void> {
 
     status.ready = true
     setPhase('ready (' + String(status.dialable) + ' dialable peers)')
-    // Warm-pool fill is now driven inside wasm by start()'s `warm_pool` arg and
-    // its maintenance loop (gated on no in-flight fetch). This extra JS-side
-    // prewarm is a belt-and-braces nudge: it tops the SAME sessions map toward
-    // the SAME target right after readiness so the "connected peers" count moves
-    // promptly (and so older wasm builds without in-loop warming still warm
-    // once). Background — readiness must not wait on it.
-    void prewarm()
   } catch (e) {
     status.lastError = errMsg(e)
     console.error('[daemon] warm failed:', e)
@@ -412,11 +404,11 @@ async function warm (): Promise<void> {
  *    "connected peers" count and broadcasts if it moved. This is cheap — a
  *    single lock-guarded `len()` inside wasm, no dialing — so it can tick fast
  *    to make the UI counter feel live while the pool warms/decays.
- *  - SLOW maintenance poll (every DAEMON_REFRESH_SECS, 45s): re-runs discovery,
- *    tops the warm session pool back up (`prewarm`), refreshes the peer-store
- *    count, and persists the store. This MUST stay infrequent: it dials peers,
- *    and dial/substream churn on the browser's single ws+yamux driver resets
- *    in-flight retrieval substreams (see the wasm daemon loop's in-flight gate).
+ *  - SLOW poll (every DAEMON_REFRESH_SECS, 45s): refreshes the peer-store
+ *    count and persists the store. Discovery and warm-pool top-ups are NOT
+ *    done here: the wasm maintenance loop started by `start()` owns both, and
+ *    only runs them while no fetch is in flight (dial churn on the browser's
+ *    single ws+yamux driver resets in-flight retrieval substreams).
  */
 function startStatusPoll (): void {
   // Fast, cheap count refresh for a live-feeling UI.
@@ -427,7 +419,7 @@ function startStatusPoll (): void {
     }, STATUS_POLL_SECS * 1000)
   }
 
-  // Slow maintenance: discovery re-warm + peer-store persistence.
+  // Slow: peer-store count + persistence.
   if (statusTimer != null) return
   statusTimer = setInterval(() => {
     if (client == null) return
@@ -440,10 +432,6 @@ function startStatusPoll (): void {
     void refreshConnected().then((connChanged) => {
       if (status.peerCount !== before || connChanged) broadcastStatus()
     })
-    // Top the warm session pool back up: sessions that died (peer dropped, idle
-    // close) are evicted by the fetch path, so re-warming here keeps the
-    // "connected peers" count from decaying to 0 between site loads.
-    void prewarm()
     try { void idbSet(IDB_PEERS_KEY, client.exportPeers()) } catch { /* best effort */ }
   }, DAEMON_REFRESH_SECS * 1000)
 }
@@ -490,6 +478,14 @@ interface FetchResult { httpStatus: number, contentType?: string, body?: ArrayBu
 
 async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchResult> {
   console.log('[daemon] fetchPath:', refHex.slice(0, 12), 'path=', rawPath, '(await warm)')
+  // One deadline across every attempt below, so the candidates plus the
+  // single-file fallback can't outlast the SW's event budget between them.
+  const deadline = Date.now() + FETCH_DEADLINE_MS
+  const bounded = <T>(start: () => Promise<T>, label: string): Promise<T> => {
+    const remaining = deadline - Date.now()
+    if (remaining <= 0) return Promise.reject(new Error('fetch deadline exceeded before ' + label))
+    return withFetchTimeout(start(), Math.min(FETCH_TIMEOUT_MS, remaining), label)
+  }
   // Bound the wait on warm so a wedged init (e.g. wasm shared-memory failure)
   // surfaces as a 503 to the SW instead of hanging the request forever.
   try {
@@ -554,11 +550,7 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       // Bound each manifest fetch: if a wss:// dial hangs without timing out
       // inside the wasm (the unverified browser /ws dial path), surface it as
       // a timeout error instead of leaving the SW request pending forever.
-      const r = await withFetchTimeout(
-        c.fetchManifestPath(refHex, candidate, FETCH_RETRIES),
-        FETCH_TIMEOUT_MS,
-        candidate
-      )
+      const r = await bounded(() => c.fetchManifestPath(refHex, candidate, FETCH_RETRIES), candidate)
       const bytes = r.bytes.slice()
       setPhase('got ' + candidate + ' (' + bytes.length + ' bytes, L2 hits ' + c.chunkStoreHits() + ')', refHex)
       // A feed-resolved fetch may have advanced a feed's cached head index;
@@ -581,16 +573,13 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
   // a genuine deep 404 on a multi-file site still surfaces as a 404.
   if (p === '') {
     try {
-      const list = JSON.parse(await c.listManifest(refHex, FETCH_RETRIES)) as Array<{ path: string, contentType?: string }>
+      const listing = await bounded(() => c.listManifest(refHex, FETCH_RETRIES), 'manifest listing')
+      const list = JSON.parse(listing) as Array<{ path: string, contentType?: string }>
       const files = list.filter(e => e.path !== '' && e.path !== '/')
       if (files.length === 1) {
         const only = files[0]
         setPhase('single-file fallback: fetching ' + only.path, refHex)
-        const r = await withFetchTimeout(
-          c.fetchManifestPath(refHex, only.path, FETCH_RETRIES),
-          FETCH_TIMEOUT_MS,
-          only.path
-        )
+        const r = await bounded(() => c.fetchManifestPath(refHex, only.path, FETCH_RETRIES), only.path)
         const bytes = r.bytes.slice()
         setPhase('got ' + only.path + ' (' + bytes.length + ' bytes, single-file)', refHex)
         return { httpStatus: 200, contentType: r.contentType ?? only.contentType ?? guessType(only.path), body: bytes.buffer, mutable: r.feedResolved === true }

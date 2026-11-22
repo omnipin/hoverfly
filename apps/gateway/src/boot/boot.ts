@@ -200,8 +200,8 @@ async function ensureControllingSW (): Promise<ServiceWorker> {
     setTimeout(() => {
       if (navigator.serviceWorker.controller != null) { resolve(navigator.serviceWorker.controller); return }
       // One-shot reload so a freshly-installed SW can claim the page.
-      if (sessionStorage.getItem('gw-reloaded') == null) {
-        sessionStorage.setItem('gw-reloaded', '1')
+      if (sessionStorage.getItem(reloadKey) == null) {
+        sessionStorage.setItem(reloadKey, '1')
         location.reload()
       } else {
         reject(new Error('service worker did not take control'))
@@ -630,7 +630,6 @@ function renderShell (): ShellUi {
       const phaseForUs = s.phase != null && s.phase !== '' &&
         (s.phaseRef == null || OWN_REF == null || s.phaseRef === OWN_REF)
       if (!loaded) loadingSub.textContent = phaseForUs ? (s.phase as string) : msg
-      if (loaded) setTimeout(() => pill.classList.add('gw-min'), 1500)
     },
     fail (msg) { failShell(msg) }
   }

@@ -109,9 +109,22 @@ export const FETCH_RETRIES = 24
  * ceiling is just how many of the scarce, flaky browser /ws peers actually
  * accept a connection). A positive value caps the pool at that many sessions.
  * Passed to `start()` so warming happens inside wasm (between page loads, gated
- * on no in-flight fetch). Also used by the JS-side prewarm nudge/poll.
+ * on no in-flight fetch).
  */
 export const PREWARM_SESSIONS = 0
+/**
+ * Total budget (ms) for one service-worker fetch event. Chrome hard-kills a
+ * service worker whose event hasn't settled within ~5 minutes, and the request
+ * then dies as a bare network error. Staying under the cap keeps the worst case
+ * a readable 504 page.
+ */
+export const EVENT_BUDGET_MS = 290_000
+/**
+ * Deadline (ms) for the daemon's whole `fetchPath` (every manifest candidate
+ * plus the single-file fallback). Kept below EVENT_BUDGET_MS so the daemon's
+ * own error reply still reaches the SW before the SW gives up.
+ */
+export const FETCH_DEADLINE_MS = EVENT_BUDGET_MS - 10_000
 /** Cloudflare is hoverfly's built-in default; leave undefined to use it. */
 export const DOH_URL: string | undefined = undefined
 /**
