@@ -236,8 +236,8 @@ jobs:
       # wasm-bindgen CLI must match the crate version in Cargo.lock.
       - name: Install wasm-bindgen
         run: |
-          curl -fL https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.108/wasm-bindgen-0.2.108-x86_64-unknown-linux-musl.tar.gz \
-            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 wasm-bindgen-0.2.108-x86_64-unknown-linux-musl/wasm-bindgen
+          curl -fL https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.130/wasm-bindgen-0.2.130-x86_64-unknown-linux-musl.tar.gz \
+            | tar -xz -C "$HOME/.cargo/bin" --strip-components=1 wasm-bindgen-0.2.130-x86_64-unknown-linux-musl/wasm-bindgen
 
       # --no-default-features drops the native-only CLI bins; --lib builds
       # the cdylib, then wasm-bindgen emits the ESM package into pkg/.

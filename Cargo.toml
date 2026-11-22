@@ -44,12 +44,6 @@ bridge = []
 # builds use --no-default-features and never see it.
 pusher = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
 
-# Redirect futures-bounded to a vendored copy whose `Delay::tokio` falls back to
-# futures-timer on wasm32 (real tokio's timer panics in the browser). Fixes the
-# libp2p-identify (and any other) `futures_bounded::Delay::tokio` usage on wasm.
-[patch.crates-io]
-futures-bounded = { path = "vendor/futures-bounded" }
-
 [dependencies]
 nectar-primitives = "0.4.0"
 nectar-mantaray   = "0.4.0"

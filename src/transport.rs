@@ -2360,6 +2360,9 @@ impl SessionDriver {
                                 Some(ConnectionError::KeepAliveTimeout) => {
                                     diag::CONN_CLOSED_KEEPALIVE.fetch_add(1, Ordering::Relaxed);
                                 }
+                                Some(ConnectionError::Panicked(trace)) => {
+                                    tracing::warn!(%peer_id, %trace, "connection handler panicked");
+                                }
                                 None => {
                                     diag::CONN_CLOSED_CLEAN.fetch_add(1, Ordering::Relaxed);
                                 }
