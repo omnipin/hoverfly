@@ -89,12 +89,6 @@ let warmPromise: Promise<void> | null = null
 let statusTimer: ReturnType<typeof setInterval> | null = null
 let countTimer: ReturnType<typeof setInterval> | null = null
 
-// NB: every HoverflyClient method now takes `&self` (the node keeps its peers
-// behind interior mutability and runs discovery on a background task inside the
-// wasm daemon), so overlapping calls no longer trip wasm-bindgen's mutable-
-// borrow guard. Fetches can run concurrently with each other and with the
-// daemon's background maintenance — no JS-side serialization required.
-
 // ---------------- IndexedDB (peer-store persistence) ----------------
 // One connection for the worker's lifetime, reopened only if it fails or the
 // browser closes it.
@@ -351,7 +345,7 @@ async function warm (): Promise<void> {
     // windows for retrieval. We bound the await with a timeout so a stalled
     // bootnode dial can't wedge warm forever; start() keeps running in the
     // background past the timeout (its loop is already spawned internally).
-    setPhase('eager discovery (peers may collide with fetch if skipped)')
+    setPhase('eager discovery')
     const startPromise = c.start(status.bootstrap, DAEMON_REFRESH_SECS, DISCOVER_WAIT_SECS, PREWARM_SESSIONS)
       .then(async (count) => {
         refreshCounts()
@@ -535,8 +529,8 @@ async function handleFetchPath (refHex: string, rawPath: string): Promise<FetchR
       setPhase('fetching ' + (candidate || '(root)') +
         ' · ' + status.connected + '/' + status.dialable + ' nodes…', refHex)
       // Bound each manifest fetch: if a wss:// dial hangs without timing out
-      // inside the wasm (the unverified browser /ws dial path), surface it as
-      // a timeout error instead of leaving the SW request pending forever.
+      // inside the wasm, surface it as a timeout error instead of leaving the
+      // SW request pending forever.
       const r = await bounded(() => c.fetchManifestPath(refHex, candidate, FETCH_RETRIES), candidate)
       const bytes = r.bytes.slice()
       setPhase('got ' + candidate + ' (' + bytes.length + ' bytes, L2 hits ' + c.chunkStoreHits() + ')', refHex)
@@ -658,6 +652,4 @@ self.onconnect = (e: MessageEvent) => {
   void ensureWarm() // begin warming as soon as anything connects
 }
 
-// Fallback for environments that surface SharedWorker as a module worker with
-// a direct message channel rather than onconnect (defensive).
 self.addEventListener('error', (e) => console.error('[daemon] error', e))

@@ -1,6 +1,7 @@
-// Pure-logic self-tests (no DOM): run with `npm run selftest`.
+// Pure-logic self-tests (no DOM, no network): run with `pnpm selftest`.
 // Validates the swarm CID codec against hoverfly's `src/cid.rs` test vector,
-// CID<->reference round-trips, reference normalization, and host parsing.
+// CID<->reference round-trips, reference normalization, host parsing, and
+// ENS contenthash decoding.
 
 import assert from 'node:assert/strict'
 import { base32LowerDecode, base32LowerEncode, cidToReference, decodeSwarmContenthash, referenceToCid } from '../src/shared/swarm-cid.ts'

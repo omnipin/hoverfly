@@ -41,21 +41,23 @@ iframe connects to the **same instance**: one hoverfly node, one warm
 across all sites. The first request pays discovery; every later one reuses live
 forwarders.
 
-To make that warm cache reusable, this work added two bindings to hoverfly's
-wasm façade (`src/wasm.rs`) that wrap the already-tested walkers in
-`src/client.rs`:
-
-- `fetchManifestPath(root, path, retries) -> { bytes, contentType }` — resolves
-  `path` through the mantaray manifest and returns the file (uses the
-  `*_cached_ex` "daemon warm path").
-- `listManifest(root, retries) -> JSON` — directory listing.
+The daemon calls `start()` on the wasm client, which runs one eager discovery
+round, opens a warm pool of retrieval sessions, and then keeps both topped up
+in the background — but only while no fetch is in flight, since dialing on the
+browser's single ws+yamux connection driver resets in-flight retrieval
+substreams. Requests go through `fetchManifestPath(root, path, retries)`, which
+resolves `path` through the mantaray manifest (and through a feed, for mutable
+sites) and returns `{ bytes, contentType, feedResolved }`.
 
 ## Running
 
 ```bash
-# 1. Build the hoverfly wasm package (from the repo root) if pkg/ is stale:
+# 1. Build the threaded hoverfly wasm package (from the repo root) if pkg/ is
+#    stale. `wasm-threads` is required: the gateway runs the node over shared
+#    memory with a thread pool. The wasm-bindgen CLI version must match the
+#    `wasm-bindgen` crate version in Cargo.lock.
 RUSTUP_TOOLCHAIN=nightly cargo build --release --locked \
-  --target wasm32-unknown-unknown --no-default-features --lib
+  --target wasm32-unknown-unknown --no-default-features --features wasm-threads --lib
 wasm-bindgen --target web --out-dir pkg \
   target/wasm32-unknown-unknown/release/hoverfly.wasm
 
@@ -67,10 +69,13 @@ pnpm start            # builds, then serves on http://bzz.localhost:3000
 
 Open **http://bzz.localhost:3000** in Chrome. (`*.localhost` resolves to
 127.0.0.1 automatically — no `/etc/hosts` needed.) Enter a Swarm reference
-(64-char hex) or a swarm CID (`b…`) and it opens at `<cid>.bzz.localhost:3000`.
+(64-char hex), a swarm CID (`b…`) or an ENS name (`swarm.eth`) and it opens at
+`<cid>.bzz.localhost:3000`. ENS names are resolved through the ENS Universal
+Resolver (so offchain/wildcard names work too) and must carry a Swarm
+contenthash.
 
-`pnpm run watch` rebuilds on source changes (re-run `pnpm run build` after
-editing `public/`).
+`pnpm watch` rebuilds on source changes (re-run `pnpm build` after editing
+`public/`). `pnpm selftest` runs the pure-logic tests.
 
 ## Connectivity: browser-dialable peers
 
@@ -102,18 +107,14 @@ What the daemon does:
   refresh from the live bootnodes (the seed goes stale), persisting the result
   to IndexedDB.
 
-The landing page shows a live **dialable peer count** and a **Discover** box.
-For best reliability, point discovery at a WebSocket-capable bee you control
-(`/ip4/…/tcp/…/tls/sni/…/ws/p2p/…` or `/dns4/host/tcp/443/wss/p2p/…`).
+The landing page shows the live **connected peer** count (open retrieval
+sessions) and a **Discover** box. For best reliability, point discovery at a
+WebSocket-capable bee you control (`/ip4/…/tcp/…/tls/sni/…/ws/p2p/…` or
+`/dns4/host/tcp/443/wss/p2p/…`).
 
 > Regenerate the seed by hand (the cron in `omnipin/hoverfly-peers` normally
 > does this):
 > `target/release/hoverfly discover /dnsaddr/mainnet.ethswarm.org --rounds 3 --ws-only -o peers.ws.json`.
-
-> The wasm `/ws` dial path itself still needs verification in a real browser —
-> the peer availability and multiaddr shape are confirmed here, but the
-> `websocket-websys` dial to a `/tls/sni/…/ws` AutoTLS address has not been
-> exercised end-to-end from a browser yet.
 
 ## How a request is served
 
@@ -128,7 +129,8 @@ For best reliability, point discovery at a WebSocket-capable bee you control
 4. The iframe's document + subresource requests (`destination` ≠ `document`) are
    intercepted by the SW, which calls `fetchPath(ref, path)` on the daemon and
    returns a `Response` (Content-Type from manifest metadata; directories fall
-   back to `index.html`). Responses are content-addressed, so they're cached.
+   back to `index.html`). Content-addressed responses are cached; responses
+   resolved through a feed are mutable and never cached.
 
 ## Cross-origin isolation
 
@@ -148,17 +150,21 @@ SharedWorker. Chrome-first (uses `request.destination`, module SharedWorkers).
 ## Layout
 
 ```
-src/shared/   swarm-cid.ts (CIDv1 <-> ref, ports cid.rs), swarm-ref, parse-request,
-              config, protocol (daemon RPC + DaemonRpc client), bytes
+src/shared/   swarm-cid.ts (CIDv1 <-> ref, ports cid.rs; ENS contenthash decode),
+              ens.ts (ENS -> Swarm ref via the Universal Resolver), swarm-ref,
+              parse-request, config, protocol (daemon RPC + DaemonRpc client), bytes
 src/daemon/   daemon.ts          SharedWorker: the one warm hoverfly node
 src/frame/    frame.ts           broker iframe (relays ports to the daemon)
 src/sw/       sw.ts              content-origin service worker
 src/boot/     boot.ts            subdomain boot shell + content iframe
 src/app/      landing.ts         root landing page + daemon status
-public/       index.html, boot.html, daemon-frame.html, __gw__/styles.css
+public/       index.html, boot.html, __gw__/ (daemon-frame.html, unregister.html,
+              styles.css, favicon.svg)
 build.js      esbuild + vendors ../../pkg into dist/__gw__/hoverfly/
 serve.js      subdomain-aware dev server with isolation headers
-scripts/      selftest.ts        pure-logic tests (CID codec, host parsing)
+Caddyfile     production static server (on-demand TLS per <cid> subdomain)
+deploy/       ask-tls.js + systemd unit: the Caddy on-demand TLS gatekeeper
+scripts/      selftest.ts        pure-logic tests (CID codec, host parsing, ENS decode)
 ```
 
 ## Limitations
@@ -166,6 +172,5 @@ scripts/      selftest.ts        pure-logic tests (CID codec, host parsing)
 - Mainnet retrieval depends on reachable `/ws[s]` peers (see caveat).
 - The served site renders inside an iframe (address bar stays at the shell URL);
   in-site navigation works within the iframe.
-- Encrypted references, ENS names, and Swarm feeds aren't wired up (raw manifest
-  references only). The wasm exposes `listManifest` for future directory pages.
+- Encrypted references aren't supported.
 - Targets recent Chrome.

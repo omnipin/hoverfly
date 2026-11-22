@@ -54,8 +54,8 @@
 	root * /var/www/bzz-gateway/dist
 	encode zstd gzip
 
-	# gateway "unregister" escape hatch (serve.js: ?gw-unregister) — serve the
-	# inline unregister page generated at deploy time.
+	# gateway "unregister" escape hatch (serve.js: ?gw-unregister) — serve
+	# public/__gw__/unregister.html.
 	@unregister query gw-unregister=*
 	handle @unregister {
 		rewrite * /__gw__/unregister.html
