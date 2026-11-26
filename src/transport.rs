@@ -1012,6 +1012,13 @@ impl Transport {
                 &underlay,
                 &self.signer,
                 self.config.advertise.as_ref(),
+                // Light, unlike every session: bee admits a light peer
+                // without the bin-saturation check (`Kad.Pick`), so the
+                // crawl isn't refused by bees whose bin for us is full.
+                // `Kad.Announce` sends a light peer the same hive batches,
+                // and no chunk crosses this connection, so the 10x narrower
+                // light accounting budget costs nothing here.
+                false,
             ),
         )
         .await
@@ -1289,6 +1296,38 @@ impl PeerSession {
             &underlay,
             &transport.signer,
             transport.config.advertise.as_ref(),
+            // Advertise as full_node. Tried light_node empirically TWICE:
+            //
+            // Attempt 1 (May 2026, kept the full `REFRESH_RATE_PLUR=4.5M`):
+            // pool filled in ~300 ms (bee skips bin-saturation for
+            // lights) and then collapsed inside 30s as peers blocklisted
+            // us for over-debt — our outstanding balance (sized for full
+            // node) immediately overshot bee's 1.125M light disconnect
+            // limit.
+            //
+            // Attempt 2 (also May 2026, this time WITH the matched light
+            // `REFRESH_RATE_PLUR=450K` + `SAFE_PEER_THRESHOLD_PLUR=900K`):
+            // pool fills fast (<1s, confirms Pick bypass works), but
+            // upload throughput regresses 5-6× (30-40 KiB/s vs the
+            // full-node ~194 KiB/s baseline). The light refresh rate
+            // (450K/s of credit per peer per second) is genuinely the
+            // binding constraint at our buffer=128 concurrency: the
+            // dispatcher concentrates pushes on top-PO peers, those
+            // peers exhaust their per-second credit, and the dispatcher
+            // rotates through credit-saturated peers with ~3× more
+            // overdrafts than full-node mode.
+            //
+            // The fundamental trade-off: light mode bypasses the bin
+            // saturation gate (`Kad.Pick` at kademlia.go:1135-1149
+            // short-circuits to true for !FullNode) but accepts a 10×
+            // narrower accounting budget. For our high-concurrency
+            // upload workload the budget is the worse constraint.
+            //
+            // Conclusion: stay full_node=true. The earlier comment that
+            // "the dialer forces" was wrong (Pick IS called against us
+            // in the inbound-handshake handler at handshake.go:355), but
+            // light_node is still net-worse for throughput.
+            true,
         )
         .await?;
         let _peer_threshold = do_pricing(
@@ -2577,9 +2616,10 @@ async fn do_handshake(
     underlay: &Multiaddr,
     signer: &SwarmSigner,
     advertised: Option<&Multiaddr>,
+    full_node: bool,
 ) -> Result<handshake::HandshakeResult, TransportError> {
     let local_peer_id = *swarm.local_peer_id();
-    debug!(target: "hoverfly::transport", "opening outbound handshake");
+    debug!(target: "hoverfly::transport", "opening outbound handshake (full_node={full_node})");
 
     let mut stream = poll_until(swarm, control.open_stream(peer_id, HANDSHAKE_PROTO))
         .await
@@ -2593,38 +2633,7 @@ async fn do_handshake(
             underlay,
             advertised,
             &local_peer_id,
-            // Advertise as full_node. Tried light_node empirically TWICE:
-            //
-            // Attempt 1 (May 2026, kept the full `REFRESH_RATE_PLUR=4.5M`):
-            // pool filled in ~300 ms (bee skips bin-saturation for
-            // lights) and then collapsed inside 30s as peers blocklisted
-            // us for over-debt — our outstanding balance (sized for full
-            // node) immediately overshot bee's 1.125M light disconnect
-            // limit.
-            //
-            // Attempt 2 (also May 2026, this time WITH the matched light
-            // `REFRESH_RATE_PLUR=450K` + `SAFE_PEER_THRESHOLD_PLUR=900K`):
-            // pool fills fast (<1s, confirms Pick bypass works), but
-            // upload throughput regresses 5-6× (30-40 KiB/s vs the
-            // full-node ~194 KiB/s baseline). The light refresh rate
-            // (450K/s of credit per peer per second) is genuinely the
-            // binding constraint at our buffer=128 concurrency: the
-            // dispatcher concentrates pushes on top-PO peers, those
-            // peers exhaust their per-second credit, and the dispatcher
-            // rotates through credit-saturated peers with ~3× more
-            // overdrafts than full-node mode.
-            //
-            // The fundamental trade-off: light mode bypasses the bin
-            // saturation gate (`Kad.Pick` at kademlia.go:1135-1149
-            // short-circuits to true for !FullNode) but accepts a 10×
-            // narrower accounting budget. For our high-concurrency
-            // upload workload the budget is the worse constraint.
-            //
-            // Conclusion: stay full_node=true. The earlier comment that
-            // "the dialer forces" was wrong (Pick IS called against us
-            // in the inbound-handshake handler at handshake.go:355), but
-            // light_node is still net-worse for throughput.
-            true,
+            full_node,
         );
         // Run handshake while still draining inbound handshake/swarm
         // events, so a peer's inbound dial-back doesn't stall.
@@ -2636,7 +2645,7 @@ async fn do_handshake(
                     if let Some((pid, mut s)) = ev {
                         if pid == peer_id {
                             let _ = poll_until(swarm,
-                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, true)
+                                respond_to_handshake(&mut s, signer, None, advertised, &local_peer_id, pid, full_node)
                             ).await;
                         }
                     }

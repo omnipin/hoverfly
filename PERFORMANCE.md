@@ -11,9 +11,11 @@ the workloads we test is roughly 2-3×.
 
 hoverfly is a **light node**: it stores no chunks, keeps no reserve, and
 serves no pullsync. Functionally it is a client. But at the bee handshake it
-deliberately advertises **`full_node = true`** (see the call-site comment in
-`transport.rs`, `run_handshake` / `respond_to_handshake` — every caller
-passes `true`). This is a measured throughput decision, not an accident:
+deliberately advertises **`full_node = true`** on every session it pushes
+or fetches over (see the call-site comment in `PeerSession::connect_inner`).
+The one exception is the discovery crawl (`Transport::discover_peers`),
+which handshakes as light: see "Discovery". This is a measured throughput
+decision, not an accident:
 
 - Advertising `light` (`full_node = false`) was tried **twice** and both
   regressed:
@@ -46,6 +48,14 @@ Discovery is hive-driven: dial a peer, accept its hive stream, listen for
 broadcast peer announcements for `--wait` seconds, recurse for `--rounds`
 hops. The slow knob is the per-peer wait, so wins come from parallelism
 and peerlist hygiene.
+
+- **Light handshake.** The crawl connection advertises `full_node = false`.
+  Bee admits a light peer without the `Kad.Pick` bin-saturation check, so a
+  bee whose bin for our overlay is full still answers instead of refusing
+  the handshake. `Kad.Announce` sends a light peer the same hive batches
+  (it only skips gossiping *about* us to others), and no chunk crosses a
+  crawl connection, so the narrower light accounting budget never applies.
+  Push and fetch sessions stay full.
 
 - **Parallel per-round dialing.** `--discover-concurrency`
   (`DEFAULT_DISCOVER_CONCURRENCY = 16`) keeps N hive exchanges in flight at

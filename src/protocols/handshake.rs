@@ -15,8 +15,9 @@
 //!
 //! `full_node` is a parameter of [`run`]; the value hoverfly actually
 //! advertises is chosen by the caller (`transport.rs` passes
-//! `full_node = true` — a deliberate throughput/accounting tactic, see
-//! that call site's comment). We run no on-chain chequebook, so we
+//! `full_node = true` for push/fetch sessions — a deliberate
+//! throughput/accounting tactic, see `PeerSession::connect_inner` — and
+//! `false` for the discovery crawl). We run no on-chain chequebook, so we
 //! always send the zero `chequebook_address` to signal "no
 //! chequebook"; that's safe under either `full_node` value because bee's
 //! chequebook-verification gate only fires when the *peer* runs
