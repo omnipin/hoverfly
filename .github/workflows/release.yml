@@ -1,15 +1,14 @@
 name: release
 
-# Triggered when you publish a GitHub release (or pre-release) via the
-# UI / API. The release itself — with auto-generated changelog notes —
-# is created manually so GitHub's "Generate release notes" button can
-# do its thing. This workflow only attaches platform binaries.
+# Triggered when a GitHub release (or pre-release) is published. The
+# release itself, with generated notes, is created from the CLI; this
+# workflow only attaches platform binaries and publishes to npm.
 #
-# Workflow:
+# Workflow (full checklist in AGENTS.md, "Releases"):
 #   1. Bump, commit and tag (see release.toml), then push:
 #        cargo release patch --execute && git push --follow-tags
-#   2. On GitHub, "Draft a new release" against the tag, click
-#      "Generate release notes", review, then "Publish release".
+#   2. Publish the release:
+#        gh release create vX.Y.Z --verify-tag --title vX.Y.Z --generate-notes
 #   3. This workflow fires, builds for each target, and uploads
 #      `hoverfly-vX.Y.Z-<target>.tar.gz` + .sha256 to the release.
 #

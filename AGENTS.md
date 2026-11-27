@@ -663,6 +663,35 @@ near-unused (one `block_on` in `src/protocols/pushsync.rs`). Verify changes by:
   `1`; the value is also capped by the live pool size, so on a small/attrited
   pool the user-supplied number is the upper bound, not the guarantee.
 
+## Releases
+
+Cutting a release is a CLI-only job; no GitHub UI step. When asked for a new
+release:
+
+1. Start from a clean, up-to-date `main` (`git switch main && git pull`).
+   `cargo release` refuses to run off `main` or with uncommitted or
+   untracked files (`.env` is gitignored for this reason).
+2. Pick the bump: `patch` unless the user says otherwise. Ask before a
+   `minor` (or an exact `X.Y.Z`). On `0.x`, a minor bump is the breaking one.
+3. Dry run with `cargo release patch`. It must touch exactly four places:
+   `Cargo.toml`, `Cargo.lock`, the `HOVERFLY_VERSION=` install line in
+   `README.md`, and the "currently `X.Y.Z`" line under "Build" in this file.
+   The patterns live in `release.toml`.
+4. `cargo release patch --execute --no-confirm`. This creates a signed
+   `chore(release): vX.Y.Z` commit and an annotated `vX.Y.Z` tag. It does
+   not push or publish to crates.io. If it's missing, install it with
+   `cargo binstall cargo-release`.
+5. `git push --follow-tags origin main`.
+6. `gh release create vX.Y.Z --verify-tag --title vX.Y.Z --generate-notes`.
+   The title is the bare tag and the notes are GitHub's generated "What's
+   Changed" list. Add `--prerelease` for a pre-release.
+7. Publishing fires `.github/workflows/release.yml`. It builds and attests
+   the four platform tarballs and publishes `@omnipin/hoverfly` to npm. Watch
+   it with `gh run watch $(gh run list --workflow release.yml -L 1 --json
+   databaseId -q '.[0].databaseId')`. When it finishes, confirm the release
+   has 8 assets (`gh release view vX.Y.Z --json assets`): a tarball plus a
+   `.sha256` per target.
+
 ## When changing this code
 
 - After any `transport.rs`, `client.rs`, or trait-bound change, run `cargo
