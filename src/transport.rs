@@ -2691,7 +2691,14 @@ async fn do_pricing(
                     }
                 }
             }
-            _ = swarm.select_next_some() => {}
+            ev = swarm.select_next_some() => {
+                // No pricing comes over a connection bee has dropped.
+                if let SwarmEvent::ConnectionClosed { peer_id: pid, num_established: 0, .. } = ev {
+                    if pid == peer_id {
+                        return Err(TransportError::ConnectionClosed);
+                    }
+                }
+            }
         }
     }
     debug!(target: "hoverfly::transport", "opening outbound pricing");
