@@ -6,7 +6,8 @@ name: release
 # do its thing. This workflow only attaches platform binaries.
 #
 # Workflow:
-#   1. Tag locally and push it:  git push origin v0.2.0
+#   1. Bump, commit and tag (see release.toml), then push:
+#        cargo release patch --execute && git push --follow-tags
 #   2. On GitHub, "Draft a new release" against the tag, click
 #      "Generate release notes", review, then "Publish release".
 #   3. This workflow fires, builds for each target, and uploads
