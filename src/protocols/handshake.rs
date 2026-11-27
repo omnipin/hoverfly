@@ -12,6 +12,8 @@
 //!   1. Send `Syn { observed_underlay }`.
 //!   2. Receive `SynAck { syn, ack }`.
 //!   3. Send `Ack { address: BzzAddress, network_id, full_node, ... }`.
+//!   4. Read to EOF: a clean close means bee admitted us, a reset means it
+//!      refused us.
 //!
 //! `full_node` is a parameter of [`run`]; the value hoverfly actually
 //! advertises is chosen by the caller (`transport.rs` passes
@@ -48,6 +50,13 @@ pub enum HandshakeError {
     TimestampInvalid(i64),
     #[error("peer's overlay is not derived from its signing key")]
     OverlayMismatch,
+    /// Bee reset the stream after our Ack instead of closing it: it
+    /// rejected the handshake, typically `Kad.Pick` refusing a full-node
+    /// peer into a saturated bin.
+    #[error("peer refused the handshake: {0}")]
+    Refused(std::io::Error),
+    #[error("peer sent data after the handshake")]
+    TrailingData,
 }
 
 #[derive(Debug, Clone)]
@@ -209,6 +218,17 @@ where
     match peer_eth_address {
         Some(eth) if crate::signer::derive_overlay(&eth, network_id, &nonce32) == peer_overlay => {}
         _ => return Err(HandshakeError::OverlayMismatch),
+    }
+
+    // 4. Wait for bee's verdict on our Ack. It closes its write side once
+    // it has admitted us and resets the stream (then closes the connection)
+    // when it refuses us. Without this a refusal looks like success, and
+    // the caller only notices when the pricing exchange times out.
+    let mut probe = [0u8; 1];
+    match futures::AsyncReadExt::read(stream, &mut probe).await {
+        Ok(0) => {}
+        Ok(_) => return Err(HandshakeError::TrailingData),
+        Err(e) => return Err(HandshakeError::Refused(e)),
     }
 
     Ok(HandshakeResult {
