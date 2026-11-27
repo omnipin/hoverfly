@@ -25,7 +25,7 @@ download files to decentralized storage natively and in a browser.
 curl -fsSL https://raw.githubusercontent.com/omnipin/hoverfly/main/install.sh | sh
 ```
 
-This installs to `~/.local/bin`. Pin a version with `HOVERFLY_VERSION=v0.3.1`
+This installs to `~/.local/bin`. Pin a version with `HOVERFLY_VERSION=v0.3.2`
 before `sh`, or build from source:
 
 ```sh
