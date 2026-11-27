@@ -23,3 +23,6 @@ cheques.json
 peers.seed.json
 peers.ws.json
 .DS_Store
+# Local secrets (RPC URLs, keys). Also keeps `cargo release` from refusing
+# to run on an untracked file.
+.env

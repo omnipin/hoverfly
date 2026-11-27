@@ -1,0 +1,15 @@
+# `cargo release <patch|minor|major|X.Y.Z> --execute` (cargo-release)
+# bumps the version in Cargo.toml / Cargo.lock and the docs below, commits
+# `chore(release): vX.Y.Z` and creates an annotated `vX.Y.Z` tag. Drop
+# `--execute` for a dry run. Then `git push --follow-tags` and publish the
+# release from the GitHub UI; `.github/workflows/release.yml` does the rest.
+allow-branch = ["main"]
+publish = false
+push = false
+tag-name = "v{{version}}"
+tag-message = "v{{version}}"
+pre-release-commit-message = "chore(release): v{{version}}"
+pre-release-replacements = [
+  { file = "README.md", search = "HOVERFLY_VERSION=v[0-9][0-9A-Za-z.+-]*", replace = "HOVERFLY_VERSION=v{{version}}", exactly = 1 },
+  { file = "AGENTS.md", search = "currently\\n  `[^`]+`", replace = "currently\n  `{{version}}`", exactly = 1 },
+]
